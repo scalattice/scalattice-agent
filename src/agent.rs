@@ -51,7 +51,10 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
                     kind: "heartbeat",
                     specs: Some(specs),
                 })?;
-                write.send(Message::Text(hb)).await?;
+                write
+                    .send(Message::Text(hb))
+                    .await
+                    .map_err(|err| anyhow!("websocket write failed: {err}"))?;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("shutting down");
@@ -71,7 +74,6 @@ async fn handle_server_message<W>(
 ) -> Result<bool>
 where
     W: SinkExt<Message> + Unpin,
-    <W as SinkExt<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     match msg {
         Message::Text(text) => {
@@ -86,7 +88,8 @@ where
                     let register = register_message(config.region.clone(), models, specs);
                     write
                         .send(Message::Text(serde_json::to_string(&register)?))
-                        .await?;
+                        .await
+                        .map_err(|err| anyhow!("websocket write failed: {err}"))?;
                 }
                 "registered" => {
                     let reg = parse_registered(data)?;
@@ -119,7 +122,10 @@ where
             }
         }
         Message::Ping(payload) => {
-            write.send(Message::Pong(payload)).await?;
+            write
+                .send(Message::Pong(payload))
+                .await
+                .map_err(|err| anyhow!("websocket write failed: {err}"))?;
         }
         Message::Close(_) => return Ok(false),
         _ => {}
@@ -153,7 +159,6 @@ fn pick_models(requested: &[String], catalog: &[CatalogModel]) -> Vec<String> {
 async fn respond_invoke<W>(config: &AgentConfig, write: &mut W, invoke: crate::protocol::InvokeMessage) -> Result<()>
 where
     W: SinkExt<Message> + Unpin,
-    <W as SinkExt<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     info!(
         "invoke {} · model {} · runtime {}",
@@ -185,7 +190,8 @@ where
         };
         write
             .send(Message::Text(serde_json::to_string(&result)?))
-            .await?;
+            .await
+            .map_err(|err| anyhow!("websocket write failed: {err}"))?;
         return Ok(());
     }
 
@@ -199,7 +205,8 @@ where
     };
     write
         .send(Message::Text(serde_json::to_string(&err)?))
-        .await?;
+        .await
+        .map_err(|e| anyhow!("websocket write failed: {e}"))?;
     Ok(())
 }
 

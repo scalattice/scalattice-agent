@@ -83,33 +83,37 @@ fn detect_nvidia_gpus() -> Option<NvidiaGpuSnapshot> {
         return None;
     }
 
-    let lines: Vec<&str> = String::from_utf8_lossy(&output.stdout)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<String> = stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .map(str::to_string)
         .collect();
 
     if lines.is_empty() {
         return None;
     }
 
-    let mut best: Option<(u32, Vec<&str>)> = None;
-    for line in &lines {
+    let mut best: Option<(u32, usize)> = None;
+    for (idx, line) in lines.iter().enumerate() {
         let parts: Vec<&str> = line.split(',').map(str::trim).collect();
         if parts.len() < 5 {
             continue;
         }
-        let vram_gb = parts[2].parse::<f32>().ok().map(|mb| mb_to_gb(mb));
+        let vram_gb = parts[2].parse::<f32>().ok().map(mb_to_gb);
         let score = vram_gb.unwrap_or(0);
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
-            best = Some((score, parts));
+            best = Some((score, idx));
         }
     }
 
-    let (parts, count) = match best {
-        Some((_, parts)) => (parts, lines.len().min(255) as u8),
+    let (idx, count) = match best {
+        Some((_, idx)) => (idx, lines.len().min(255) as u8),
         None => return None,
     };
+
+    let parts: Vec<&str> = lines[idx].split(',').map(str::trim).collect();
 
     let vram_gb = parts[2].parse::<f32>().ok().map(|mb| mb_to_gb(mb));
     let vram_used_gb = parts[3].parse::<f32>().ok().map(|mb| mb_to_gb(mb));
