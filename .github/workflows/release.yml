@@ -40,11 +40,12 @@ jobs:
 
       - name: Install CUDA toolkit (x86_64 GPU build)
         if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.2
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda
         with:
-          cuda: '12.4.0'
+          cuda: '12.6.0'
           method: network
+          use-github-cache: false
 
       - name: Build release binary
         run: |
