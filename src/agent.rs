@@ -5,13 +5,17 @@ use crate::protocol::{
 };
 use crate::specs::{detect_machine_specs, MachineSpecs};
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::time::interval;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{info, warn};
+
+type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     let specs = detect_machine_specs();
@@ -51,10 +55,7 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
                     kind: "heartbeat",
                     specs: Some(specs),
                 })?;
-                write
-                    .send(Message::Text(hb))
-                    .await
-                    .map_err(|err| anyhow!("websocket write failed: {err}"))?;
+                write.send(Message::Text(hb)).await?;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("shutting down");
@@ -66,15 +67,12 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
     Ok(())
 }
 
-async fn handle_server_message<W>(
+async fn handle_server_message(
     config: &AgentConfig,
-    write: &mut W,
+    write: &mut WsWrite,
     registered: &mut bool,
     msg: Message,
-) -> Result<bool>
-where
-    W: SinkExt<Message> + Unpin,
-{
+) -> Result<bool> {
     match msg {
         Message::Text(text) => {
             let data = text.as_bytes();
@@ -88,8 +86,7 @@ where
                     let register = register_message(config.region.clone(), models, specs);
                     write
                         .send(Message::Text(serde_json::to_string(&register)?))
-                        .await
-                        .map_err(|err| anyhow!("websocket write failed: {err}"))?;
+                        .await?;
                 }
                 "registered" => {
                     let reg = parse_registered(data)?;
@@ -122,10 +119,7 @@ where
             }
         }
         Message::Ping(payload) => {
-            write
-                .send(Message::Pong(payload))
-                .await
-                .map_err(|err| anyhow!("websocket write failed: {err}"))?;
+            write.send(Message::Pong(payload)).await?;
         }
         Message::Close(_) => return Ok(false),
         _ => {}
@@ -156,10 +150,11 @@ fn pick_models(requested: &[String], catalog: &[CatalogModel]) -> Vec<String> {
         .collect()
 }
 
-async fn respond_invoke<W>(config: &AgentConfig, write: &mut W, invoke: crate::protocol::InvokeMessage) -> Result<()>
-where
-    W: SinkExt<Message> + Unpin,
-{
+async fn respond_invoke(
+    config: &AgentConfig,
+    write: &mut WsWrite,
+    invoke: crate::protocol::InvokeMessage,
+) -> Result<()> {
     info!(
         "invoke {} · model {} · runtime {}",
         invoke.id, invoke.model_id, invoke.runtime_model
@@ -190,8 +185,7 @@ where
         };
         write
             .send(Message::Text(serde_json::to_string(&result)?))
-            .await
-            .map_err(|err| anyhow!("websocket write failed: {err}"))?;
+            .await?;
         return Ok(());
     }
 
@@ -205,8 +199,7 @@ where
     };
     write
         .send(Message::Text(serde_json::to_string(&err)?))
-        .await
-        .map_err(|e| anyhow!("websocket write failed: {e}"))?;
+        .await?;
     Ok(())
 }
 
