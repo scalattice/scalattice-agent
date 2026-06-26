@@ -1,3 +1,4 @@
+use crate::runtime::AgentRuntime;
 use crate::specs::MachineSpecs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +42,8 @@ pub struct RegisterMessage {
     pub vram_gb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub specs: Option<MachineSpecs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntime>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +95,8 @@ pub struct HeartbeatMessage {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub specs: Option<MachineSpecs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntime>,
 }
 
 pub fn parse_envelope(data: &[u8]) -> anyhow::Result<Envelope> {

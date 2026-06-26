@@ -3,12 +3,15 @@ use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_ready, parse_registered, CatalogModel,
     HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
 };
+use crate::runtime::{build_runtime, JobState};
 use crate::specs::{detect_machine_specs, MachineSpecs};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -17,9 +20,64 @@ use tracing::{info, warn};
 
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
+struct SessionState {
+    registered: bool,
+    demo_mode: bool,
+    job_state: JobState,
+    active_job_id: Option<String>,
+    active_model_id: Option<String>,
+    advertised_models: Vec<String>,
+    loaded_models: Vec<String>,
+}
+
+impl SessionState {
+    fn new(demo_mode: bool) -> Self {
+        Self {
+            registered: false,
+            demo_mode,
+            job_state: JobState::Idle,
+            active_job_id: None,
+            active_model_id: None,
+            advertised_models: Vec::new(),
+            loaded_models: Vec::new(),
+        }
+    }
+
+    fn runtime(&self) -> crate::runtime::AgentRuntime {
+        build_runtime(
+            self.demo_mode,
+            self.job_state,
+            self.active_job_id.clone(),
+            self.active_model_id.clone(),
+            &self.loaded_models,
+        )
+    }
+}
+
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
+    if config.demo_mode {
+        info!("demo mode enabled: echo responses only");
+    } else {
+        info!("production mode: model weights must be loaded locally for real inference");
+    }
+
+    let mut backoff = Duration::from_secs(3);
+    loop {
+        match run_agent_session(&config).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                warn!("disconnected: {err:#}; reconnecting in {:?}…", backoff);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(120));
+            }
+        }
+    }
+}
+
+async fn run_agent_session(config: &AgentConfig) -> Result<()> {
+    let state = Arc::new(Mutex::new(SessionState::new(config.demo_mode)));
 
     let mut request = config
         .ws_url
@@ -35,7 +93,6 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
         .context("WebSocket connect failed (check token and network)")?;
 
     let (mut write, mut read) = ws.split();
-    let mut registered = false;
     let mut heartbeat = interval(Duration::from_secs(25));
 
     loop {
@@ -45,21 +102,19 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
                     bail!("connection closed by server");
                 };
                 let msg = msg.context("websocket read error")?;
-                if !handle_server_message(&config, &mut write, &mut registered, msg).await? {
+                if !handle_server_message(config, &state, &mut write, msg).await? {
                     break;
                 }
             }
-            _ = heartbeat.tick(), if registered => {
-                let specs = detect_machine_specs();
-                let hb = serde_json::to_string(&HeartbeatMessage {
-                    kind: "heartbeat",
-                    specs: Some(specs),
-                })?;
-                write.send(Message::Text(hb)).await?;
+            _ = heartbeat.tick() => {
+                let registered = state.lock().await.registered;
+                if registered {
+                    send_heartbeat(&state, &mut write).await?;
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("shutting down");
-                break;
+                return Ok(());
             }
         }
     }
@@ -67,10 +122,24 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
     Ok(())
 }
 
+async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -> Result<()> {
+    let (specs, runtime) = {
+        let guard = state.lock().await;
+        (detect_machine_specs(), guard.runtime())
+    };
+    let hb = serde_json::to_string(&HeartbeatMessage {
+        kind: "heartbeat",
+        specs: Some(specs),
+        runtime: Some(runtime),
+    })?;
+    write.send(Message::Text(hb)).await?;
+    Ok(())
+}
+
 async fn handle_server_message(
     config: &AgentConfig,
+    state: &Arc<Mutex<SessionState>>,
     write: &mut WsWrite,
-    registered: &mut bool,
     msg: Message,
 ) -> Result<bool> {
     match msg {
@@ -83,26 +152,42 @@ async fn handle_server_message(
                     info!("assigned node {}", ready.node_id);
                     let models = pick_models(&config.models, &ready.catalog);
                     let specs = detect_machine_specs();
-                    let register = register_message(config.region.clone(), models, specs);
+                    let runtime = {
+                        let mut guard = state.lock().await;
+                        guard.advertised_models = models.clone();
+                        guard.runtime()
+                    };
+                    let register = RegisterMessage {
+                        kind: "register",
+                        region: config.region.clone(),
+                        models,
+                        gpu_name: specs.gpu_name.clone(),
+                        vram_gb: specs.vram_gb,
+                        specs: Some(specs),
+                        runtime: Some(runtime),
+                    };
                     write
                         .send(Message::Text(serde_json::to_string(&register)?))
                         .await?;
                 }
                 "registered" => {
                     let reg = parse_registered(data)?;
-                    *registered = true;
-                    info!(
-                        "registered · node {} · models: {}",
-                        reg.node_id,
-                        reg.models.join(", ")
-                    );
-                    if config.demo_mode {
-                        warn!("demo mode enabled (SCALATTICE_AGENT_DEMO=1): echo responses only");
+                    {
+                        let mut guard = state.lock().await;
+                        guard.registered = true;
+                        guard.advertised_models = reg.models.clone();
                     }
+                    let runtime = state.lock().await.runtime();
+                    info!(
+                        "registered · node {} · models: {} · {}",
+                        reg.node_id,
+                        reg.models.join(", "),
+                        runtime.status_label
+                    );
                 }
                 "invoke" => {
                     let invoke = parse_invoke(data)?;
-                    respond_invoke(config, write, invoke).await?;
+                    respond_invoke(config, state, write, invoke).await?;
                 }
                 "pong" => {}
                 "error" => {
@@ -127,17 +212,6 @@ async fn handle_server_message(
     Ok(true)
 }
 
-fn register_message(region: String, models: Vec<String>, specs: MachineSpecs) -> RegisterMessage {
-    RegisterMessage {
-        kind: "register",
-        region,
-        models,
-        gpu_name: specs.gpu_name.clone(),
-        vram_gb: specs.vram_gb,
-        specs: Some(specs),
-    }
-}
-
 fn pick_models(requested: &[String], catalog: &[CatalogModel]) -> Vec<String> {
     if requested.is_empty() {
         return catalog.iter().map(|m| m.model_id.clone()).collect();
@@ -152,6 +226,7 @@ fn pick_models(requested: &[String], catalog: &[CatalogModel]) -> Vec<String> {
 
 async fn respond_invoke(
     config: &AgentConfig,
+    state: &Arc<Mutex<SessionState>>,
     write: &mut WsWrite,
     invoke: crate::protocol::InvokeMessage,
 ) -> Result<()> {
@@ -160,47 +235,68 @@ async fn respond_invoke(
         invoke.id, invoke.model_id, invoke.runtime_model
     );
 
-    if config.demo_mode {
-        let user = invoke
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
-
-        let content = format!("[demo agent echo] {user}");
-        let prompt_tokens = estimate_tokens(&invoke.messages);
-        let completion_tokens = estimate_tokens(&[crate::protocol::ChatMessage {
-            role: "assistant".to_string(),
-            content: content.clone(),
-        }]);
-
-        let result = InvokeResultMessage {
-            kind: "invoke_result",
-            id: invoke.id,
-            content,
-            prompt_tokens,
-            completion_tokens,
-        };
-        write
-            .send(Message::Text(serde_json::to_string(&result)?))
-            .await?;
-        return Ok(());
+    {
+        let mut guard = state.lock().await;
+        guard.job_state = JobState::Busy;
+        guard.active_job_id = Some(invoke.id.clone());
+        guard.active_model_id = Some(invoke.model_id.clone());
     }
+    send_heartbeat(state, write).await?;
 
-    let err = InvokeErrorMessage {
-        kind: "invoke_error",
-        id: invoke.id,
-        error: format!(
-            "Model runtime not loaded on this agent yet. Pull weights for {} and enable SCALATTICE_AGENT_DEMO=1 for connectivity testing.",
-            invoke.runtime_model
-        ),
-    };
-    write
-        .send(Message::Text(serde_json::to_string(&err)?))
-        .await?;
-    Ok(())
+    let result = async {
+        if config.demo_mode {
+            let user = invoke
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.as_str())
+                .unwrap_or("");
+
+            let content = format!("[demo agent echo] {user}");
+            let prompt_tokens = estimate_tokens(&invoke.messages);
+            let completion_tokens = estimate_tokens(&[crate::protocol::ChatMessage {
+                role: "assistant".to_string(),
+                content: content.clone(),
+            }]);
+
+            let result = InvokeResultMessage {
+                kind: "invoke_result",
+                id: invoke.id,
+                content,
+                prompt_tokens,
+                completion_tokens,
+            };
+            write
+                .send(Message::Text(serde_json::to_string(&result)?))
+                .await?;
+            Ok(())
+        } else {
+            let err = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke.id,
+                error: format!(
+                    "Model runtime not loaded on this agent yet. Pull weights for {} and enable SCALATTICE_AGENT_DEMO=1 for connectivity testing.",
+                    invoke.runtime_model
+                ),
+            };
+            write
+                .send(Message::Text(serde_json::to_string(&err)?))
+                .await?;
+            Ok(())
+        }
+    }
+    .await;
+
+    {
+        let mut guard = state.lock().await;
+        guard.job_state = JobState::Idle;
+        guard.active_job_id = None;
+        guard.active_model_id = None;
+    }
+    send_heartbeat(state, write).await?;
+
+    result
 }
 
 fn estimate_tokens(messages: &[crate::protocol::ChatMessage]) -> u32 {

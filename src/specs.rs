@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use serde::Serialize;
 use std::process::Command;
 
@@ -77,7 +78,16 @@ fn detect_gpus() -> Option<GpuSnapshot> {
 }
 
 fn detect_nvidia_gpus() -> Option<GpuSnapshot> {
-    let output = Command::new("nvidia-smi")
+    for bin in ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi", "nvidia-smi"] {
+        if let Some(snapshot) = detect_nvidia_gpus_from(bin) {
+            return Some(snapshot);
+        }
+    }
+    None
+}
+
+fn detect_nvidia_gpus_from(bin: &str) -> Option<GpuSnapshot> {
+    let output = Command::new(bin)
         .args([
             "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,driver_version",
             "--format=csv,noheader,nounits",
@@ -142,23 +152,31 @@ fn detect_nvidia_gpus() -> Option<GpuSnapshot> {
 }
 
 fn detect_cuda_version() -> Option<String> {
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=cuda_version", "--format=csv,noheader"])
-        .output()
-        .ok()?;
+    for bin in ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi", "nvidia-smi"] {
+        let output = match Command::new(bin)
+            .args(["--query-gpu=cuda_version", "--format=csv,noheader"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
 
-    if !output.status.success() {
-        return None;
+        if !output.status.success() {
+            continue;
+        }
+
+        let version = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if !version.is_empty() {
+            return Some(version);
+        }
     }
-
-    let version = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    (!version.is_empty()).then_some(version)
+    None
 }
 
 fn detect_amd_gpus() -> Option<GpuSnapshot> {
@@ -232,7 +250,7 @@ fn detect_pci_gpus() -> Option<GpuSnapshot> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let names: Vec<String> = stdout
+    let raw_names: Vec<String> = stdout
         .lines()
         .filter_map(|line| {
             let lower = line.to_ascii_lowercase();
@@ -253,6 +271,8 @@ fn detect_pci_gpus() -> Option<GpuSnapshot> {
         })
         .collect();
 
+    let names = dedupe_pci_gpu_names(raw_names);
+
     if names.is_empty() {
         return None;
     }
@@ -266,6 +286,60 @@ fn detect_pci_gpus() -> Option<GpuSnapshot> {
         driver_version: None,
         cuda_version: None,
     })
+}
+
+fn dedupe_pci_gpu_names(raw_names: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for raw in raw_names {
+        let key = pci_gpu_dedupe_key(&raw);
+        if seen.insert(key) {
+            out.push(clean_pci_gpu_name(&raw));
+        }
+    }
+    out
+}
+
+fn pci_gpu_dedupe_key(raw: &str) -> String {
+    if let Some(start) = raw.find('[') {
+        if let Some(end) = raw[start + 1..].find(']') {
+            return raw[start + 1..start + 1 + end].to_ascii_lowercase();
+        }
+    }
+    raw.split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn clean_pci_gpu_name(raw: &str) -> String {
+    if let Some(start) = raw.find('[') {
+        if let Some(end) = raw[start + 1..].find(']') {
+            let inner = &raw[start + 1..start + 1 + end];
+            if raw.to_ascii_lowercase().contains("nvidia") {
+                return format!("NVIDIA {inner}");
+            }
+            if raw.to_ascii_lowercase().contains("amd") {
+                return format!("AMD {inner}");
+            }
+            return inner.to_string();
+        }
+    }
+
+    let mut name = raw.to_string();
+    for prefix in [
+        "NVIDIA Corporation ",
+        "Advanced Micro Devices, Inc. [AMD/ATI] ",
+        "Advanced Micro Devices, Inc. ",
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            name = rest.to_string();
+            break;
+        }
+    }
+
+  name.trim().to_string()
 }
 
 fn detect_hostname() -> Option<String> {

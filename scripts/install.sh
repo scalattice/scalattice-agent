@@ -131,6 +131,10 @@ else
 fi
 echo "  3. scalattice-agent status"
 echo "  4. scalattice-agent connect"
+echo "  5. scalattice-agent service install   # optional: run in background, auto-restart"
 echo ""
 echo "Demo / connectivity testing without model weights:"
 echo "  SCALATTICE_AGENT_DEMO=1 scalattice-agent connect"
+echo ""
+echo "After power loss or disconnects, v1.0.3+ reconnects automatically in the foreground."
+echo "For boot-time start: scalattice-agent service install && sudo loginctl enable-linger \$USER"

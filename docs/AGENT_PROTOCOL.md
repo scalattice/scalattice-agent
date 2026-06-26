@@ -51,11 +51,18 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
     "hostname": "gpu-box",
     "cpuModel": "AMD Ryzen 9 7950X",
     "ramGb": 128
+  },
+  "runtime": {
+    "demoMode": false,
+    "ready": false,
+    "jobState": "idle",
+    "statusLabel": "Connected · no model runtime loaded",
+    "loadedModels": []
   }
 }
 ```
 
-`gpuName` and `vramGb` are kept for compatibility. Prefer sending the full `specs` object.
+`gpuName` and `vramGb` are kept for compatibility. Prefer sending the full `specs` object. Include `runtime` so the Providers dashboard can show demo mode, readiness, and active jobs.
 
 3. **Server → client** `registered`: the machine is in the live operator pool.
 
@@ -83,11 +90,18 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
     "hostname": "gpu-box",
     "cpuModel": "AMD Ryzen 9 7950X",
     "ramGb": 128
+  },
+  "runtime": {
+    "demoMode": true,
+    "ready": true,
+    "jobState": "idle",
+    "statusLabel": "Idle · demo mode (echo only)",
+    "loadedModels": []
   }
 }
 ```
 
-The reference agent detects NVIDIA (`nvidia-smi`), AMD (`rocm-smi`), and PCI graphics devices (`lspci`), plus host CPU/RAM via `/proc`.
+The reference agent sends an extra heartbeat when a job starts or finishes so `jobState: busy` appears on the dashboard immediately. GPU detection uses NVIDIA (`nvidia-smi`), AMD (`rocm-smi`), and PCI graphics devices (`lspci`), plus host CPU/RAM via `/proc`.
 
 5. **Server → client** `invoke`: inference job:
 
@@ -139,6 +153,16 @@ The reference agent detects NVIDIA (`nvidia-smi`), AMD (`rocm-smi`), and PCI gra
 | `SCALATTICE_AGENT_REGION` | Region: `auto`, `us`, `eu`, or `ap` |
 | `SCALATTICE_AGENT_MODELS` | Comma-separated catalog model ids to advertise |
 | `SCALATTICE_AGENT_DEMO` | Set to `1` for echo-only connectivity testing |
+
+## Background service (Linux + systemd)
+
+```bash
+scalattice-agent service install    # user unit, auto-restart on disconnect
+scalattice-agent service status
+sudo loginctl enable-linger $USER   # optional: start at boot without login
+```
+
+Foreground `connect` (v1.0.3+) also reconnects automatically after network drops.
 
 ## Implementation notes
 

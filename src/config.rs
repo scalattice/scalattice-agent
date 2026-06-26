@@ -41,7 +41,7 @@ impl AgentConfig {
             })
             .unwrap_or_default();
 
-        let demo_mode = demo || env::var("SCALATTICE_AGENT_DEMO").ok().as_deref() == Some("1");
+        let demo_mode = demo || crate::runtime::demo_mode_from_env();
 
         Ok(Self {
             token,
