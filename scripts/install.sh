@@ -454,6 +454,8 @@ if [ -n "$TOKEN" ]; then
   echo "  Manage GPUs, models, demo mode, and schedules from the dashboard."
 else
   echo "  1. Create a machine token at https://scalattice.cloud/providers"
-  echo "  2. Re-run: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…"
+  echo "  2. Run: scalattice-agent set-token --token slt_provider_…"
+  echo "     or re-run: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…"
+  echo "  Without a token this machine will not appear on the dashboard."
 fi
 echo "  Check connection: scalattice-agent status"

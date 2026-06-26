@@ -98,6 +98,26 @@ pub fn install_user_service() -> Result<()> {
         );
     }
 
+    let env_raw = fs::read_to_string(&env_file)?;
+    let has_token = env_raw.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let Some((key, value)) = assignment.split_once('=') else {
+            return false;
+        };
+        key.trim() == "SCALATTICE_AGENT_TOKEN"
+            && !value.trim().trim_matches('"').trim_matches('\'').is_empty()
+    });
+    if !has_token {
+        bail!(
+            "SCALATTICE_AGENT_TOKEN is not set in {} - run: scalattice-agent set-token --token slt_provider_…",
+            env_file.display()
+        );
+    }
+
     sync_systemd_env_file(&home)?;
 
     let systemd_env = systemd_env_path(&home);

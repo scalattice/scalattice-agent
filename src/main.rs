@@ -120,6 +120,8 @@ fn print_status() -> Result<()> {
     if !agent_token_configured() {
         println!("token: not set — create one at https://scalattice.cloud/providers");
         println!("set token: scalattice-agent set-token --token slt_provider_…");
+    } else {
+        println!("token: set");
     }
 
     println!("dashboard: https://scalattice.cloud/providers");
@@ -135,11 +137,36 @@ fn agent_token_configured() -> bool {
     {
         return true;
     }
+
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };
-    let path = std::path::PathBuf::from(home).join(".config/scalattice/agent.env");
-    std::fs::read_to_string(path)
-        .ok()
-        .is_some_and(|raw| raw.contains("SCALATTICE_AGENT_TOKEN="))
+
+    for name in ["agent.env", "agent.systemd.env"] {
+        let path = std::path::PathBuf::from(&home)
+            .join(".config/scalattice")
+            .join(name);
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+            let Some((key, value)) = assignment.split_once('=') else {
+                continue;
+            };
+            if key.trim() != "SCALATTICE_AGENT_TOKEN" {
+                continue;
+            }
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if !value.is_empty() {
+                return true;
+            }
+        }
+    }
+
+    false
 }
