@@ -1,0 +1,115 @@
+use crate::specs::MachineSpecs;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Deserialize)]
+pub struct Envelope {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CatalogModel {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "displayName", default)]
+    pub display_name: String,
+    #[serde(rename = "runtimeModel", default)]
+    pub runtime_model: String,
+    #[serde(rename = "maxContextTokens", default)]
+    pub max_context_tokens: u32,
+    #[serde(default)]
+    pub regions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadyMessage {
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    pub catalog: Vec<CatalogModel>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub region: String,
+    pub models: Vec<String>,
+    #[serde(rename = "gpuName", skip_serializing_if = "Option::is_none")]
+    pub gpu_name: Option<String>,
+    #[serde(rename = "vramGb", skip_serializing_if = "Option::is_none")]
+    pub vram_gb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specs: Option<MachineSpecs>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisteredMessage {
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InvokeMessage {
+    pub id: String,
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "runtimeModel")]
+    pub runtime_model: String,
+    pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvokeResultMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub id: String,
+    pub content: String,
+    #[serde(rename = "promptTokens")]
+    pub prompt_tokens: u32,
+    #[serde(rename = "completionTokens")]
+    pub completion_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvokeErrorMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeartbeatMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specs: Option<MachineSpecs>,
+}
+
+pub fn parse_envelope(data: &[u8]) -> anyhow::Result<Envelope> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+pub fn parse_ready(data: &[u8]) -> anyhow::Result<ReadyMessage> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+pub fn parse_registered(data: &[u8]) -> anyhow::Result<RegisteredMessage> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+pub fn parse_invoke(data: &[u8]) -> anyhow::Result<InvokeMessage> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+pub fn parse_error(data: &[u8]) -> anyhow::Result<Value> {
+    Ok(serde_json::from_slice(data)?)
+}
