@@ -21,15 +21,16 @@ jobs:
             features: gpu
             no_default_features: false
             cuda: true
+            cuda_repo_arch: x86_64
 
-          # aarch64: native ARM runner — CUDA (Jetson / ARM NVIDIA) + Vulkan (Mali, Adreno, etc.)
-          # Built natively to avoid cross-compile CMake conflicts in llama.cpp.
+          # aarch64: native ARM runner — CUDA (SBSA/Jetson-class) + Vulkan
           - id: aarch64-gpu
             target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             features: arm-gpu
             no_default_features: true
             cuda: true
+            cuda_repo_arch: sbsa
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -49,17 +50,33 @@ jobs:
             build-essential \
             pkg-config \
             libvulkan-dev \
-            mesa-vulkan-drivers
+            mesa-vulkan-drivers \
+            glslang-tools \
+            wget
 
-      - name: Install CUDA toolkit
+      # Jimver/cuda-toolkit pulls nvidia-dkms + drivers — fails on GitHub runners.
+      # Install nvcc + dev libs only (no kernel driver).
+      - name: Install CUDA toolkit (dev only, no driver)
         id: cuda
         if: matrix.cuda
         continue-on-error: ${{ matrix.id == 'aarch64-gpu' }}
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: '12.6.0'
-          method: network
-          use-github-cache: false
+        run: |
+          set -euo pipefail
+          repo=ubuntu2404
+          arch="${{ matrix.cuda_repo_arch }}"
+          keyring="cuda-keyring_1.1-1_all.deb"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${repo}/${arch}/${keyring}"
+          sudo dpkg -i "${keyring}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-6 \
+            cuda-cudart-dev-12-6 \
+            cuda-nvrtc-dev-12-6 \
+            cuda-cccl-12-6 \
+            libcublas-dev-12-6 \
+            libcurand-dev-12-6
+          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
 
       - name: Require CUDA (x86_64)
         if: matrix.id == 'x86_64-gpu' && steps.cuda.outcome != 'success'
@@ -74,7 +91,7 @@ jobs:
           set -euo pipefail
           features="${{ matrix.features }}"
           if [ "${{ matrix.id }}" = "aarch64-gpu" ] && [ "${{ steps.cuda.outcome }}" != "success" ]; then
-            echo "CUDA unavailable on ARM runner — building with Vulkan GPU backend (Jetson: use NVIDIA driver + rebuild with CUDA locally if needed)"
+            echo "CUDA SBSA packages unavailable — building Vulkan GPU backend only"
             features="vulkan"
           fi
           args=(build --release --target "${{ matrix.target }}")
