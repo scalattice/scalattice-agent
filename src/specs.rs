@@ -492,7 +492,7 @@ pub fn detect_cpu_model() -> Option<String> {
     Some(model)
 }
 
-fn detect_ram_gb() -> Option<u32> {
+pub fn detect_ram_gb() -> Option<u32> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kb = info
         .lines()
