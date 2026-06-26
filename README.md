@@ -49,19 +49,15 @@ See [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md) in this repository.
 
 ## Build from source
 
-**x86_64** (NVIDIA GTX/RTX, AMD/Intel Vulkan):
-
 ```bash
+# x86_64 Linux (NVIDIA + AMD/Intel Vulkan)
 cargo build --release --features gpu
-```
 
-**aarch64** (Jetson / ARM NVIDIA + ARM Vulkan GPUs):
-
-```bash
+# aarch64 Linux (NVIDIA + ARM Vulkan) — build natively on ARM
 cargo build --release --no-default-features --features arm-gpu
 ```
 
-Release binaries are published for both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`.
+CI release binaries include **CUDA + Vulkan** on both x86_64 and aarch64.
 
 ## License
 

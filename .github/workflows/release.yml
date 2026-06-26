@@ -14,23 +14,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # x86_64: NVIDIA CUDA (GTX/RTX, multi-GPU) + Vulkan (AMD/Intel) via dynamic backends
+          # NVIDIA (CUDA) + AMD/Intel (Vulkan) + runtime backend loading
           - id: x86_64-gpu
             target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             features: gpu
             no_default_features: false
-            cuda: true
-            cuda_repo_arch: x86_64
+            cuda_repo: ubuntu2404/x86_64
 
-          # aarch64: native ARM runner — CUDA (SBSA/Jetson-class) + Vulkan
+          # Native ARM: NVIDIA SBSA CUDA + Vulkan (Jetson, Graviton, Mali, Adreno)
           - id: aarch64-gpu
             target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             features: arm-gpu
             no_default_features: true
-            cuda: true
-            cuda_repo_arch: sbsa
+            cuda_repo: ubuntu2404/sbsa
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -40,7 +38,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install build dependencies
+      - name: Install build + Vulkan dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -49,23 +47,22 @@ jobs:
             cmake \
             build-essential \
             pkg-config \
+            wget \
+            glslc \
             libvulkan-dev \
-            mesa-vulkan-drivers \
-            glslang-tools \
-            wget
+            spirv-headers \
+            libshaderc-dev \
+            spirv-tools \
+            mesa-vulkan-drivers
+          echo "=== GPU build tools ==="
+          glslc --version
+          pkg-config --modversion vulkan || true
 
-      # Jimver/cuda-toolkit pulls nvidia-dkms + drivers — fails on GitHub runners.
-      # Install nvcc + dev libs only (no kernel driver).
       - name: Install CUDA toolkit (dev only, no driver)
-        id: cuda
-        if: matrix.cuda
-        continue-on-error: ${{ matrix.id == 'aarch64-gpu' }}
         run: |
           set -euo pipefail
-          repo=ubuntu2404
-          arch="${{ matrix.cuda_repo_arch }}"
           keyring="cuda-keyring_1.1-1_all.deb"
-          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${repo}/${arch}/${keyring}"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${{ matrix.cuda_repo }}/${keyring}"
           sudo dpkg -i "${keyring}"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -77,28 +74,19 @@ jobs:
             libcurand-dev-12-6
           echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
-
-      - name: Require CUDA (x86_64)
-        if: matrix.id == 'x86_64-gpu' && steps.cuda.outcome != 'success'
-        run: |
-          echo "CUDA toolkit install failed — x86_64 GPU build cannot continue."
-          exit 1
+          nvcc --version
 
       - name: Build release binary
         env:
           CMAKE_PREFIX_PATH: /usr
+          Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
         run: |
           set -euo pipefail
-          features="${{ matrix.features }}"
-          if [ "${{ matrix.id }}" = "aarch64-gpu" ] && [ "${{ steps.cuda.outcome }}" != "success" ]; then
-            echo "CUDA SBSA packages unavailable — building Vulkan GPU backend only"
-            features="vulkan"
-          fi
           args=(build --release --target "${{ matrix.target }}")
           if [ "${{ matrix.no_default_features }}" = "true" ]; then
             args+=(--no-default-features)
           fi
-          args+=(--features "$features")
+          args+=(--features "${{ matrix.features }}")
           echo "cargo ${args[*]}"
           cargo "${args[@]}"
 
