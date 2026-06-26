@@ -16,10 +16,12 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             features: "gpu"
+            cpu_only: false
             cuda: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            features: "vulkan"
+            # CPU-only on arm64 for now (cross-compiling CUDA/Vulkan is brittle in CI).
+            cpu_only: true
             cuda: false
     runs-on: ${{ matrix.os }}
     steps:
@@ -58,7 +60,11 @@ jobs:
             export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
             export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           fi
-          cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          if [ "${{ matrix.cpu_only }}" = "true" ]; then
+            cargo build --release --target ${{ matrix.target }} --no-default-features
+          else
+            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          fi
 
       - name: Package tarball
         run: |

@@ -31,9 +31,10 @@ url = "2"
 [features]
 default = ["gpu"]
 # NVIDIA multi-GPU tensor parallel + AMD/Intel via Vulkan in one binary.
-gpu = ["cuda", "vulkan"]
+gpu = ["cuda", "vulkan", "dynamic-backends"]
 cuda = ["llama-cpp-2/cuda"]
-vulkan = ["llama-cpp-2/vulkan", "llama-cpp-2/dynamic-backends"]
+vulkan = ["llama-cpp-2/vulkan"]
+dynamic-backends = ["llama-cpp-2/dynamic-backends"]
 rocm = ["llama-cpp-2/rocm"]
 
 [profile.release]
