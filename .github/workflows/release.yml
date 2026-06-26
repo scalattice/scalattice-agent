@@ -73,12 +73,14 @@ jobs:
             libcublas-dev-12-6 \
             libcurand-dev-12-6
           echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "PATH=/usr/local/cuda-12.6/bin:${PATH}" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
-          nvcc --version
+          /usr/local/cuda-12.6/bin/nvcc --version
 
       - name: Build release binary
         env:
           CMAKE_PREFIX_PATH: /usr
+          CUDA_PATH: /usr/local/cuda-12.6
           Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
         run: |
           set -euo pipefail
