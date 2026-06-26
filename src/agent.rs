@@ -4,7 +4,7 @@ use crate::protocol::{
     HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
 };
 use crate::runtime::{build_runtime, JobState};
-use crate::specs::{detect_machine_specs, MachineSpecs};
+use crate::specs::detect_machine_specs;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
