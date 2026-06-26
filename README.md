@@ -49,10 +49,19 @@ See [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md) in this repository.
 
 ## Build from source
 
+**x86_64** (NVIDIA GTX/RTX, AMD/Intel Vulkan):
+
 ```bash
-cargo build --release
-./target/release/scalattice-agent connect --foreground
+cargo build --release --features gpu
 ```
+
+**aarch64** (Jetson / ARM NVIDIA + ARM Vulkan GPUs):
+
+```bash
+cargo build --release --no-default-features --features arm-gpu
+```
+
+Release binaries are published for both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`.
 
 ## License
 

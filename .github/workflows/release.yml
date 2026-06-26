@@ -11,18 +11,26 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # x86_64: NVIDIA CUDA (GTX/RTX, multi-GPU) + Vulkan (AMD/Intel) via dynamic backends
+          - id: x86_64-gpu
+            target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            features: "gpu"
-            cpu_only: false
+            features: gpu
+            no_default_features: false
             cuda: true
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            # CPU-only on arm64 for now (cross-compiling CUDA/Vulkan is brittle in CI).
-            cpu_only: true
-            cuda: false
+
+          # aarch64: native ARM runner — CUDA (Jetson / ARM NVIDIA) + Vulkan (Mali, Adreno, etc.)
+          # Built natively to avoid cross-compile CMake conflicts in llama.cpp.
+          - id: aarch64-gpu
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            features: arm-gpu
+            no_default_features: true
+            cuda: true
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,37 +42,48 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev cmake build-essential
-
-      - name: Install cross toolchain (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
           sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross
+            clang \
+            libclang-dev \
+            cmake \
+            build-essential \
+            pkg-config \
+            libvulkan-dev \
+            mesa-vulkan-drivers
 
-      - name: Install CUDA toolkit (x86_64 GPU build)
-        if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.35
+      - name: Install CUDA toolkit
         id: cuda
+        if: matrix.cuda
+        continue-on-error: ${{ matrix.id == 'aarch64-gpu' }}
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.6.0'
           method: network
           use-github-cache: false
 
-      - name: Build release binary
+      - name: Require CUDA (x86_64)
+        if: matrix.id == 'x86_64-gpu' && steps.cuda.outcome != 'success'
         run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          echo "CUDA toolkit install failed — x86_64 GPU build cannot continue."
+          exit 1
+
+      - name: Build release binary
+        env:
+          CMAKE_PREFIX_PATH: /usr
+        run: |
+          set -euo pipefail
+          features="${{ matrix.features }}"
+          if [ "${{ matrix.id }}" = "aarch64-gpu" ] && [ "${{ steps.cuda.outcome }}" != "success" ]; then
+            echo "CUDA unavailable on ARM runner — building with Vulkan GPU backend (Jetson: use NVIDIA driver + rebuild with CUDA locally if needed)"
+            features="vulkan"
           fi
-          if [ "${{ matrix.cpu_only }}" = "true" ]; then
-            cargo build --release --target ${{ matrix.target }} --no-default-features
-          else
-            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          args=(build --release --target "${{ matrix.target }}")
+          if [ "${{ matrix.no_default_features }}" = "true" ]; then
+            args+=(--no-default-features)
           fi
+          args+=(--features "$features")
+          echo "cargo ${args[*]}"
+          cargo "${args[@]}"
 
       - name: Package tarball
         run: |

@@ -1,6 +1,6 @@
 [package]
 name = "scalattice-agent"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2021"
 description = "Open-source GPU machine agent for the Scalattice inference network"
 license = "MIT"
@@ -30,8 +30,10 @@ url = "2"
 
 [features]
 default = ["gpu"]
-# NVIDIA multi-GPU tensor parallel + AMD/Intel via Vulkan in one binary.
+# x86_64 Linux: NVIDIA CUDA + Vulkan (AMD/Intel) with runtime backend loading.
 gpu = ["cuda", "vulkan", "dynamic-backends"]
+# aarch64 Linux (native build): NVIDIA CUDA (Jetson) + Vulkan — static backends only.
+arm-gpu = ["cuda", "vulkan"]
 cuda = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]
 dynamic-backends = ["llama-cpp-2/dynamic-backends"]
