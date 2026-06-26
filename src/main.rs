@@ -4,6 +4,7 @@ mod protocol;
 mod runtime;
 mod service;
 mod specs;
+mod state;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -105,7 +106,10 @@ fn print_status(token: Option<String>, ws: Option<String>) -> Result<()> {
 
     println!("scalattice-agent {}", env!("CARGO_PKG_VERSION"));
     println!("{}", specs::status_line(&specs));
-    println!("demo mode: controlled per GPU in Scalattice Cloud → Providers");
+    println!("demo mode: {}", state::demo_status_line());
+    if let Some(label) = state::connection_status_line() {
+        println!("runtime: {label}");
+    }
 
     let token_set = token
         .or_else(|| std::env::var("SCALATTICE_AGENT_TOKEN").ok())
@@ -124,6 +128,14 @@ fn print_status(token: Option<String>, ws: Option<String>) -> Result<()> {
         .or_else(|| std::env::var("SCALATTICE_AGENT_WS").ok())
         .unwrap_or_else(|| "wss://api.scalattice.cloud/v1/operators/agent/ws".to_string());
     println!("ws: {ws_url}");
+
+    if service::systemd_available() {
+        match service::service_active() {
+            true => println!("service: running"),
+            false => println!("service: not running"),
+        }
+    }
+
     println!();
     if service::systemd_available() {
         println!("connect:    scalattice-agent connect              (background service)");

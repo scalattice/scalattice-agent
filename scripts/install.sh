@@ -104,7 +104,7 @@ write_env_files() {
   } > "$ENV_FILE"
 
   {
-    echo "PATH=$INSTALL_DIR:/usr/local/bin:/usr/bin:/bin"
+    echo "PATH=$INSTALL_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     if [ -n "$TOKEN" ]; then
       echo "SCALATTICE_AGENT_TOKEN=$TOKEN"
       echo "SCALATTICE_AGENT_WS=wss://api.scalattice.cloud/v1/operators/agent/ws"
@@ -112,6 +112,23 @@ write_env_files() {
   } > "$SYSTEMD_ENV_FILE"
 
   echo "==> Wrote $ENV_FILE"
+}
+
+enable_boot_linger() {
+  USER_NAME="$(id -un)"
+  if ! command -v loginctl >/dev/null 2>&1; then
+    return 0
+  fi
+  if loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null | grep -q '^yes$'; then
+    echo "==> Boot without login: already enabled"
+    return 0
+  fi
+  if sudo -n loginctl enable-linger "$USER_NAME" 2>/dev/null; then
+    echo "==> Boot without login: enabled"
+    return 0
+  fi
+  echo "==> Boot without login: needs sudo - run once:"
+  echo "    sudo loginctl enable-linger $USER_NAME"
 }
 
 echo "==> Installing scalattice-agent to $INSTALL_DIR"
@@ -141,8 +158,12 @@ if [ -n "$TOKEN" ] && command -v systemctl >/dev/null 2>&1; then
   if "$INSTALL_DIR/$BIN_NAME" service install; then
     echo "==> Agent is running in the background"
   else
-    echo "==> Could not start background service — after sourcing agent.env, run: scalattice-agent connect"
+    echo "==> Could not start background service - after sourcing agent.env, run: scalattice-agent connect"
   fi
+fi
+
+if [ -n "$TOKEN" ]; then
+  enable_boot_linger
 fi
 
 echo ""
@@ -163,4 +184,3 @@ step=$((step + 1))
 echo "  $step. scalattice-agent connect"
 echo ""
 echo "Debug in foreground: scalattice-agent connect --foreground"
-echo "Boot without login:  sudo loginctl enable-linger \$USER"

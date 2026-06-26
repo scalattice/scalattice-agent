@@ -7,7 +7,7 @@ const UNIT_NAME: &str = "scalattice-agent.service";
 
 pub fn ensure_service_running() -> Result<()> {
     if !systemd_available() {
-        bail!("systemd is required for background mode — use: scalattice-agent connect --foreground");
+        bail!("systemd is required for background mode - use: scalattice-agent connect --foreground");
     }
 
     let home = home_dir()?;
@@ -37,7 +37,7 @@ pub fn install_user_service() -> Result<()> {
 
     if !env_file.is_file() {
         bail!(
-            "missing {} — run the install script or create agent.env with SCALATTICE_AGENT_TOKEN",
+            "missing {} - run the install script or create agent.env with SCALATTICE_AGENT_TOKEN",
             env_file.display()
         );
     }
@@ -45,7 +45,10 @@ pub fn install_user_service() -> Result<()> {
     sync_systemd_env_file(&home)?;
 
     let systemd_env = systemd_env_path(&home);
-    let path_prefix = format!("{}:/usr/local/bin:/usr/bin:/bin", bin.parent().unwrap_or(Path::new("/usr/local/bin")).display());
+    let path_prefix = format!(
+        "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        bin.parent().unwrap_or(Path::new("/usr/local/bin")).display()
+    );
 
     fs::create_dir_all(unit_path.parent().context("unit path parent")?)?;
     let unit = format!(
@@ -75,7 +78,7 @@ WantedBy=default.target
     run_systemctl(&["--user", "daemon-reload"])?;
     run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
     verify_service_active()?;
-    enable_linger_hint(&home);
+    try_enable_linger(&home);
     Ok(())
 }
 
@@ -90,6 +93,13 @@ pub fn uninstall_user_service() -> Result<()> {
     }
     let _ = run_systemctl(&["--user", "daemon-reload"]);
     Ok(())
+}
+
+pub fn service_active() -> bool {
+    if !systemd_available() {
+        return false;
+    }
+    run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok()
 }
 
 pub fn service_status() -> Result<()> {
@@ -127,12 +137,12 @@ fn verify_service_active() -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("service failed to start — recent logs:");
+    eprintln!("service failed to start - recent logs:");
     let _ = Command::new("systemctl")
         .args(["--user", "status", UNIT_NAME, "--no-pager", "-n", "15"])
         .status();
 
-    bail!("scalattice-agent service is not running — try: scalattice-agent connect --foreground");
+    bail!("scalattice-agent service is not running - try: scalattice-agent connect --foreground");
 }
 
 fn sync_systemd_env_file(home: &Path) -> Result<()> {
@@ -225,14 +235,43 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
     }
 }
 
-fn enable_linger_hint(home: &Path) {
+fn try_enable_linger(home: &Path) -> bool {
     let user = home
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("YOUR_USER");
-    println!();
-    println!("To start automatically after reboot (without logging in):");
-    println!("  sudo loginctl enable-linger {user}");
+        .unwrap_or("");
+
+    if user.is_empty() {
+        return false;
+    }
+
+    let already = Command::new("loginctl")
+        .args(["show-user", user, "-p", "Linger", "--value"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
+        .unwrap_or(false);
+
+    if already {
+        println!("==> Boot without login: already enabled");
+        return true;
+    }
+
+    if Command::new("sudo")
+        .args(["-n", "loginctl", "enable-linger", user])
+        .output()
+        .ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        println!("==> Boot without login: enabled");
+        return true;
+    }
+
+    println!("==> Boot without login: needs sudo - run once:");
+    println!("    sudo loginctl enable-linger {user}");
+    false
 }
 
 mod which {

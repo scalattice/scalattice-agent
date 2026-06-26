@@ -78,7 +78,13 @@ fn detect_gpus() -> Option<GpuSnapshot> {
 }
 
 fn detect_nvidia_gpus() -> Option<GpuSnapshot> {
-    for bin in ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi", "nvidia-smi"] {
+    for bin in [
+        "/usr/bin/nvidia-smi",
+        "/usr/sbin/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+        "/usr/local/cuda/bin/nvidia-smi",
+        "nvidia-smi",
+    ] {
         if let Some(snapshot) = detect_nvidia_gpus_from(bin) {
             return Some(snapshot);
         }
@@ -117,7 +123,7 @@ fn detect_nvidia_gpus_from(bin: &str) -> Option<GpuSnapshot> {
         if parts.len() < 5 {
             continue;
         }
-        let vram_gb = parts[2].parse::<f32>().ok().map(mb_to_gb);
+        let vram_gb = parts[2].parse::<f32>().ok().and_then(mb_to_gb);
         let score = vram_gb.unwrap_or(0);
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
             best = Some((score, idx));
@@ -130,8 +136,8 @@ fn detect_nvidia_gpus_from(bin: &str) -> Option<GpuSnapshot> {
     };
 
     let parts: Vec<&str> = lines[idx].split(',').map(str::trim).collect();
-    let vram_gb = parts[2].parse::<f32>().ok().map(mb_to_gb);
-    let vram_used_gb = parts[3].parse::<f32>().ok().map(mb_to_gb);
+    let vram_gb = parts[2].parse::<f32>().ok().and_then(mb_to_gb);
+    let vram_used_gb = parts[3].parse::<f32>().ok().and_then(mb_to_gb);
     let util_pct = parts[4]
         .parse::<f32>()
         .ok()
@@ -152,7 +158,12 @@ fn detect_nvidia_gpus_from(bin: &str) -> Option<GpuSnapshot> {
 }
 
 fn detect_cuda_version() -> Option<String> {
-    for bin in ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi", "nvidia-smi"] {
+    for bin in [
+        "/usr/bin/nvidia-smi",
+        "/usr/sbin/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+        "nvidia-smi",
+    ] {
         let output = match Command::new(bin)
             .args(["--query-gpu=cuda_version", "--format=csv,noheader"])
             .output()
@@ -240,7 +251,7 @@ fn detect_amd_vram_gb() -> Option<u32> {
         }
     }
 
-    (best_mb > 0.0).then(|| mb_to_gb(best_mb))
+    mb_to_gb(best_mb)
 }
 
 fn detect_pci_gpus() -> Option<GpuSnapshot> {
@@ -383,6 +394,9 @@ fn detect_ram_gb() -> Option<u32> {
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
 }
 
-fn mb_to_gb(mb: f32) -> u32 {
-    ((mb / 1024.0).round() as u32).max(1)
+fn mb_to_gb(mb: f32) -> Option<u32> {
+    if mb <= 0.0 {
+        return None;
+    }
+    Some(((mb / 1024.0).round() as u32).max(1))
 }

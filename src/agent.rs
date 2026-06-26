@@ -5,6 +5,7 @@ use crate::protocol::{
 };
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::detect_machine_specs;
+use crate::state;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -56,12 +57,20 @@ impl SessionState {
             &self.loaded_models,
         )
     }
+
+    fn persist_local_state(&self, node_id: Option<&str>) {
+        let runtime = self.runtime();
+        state::update_connection_state(
+            self.demo_mode,
+            Some(runtime.status_label),
+            node_id.map(str::to_string),
+        );
+    }
 }
 
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
-    info!("demo mode is controlled per GPU in the Scalattice Cloud dashboard");
 
     let mut backoff = Duration::from_secs(3);
     loop {
@@ -153,6 +162,7 @@ async fn handle_server_message(
                     {
                         let mut guard = state.lock().await;
                         guard.set_demo_mode(ready.demo_mode);
+                        guard.persist_local_state(Some(&ready.node_id));
                         if ready.demo_mode {
                             info!("demo mode enabled for this GPU (dashboard setting)");
                         }
@@ -183,6 +193,7 @@ async fn handle_server_message(
                         let mut guard = state.lock().await;
                         guard.registered = true;
                         guard.advertised_models = reg.models.clone();
+                        guard.persist_local_state(Some(&reg.node_id));
                     }
                     let runtime = state.lock().await.runtime();
                     info!(
@@ -198,8 +209,8 @@ async fn handle_server_message(
                 }
                 "pong" => {
                     if let Ok(pong) = parse_pong(data) {
+                        let mut guard = state.lock().await;
                         if let Some(demo_mode) = pong.demo_mode {
-                            let mut guard = state.lock().await;
                             if guard.demo_mode != demo_mode {
                                 guard.set_demo_mode(demo_mode);
                                 info!(
@@ -208,6 +219,7 @@ async fn handle_server_message(
                                 );
                             }
                         }
+                        guard.persist_local_state(None);
                     }
                 }
                 "error" => {
