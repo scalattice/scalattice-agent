@@ -19,7 +19,7 @@ export SCALATTICE_AGENT_TOKEN=slt_provider_…
 scalattice-agent connect
 ```
 
-Install script downloads a release binary from [GitHub](https://github.com/robottik-software/scalattice-client) when available, or builds from source with Rust/Cargo.
+Install script downloads a release binary from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) when available, or builds from source with Rust/Cargo.
 
 ## Quick start
 

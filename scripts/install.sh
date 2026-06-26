@@ -6,7 +6,7 @@
 set -eu
 
 INSTALL_DIR="${SCALATTICE_INSTALL_DIR:-$HOME/.local/bin}"
-GITHUB_REPO="${SCALATTICE_AGENT_REPO:-robottik-software/scalattice-client}"
+GITHUB_REPO="${SCALATTICE_AGENT_REPO:-Robottik-Software/Scalattice-Client}"
 VERSION="${SCALATTICE_AGENT_VERSION:-latest}"
 TOKEN=""
 

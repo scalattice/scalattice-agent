@@ -5,7 +5,7 @@ use crate::protocol::{
 };
 use crate::specs::{detect_machine_specs, MachineSpecs};
 use anyhow::{anyhow, bail, Context, Result};
-use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::net::TcpStream;
