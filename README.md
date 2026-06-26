@@ -10,12 +10,8 @@ From any machine with `curl`:
 
 ```bash
 curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_YOUR_TOKEN
-```
-
-Or set the token after install:
-
-```bash
-export SCALATTICE_AGENT_TOKEN=slt_provider_…
+source ~/.config/scalattice/agent.env
+scalattice-agent status
 scalattice-agent connect
 ```
 
@@ -29,7 +25,7 @@ Install script downloads a release binary from [GitHub](https://github.com/Robot
 
 ```bash
 curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…
-export SCALATTICE_AGENT_TOKEN=slt_provider_…   # if not written by installer
+source ~/.config/scalattice/agent.env
 scalattice-agent status
 scalattice-agent connect
 ```

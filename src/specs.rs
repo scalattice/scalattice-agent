@@ -25,6 +25,16 @@ pub struct MachineSpecs {
     pub ram_gb: Option<u32>,
 }
 
+struct GpuSnapshot {
+    name: Option<String>,
+    vram_gb: Option<u32>,
+    vram_used_gb: Option<u32>,
+    util_pct: Option<u8>,
+    count: Option<u8>,
+    driver_version: Option<String>,
+    cuda_version: Option<String>,
+}
+
 pub fn detect_machine_specs() -> MachineSpecs {
     let mut specs = MachineSpecs {
         hostname: detect_hostname(),
@@ -33,7 +43,7 @@ pub fn detect_machine_specs() -> MachineSpecs {
         ..MachineSpecs::default()
     };
 
-    if let Some(gpu) = detect_nvidia_gpus() {
+    if let Some(gpu) = detect_gpus() {
         specs.gpu_name = gpu.name;
         specs.vram_gb = gpu.vram_gb;
         specs.vram_used_gb = gpu.vram_used_gb;
@@ -56,21 +66,17 @@ pub fn status_line(specs: &MachineSpecs) -> String {
             format!("GPU detected · {name} · {vram} GB VRAM{util}")
         }
         (Some(name), None) => format!("GPU detected · {name}"),
-        (None, _) => "No NVIDIA GPU detected (nvidia-smi not found)".to_string(),
+        (None, _) => "No GPU detected (install vendor tools or check drivers)".to_string(),
     }
 }
 
-struct NvidiaGpuSnapshot {
-    name: Option<String>,
-    vram_gb: Option<u32>,
-    vram_used_gb: Option<u32>,
-    util_pct: Option<u8>,
-    count: Option<u8>,
-    driver_version: Option<String>,
-    cuda_version: Option<String>,
+fn detect_gpus() -> Option<GpuSnapshot> {
+    detect_nvidia_gpus()
+        .or_else(detect_amd_gpus)
+        .or_else(detect_pci_gpus)
 }
 
-fn detect_nvidia_gpus() -> Option<NvidiaGpuSnapshot> {
+fn detect_nvidia_gpus() -> Option<GpuSnapshot> {
     let output = Command::new("nvidia-smi")
         .args([
             "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,driver_version",
@@ -114,12 +120,14 @@ fn detect_nvidia_gpus() -> Option<NvidiaGpuSnapshot> {
     };
 
     let parts: Vec<&str> = lines[idx].split(',').map(str::trim).collect();
+    let vram_gb = parts[2].parse::<f32>().ok().map(mb_to_gb);
+    let vram_used_gb = parts[3].parse::<f32>().ok().map(mb_to_gb);
+    let util_pct = parts[4]
+        .parse::<f32>()
+        .ok()
+        .map(|v| v.round().clamp(0.0, 100.0) as u8);
 
-    let vram_gb = parts[2].parse::<f32>().ok().map(|mb| mb_to_gb(mb));
-    let vram_used_gb = parts[3].parse::<f32>().ok().map(|mb| mb_to_gb(mb));
-    let util_pct = parts[4].parse::<f32>().ok().map(|v| v.round().clamp(0.0, 100.0) as u8);
-
-    Some(NvidiaGpuSnapshot {
+    Some(GpuSnapshot {
         name: Some(parts[1].to_string()),
         vram_gb,
         vram_used_gb,
@@ -151,6 +159,113 @@ fn detect_cuda_version() -> Option<String> {
         .to_string();
 
     (!version.is_empty()).then_some(version)
+}
+
+fn detect_amd_gpus() -> Option<GpuSnapshot> {
+    let output = Command::new("rocm-smi")
+        .args(["--showproductname"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut names = Vec::new();
+    for line in stdout.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("card series") || lower.contains("card model")) {
+            continue;
+        }
+        if let Some(name) = line.rsplit(':').next().map(str::trim).filter(|v| !v.is_empty()) {
+            names.push(name.to_string());
+        }
+    }
+
+    if names.is_empty() {
+        return None;
+    }
+
+    Some(GpuSnapshot {
+        name: Some(format!("AMD {}", names[0])),
+        vram_gb: detect_amd_vram_gb(),
+        vram_used_gb: None,
+        util_pct: None,
+        count: Some(names.len().min(255) as u8),
+        driver_version: Some("ROCm".to_string()),
+        cuda_version: None,
+    })
+}
+
+fn detect_amd_vram_gb() -> Option<u32> {
+    let output = Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut best_mb = 0.0_f32;
+    for line in stdout.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("total") {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            if let Ok(value) = token.parse::<f32>() {
+                best_mb = best_mb.max(value);
+            }
+        }
+    }
+
+    (best_mb > 0.0).then(|| mb_to_gb(best_mb))
+}
+
+fn detect_pci_gpus() -> Option<GpuSnapshot> {
+    let output = Command::new("lspci").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let names: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if !(lower.contains("vga compatible controller")
+                || lower.contains("3d controller")
+                || lower.contains("display controller"))
+            {
+                return None;
+            }
+            let name = line
+                .split_once(':')
+                .map(|(_, rest)| rest.trim())
+                .filter(|value| !value.is_empty())?;
+            if name.eq_ignore_ascii_case("device") {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect();
+
+    if names.is_empty() {
+        return None;
+    }
+
+    Some(GpuSnapshot {
+        name: Some(names[0].clone()),
+        vram_gb: None,
+        vram_used_gb: None,
+        util_pct: None,
+        count: Some(names.len().min(255) as u8),
+        driver_version: None,
+        cuda_version: None,
+    })
 }
 
 fn detect_hostname() -> Option<String> {

@@ -112,9 +112,7 @@ fi
 if [ -n "$TOKEN" ] || [ -n "$needs_path" ]; then
   {
     echo "# Scalattice agent environment (source this file: . $ENV_FILE)"
-    if [ -n "$needs_path" ]; then
-      echo "export PATH=\"$INSTALL_DIR:\$PATH\""
-    fi
+    echo "export PATH=\"$INSTALL_DIR:\$PATH\""
     if [ -n "$TOKEN" ]; then
       echo "export SCALATTICE_AGENT_TOKEN='$TOKEN'"
       echo "export SCALATTICE_AGENT_WS='wss://api.scalattice.cloud/v1/operators/agent/ws'"
