@@ -98,21 +98,28 @@ else
   build_from_source
 fi
 
+ENV_FILE="$HOME/.config/scalattice/agent.env"
+mkdir -p "$(dirname "$ENV_FILE")"
+
+needs_path=
 if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
+  needs_path=1
   echo ""
   echo "Add $INSTALL_DIR to your PATH:"
   echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
-ENV_FILE="$HOME/.config/scalattice/agent.env"
-mkdir -p "$(dirname "$ENV_FILE")"
-
-if [ -n "$TOKEN" ]; then
-  cat > "$ENV_FILE" <<EOF
-# Scalattice agent credentials (source this file: . $ENV_FILE)
-export SCALATTICE_AGENT_TOKEN='$TOKEN'
-export SCALATTICE_AGENT_WS='wss://api.scalattice.cloud/v1/operators/agent/ws'
-EOF
+if [ -n "$TOKEN" ] || [ -n "$needs_path" ]; then
+  {
+    echo "# Scalattice agent environment (source this file: . $ENV_FILE)"
+    if [ -n "$needs_path" ]; then
+      echo "export PATH=\"$INSTALL_DIR:\$PATH\""
+    fi
+    if [ -n "$TOKEN" ]; then
+      echo "export SCALATTICE_AGENT_TOKEN='$TOKEN'"
+      echo "export SCALATTICE_AGENT_WS='wss://api.scalattice.cloud/v1/operators/agent/ws'"
+    fi
+  } > "$ENV_FILE"
   echo "==> Wrote $ENV_FILE"
 fi
 
