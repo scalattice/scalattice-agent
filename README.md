@@ -42,7 +42,7 @@ scalattice-agent connect
 
 ## Protocol
 
-See [AGENT_PROTOCOL.md](https://github.com/robottik-software/scalattice-server/blob/main/router/docs/AGENT_PROTOCOL.md) in the scalattice-server repo.
+See [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md) in this repository.
 
 ## Build from source
 
