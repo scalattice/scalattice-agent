@@ -38,9 +38,16 @@ pub fn build_runtime(
     active_job_id: Option<String>,
     active_model_id: Option<String>,
     loaded_models: &[String],
+    enabled_compute_devices: usize,
 ) -> AgentRuntime {
     let ready = demo_mode || !loaded_models.is_empty();
-    let status_label = status_label(demo_mode, ready, job_state, active_model_id.as_deref());
+    let status_label = status_label(
+        demo_mode,
+        ready,
+        job_state,
+        active_model_id.as_deref(),
+        enabled_compute_devices,
+    );
 
     AgentRuntime {
         demo_mode,
@@ -66,16 +73,31 @@ fn status_label(
     ready: bool,
     job_state: JobState,
     active_model_id: Option<&str>,
+    enabled_compute_devices: usize,
 ) -> String {
     if job_state == JobState::Busy {
         let model = active_model_id.unwrap_or("inference");
+        if enabled_compute_devices > 1 {
+            return format!("Running job across {enabled_compute_devices} devices · {model}");
+        }
         return format!("Running job · {model}");
     }
     if demo_mode {
+        if enabled_compute_devices > 1 {
+            return format!("Idle · demo mode across {enabled_compute_devices} devices (echo only)");
+        }
         return "Idle · demo mode (echo only)".to_string();
     }
     if ready {
+        if enabled_compute_devices > 1 {
+            return format!("Idle · virtual card ready across {enabled_compute_devices} devices");
+        }
         return "Idle · ready for inference".to_string();
+    }
+    if enabled_compute_devices > 1 {
+        return format!(
+            "Connected · virtual {enabled_compute_devices}-device card · load model weights or enable demo"
+        );
     }
     "Connected · no model runtime loaded".to_string()
 }

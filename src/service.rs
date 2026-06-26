@@ -5,20 +5,23 @@ use std::process::Command;
 
 const UNIT_NAME: &str = "scalattice-agent.service";
 
-pub fn ensure_service_running() -> Result<()> {
+pub fn ensure_service_running(config: &AgentConfig) -> Result<()> {
     if !systemd_available() {
         bail!("systemd is required for background mode - use: scalattice-agent connect --foreground");
     }
 
     let home = home_dir()?;
     let unit_path = systemd_user_unit_path(&home);
+    let token_changed = persist_agent_token(&config.token)?;
 
     if !unit_path.is_file() {
         install_user_service()?;
     } else {
         sync_systemd_env_file(&home)?;
         run_systemctl(&["--user", "daemon-reload"])?;
-        if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_err() {
+        if token_changed {
+            let _ = run_systemctl(&["--user", "restart", UNIT_NAME]);
+        } else if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_err() {
             run_systemctl(&["--user", "start", UNIT_NAME])?;
         } else {
             println!("scalattice-agent is running in the background");
@@ -27,6 +30,58 @@ pub fn ensure_service_running() -> Result<()> {
     }
 
     verify_service_active()
+}
+
+pub fn persist_agent_token(token: &str) -> Result<bool> {
+    let home = home_dir()?;
+    let env_file = home.join(".config/scalattice/agent.env");
+    fs::create_dir_all(env_file.parent().context("agent env parent")?)?;
+
+    let mut lines: Vec<String> = if env_file.is_file() {
+        fs::read_to_string(&env_file)?
+            .lines()
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let key = "SCALATTICE_AGENT_TOKEN";
+    let assignment = format!("{key}={token}");
+    let mut changed = false;
+    let mut found = false;
+
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let assignment_line = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if let Some((name, _)) = assignment_line.split_once('=') {
+            if name.trim() == key {
+                found = true;
+                if assignment_line != assignment {
+                    *line = assignment.clone();
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if !found {
+        if !lines.is_empty() && !lines.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
+            lines.push(String::new());
+        }
+        lines.push(assignment);
+        changed = true;
+    }
+
+    if changed {
+        fs::write(&env_file, format!("{}\n", lines.join("\n")))?;
+        sync_systemd_env_file(&home)?;
+    }
+
+    Ok(changed)
 }
 
 pub fn install_user_service() -> Result<()> {
@@ -93,6 +148,12 @@ pub fn uninstall_user_service() -> Result<()> {
     }
     let _ = run_systemctl(&["--user", "daemon-reload"]);
     Ok(())
+}
+
+pub fn restart_user_service() -> Result<()> {
+    run_systemctl(&["--user", "daemon-reload"])?;
+    run_systemctl(&["--user", "restart", UNIT_NAME])?;
+    verify_service_active()
 }
 
 pub fn service_active() -> bool {

@@ -1,5 +1,9 @@
 mod agent;
+mod compute_pool;
 mod config;
+mod inference;
+mod llm;
+mod models;
 mod protocol;
 mod runtime;
 mod service;
@@ -49,6 +53,11 @@ enum Commands {
         #[command(subcommand)]
         command: ServiceCommands,
     },
+    /// Update the machine token in agent.env and restart the background service
+    SetToken {
+        #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
+        token: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -85,7 +94,7 @@ async fn main() -> Result<()> {
             if foreground {
                 agent::run_agent(config).await?;
             } else {
-                service::ensure_service_running()?;
+                service::ensure_service_running(&config)?;
             }
         }
         Commands::Status { token, ws } => {
@@ -95,6 +104,14 @@ async fn main() -> Result<()> {
             ServiceCommands::Install => service::install_user_service()?,
             ServiceCommands::Uninstall => service::uninstall_user_service()?,
             ServiceCommands::Status => service::service_status()?,
+        },
+        Commands::SetToken { token } => {
+            let config = config::AgentConfig::from_env_and_cli(Some(token), None, None, None)?;
+            service::persist_agent_token(&config.token)?;
+            if service::systemd_available() && service::service_active() {
+                service::restart_user_service()?;
+            }
+            println!("token updated in agent.env");
         },
     }
 
@@ -106,10 +123,8 @@ fn print_status(token: Option<String>, ws: Option<String>) -> Result<()> {
 
     println!("scalattice-agent {}", env!("CARGO_PKG_VERSION"));
     println!("{}", specs::status_line(&specs));
+    println!("server: {}", state::server_status_line());
     println!("demo mode: {}", state::demo_status_line());
-    if let Some(label) = state::connection_status_line() {
-        println!("runtime: {label}");
-    }
 
     let token_set = token
         .or_else(|| std::env::var("SCALATTICE_AGENT_TOKEN").ok())
@@ -129,10 +144,32 @@ fn print_status(token: Option<String>, ws: Option<String>) -> Result<()> {
         .unwrap_or_else(|| "wss://api.scalattice.cloud/v1/operators/agent/ws".to_string());
     println!("ws: {ws_url}");
 
+    let cached = models::list_cached_runtime_models();
+    println!("models cache: {}", models::models_dir().display());
+    if cached.is_empty() {
+        println!("models: none downloaded yet (Scalattice pushes weights on connect)");
+    } else {
+        println!("models: {}", cached.join(", "));
+    }
+
     if service::systemd_available() {
         match service::service_active() {
             true => println!("service: running"),
             false => println!("service: not running"),
+        }
+    }
+
+    if specs.compute_devices.len() > 1 {
+        println!();
+        println!("compute devices:");
+        for device in &specs.compute_devices {
+            let kind = match device.kind.as_str() {
+                "cpu" => "CPU",
+                "integrated" => "integrated GPU",
+                _ => "GPU",
+            };
+            let enabled = if device.enabled { "enabled" } else { "disabled (dashboard)" };
+            println!("  - {} ({kind}) · {enabled}", device.name);
         }
     }
 

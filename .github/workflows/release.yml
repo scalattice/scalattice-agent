@@ -15,8 +15,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            features: "gpu"
+            cuda: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            features: "vulkan"
+            cuda: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,18 +29,29 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross linker (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y clang libclang-dev cmake build-essential
+
+      - name: Install cross linker (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install CUDA toolkit (x86_64 GPU build)
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.2
+        id: cuda
+        with:
+          cuda: '12.4.0'
+          method: network
 
       - name: Build release binary
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
 
       - name: Package tarball
         run: |

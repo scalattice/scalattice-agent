@@ -1,10 +1,16 @@
 use crate::config::AgentConfig;
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_pong, parse_ready, parse_registered, CatalogModel,
-    HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
+    ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
 };
+use crate::inference::{InferenceEngine, InferenceRequest};
+use crate::models::spawn_catalog_sync;
 use crate::runtime::{build_runtime, JobState};
-use crate::specs::detect_machine_specs;
+use crate::specs::{
+    apply_compute_policy, build_specs_from_devices, detect_all_compute_devices, detect_cpu_model,
+    detect_cuda_version, detect_driver_version, detect_hostname, detect_machine_specs, detect_ram_gb,
+    MachineSpecs,
+};
 use crate::state;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
@@ -24,11 +30,15 @@ type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 struct SessionState {
     registered: bool,
     demo_mode: bool,
+    compute_policy: Vec<(String, bool)>,
     job_state: JobState,
     active_job_id: Option<String>,
     active_model_id: Option<String>,
     advertised_models: Vec<String>,
-    loaded_models: Vec<String>,
+    node_id: Option<String>,
+    catalog: Vec<CatalogModel>,
+    hf_token: Option<String>,
+    last_sync_token: Option<String>,
 }
 
 impl SessionState {
@@ -36,39 +46,137 @@ impl SessionState {
         Self {
             registered: false,
             demo_mode: false,
+            compute_policy: Vec::new(),
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
             advertised_models: Vec::new(),
-            loaded_models: Vec::new(),
+            node_id: None,
+            catalog: Vec::new(),
+            hf_token: None,
+            last_sync_token: None,
         }
+    }
+
+    fn effective_hf_token(&self, server_token: Option<String>) -> Option<String> {
+        server_token
+            .or_else(|| self.hf_token.clone())
+            .or_else(|| std::env::var("SCALATTICE_HF_TOKEN").ok())
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    fn sync_model_weights(&mut self, server_token: Option<String>, agent_token: &str) {
+        if self.catalog.is_empty() {
+            return;
+        }
+        let token = self.effective_hf_token(server_token);
+        if token == self.last_sync_token && self.last_sync_token.is_some() {
+            return;
+        }
+        let can_mirror = self.catalog.iter().any(|m| {
+            m.weights
+                .as_ref()
+                .and_then(|w| w.mirror_url.as_deref())
+                .is_some_and(|url| !url.trim().is_empty())
+        });
+        if token.is_none() && !can_mirror && self.catalog.iter().any(|m| m.weights.is_some()) {
+            warn!("model downloads are not configured on the server yet (contact Scalattice support)");
+            return;
+        }
+        self.last_sync_token = token.clone();
+        if let Some(token) = token.clone() {
+            self.hf_token = Some(token);
+        }
+        spawn_catalog_sync(self.catalog.clone(), agent_token.to_string(), token);
     }
 
     fn set_demo_mode(&mut self, demo_mode: bool) {
         self.demo_mode = demo_mode;
     }
 
+    fn apply_compute_devices(&mut self, devices: &[ComputeDevicePolicy]) {
+        if devices.is_empty() {
+            return;
+        }
+        self.compute_policy = devices
+            .iter()
+            .map(|device| (device.id.clone(), device.enabled))
+            .collect();
+    }
+
+    fn enabled_devices(&self) -> crate::specs::MachineSpecs {
+        let mut devices = detect_all_compute_devices();
+        apply_compute_policy(&mut devices, &self.compute_policy);
+        build_specs_from_devices(
+            &devices,
+            detect_hostname(),
+            detect_cpu_model(),
+            detect_ram_gb(),
+            detect_driver_version(),
+            detect_cuda_version(),
+        )
+    }
+
+    fn live_specs(&self) -> MachineSpecs {
+        let mut specs = self.enabled_devices();
+        if let Ok(engine) = InferenceEngine::new(&specs.compute_devices) {
+            if engine.pool().devices.len() > 1 {
+                specs.gpu_name = Some(engine.pool().display_name.clone());
+                specs.vram_gb = Some(engine.pool().total_vram_gb);
+            }
+        }
+        specs
+    }
+
+    fn refresh_inference(&self) -> Result<InferenceEngine> {
+        let specs = self.enabled_devices();
+        let engine = InferenceEngine::new(&specs.compute_devices)?;
+        if engine.pool().devices.len() > 1 {
+            info!(
+                "virtual compute card: {} · {:?}",
+                engine.pool().display_name,
+                engine.pool().strategy
+            );
+        }
+        Ok(engine)
+    }
+
     fn runtime(&self) -> crate::runtime::AgentRuntime {
+        let specs = self.enabled_devices();
+        let loaded_models = InferenceEngine::new(&specs.compute_devices)
+            .map(|engine| engine.loaded_models())
+            .unwrap_or_default();
+        let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
+
         build_runtime(
             self.demo_mode,
             self.job_state,
             self.active_job_id.clone(),
             self.active_model_id.clone(),
-            &self.loaded_models,
+            &loaded_models,
+            enabled_count,
         )
     }
 
-    fn persist_local_state(&self, node_id: Option<&str>) {
+    fn persist_local_state(&self) {
         let runtime = self.runtime();
         state::update_connection_state(
             self.demo_mode,
             Some(runtime.status_label),
-            node_id.map(str::to_string),
+            self.node_id.clone(),
+            true,
+            self.registered,
+            None,
         );
     }
 }
 
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
+    if let Err(err) = crate::llm::init_backend() {
+        warn!("embedded llama.cpp backend init failed: {err:#}");
+    }
+
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
 
@@ -77,7 +185,8 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
         match run_agent_session(&config).await {
             Ok(()) => return Ok(()),
             Err(err) => {
-                warn!("disconnected: {err:#}; reconnecting in {:?}…", backoff);
+                state::mark_disconnected(Some(format!("{err:#}")));
+                warn!("disconnected: {err:#}; reconnecting in {:?}...", backoff);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(120));
             }
@@ -100,6 +209,13 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
     let (ws, _) = connect_async(request)
         .await
         .context("WebSocket connect failed (check token and network)")?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.node_id = None;
+        guard.registered = false;
+        guard.persist_local_state();
+    }
 
     let (mut write, mut read) = ws.split();
     let mut heartbeat = interval(Duration::from_secs(25));
@@ -134,7 +250,7 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
 async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -> Result<()> {
     let (specs, runtime) = {
         let guard = state.lock().await;
-        (detect_machine_specs(), guard.runtime())
+        (guard.live_specs(), guard.runtime())
     };
     let hb = serde_json::to_string(&HeartbeatMessage {
         kind: "heartbeat",
@@ -142,6 +258,7 @@ async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -
         runtime: Some(runtime),
     })?;
     write.send(Message::Text(hb)).await?;
+    state::touch_connection_state();
     Ok(())
 }
 
@@ -161,14 +278,24 @@ async fn handle_server_message(
                     info!("assigned node {}", ready.node_id);
                     {
                         let mut guard = state.lock().await;
+                        guard.node_id = Some(ready.node_id.clone());
                         guard.set_demo_mode(ready.demo_mode);
-                        guard.persist_local_state(Some(&ready.node_id));
+                        guard.apply_compute_devices(&ready.compute_devices);
+                        guard.catalog = ready.catalog.clone();
+                        guard.last_sync_token = None;
+                        guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);guard.persist_local_state();
                         if ready.demo_mode {
                             info!("demo mode enabled for this GPU (dashboard setting)");
                         }
                     }
+                    if let Ok(engine) = state.lock().await.refresh_inference() {
+                        let _ = crate::inference::warm_pool_devices(engine.pool()).await;
+                    }
                     let models = pick_models(&config.models, &ready.catalog);
-                    let specs = detect_machine_specs();
+                    let specs = {
+                        let guard = state.lock().await;
+                        guard.live_specs()
+                    };
                     let runtime = {
                         let mut guard = state.lock().await;
                         guard.advertised_models = models.clone();
@@ -192,8 +319,9 @@ async fn handle_server_message(
                     {
                         let mut guard = state.lock().await;
                         guard.registered = true;
+                        guard.node_id = Some(reg.node_id.clone());
                         guard.advertised_models = reg.models.clone();
-                        guard.persist_local_state(Some(&reg.node_id));
+                        guard.persist_local_state();
                     }
                     let runtime = state.lock().await.runtime();
                     info!(
@@ -219,7 +347,11 @@ async fn handle_server_message(
                                 );
                             }
                         }
-                        guard.persist_local_state(None);
+                        guard.apply_compute_devices(&pong.compute_devices);
+                        if pong.hugging_face_token.is_some() {
+                            guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
+                        }
+                        guard.persist_local_state();
                     }
                 }
                 "error" => {
@@ -274,48 +406,53 @@ async fn respond_invoke(
     }
     send_heartbeat(state, write).await?;
 
-    let demo_mode = state.lock().await.demo_mode;
+    let (demo_mode, engine) = {
+        let guard = state.lock().await;
+        let demo_mode = guard.demo_mode;
+        let engine = guard
+            .refresh_inference()
+            .context("no enabled compute devices for inference")?;
+        (demo_mode, engine)
+    };
+
     let result = async {
-        if demo_mode {
-            let user = invoke
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .map(|m| m.content.as_str())
-                .unwrap_or("");
-
-            let content = format!("[demo agent echo] {user}");
-            let prompt_tokens = estimate_tokens(&invoke.messages);
-            let completion_tokens = estimate_tokens(&[crate::protocol::ChatMessage {
-                role: "assistant".to_string(),
-                content: content.clone(),
-            }]);
-
-            let result = InvokeResultMessage {
-                kind: "invoke_result",
-                id: invoke.id,
-                content,
-                prompt_tokens,
-                completion_tokens,
-            };
-            write
-                .send(Message::Text(serde_json::to_string(&result)?))
-                .await?;
-            Ok(())
-        } else {
-            let err = InvokeErrorMessage {
-                kind: "invoke_error",
-                id: invoke.id,
-                error: format!(
-                    "Model runtime not loaded on this agent yet. Pull weights for {} or enable Demo mode on this GPU in the Scalattice Cloud dashboard.",
-                    invoke.runtime_model
-                ),
-            };
-            write
-                .send(Message::Text(serde_json::to_string(&err)?))
-                .await?;
-            Ok(())
+        match engine
+            .invoke(InferenceRequest {
+                job_id: &invoke.id,
+                model_id: &invoke.model_id,
+                runtime_model: &invoke.runtime_model,
+                messages: &invoke.messages,
+                demo_mode,
+            })
+            .await
+        {
+            Ok(output) => {
+                let result = InvokeResultMessage {
+                    kind: "invoke_result",
+                    id: invoke.id,
+                    content: output.content,
+                    prompt_tokens: output.prompt_tokens,
+                    completion_tokens: output.completion_tokens,
+                };
+                write
+                    .send(Message::Text(serde_json::to_string(&result)?))
+                    .await?;
+                Ok(())
+            }
+            Err(err) => {
+                let err = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke.id,
+                    error: format!(
+                        "Virtual card {}: {err:#}",
+                        engine.pool().display_name
+                    ),
+                };
+                write
+                    .send(Message::Text(serde_json::to_string(&err)?))
+                    .await?;
+                Ok(())
+            }
         }
     }
     .await;
@@ -329,9 +466,4 @@ async fn respond_invoke(
     send_heartbeat(state, write).await?;
 
     result
-}
-
-fn estimate_tokens(messages: &[crate::protocol::ChatMessage]) -> u32 {
-    let chars: usize = messages.iter().map(|m| m.content.len()).sum();
-    ((chars / 4).max(1)) as u32
 }

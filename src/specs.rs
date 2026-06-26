@@ -1,6 +1,21 @@
 use std::collections::HashSet;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeDevice {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    #[serde(rename = "vramGb", skip_serializing_if = "Option::is_none")]
+    pub vram_gb: Option<u32>,
+    #[serde(rename = "vramUsedGb", skip_serializing_if = "Option::is_none")]
+    pub vram_used_gb: Option<u32>,
+    #[serde(rename = "utilPct", skip_serializing_if = "Option::is_none")]
+    pub util_pct: Option<u8>,
+    #[serde(default)]
+    pub enabled: bool,
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MachineSpecs {
@@ -24,40 +39,138 @@ pub struct MachineSpecs {
     pub cpu_model: Option<String>,
     #[serde(rename = "ramGb", skip_serializing_if = "Option::is_none")]
     pub ram_gb: Option<u32>,
+    #[serde(rename = "computeDevices", skip_serializing_if = "Vec::is_empty")]
+    pub compute_devices: Vec<ComputeDevice>,
 }
 
-struct GpuSnapshot {
-    name: Option<String>,
-    vram_gb: Option<u32>,
-    vram_used_gb: Option<u32>,
-    util_pct: Option<u8>,
-    count: Option<u8>,
-    driver_version: Option<String>,
-    cuda_version: Option<String>,
+pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
+    let mut devices = Vec::new();
+    devices.extend(detect_nvidia_devices());
+    devices.extend(detect_amd_devices());
+    devices.extend(detect_integrated_pci_devices(&devices));
+    devices.extend(detect_cpu_device());
+
+    for device in &mut devices {
+        if device.kind == "discrete" {
+            device.enabled = true;
+        }
+    }
+
+    devices
+}
+
+pub fn apply_compute_policy(devices: &mut [ComputeDevice], policy: &[(String, bool)]) {
+    if policy.is_empty() {
+        return;
+    }
+    let policy_map: std::collections::HashMap<_, _> = policy.iter().cloned().collect();
+    for device in devices {
+        if let Some(enabled) = policy_map.get(&device.id) {
+            device.enabled = *enabled;
+        }
+    }
 }
 
 pub fn detect_machine_specs() -> MachineSpecs {
-    let mut specs = MachineSpecs {
-        hostname: detect_hostname(),
-        cpu_model: detect_cpu_model(),
-        ram_gb: detect_ram_gb(),
-        ..MachineSpecs::default()
-    };
-
-    if let Some(gpu) = detect_gpus() {
-        specs.gpu_name = gpu.name;
-        specs.vram_gb = gpu.vram_gb;
-        specs.vram_used_gb = gpu.vram_used_gb;
-        specs.gpu_util_pct = gpu.util_pct;
-        specs.gpu_count = gpu.count;
-        specs.driver_version = gpu.driver_version;
-        specs.cuda_version = gpu.cuda_version;
+    let hostname = detect_hostname();
+    let cpu_model = detect_cpu_model();
+    let ram_gb = detect_ram_gb();
+    let mut devices = detect_all_compute_devices();
+    if devices.is_empty() {
+        return MachineSpecs {
+            hostname,
+            cpu_model,
+            ram_gb,
+            ..MachineSpecs::default()
+        };
     }
 
-    specs
+    build_specs_from_devices(&devices, hostname, cpu_model, ram_gb, None, None)
+}
+
+pub fn build_specs_from_devices(
+    devices: &[ComputeDevice],
+    hostname: Option<String>,
+    cpu_model: Option<String>,
+    ram_gb: Option<u32>,
+    driver_version: Option<String>,
+    cuda_version: Option<String>,
+) -> MachineSpecs {
+    let enabled: Vec<&ComputeDevice> = devices.iter().filter(|d| d.enabled).collect();
+    let discrete_count = enabled
+        .iter()
+        .filter(|d| d.kind == "discrete")
+        .count();
+
+    let gpu_name = if enabled.len() == 1 {
+        Some(enabled[0].name.clone())
+    } else if enabled.len() > 1 {
+        Some(
+            enabled
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" + "),
+        )
+    } else {
+        None
+    };
+
+    let vram_gb = sum_option(enabled.iter().filter_map(|d| d.vram_gb));
+    let vram_used_gb = sum_option(enabled.iter().filter_map(|d| d.vram_used_gb));
+    let gpu_util_pct = enabled
+        .iter()
+        .filter_map(|d| d.util_pct)
+        .max();
+
+    let gpu_count = if discrete_count > 0 {
+        Some(discrete_count.min(255) as u8)
+    } else if !enabled.is_empty() {
+        Some(enabled.len().min(255) as u8)
+    } else {
+        None
+    };
+
+    MachineSpecs {
+        gpu_name,
+        vram_gb,
+        vram_used_gb,
+        gpu_util_pct,
+        gpu_count,
+        driver_version,
+        cuda_version,
+        hostname,
+        cpu_model,
+        ram_gb,
+        compute_devices: devices.to_vec(),
+    }
 }
 
 pub fn status_line(specs: &MachineSpecs) -> String {
+    let enabled: Vec<_> = specs
+        .compute_devices
+        .iter()
+        .filter(|d| d.enabled)
+        .collect();
+
+    if !enabled.is_empty() {
+        let names: Vec<_> = enabled.iter().map(|d| d.name.as_str()).collect();
+        let label = if names.len() > 1 {
+            format!("{} devices enabled", names.len())
+        } else {
+            names[0].to_string()
+        };
+        let vram = specs
+            .vram_gb
+            .map(|vram| format!(" · {vram} GB VRAM"))
+            .unwrap_or_default();
+        let util = specs
+            .gpu_util_pct
+            .map(|pct| format!(" · {pct}% load"))
+            .unwrap_or_default();
+        return format!("Compute enabled · {label}{vram}{util}");
+    }
+
     match (&specs.gpu_name, specs.vram_gb) {
         (Some(name), Some(vram)) => {
             let util = specs
@@ -67,17 +180,23 @@ pub fn status_line(specs: &MachineSpecs) -> String {
             format!("GPU detected · {name} · {vram} GB VRAM{util}")
         }
         (Some(name), None) => format!("GPU detected · {name}"),
-        (None, _) => "No GPU detected (install vendor tools or check drivers)".to_string(),
+        (None, _) => {
+            let total = specs.compute_devices.len();
+            if total > 0 {
+                format!("{total} compute device(s) detected (none enabled)")
+            } else {
+                "No GPU detected (install vendor tools or check drivers)".to_string()
+            }
+        }
     }
 }
 
-fn detect_gpus() -> Option<GpuSnapshot> {
-    detect_nvidia_gpus()
-        .or_else(detect_amd_gpus)
-        .or_else(detect_pci_gpus)
+fn sum_option(values: impl Iterator<Item = u32>) -> Option<u32> {
+    let total: u32 = values.sum();
+    if total > 0 { Some(total) } else { None }
 }
 
-fn detect_nvidia_gpus() -> Option<GpuSnapshot> {
+fn detect_nvidia_devices() -> Vec<ComputeDevice> {
     for bin in [
         "/usr/bin/nvidia-smi",
         "/usr/sbin/nvidia-smi",
@@ -85,14 +204,15 @@ fn detect_nvidia_gpus() -> Option<GpuSnapshot> {
         "/usr/local/cuda/bin/nvidia-smi",
         "nvidia-smi",
     ] {
-        if let Some(snapshot) = detect_nvidia_gpus_from(bin) {
-            return Some(snapshot);
+        let devices = detect_nvidia_devices_from(bin);
+        if !devices.is_empty() {
+            return devices;
         }
     }
-    None
+    Vec::new()
 }
 
-fn detect_nvidia_gpus_from(bin: &str) -> Option<GpuSnapshot> {
+fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
     let output = Command::new(bin)
         .args([
             "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,driver_version",
@@ -102,102 +222,43 @@ fn detect_nvidia_gpus_from(bin: &str) -> Option<GpuSnapshot> {
         .ok()?;
 
     if !output.status.success() {
-        return None;
+        return Vec::new();
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<String> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut devices = Vec::new();
 
-    if lines.is_empty() {
-        return None;
-    }
-
-    let mut best: Option<(u32, usize)> = None;
-    for (idx, line) in lines.iter().enumerate() {
+    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let parts: Vec<&str> = line.split(',').map(str::trim).collect();
         if parts.len() < 5 {
             continue;
         }
-        let vram_gb = parts[2].parse::<f32>().ok().and_then(mb_to_gb);
-        let score = vram_gb.unwrap_or(0);
-        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
-            best = Some((score, idx));
-        }
+        let index = parts[0];
+        devices.push(ComputeDevice {
+            id: format!("nvidia:{index}"),
+            kind: "discrete".to_string(),
+            name: parts[1].to_string(),
+            vram_gb: parts[2].parse::<f32>().ok().and_then(mb_to_gb),
+            vram_used_gb: parts[3].parse::<f32>().ok().and_then(mb_to_gb),
+            util_pct: parts[4]
+                .parse::<f32>()
+                .ok()
+                .map(|v| v.round().clamp(0.0, 100.0) as u8),
+            enabled: true,
+        });
     }
 
-    let (idx, count) = match best {
-        Some((_, idx)) => (idx, lines.len().min(255) as u8),
-        None => return None,
-    };
-
-    let parts: Vec<&str> = lines[idx].split(',').map(str::trim).collect();
-    let vram_gb = parts[2].parse::<f32>().ok().and_then(mb_to_gb);
-    let vram_used_gb = parts[3].parse::<f32>().ok().and_then(mb_to_gb);
-    let util_pct = parts[4]
-        .parse::<f32>()
-        .ok()
-        .map(|v| v.round().clamp(0.0, 100.0) as u8);
-
-    Some(GpuSnapshot {
-        name: Some(parts[1].to_string()),
-        vram_gb,
-        vram_used_gb,
-        util_pct,
-        count: Some(count),
-        driver_version: parts
-            .get(5)
-            .map(|value| value.to_string())
-            .filter(|value| !value.is_empty()),
-        cuda_version: detect_cuda_version(),
-    })
+    devices
 }
 
-fn detect_cuda_version() -> Option<String> {
-    for bin in [
-        "/usr/bin/nvidia-smi",
-        "/usr/sbin/nvidia-smi",
-        "/usr/local/bin/nvidia-smi",
-        "nvidia-smi",
-    ] {
-        let output = match Command::new(bin)
-            .args(["--query-gpu=cuda_version", "--format=csv,noheader"])
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
-
-        if !output.status.success() {
-            continue;
-        }
-
-        let version = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        if !version.is_empty() {
-            return Some(version);
-        }
-    }
-    None
-}
-
-fn detect_amd_gpus() -> Option<GpuSnapshot> {
+fn detect_amd_devices() -> Vec<ComputeDevice> {
     let output = Command::new("rocm-smi")
         .args(["--showproductname"])
         .output()
         .ok()?;
 
     if !output.status.success() {
-        return None;
+        return Vec::new();
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -212,19 +273,107 @@ fn detect_amd_gpus() -> Option<GpuSnapshot> {
         }
     }
 
-    if names.is_empty() {
-        return None;
-    }
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ComputeDevice {
+            id: format!("amd:{index}"),
+            kind: "discrete".to_string(),
+            name: format!("AMD {name}"),
+            vram_gb: detect_amd_vram_gb(),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        })
+        .collect()
+}
 
-    Some(GpuSnapshot {
-        name: Some(format!("AMD {}", names[0])),
-        vram_gb: detect_amd_vram_gb(),
+fn detect_integrated_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
+    let output = match Command::new("lspci").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let known_names: HashSet<String> = existing
+        .iter()
+        .map(|d| d.name.to_ascii_lowercase())
+        .collect();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw_names: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if !(lower.contains("vga compatible controller")
+                || lower.contains("3d controller")
+                || lower.contains("display controller"))
+            {
+                return None;
+            }
+            let name = line
+                .split_once(':')
+                .map(|(_, rest)| rest.trim())
+                .filter(|value| !value.is_empty())?;
+            if name.eq_ignore_ascii_case("device") {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect();
+
+    let names = dedupe_pci_gpu_names(raw_names);
+    names
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, raw)| {
+            let name = clean_pci_gpu_name(&raw);
+            if known_names.contains(&name.to_ascii_lowercase()) {
+                return None;
+            }
+            if !is_integrated_pci_name(&raw) {
+                return None;
+            }
+            Some(ComputeDevice {
+                id: format!("pci:{index}"),
+                kind: "integrated".to_string(),
+                name,
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: false,
+            })
+        })
+        .collect()
+}
+
+fn is_integrated_pci_name(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro") {
+        return false;
+    }
+    lower.contains("intel")
+        || lower.contains("uhd")
+        || lower.contains("iris")
+        || lower.contains("hd graphics")
+        || lower.contains("radeon graphics")
+        || lower.contains("vega")
+        || lower.contains("mali")
+}
+
+fn detect_cpu_device() -> Vec<ComputeDevice> {
+    let Some(cpu_model) = detect_cpu_model() else {
+        return Vec::new();
+    };
+    let ram_gb = detect_ram_gb();
+    vec![ComputeDevice {
+        id: "cpu:0".to_string(),
+        kind: "cpu".to_string(),
+        name: cpu_model,
+        vram_gb: ram_gb,
         vram_used_gb: None,
         util_pct: None,
-        count: Some(names.len().min(255) as u8),
-        driver_version: Some("ROCm".to_string()),
-        cuda_version: None,
-    })
+        enabled: false,
+    }]
 }
 
 fn detect_amd_vram_gb() -> Option<u32> {
@@ -252,51 +401,6 @@ fn detect_amd_vram_gb() -> Option<u32> {
     }
 
     mb_to_gb(best_mb)
-}
-
-fn detect_pci_gpus() -> Option<GpuSnapshot> {
-    let output = Command::new("lspci").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw_names: Vec<String> = stdout
-        .lines()
-        .filter_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            if !(lower.contains("vga compatible controller")
-                || lower.contains("3d controller")
-                || lower.contains("display controller"))
-            {
-                return None;
-            }
-            let name = line
-                .split_once(':')
-                .map(|(_, rest)| rest.trim())
-                .filter(|value| !value.is_empty())?;
-            if name.eq_ignore_ascii_case("device") {
-                return None;
-            }
-            Some(name.to_string())
-        })
-        .collect();
-
-    let names = dedupe_pci_gpu_names(raw_names);
-
-    if names.is_empty() {
-        return None;
-    }
-
-    Some(GpuSnapshot {
-        name: Some(names[0].clone()),
-        vram_gb: None,
-        vram_used_gb: None,
-        util_pct: None,
-        count: Some(names.len().min(255) as u8),
-        driver_version: None,
-        cuda_version: None,
-    })
 }
 
 fn dedupe_pci_gpu_names(raw_names: Vec<String>) -> Vec<String> {
@@ -343,6 +447,7 @@ fn clean_pci_gpu_name(raw: &str) -> String {
         "NVIDIA Corporation ",
         "Advanced Micro Devices, Inc. [AMD/ATI] ",
         "Advanced Micro Devices, Inc. ",
+        "Intel Corporation ",
     ] {
         if let Some(rest) = name.strip_prefix(prefix) {
             name = rest.to_string();
@@ -350,7 +455,7 @@ fn clean_pci_gpu_name(raw: &str) -> String {
         }
     }
 
-  name.trim().to_string()
+    name.trim().to_string()
 }
 
 fn detect_hostname() -> Option<String> {
@@ -394,9 +499,90 @@ fn detect_ram_gb() -> Option<u32> {
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
 }
 
+pub fn detect_cuda_version() -> Option<String> {
+    for bin in [
+        "/usr/bin/nvidia-smi",
+        "/usr/sbin/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+        "nvidia-smi",
+    ] {
+        let output = match Command::new(bin)
+            .args(["--query-gpu=cuda_version", "--format=csv,noheader"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let version = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+    None
+}
+
+pub fn detect_driver_version() -> Option<String> {
+    for bin in [
+        "/usr/bin/nvidia-smi",
+        "/usr/sbin/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+        "nvidia-smi",
+    ] {
+        let output = match Command::new(bin)
+            .args(["--query-gpu=driver_version", "--format=csv,noheader"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let version = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+    None
+}
+
 fn mb_to_gb(mb: f32) -> Option<u32> {
     if mb <= 0.0 {
         return None;
     }
     Some(((mb / 1024.0).round() as u32).max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integrated_pci_names_are_detected() {
+        assert!(is_integrated_pci_name(
+            "Intel Corporation UHD Graphics 620 [8086:5917]"
+        ));
+        assert!(!is_integrated_pci_name(
+            "NVIDIA Corporation GP107 [GeForce GTX 1650 SUPER]"
+        ));
+    }
 }

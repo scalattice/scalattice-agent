@@ -10,6 +10,17 @@ pub struct Envelope {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct ModelWeights {
+    pub source: String,
+    pub repo: String,
+    pub filename: String,
+    #[serde(default)]
+    pub revision: String,
+    #[serde(rename = "mirrorUrl", default)]
+    pub mirror_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CatalogModel {
     #[serde(rename = "modelId")]
     pub model_id: String,
@@ -21,6 +32,15 @@ pub struct CatalogModel {
     pub max_context_tokens: u32,
     #[serde(default)]
     pub regions: Vec<String>,
+    #[serde(default)]
+    pub weights: Option<ModelWeights>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComputeDevicePolicy {
+    pub id: String,
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,12 +50,20 @@ pub struct ReadyMessage {
     pub catalog: Vec<CatalogModel>,
     #[serde(rename = "demoMode", default)]
     pub demo_mode: bool,
+    #[serde(rename = "computeDevices", default)]
+    pub compute_devices: Vec<ComputeDevicePolicy>,
+    #[serde(rename = "huggingFaceToken", default)]
+    pub hugging_face_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PongMessage {
     #[serde(rename = "demoMode")]
     pub demo_mode: Option<bool>,
+    #[serde(rename = "computeDevices", default)]
+    pub compute_devices: Vec<ComputeDevicePolicy>,
+    #[serde(rename = "huggingFaceToken", default)]
+    pub hugging_face_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -2,13 +2,18 @@
 # Scalattice GPU agent installer
 # Usage:
 #   curl -fsSL https://scalattice.cloud/install/agent | sh
-#   curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…
+#   curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_...
 set -eu
 
 INSTALL_DIR="${SCALATTICE_INSTALL_DIR:-$HOME/.local/bin}"
 GITHUB_REPO="${SCALATTICE_AGENT_REPO:-Robottik-Software/Scalattice-Client}"
 VERSION="${SCALATTICE_AGENT_VERSION:-latest}"
 TOKEN=""
+
+ENV_FILE="$HOME/.config/scalattice/agent.env"
+SYSTEMD_ENV_FILE="$HOME/.config/scalattice/agent.systemd.env"
+STATE_FILE="$HOME/.config/scalattice/agent.state.json"
+UNIT_FILE="$HOME/.config/systemd/user/scalattice-agent.service"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,7 +30,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -h|--help)
-      echo "Usage: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…"
+      echo "Usage: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_..."
       exit 0
       ;;
     *)
@@ -57,6 +62,32 @@ BIN_NAME="scalattice-agent"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+read_existing_token() {
+  if [ -n "$TOKEN" ]; then
+    return 0
+  fi
+
+  for file in "$ENV_FILE" "$SYSTEMD_ENV_FILE"; do
+    [ -f "$file" ] || continue
+    line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?SCALATTICE_AGENT_TOKEN=' "$file" 2>/dev/null | head -1 || true)"
+    [ -n "$line" ] || continue
+    TOKEN="$(printf '%s\n' "$line" | sed -E "s/^[[:space:]]*(export[[:space:]]+)?SCALATTICE_AGENT_TOKEN=//; s/^['\"]//; s/['\"]$//")"
+    [ -n "$TOKEN" ] && return 0
+  done
+}
+
+remove_previous_install() {
+  echo "==> Removing previous scalattice-agent install"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop scalattice-agent.service 2>/dev/null || true
+    systemctl --user disable scalattice-agent.service 2>/dev/null || true
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+
+  rm -f "$STATE_FILE" "$ENV_FILE" "$SYSTEMD_ENV_FILE" "$UNIT_FILE"
+}
+
 download_release() {
   if [ "$VERSION" = "latest" ]; then
     URL="https://github.com/$GITHUB_REPO/releases/latest/download/scalattice-agent-${ARCH}.tar.gz"
@@ -84,14 +115,12 @@ build_from_source() {
     exit 1
   fi
 
-  echo "==> Building scalattice-agent from source (this may take a few minutes)…"
+  echo "==> Building scalattice-agent from source (this may take a few minutes)..."
   cargo install --git "https://github.com/${GITHUB_REPO}.git" --locked --root "$TMP/cargo-root" "$BIN_NAME"
   install -m 0755 "$TMP/cargo-root/bin/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 }
 
 write_env_files() {
-  ENV_FILE="$HOME/.config/scalattice/agent.env"
-  SYSTEMD_ENV_FILE="$HOME/.config/scalattice/agent.systemd.env"
   mkdir -p "$(dirname "$ENV_FILE")"
 
   {
@@ -131,12 +160,15 @@ enable_boot_linger() {
   echo "    sudo loginctl enable-linger $USER_NAME"
 }
 
+read_existing_token
+remove_previous_install
+
 echo "==> Installing scalattice-agent to $INSTALL_DIR"
 
 if download_release 2>/dev/null; then
   echo "==> Installed release binary"
 else
-  echo "==> Release download unavailable, falling back to source build…"
+  echo "==> Release download unavailable, falling back to source build..."
   build_from_source
 fi
 
@@ -148,9 +180,7 @@ if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
   echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
-if [ -n "$TOKEN" ] || [ -n "$needs_path" ]; then
-  write_env_files
-fi
+write_env_files
 
 if [ -n "$TOKEN" ] && command -v systemctl >/dev/null 2>&1; then
   echo "==> Installing background service"
@@ -172,7 +202,7 @@ step=1
 if [ -z "$TOKEN" ]; then
   echo "  $step. Create an agent token at https://scalattice.cloud/providers"
   step=$((step + 1))
-  echo "  $step. Re-run this installer with --token slt_provider_…"
+  echo "  $step. Re-run this installer with --token slt_provider_..."
   step=$((step + 1))
 fi
 if [ -n "$TOKEN" ] || [ -n "$needs_path" ]; then
