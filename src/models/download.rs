@@ -2,6 +2,7 @@ use crate::models::storage::{ensure_model_dir, is_download_complete, target_gguf
 use crate::protocol::{CatalogModel, ModelWeights};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
 async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Option<&str>) -> Result<()> {
@@ -33,7 +34,6 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read download chunk")?;
-        use tokio::io::AsyncWriteExt;
         file.write_all(&chunk)
             .await
             .context("write download chunk")?;

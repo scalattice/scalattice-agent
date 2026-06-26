@@ -213,13 +213,15 @@ fn detect_nvidia_devices() -> Vec<ComputeDevice> {
 }
 
 fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
-    let output = Command::new(bin)
+    let Ok(output) = Command::new(bin)
         .args([
             "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,driver_version",
             "--format=csv,noheader,nounits",
         ])
         .output()
-        .ok()?;
+    else {
+        return Vec::new();
+    };
 
     if !output.status.success() {
         return Vec::new();
@@ -252,10 +254,12 @@ fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
 }
 
 fn detect_amd_devices() -> Vec<ComputeDevice> {
-    let output = Command::new("rocm-smi")
+    let Ok(output) = Command::new("rocm-smi")
         .args(["--showproductname"])
         .output()
-        .ok()?;
+    else {
+        return Vec::new();
+    };
 
     if !output.status.success() {
         return Vec::new();
@@ -458,7 +462,7 @@ fn clean_pci_gpu_name(raw: &str) -> String {
     name.trim().to_string()
 }
 
-fn detect_hostname() -> Option<String> {
+pub fn detect_hostname() -> Option<String> {
     if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
         let trimmed = host.trim().to_string();
         if !trimmed.is_empty() {
@@ -475,7 +479,7 @@ fn detect_hostname() -> Option<String> {
     (!host.is_empty()).then_some(host)
 }
 
-fn detect_cpu_model() -> Option<String> {
+pub fn detect_cpu_model() -> Option<String> {
     let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     let model = info
         .lines()

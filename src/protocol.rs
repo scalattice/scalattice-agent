@@ -9,7 +9,7 @@ pub struct Envelope {
     pub kind: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelWeights {
     pub source: String,
     pub repo: String,
@@ -20,7 +20,7 @@ pub struct ModelWeights {
     pub mirror_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CatalogModel {
     #[serde(rename = "modelId")]
     pub model_id: String,

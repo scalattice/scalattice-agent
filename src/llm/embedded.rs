@@ -4,6 +4,7 @@ use crate::compute_pool::{PoolStrategy, VirtualCard};
 use crate::protocol::ChatMessage;
 use anyhow::{Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::LogOptions;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
@@ -31,7 +32,7 @@ pub struct GenerateOutput {
 }
 
 pub fn init_backend() -> Result<()> {
-    llama_cpp_2::send_logs_to_tracing();
+    llama_cpp_2::send_logs_to_tracing(LogOptions::default());
     backend().map(|_| ())
 }
 
@@ -49,9 +50,9 @@ fn backend() -> Result<&'static LlamaBackend> {
 pub fn generate(config: &GenerateConfig) -> Result<GenerateOutput> {
     let backend = backend()?;
     let model_params = model_params_for_pool(&config.pool)?;
-    let ctx_params = LlamaContextParams::default().with_n_ctx(
+    let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
         NonZeroU32::new(4096).context("invalid default context size")?,
-    );
+    ));
 
     let model = LlamaModel::load_from_file(backend, &config.model_path, &model_params)
         .with_context(|| format!("load model {}", config.model_path.display()))?;
@@ -170,7 +171,7 @@ fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelParams> {
                     .with_devices(std::slice::from_ref(&ggml_devices[0]))
                     .context("configure GPU for CPU offload path")?;
             }
-            model_params = model_params.with_n_gpu_layers(pool.gpu_layer_budget as i32);
+            model_params = model_params.with_n_gpu_layers(pool.gpu_layer_budget);
         }
         PoolStrategy::CpuOnly => {
             model_params = model_params.with_n_gpu_layers(0);
