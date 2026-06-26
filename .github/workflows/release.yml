@@ -94,9 +94,22 @@ jobs:
 
       - name: Package tarball
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/scalattice-agent" dist/
-          tar -czf "dist/scalattice-agent-${{ matrix.target }}.tar.gz" -C dist scalattice-agent
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          RELEASE="target/${TARGET}/release"
+          mkdir -p dist/lib
+          cp "${RELEASE}/scalattice-agent" dist/
+          # If any llama.cpp objects were built as .so, bundle them for install.sh.
+          find "${RELEASE}/build" -type f \( -name 'libggml*.so*' -o -name 'libllama*.so*' \) 2>/dev/null \
+            | while read -r lib; do
+                cp -L "$lib" "dist/lib/$(basename "$lib")"
+              done || true
+          if [ -z "$(ls -A dist/lib 2>/dev/null)" ]; then
+            rmdir dist/lib
+            tar -czf "dist/scalattice-agent-${TARGET}.tar.gz" -C dist scalattice-agent
+          else
+            tar -czf "dist/scalattice-agent-${TARGET}.tar.gz" -C dist scalattice-agent lib
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

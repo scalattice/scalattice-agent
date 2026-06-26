@@ -6,6 +6,7 @@
 set -eu
 
 INSTALL_DIR="${SCALATTICE_INSTALL_DIR:-$HOME/.local/bin}"
+LIB_DIR="${SCALATTICE_LIB_DIR:-$HOME/.local/lib/scalattice}"
 GITHUB_REPO="${SCALATTICE_AGENT_REPO:-Robottik-Software/Scalattice-Client}"
 VERSION="${SCALATTICE_AGENT_VERSION:-latest}"
 TOKEN=""
@@ -86,6 +87,21 @@ remove_previous_install() {
   fi
 
   rm -f "$STATE_FILE" "$ENV_FILE" "$SYSTEMD_ENV_FILE" "$UNIT_FILE"
+  rm -rf "$LIB_DIR"
+}
+
+install_release_libs() {
+  [ -d "$TMP/lib" ] || return 0
+  [ -n "$(ls -A "$TMP/lib" 2>/dev/null)" ] || return 0
+  mkdir -p "$LIB_DIR"
+  install -m 0755 "$TMP"/lib/* "$LIB_DIR/"
+  echo "==> Installed runtime libraries to $LIB_DIR"
+}
+
+library_path_export() {
+  if [ -n "$(ls -A "$LIB_DIR" 2>/dev/null)" ]; then
+    printf '%s' "$LIB_DIR"
+  fi
 }
 
 download_release() {
@@ -105,6 +121,7 @@ download_release() {
 
   tar -xzf "$TMP/agent.tar.gz" -C "$TMP"
   install -m 0755 "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+  install_release_libs
 }
 
 build_from_source() {
@@ -122,10 +139,14 @@ build_from_source() {
 
 write_env_files() {
   mkdir -p "$(dirname "$ENV_FILE")"
+  lib_path="$(library_path_export)"
 
   {
     echo "# Scalattice agent environment (source this file: . $ENV_FILE)"
     echo "export PATH=\"$INSTALL_DIR:\$PATH\""
+    if [ -n "$lib_path" ]; then
+      echo "export LD_LIBRARY_PATH=\"$lib_path:\${LD_LIBRARY_PATH:-}\""
+    fi
     if [ -n "$TOKEN" ]; then
       echo "export SCALATTICE_AGENT_TOKEN='$TOKEN'"
       echo "export SCALATTICE_AGENT_WS='wss://api.scalattice.cloud/v1/operators/agent/ws'"
@@ -134,6 +155,9 @@ write_env_files() {
 
   {
     echo "PATH=$INSTALL_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [ -n "$lib_path" ]; then
+      echo "LD_LIBRARY_PATH=$lib_path"
+    fi
     if [ -n "$TOKEN" ]; then
       echo "SCALATTICE_AGENT_TOKEN=$TOKEN"
       echo "SCALATTICE_AGENT_WS=wss://api.scalattice.cloud/v1/operators/agent/ws"
@@ -185,6 +209,10 @@ write_env_files
 if [ -n "$TOKEN" ] && command -v systemctl >/dev/null 2>&1; then
   echo "==> Installing background service"
   export PATH="$INSTALL_DIR:$PATH"
+  lib_path="$(library_path_export)"
+  if [ -n "$lib_path" ]; then
+    export LD_LIBRARY_PATH="$lib_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
   if "$INSTALL_DIR/$BIN_NAME" service install; then
     echo "==> Agent is running in the background"
   else
