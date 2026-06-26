@@ -104,6 +104,54 @@ library_path_export() {
   fi
 }
 
+ensure_runtime_deps() {
+  bin="$INSTALL_DIR/$BIN_NAME"
+  [ -x "$bin" ] || return 0
+
+  apt_pkgs=""
+  while read -r lib; do
+    [ -n "$lib" ] || continue
+    case "$lib" in
+      libvulkan.so.1) apt_pkgs="$apt_pkgs libvulkan1" ;;
+      libcuda.so.1)
+        echo "==> NVIDIA driver required (libcuda.so.1 missing)" >&2
+        echo "    Install an NVIDIA driver package, e.g. sudo apt install -y nvidia-driver-550" >&2
+        ;;
+    esac
+  done <<EOF
+$(ldd "$bin" 2>/dev/null | awk '/not found/ {print $1}')
+EOF
+
+  apt_pkgs="$(printf '%s\n' $apt_pkgs | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  [ -n "$apt_pkgs" ] || return 0
+
+  echo "==> Missing system libraries for scalattice-agent"
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "==> Installing: $apt_pkgs"
+    if sudo -n apt-get install -y $apt_pkgs >/dev/null 2>&1; then
+      echo "==> Installed runtime dependencies"
+      return 0
+    fi
+    echo "==> Run: sudo apt-get install -y $apt_pkgs"
+  else
+    echo "==> Install OS packages providing:$apt_pkgs"
+  fi
+  return 1
+}
+
+verify_binary() {
+  bin="$INSTALL_DIR/$BIN_NAME"
+  if "$bin" --version >/dev/null 2>&1; then
+    return 0
+  fi
+  ensure_runtime_deps || true
+  if "$bin" --version >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "==> Binary failed to start. Check: ldd $bin" >&2
+  return 1
+}
+
 download_release() {
   if [ "$VERSION" = "latest" ]; then
     URL="https://github.com/$GITHUB_REPO/releases/latest/download/scalattice-agent-${ARCH}.tar.gz"
@@ -195,6 +243,8 @@ else
   echo "==> Release download unavailable, falling back to source build..."
   build_from_source
 fi
+
+verify_binary || true
 
 needs_path=
 if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then

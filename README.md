@@ -17,7 +17,19 @@ scalattice-agent connect   # background service (installed automatically with --
 
 Use `scalattice-agent connect --foreground` for debugging in the terminal.
 
-Install script downloads a release binary from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) when available, or builds from source with Rust/Cargo.
+Install script downloads a self-contained release from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) (binary + bundled runtime libraries), or builds from source with Rust/Cargo.
+
+### Hardware support
+
+Release builds include **CUDA** (NVIDIA) and **Vulkan** (AMD/Intel/ARM) backends. The installer ships every library we are allowed to redistribute (Vulkan loader, llama.cpp modules, etc.) — no `apt install libvulkan1` or similar.
+
+| Hardware | What the host needs |
+|----------|---------------------|
+| NVIDIA GTX/RTX | NVIDIA driver installed (provides `libcuda.so`; standard on GPU workstations) |
+| AMD / Intel GPU | Vulkan ICD from the vendor (usually already present with GPU drivers) |
+| CPU only | Nothing extra — agent connects; inference uses CPU backend |
+
+We cannot bundle NVIDIA's `libcuda.so` (license). Machines without a GPU driver still run the agent; GPU inference activates when the driver is present.
 
 ## Quick start
 

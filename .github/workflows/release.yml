@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # NVIDIA (CUDA) + AMD/Intel (Vulkan) + runtime backend loading
+          # NVIDIA CUDA + AMD/Intel Vulkan; installer ships bundled runtime libs
           - id: x86_64-gpu
             target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -53,6 +53,8 @@ jobs:
             spirv-headers \
             libshaderc-dev \
             spirv-tools \
+            libvulkan1 \
+            patchelf \
             mesa-vulkan-drivers
           echo "=== GPU build tools ==="
           glslc --version
@@ -97,19 +99,20 @@ jobs:
           set -euo pipefail
           TARGET="${{ matrix.target }}"
           RELEASE="target/${TARGET}/release"
-          mkdir -p dist/lib
-          cp "${RELEASE}/scalattice-agent" dist/
-          # If any llama.cpp objects were built as .so, bundle them for install.sh.
-          find "${RELEASE}/build" -type f \( -name 'libggml*.so*' -o -name 'libllama*.so*' \) 2>/dev/null \
-            | while read -r lib; do
-                cp -L "$lib" "dist/lib/$(basename "$lib")"
-              done || true
-          if [ -z "$(ls -A dist/lib 2>/dev/null)" ]; then
-            rmdir dist/lib
-            tar -czf "dist/scalattice-agent-${TARGET}.tar.gz" -C dist scalattice-agent
-          else
+          BIN="${RELEASE}/scalattice-agent"
+          mkdir -p dist
+          cp "$BIN" dist/scalattice-agent
+          chmod +x scripts/bundle-release-libs.sh
+          scripts/bundle-release-libs.sh dist/scalattice-agent dist "${RELEASE}"
+          if [ -d dist/lib ]; then
             tar -czf "dist/scalattice-agent-${TARGET}.tar.gz" -C dist scalattice-agent lib
+          else
+            tar -czf "dist/scalattice-agent-${TARGET}.tar.gz" -C dist scalattice-agent
           fi
+          echo "=== bundled libraries ==="
+          tar -tzf "dist/scalattice-agent-${TARGET}.tar.gz"
+          echo "=== dynamic deps (should be glibc + libcuda only) ==="
+          ldd dist/scalattice-agent || true
 
       - uses: actions/upload-artifact@v4
         with:

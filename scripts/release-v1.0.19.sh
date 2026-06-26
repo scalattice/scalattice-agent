@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REMOTE="${1:-origin}"
-TAG="v1.0.18"
+TAG="v1.0.19"
 git push "$REMOTE" main
 if git rev-parse "$TAG" >/dev/null 2>&1; then
   git tag -d "$TAG"

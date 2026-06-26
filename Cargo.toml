@@ -1,6 +1,6 @@
 [package]
 name = "scalattice-agent"
-version = "1.0.18"
+version = "1.0.20"
 edition = "2021"
 description = "Open-source GPU machine agent for the Scalattice inference network"
 license = "MIT"
@@ -30,9 +30,9 @@ url = "2"
 
 [features]
 default = ["gpu"]
-# x86_64: NVIDIA CUDA + AMD/Intel Vulkan (static backends — portable single binary)
+# x86_64: NVIDIA CUDA + AMD/Intel Vulkan; release bundles non-driver .so deps
 gpu = ["cuda", "vulkan"]
-# aarch64 native: NVIDIA CUDA + Vulkan (static backends — avoids cross-compile CMake issues)
+# aarch64 native: NVIDIA CUDA + Vulkan (Jetson, Graviton, Mali, Adreno)
 arm-gpu = ["cuda", "vulkan"]
 cuda = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]
