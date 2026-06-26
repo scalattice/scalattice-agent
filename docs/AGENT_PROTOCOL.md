@@ -13,21 +13,14 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 
 ## Message flow
 
-1. **Server → client** `ready`: assigns `nodeId`, sends the model catalog:
+1. **Server → client** `ready`: assigns `nodeId`, sends the model catalog, and the dashboard **demo mode** flag for this GPU:
 
 ```json
 {
   "type": "ready",
   "nodeId": "agent-uuid",
-  "catalog": [
-    {
-      "modelId": "mistral-large",
-      "displayName": "Mistral Large",
-      "runtimeModel": "mistralai/Mistral-Large-Instruct-2407",
-      "maxContextTokens": 32768,
-      "regions": ["us", "eu"]
-    }
-  ]
+  "demoMode": false,
+  "catalog": [ ... ]
 }
 ```
 
@@ -74,7 +67,13 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 }
 ```
 
-4. **Client ↔ server** `heartbeat` / `pong` every ~25s. Heartbeats may refresh live machine specs:
+4. **Client ↔ server** `heartbeat` / `pong` every ~25s. The server includes the current `demoMode` on each `pong` so dashboard toggles apply without reconnecting:
+
+```json
+{ "type": "pong", "demoMode": false }
+```
+
+Heartbeats may refresh live machine specs:
 
 ```json
 {
@@ -152,17 +151,21 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 | `SCALATTICE_AGENT_WS` | WebSocket URL (default `wss://api.scalattice.cloud/v1/operators/agent/ws`) |
 | `SCALATTICE_AGENT_REGION` | Region: `auto`, `us`, `eu`, or `ap` |
 | `SCALATTICE_AGENT_MODELS` | Comma-separated catalog model ids to advertise |
-| `SCALATTICE_AGENT_DEMO` | Set to `1` for echo-only connectivity testing |
+
+**Demo mode** is toggled per GPU on the Providers dashboard (off by default), not via environment variables.
 
 ## Background service (Linux + systemd)
 
+`scalattice-agent connect` starts (or ensures) a user systemd service by default.
+
 ```bash
-scalattice-agent service install    # user unit, auto-restart on disconnect
+scalattice-agent connect              # background service (default)
+scalattice-agent connect --foreground # blocking terminal, for debugging
 scalattice-agent service status
-sudo loginctl enable-linger $USER   # optional: start at boot without login
+sudo loginctl enable-linger $USER     # optional: start at boot without login
 ```
 
-Foreground `connect` (v1.0.3+) also reconnects automatically after network drops.
+The curl installer with `--token` writes `agent.env` and installs the background service automatically.
 
 ## Implementation notes
 

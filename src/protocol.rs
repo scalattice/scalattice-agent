@@ -28,6 +28,14 @@ pub struct ReadyMessage {
     #[serde(rename = "nodeId")]
     pub node_id: String,
     pub catalog: Vec<CatalogModel>,
+    #[serde(rename = "demoMode", default)]
+    pub demo_mode: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PongMessage {
+    #[serde(rename = "demoMode")]
+    pub demo_mode: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +112,10 @@ pub fn parse_envelope(data: &[u8]) -> anyhow::Result<Envelope> {
 }
 
 pub fn parse_ready(data: &[u8]) -> anyhow::Result<ReadyMessage> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+pub fn parse_pong(data: &[u8]) -> anyhow::Result<PongMessage> {
     Ok(serde_json::from_slice(data)?)
 }
 

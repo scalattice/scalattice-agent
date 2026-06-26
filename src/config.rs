@@ -7,11 +7,15 @@ pub struct AgentConfig {
     pub ws_url: String,
     pub region: String,
     pub models: Vec<String>,
-    pub demo_mode: bool,
 }
 
 impl AgentConfig {
-    pub fn from_env_and_cli(token: Option<String>, ws_url: Option<String>, region: Option<String>, models: Option<String>, demo: bool) -> Result<Self> {
+    pub fn from_env_and_cli(
+        token: Option<String>,
+        ws_url: Option<String>,
+        region: Option<String>,
+        models: Option<String>,
+    ) -> Result<Self> {
         let token = token
             .or_else(|| env::var("SCALATTICE_AGENT_TOKEN").ok())
             .map(|t| t.trim().to_string())
@@ -41,14 +45,11 @@ impl AgentConfig {
             })
             .unwrap_or_default();
 
-        let demo_mode = demo || crate::runtime::demo_mode_from_env();
-
         Ok(Self {
             token,
             ws_url,
             region,
             models,
-            demo_mode,
         })
     }
 }

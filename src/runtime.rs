@@ -79,13 +79,3 @@ fn status_label(
     }
     "Connected · no model runtime loaded".to_string()
 }
-
-pub fn demo_mode_from_env() -> bool {
-    match std::env::var("SCALATTICE_AGENT_DEMO").ok() {
-        Some(value) => {
-            let v = value.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-        }
-        None => false,
-    }
-}

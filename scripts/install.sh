@@ -89,6 +89,31 @@ build_from_source() {
   install -m 0755 "$TMP/cargo-root/bin/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 }
 
+write_env_files() {
+  ENV_FILE="$HOME/.config/scalattice/agent.env"
+  SYSTEMD_ENV_FILE="$HOME/.config/scalattice/agent.systemd.env"
+  mkdir -p "$(dirname "$ENV_FILE")"
+
+  {
+    echo "# Scalattice agent environment (source this file: . $ENV_FILE)"
+    echo "export PATH=\"$INSTALL_DIR:\$PATH\""
+    if [ -n "$TOKEN" ]; then
+      echo "export SCALATTICE_AGENT_TOKEN='$TOKEN'"
+      echo "export SCALATTICE_AGENT_WS='wss://api.scalattice.cloud/v1/operators/agent/ws'"
+    fi
+  } > "$ENV_FILE"
+
+  {
+    echo "PATH=$INSTALL_DIR:/usr/local/bin:/usr/bin:/bin"
+    if [ -n "$TOKEN" ]; then
+      echo "SCALATTICE_AGENT_TOKEN=$TOKEN"
+      echo "SCALATTICE_AGENT_WS=wss://api.scalattice.cloud/v1/operators/agent/ws"
+    fi
+  } > "$SYSTEMD_ENV_FILE"
+
+  echo "==> Wrote $ENV_FILE"
+}
+
 echo "==> Installing scalattice-agent to $INSTALL_DIR"
 
 if download_release 2>/dev/null; then
@@ -97,9 +122,6 @@ else
   echo "==> Release download unavailable, falling back to source build…"
   build_from_source
 fi
-
-ENV_FILE="$HOME/.config/scalattice/agent.env"
-mkdir -p "$(dirname "$ENV_FILE")"
 
 needs_path=
 if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
@@ -110,31 +132,35 @@ if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
 fi
 
 if [ -n "$TOKEN" ] || [ -n "$needs_path" ]; then
-  {
-    echo "# Scalattice agent environment (source this file: . $ENV_FILE)"
-    echo "export PATH=\"$INSTALL_DIR:\$PATH\""
-    if [ -n "$TOKEN" ]; then
-      echo "export SCALATTICE_AGENT_TOKEN='$TOKEN'"
-      echo "export SCALATTICE_AGENT_WS='wss://api.scalattice.cloud/v1/operators/agent/ws'"
-    fi
-  } > "$ENV_FILE"
-  echo "==> Wrote $ENV_FILE"
+  write_env_files
+fi
+
+if [ -n "$TOKEN" ] && command -v systemctl >/dev/null 2>&1; then
+  echo "==> Installing background service"
+  export PATH="$INSTALL_DIR:$PATH"
+  if "$INSTALL_DIR/$BIN_NAME" service install; then
+    echo "==> Agent is running in the background"
+  else
+    echo "==> Could not start background service — after sourcing agent.env, run: scalattice-agent connect"
+  fi
 fi
 
 echo ""
 echo "Done. Next steps:"
-echo "  1. Create an agent token at https://scalattice.cloud/providers"
-if [ -n "$TOKEN" ]; then
-  echo "  2. source $ENV_FILE"
-else
-  echo "  2. export SCALATTICE_AGENT_TOKEN=slt_provider_…"
+step=1
+if [ -z "$TOKEN" ]; then
+  echo "  $step. Create an agent token at https://scalattice.cloud/providers"
+  step=$((step + 1))
+  echo "  $step. Re-run this installer with --token slt_provider_…"
+  step=$((step + 1))
 fi
-echo "  3. scalattice-agent status"
-echo "  4. scalattice-agent connect"
-echo "  5. scalattice-agent service install   # optional: run in background, auto-restart"
+if [ -n "$TOKEN" ] || [ -n "$needs_path" ]; then
+  echo "  $step. source $HOME/.config/scalattice/agent.env"
+  step=$((step + 1))
+fi
+echo "  $step. scalattice-agent status"
+step=$((step + 1))
+echo "  $step. scalattice-agent connect"
 echo ""
-echo "Demo / connectivity testing without model weights:"
-echo "  SCALATTICE_AGENT_DEMO=1 scalattice-agent connect"
-echo ""
-echo "After power loss or disconnects, v1.0.3+ reconnects automatically in the foreground."
-echo "For boot-time start: scalattice-agent service install && sudo loginctl enable-linger \$USER"
+echo "Debug in foreground: scalattice-agent connect --foreground"
+echo "Boot without login:  sudo loginctl enable-linger \$USER"

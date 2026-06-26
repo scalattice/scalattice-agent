@@ -1,6 +1,6 @@
 use crate::config::AgentConfig;
 use crate::protocol::{
-    parse_envelope, parse_error, parse_invoke, parse_ready, parse_registered, CatalogModel,
+    parse_envelope, parse_error, parse_invoke, parse_pong, parse_ready, parse_registered, CatalogModel,
     HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
 };
 use crate::runtime::{build_runtime, JobState};
@@ -31,16 +31,20 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn new(demo_mode: bool) -> Self {
+    fn new() -> Self {
         Self {
             registered: false,
-            demo_mode,
+            demo_mode: false,
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
             advertised_models: Vec::new(),
             loaded_models: Vec::new(),
         }
+    }
+
+    fn set_demo_mode(&mut self, demo_mode: bool) {
+        self.demo_mode = demo_mode;
     }
 
     fn runtime(&self) -> crate::runtime::AgentRuntime {
@@ -57,11 +61,7 @@ impl SessionState {
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
-    if config.demo_mode {
-        info!("demo mode enabled: echo responses only");
-    } else {
-        info!("production mode: model weights must be loaded locally for real inference");
-    }
+    info!("demo mode is controlled per GPU in the Scalattice Cloud dashboard");
 
     let mut backoff = Duration::from_secs(3);
     loop {
@@ -77,7 +77,7 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
 }
 
 async fn run_agent_session(config: &AgentConfig) -> Result<()> {
-    let state = Arc::new(Mutex::new(SessionState::new(config.demo_mode)));
+    let state = Arc::new(Mutex::new(SessionState::new()));
 
     let mut request = config
         .ws_url
@@ -150,6 +150,13 @@ async fn handle_server_message(
                 "ready" => {
                     let ready = parse_ready(data)?;
                     info!("assigned node {}", ready.node_id);
+                    {
+                        let mut guard = state.lock().await;
+                        guard.set_demo_mode(ready.demo_mode);
+                        if ready.demo_mode {
+                            info!("demo mode enabled for this GPU (dashboard setting)");
+                        }
+                    }
                     let models = pick_models(&config.models, &ready.catalog);
                     let specs = detect_machine_specs();
                     let runtime = {
@@ -187,9 +194,22 @@ async fn handle_server_message(
                 }
                 "invoke" => {
                     let invoke = parse_invoke(data)?;
-                    respond_invoke(config, state, write, invoke).await?;
+                    respond_invoke(state, write, invoke).await?;
                 }
-                "pong" => {}
+                "pong" => {
+                    if let Ok(pong) = parse_pong(data) {
+                        if let Some(demo_mode) = pong.demo_mode {
+                            let mut guard = state.lock().await;
+                            if guard.demo_mode != demo_mode {
+                                guard.set_demo_mode(demo_mode);
+                                info!(
+                                    "demo mode {}",
+                                    if demo_mode { "enabled" } else { "disabled" }
+                                );
+                            }
+                        }
+                    }
+                }
                 "error" => {
                     let err = parse_error(data)?;
                     let message = err
@@ -225,7 +245,6 @@ fn pick_models(requested: &[String], catalog: &[CatalogModel]) -> Vec<String> {
 }
 
 async fn respond_invoke(
-    config: &AgentConfig,
     state: &Arc<Mutex<SessionState>>,
     write: &mut WsWrite,
     invoke: crate::protocol::InvokeMessage,
@@ -243,8 +262,9 @@ async fn respond_invoke(
     }
     send_heartbeat(state, write).await?;
 
+    let demo_mode = state.lock().await.demo_mode;
     let result = async {
-        if config.demo_mode {
+        if demo_mode {
             let user = invoke
                 .messages
                 .iter()
@@ -276,7 +296,7 @@ async fn respond_invoke(
                 kind: "invoke_error",
                 id: invoke.id,
                 error: format!(
-                    "Model runtime not loaded on this agent yet. Pull weights for {} and enable SCALATTICE_AGENT_DEMO=1 for connectivity testing.",
+                    "Model runtime not loaded on this agent yet. Pull weights for {} or enable Demo mode on this GPU in the Scalattice Cloud dashboard.",
                     invoke.runtime_model
                 ),
             };

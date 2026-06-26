@@ -1,9 +1,33 @@
 use anyhow::{bail, Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const UNIT_NAME: &str = "scalattice-agent.service";
+
+pub fn ensure_service_running() -> Result<()> {
+    if !systemd_available() {
+        bail!("systemd is required for background mode — use: scalattice-agent connect --foreground");
+    }
+
+    let home = home_dir()?;
+    let unit_path = systemd_user_unit_path(&home);
+
+    if !unit_path.is_file() {
+        install_user_service()?;
+    } else {
+        sync_systemd_env_file(&home)?;
+        run_systemctl(&["--user", "daemon-reload"])?;
+        if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_err() {
+            run_systemctl(&["--user", "start", UNIT_NAME])?;
+        } else {
+            println!("scalattice-agent is running in the background");
+            return Ok(());
+        }
+    }
+
+    verify_service_active()
+}
 
 pub fn install_user_service() -> Result<()> {
     let home = home_dir()?;
@@ -18,6 +42,11 @@ pub fn install_user_service() -> Result<()> {
         );
     }
 
+    sync_systemd_env_file(&home)?;
+
+    let systemd_env = systemd_env_path(&home);
+    let path_prefix = format!("{}:/usr/local/bin:/usr/bin:/bin", bin.parent().unwrap_or(Path::new("/usr/local/bin")).display());
+
     fs::create_dir_all(unit_path.parent().context("unit path parent")?)?;
     let unit = format!(
         r#"[Unit]
@@ -27,15 +56,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=PATH={path}
 EnvironmentFile={env}
-ExecStart={bin} connect
+ExecStart={bin} connect --foreground
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=default.target
 "#,
-        env = env_file.display(),
+        path = path_prefix,
+        env = systemd_env.display(),
         bin = bin.display(),
     );
     fs::write(&unit_path, unit)?;
@@ -43,9 +74,8 @@ WantedBy=default.target
 
     run_systemctl(&["--user", "daemon-reload"])?;
     run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
+    verify_service_active()?;
     enable_linger_hint(&home);
-
-    println!("Service enabled. Check: scalattice-agent service status");
     Ok(())
 }
 
@@ -73,7 +103,7 @@ pub fn service_status() -> Result<()> {
     if unit_path.is_file() {
         println!("unit file: {}", unit_path.display());
     } else {
-        println!("unit file: not installed (run: scalattice-agent service install)");
+        println!("unit file: not installed (run: scalattice-agent connect)");
     }
 
     if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok() {
@@ -91,13 +121,58 @@ pub fn service_status() -> Result<()> {
     Ok(())
 }
 
+fn verify_service_active() -> Result<()> {
+    if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok() {
+        println!("scalattice-agent is running in the background");
+        return Ok(());
+    }
+
+    eprintln!("service failed to start — recent logs:");
+    let _ = Command::new("systemctl")
+        .args(["--user", "status", UNIT_NAME, "--no-pager", "-n", "15"])
+        .status();
+
+    bail!("scalattice-agent service is not running — try: scalattice-agent connect --foreground");
+}
+
+fn sync_systemd_env_file(home: &Path) -> Result<()> {
+    let env_file = home.join(".config/scalattice/agent.env");
+    let systemd_env = systemd_env_path(home);
+    let raw = fs::read_to_string(&env_file)
+        .with_context(|| format!("read {}", env_file.display()))?;
+
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if assignment.contains('=') {
+            lines.push(assignment.to_string());
+        }
+    }
+
+    if lines.is_empty() {
+        bail!("no variables found in {}", env_file.display());
+    }
+
+    fs::create_dir_all(systemd_env.parent().context("systemd env parent")?)?;
+    fs::write(&systemd_env, format!("{}\n", lines.join("\n")))?;
+    Ok(())
+}
+
+fn systemd_env_path(home: &Path) -> PathBuf {
+    home.join(".config/scalattice/agent.systemd.env")
+}
+
 fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")
 }
 
-fn systemd_user_unit_path(home: &PathBuf) -> PathBuf {
+fn systemd_user_unit_path(home: &Path) -> PathBuf {
     home.join(".config/systemd/user").join(UNIT_NAME)
 }
 
@@ -121,7 +196,7 @@ fn resolve_agent_binary() -> Result<PathBuf> {
     bail!("scalattice-agent binary not found in PATH or ~/.local/bin");
 }
 
-fn systemd_available() -> bool {
+pub fn systemd_available() -> bool {
     Command::new("systemctl")
         .arg("--version")
         .output()
@@ -150,7 +225,7 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
     }
 }
 
-fn enable_linger_hint(home: &PathBuf) {
+fn enable_linger_hint(home: &Path) {
     let user = home
         .file_name()
         .and_then(|s| s.to_str())

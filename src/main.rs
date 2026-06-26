@@ -7,7 +7,6 @@ mod specs;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use runtime::demo_mode_from_env;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -23,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Connect to Scalattice and accept inference jobs
+    /// Connect to Scalattice and accept inference jobs (background service by default)
     Connect {
         #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
         token: Option<String>,
@@ -33,10 +32,9 @@ enum Commands {
         region: Option<String>,
         #[arg(long, env = "SCALATTICE_AGENT_MODELS")]
         models: Option<String>,
-        /// Echo user messages back (for network testing without loaded weights).
-        /// Also enabled when SCALATTICE_AGENT_DEMO=1 (read in config, not via clap env).
+        /// Run in the foreground instead of the background systemd service
         #[arg(long)]
-        demo: bool,
+        foreground: bool,
     },
     /// Show local GPU detection and configuration hints
     Status {
@@ -80,10 +78,14 @@ async fn main() -> Result<()> {
             ws,
             region,
             models,
-            demo,
+            foreground,
         } => {
-            let config = config::AgentConfig::from_env_and_cli(token, ws, region, models, demo)?;
-            agent::run_agent(config).await?;
+            let config = config::AgentConfig::from_env_and_cli(token, ws, region, models)?;
+            if foreground {
+                agent::run_agent(config).await?;
+            } else {
+                service::ensure_service_running()?;
+            }
         }
         Commands::Status { token, ws } => {
             print_status(token, ws)?;
@@ -100,26 +102,10 @@ async fn main() -> Result<()> {
 
 fn print_status(token: Option<String>, ws: Option<String>) -> Result<()> {
     let specs = specs::detect_machine_specs();
-    let demo = demo_mode_from_env();
 
     println!("scalattice-agent {}", env!("CARGO_PKG_VERSION"));
     println!("{}", specs::status_line(&specs));
-    println!(
-        "mode: {}",
-        if demo {
-            "demo (SCALATTICE_AGENT_DEMO=1 — echo only, no real inference)"
-        } else {
-            "production (model weights must be loaded for real inference)"
-        }
-    );
-    println!(
-        "inference ready: {}",
-        if demo {
-            "yes — demo echo responses"
-        } else {
-            "no — pull model weights locally, or set SCALATTICE_AGENT_DEMO=1 to test connectivity"
-        }
-    );
+    println!("demo mode: controlled per GPU in Scalattice Cloud → Providers");
 
     let token_set = token
         .or_else(|| std::env::var("SCALATTICE_AGENT_TOKEN").ok())
@@ -139,7 +125,11 @@ fn print_status(token: Option<String>, ws: Option<String>) -> Result<()> {
         .unwrap_or_else(|| "wss://api.scalattice.cloud/v1/operators/agent/ws".to_string());
     println!("ws: {ws_url}");
     println!();
-    println!("Foreground:  scalattice-agent connect");
-    println!("Background:  scalattice-agent service install");
+    if service::systemd_available() {
+        println!("connect:    scalattice-agent connect              (background service)");
+        println!("foreground: scalattice-agent connect --foreground");
+    } else {
+        println!("connect:    scalattice-agent connect --foreground");
+    }
     Ok(())
 }
