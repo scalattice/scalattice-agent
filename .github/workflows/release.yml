@@ -34,9 +34,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev cmake build-essential
 
-      - name: Install cross linker (aarch64)
+      - name: Install cross toolchain (aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: |
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
 
       - name: Install CUDA toolkit (x86_64 GPU build)
         if: matrix.cuda
@@ -51,6 +55,8 @@ jobs:
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           fi
           cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
 
