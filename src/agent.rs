@@ -39,6 +39,7 @@ struct SessionState {
     catalog: Vec<CatalogModel>,
     hf_token: Option<String>,
     last_sync_token: Option<String>,
+    weights_synced: bool,
 }
 
 impl SessionState {
@@ -55,6 +56,7 @@ impl SessionState {
             catalog: Vec::new(),
             hf_token: None,
             last_sync_token: None,
+            weights_synced: false,
         }
     }
 
@@ -67,13 +69,10 @@ impl SessionState {
     }
 
     fn sync_model_weights(&mut self, server_token: Option<String>, agent_token: &str) {
-        if self.catalog.is_empty() {
+        if self.catalog.is_empty() || self.weights_synced {
             return;
         }
         let token = self.effective_hf_token(server_token);
-        if token == self.last_sync_token && self.last_sync_token.is_some() {
-            return;
-        }
         let can_mirror = self.catalog.iter().any(|m| {
             m.weights
                 .as_ref()
@@ -84,10 +83,12 @@ impl SessionState {
             warn!("model downloads are not configured on the server yet (contact Scalattice support)");
             return;
         }
+        self.weights_synced = true;
         self.last_sync_token = token.clone();
         if let Some(token) = token.clone() {
             self.hf_token = Some(token);
         }
+        info!("starting model weight downloads for {} catalog model(s)", self.catalog.len());
         spawn_catalog_sync(self.catalog.clone(), agent_token.to_string(), token);
     }
 
@@ -161,6 +162,7 @@ impl SessionState {
 
     fn persist_local_state(&self) {
         let runtime = self.runtime();
+        let devices = self.enabled_devices().compute_devices;
         state::update_connection_state(
             self.demo_mode,
             Some(runtime.status_label),
@@ -168,6 +170,7 @@ impl SessionState {
             true,
             self.registered,
             None,
+            devices,
         );
     }
 }
@@ -283,7 +286,9 @@ async fn handle_server_message(
                         guard.apply_compute_devices(&ready.compute_devices);
                         guard.catalog = ready.catalog.clone();
                         guard.last_sync_token = None;
-                        guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);guard.persist_local_state();
+                        guard.weights_synced = false;
+                        guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);
+                        guard.persist_local_state();
                         if ready.demo_mode {
                             info!("demo mode enabled for this GPU (dashboard setting)");
                         }
@@ -348,7 +353,7 @@ async fn handle_server_message(
                             }
                         }
                         guard.apply_compute_devices(&pong.compute_devices);
-                        if pong.hugging_face_token.is_some() {
+                        if pong.hugging_face_token.is_some() && !guard.weights_synced {
                             guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
                         }
                         guard.persist_local_state();

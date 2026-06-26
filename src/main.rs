@@ -41,13 +41,8 @@ enum Commands {
         #[arg(long)]
         foreground: bool,
     },
-    /// Show local GPU detection and configuration hints
-    Status {
-        #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
-        token: Option<String>,
-        #[arg(long, env = "SCALATTICE_AGENT_WS")]
-        ws: Option<String>,
-    },
+    /// Show whether this machine is connected to Scalattice Cloud
+    Status,
     /// Install or manage a background systemd user service
     Service {
         #[command(subcommand)]
@@ -97,8 +92,8 @@ async fn main() -> Result<()> {
                 service::ensure_service_running(&config)?;
             }
         }
-        Commands::Status { token, ws } => {
-            print_status(token, ws)?;
+        Commands::Status => {
+            print_status()?;
         }
         Commands::Service { command } => match command {
             ServiceCommands::Install => service::install_user_service()?,
@@ -118,67 +113,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_status(token: Option<String>, ws: Option<String>) -> Result<()> {
-    let specs = specs::detect_machine_specs();
-
+fn print_status() -> Result<()> {
     println!("scalattice-agent {}", env!("CARGO_PKG_VERSION"));
-    println!("{}", specs::status_line(&specs));
-    println!("server: {}", state::server_status_line());
-    println!("demo mode: {}", state::demo_status_line());
+    println!("{}", state::cloud_connection_line());
 
-    let token_set = token
-        .or_else(|| std::env::var("SCALATTICE_AGENT_TOKEN").ok())
-        .filter(|t| !t.is_empty())
-        .is_some();
-    println!(
-        "token: {}",
-        if token_set {
-            "set"
-        } else {
-            "missing (create on Scalattice Cloud → Providers)"
-        }
-    );
-
-    let ws_url = ws
-        .or_else(|| std::env::var("SCALATTICE_AGENT_WS").ok())
-        .unwrap_or_else(|| "wss://api.scalattice.cloud/v1/operators/agent/ws".to_string());
-    println!("ws: {ws_url}");
-
-    let cached = models::list_cached_runtime_models();
-    println!("models cache: {}", models::models_dir().display());
-    if cached.is_empty() {
-        println!("models: none downloaded yet (Scalattice pushes weights on connect)");
-    } else {
-        println!("models: {}", cached.join(", "));
+    if !agent_token_configured() {
+        println!("token: not set — create one at https://scalattice.cloud/providers");
+        println!("set token: scalattice-agent set-token --token slt_provider_…");
     }
 
-    if service::systemd_available() {
-        match service::service_active() {
-            true => println!("service: running"),
-            false => println!("service: not running"),
-        }
-    }
-
-    if specs.compute_devices.len() > 1 {
-        println!();
-        println!("compute devices:");
-        for device in &specs.compute_devices {
-            let kind = match device.kind.as_str() {
-                "cpu" => "CPU",
-                "integrated" => "integrated GPU",
-                _ => "GPU",
-            };
-            let enabled = if device.enabled { "enabled" } else { "disabled (dashboard)" };
-            println!("  - {} ({kind}) · {enabled}", device.name);
-        }
-    }
-
-    println!();
-    if service::systemd_available() {
-        println!("connect:    scalattice-agent connect              (background service)");
-        println!("foreground: scalattice-agent connect --foreground");
-    } else {
-        println!("connect:    scalattice-agent connect --foreground");
-    }
+    println!("dashboard: https://scalattice.cloud/providers");
+    println!("manage GPUs, models, and jobs in the provider dashboard");
     Ok(())
+}
+
+fn agent_token_configured() -> bool {
+    if std::env::var("SCALATTICE_AGENT_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .is_some()
+    {
+        return true;
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let path = std::path::PathBuf::from(home).join(".config/scalattice/agent.env");
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|raw| raw.contains("SCALATTICE_AGENT_TOKEN="))
 }

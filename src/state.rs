@@ -3,6 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::specs::ComputeDevice;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLocalState {
     pub demo_mode: bool,
@@ -14,6 +16,8 @@ pub struct AgentLocalState {
     pub server_connected: bool,
     #[serde(default)]
     pub server_registered: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compute_devices: Vec<ComputeDevice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
@@ -32,6 +36,7 @@ pub fn update_connection_state(
     server_connected: bool,
     server_registered: bool,
     last_error: Option<String>,
+    compute_devices: Vec<ComputeDevice>,
 ) {
     let Some(path) = state_file_path() else {
         return;
@@ -47,6 +52,7 @@ pub fn update_connection_state(
         node_id: None,
         server_connected: false,
         server_registered: false,
+        compute_devices: Vec::new(),
         last_error: None,
         updated_at_ms: 0,
     });
@@ -59,6 +65,9 @@ pub fn update_connection_state(
     }
     state.server_connected = server_connected;
     state.server_registered = server_registered;
+    if !compute_devices.is_empty() {
+        state.compute_devices = compute_devices;
+    }
     if let Some(err) = last_error {
         state.last_error = Some(err);
     } else if server_registered {
@@ -87,6 +96,7 @@ pub fn mark_disconnected(error: Option<String>) {
         node_id: None,
         server_connected: false,
         server_registered: false,
+        compute_devices: Vec::new(),
         last_error: None,
         updated_at_ms: 0,
     });
@@ -106,6 +116,31 @@ pub fn read_state() -> Option<AgentLocalState> {
     serde_json::from_str(&raw).ok()
 }
 
+pub fn effective_machine_specs() -> crate::specs::MachineSpecs {
+    if let Some(state) = read_state() {
+        if is_recent(state.updated_at_ms) && !state.compute_devices.is_empty() {
+            return crate::specs::MachineSpecs {
+                compute_devices: state.compute_devices.clone(),
+                ..crate::specs::build_specs_from_devices(
+                    &state.compute_devices,
+                    crate::specs::detect_hostname(),
+                    crate::specs::detect_cpu_model(),
+                    crate::specs::detect_ram_gb(),
+                    crate::specs::detect_driver_version(),
+                    crate::specs::detect_cuda_version(),
+                )
+            };
+        }
+    }
+    crate::specs::detect_machine_specs()
+}
+
+pub fn agent_session_recent() -> bool {
+    read_state()
+        .map(|s| is_recent(s.updated_at_ms) && s.server_registered)
+        .unwrap_or(false)
+}
+
 pub fn demo_status_line() -> String {
     let Some(state) = read_state() else {
         return "unknown (not connected yet)".to_string();
@@ -120,6 +155,32 @@ pub fn demo_status_line() -> String {
     } else {
         "off".to_string()
     }
+}
+
+pub fn cloud_connection_line() -> String {
+    let Some(state) = read_state() else {
+        return "Scalattice Cloud: not connected".to_string();
+    };
+
+    if let Some(err) = &state.last_error {
+        if !is_recent(state.updated_at_ms) {
+            return format!("Scalattice Cloud: not connected ({err})");
+        }
+    }
+
+    if !is_recent(state.updated_at_ms) {
+        return "Scalattice Cloud: not connected".to_string();
+    }
+
+    if state.server_registered {
+        return "Scalattice Cloud: connected".to_string();
+    }
+
+    if state.server_connected {
+        return "Scalattice Cloud: connecting…".to_string();
+    }
+
+    "Scalattice Cloud: not connected".to_string()
 }
 
 pub fn server_status_line() -> String {

@@ -182,8 +182,11 @@ pub fn status_line(specs: &MachineSpecs) -> String {
         (Some(name), None) => format!("GPU detected · {name}"),
         (None, _) => {
             let total = specs.compute_devices.len();
-            if total > 0 {
-                format!("{total} compute device(s) detected (none enabled)")
+            let enabled = specs.compute_devices.iter().filter(|d| d.enabled).count();
+            if total > 0 && enabled > 0 {
+                format!("{enabled} of {total} compute device(s) enabled")
+            } else if total > 0 {
+                format!("{total} compute device(s) detected (none enabled in dashboard)")
             } else {
                 "No GPU detected (install vendor tools or check drivers)".to_string()
             }
@@ -198,6 +201,7 @@ fn sum_option(values: impl Iterator<Item = u32>) -> Option<u32> {
 
 fn detect_nvidia_devices() -> Vec<ComputeDevice> {
     for bin in [
+        "/usr/lib/nvidia/bin/nvidia-smi",
         "/usr/bin/nvidia-smi",
         "/usr/sbin/nvidia-smi",
         "/usr/local/bin/nvidia-smi",

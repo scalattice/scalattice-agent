@@ -10,6 +10,14 @@ LIB_DIR="${SCALATTICE_LIB_DIR:-$HOME/.local/lib/scalattice}"
 GITHUB_REPO="${SCALATTICE_AGENT_REPO:-Robottik-Software/Scalattice-Client}"
 VERSION="${SCALATTICE_AGENT_VERSION:-latest}"
 TOKEN=""
+SKIP_DEPS=0
+AUTO_REBOOT=0
+NO_AUTO_REBOOT=0
+REBOOT_REQUIRED=0
+
+HAS_NVIDIA_GPU=0
+HAS_AMD_GPU=0
+HAS_INTEL_GPU=0
 
 ENV_FILE="$HOME/.config/scalattice/agent.env"
 SYSTEMD_ENV_FILE="$HOME/.config/scalattice/agent.systemd.env"
@@ -30,8 +38,23 @@ while [ $# -gt 0 ]; do
       VERSION="${2:-}"
       shift 2
       ;;
+    --skip-deps)
+      SKIP_DEPS=1
+      shift
+      ;;
+    --auto-reboot)
+      AUTO_REBOOT=1
+      shift
+      ;;
+    --no-auto-reboot)
+      AUTO_REBOOT=0
+      NO_AUTO_REBOOT=1
+      shift
+      ;;
     -h|--help)
       echo "Usage: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_..."
+      echo "       Add --skip-deps to skip automatic GPU driver / library setup"
+      echo "       Add --auto-reboot to reboot automatically after NVIDIA driver install"
       exit 0
       ;;
     *)
@@ -77,6 +100,152 @@ read_existing_token() {
   done
 }
 
+detect_compute_hardware() {
+  HAS_NVIDIA_GPU=0
+  HAS_AMD_GPU=0
+  HAS_INTEL_GPU=0
+
+  if command -v lspci >/dev/null 2>&1; then
+    pci="$(lspci -nn 2>/dev/null || true)"
+    echo "$pci" | grep -Eiq 'nvidia|10de:' && HAS_NVIDIA_GPU=1
+    echo "$pci" | grep -Eiq 'amd/ati|advanced micro devices|1002:' && HAS_AMD_GPU=1
+    echo "$pci" | grep -Eiq 'intel.*graphics|8086:' && HAS_INTEL_GPU=1
+  fi
+
+  # Jetson / Tegra often omit lspci labels — check platform and loaded driver.
+  if [ "$HAS_NVIDIA_GPU" -eq 0 ]; then
+    if [ -f /etc/nv_tegra_release ] || [ -d /sys/module/nvidia ]; then
+      HAS_NVIDIA_GPU=1
+    fi
+  fi
+}
+
+libcuda_available() {
+  ldconfig -p 2>/dev/null | grep -q 'libcuda\.so' && return 0
+  for p in \
+    /usr/lib/x86_64-linux-gnu/libcuda.so* \
+    /usr/lib/aarch64-linux-gnu/libcuda.so* \
+    /usr/lib/libcuda.so* \
+    /lib/x86_64-linux-gnu/libcuda.so* \
+    /lib/aarch64-linux-gnu/libcuda.so*
+  do
+    for f in $p; do
+      [ -e "$f" ] && return 0
+    done
+  done
+  return 1
+}
+
+nvidia_driver_working() {
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
+apt_install() {
+  pkgs="$1"
+  [ -n "$pkgs" ] || return 0
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "==> Install OS packages manually: $pkgs"
+    return 1
+  fi
+
+  echo "==> Installing host packages: $pkgs"
+  if sudo -n apt-get update -qq >/dev/null 2>&1 && sudo -n apt-get install -y -qq $pkgs >/dev/null 2>&1; then
+    echo "==> Installed: $pkgs"
+    return 0
+  fi
+
+  if [ -t 0 ]; then
+    echo "==> Sudo required to install: $pkgs"
+    if sudo apt-get update && sudo apt-get install -y $pkgs; then
+      echo "==> Installed: $pkgs"
+      return 0
+    fi
+  fi
+
+  echo "==> Could not install automatically. Run:"
+  echo "    sudo apt-get update && sudo apt-get install -y $pkgs"
+  return 1
+}
+
+maybe_reboot() {
+  [ "$REBOOT_REQUIRED" -eq 1 ] || return 0
+  echo ""
+  echo "==> NVIDIA driver installed — reboot required"
+  if [ "$AUTO_REBOOT" -eq 1 ]; then
+    echo "==> Rebooting now (SCALATTICE_AUTO_REBOOT=1)…"
+    sudo reboot
+    exit 0
+  fi
+  if [ -t 0 ]; then
+    printf "Reboot now? [y/N] "
+    read -r ans || ans=""
+    case "$ans" in
+      y|Y|yes|YES)
+        echo "==> Rebooting…"
+        sudo reboot
+        exit 0
+        ;;
+    esac
+  fi
+  echo "==> After reboot, re-run this installer with your token"
+  exit 0
+}
+
+ensure_nvidia_driver() {
+  [ "$HAS_NVIDIA_GPU" -eq 1 ] || return 0
+  nvidia_driver_working && return 0
+  libcuda_available && return 0
+
+  echo "==> NVIDIA GPU detected but CUDA driver is not ready"
+
+  driver_pkg=""
+  if command -v ubuntu-drivers >/dev/null 2>&1; then
+    driver_pkg="$(ubuntu-drivers devices 2>/dev/null | awk '/recommended/ {print $3; exit}')"
+  fi
+  if [ -z "$driver_pkg" ]; then
+    driver_pkg="nvidia-driver-550"
+  fi
+
+  if apt_install "ubuntu-drivers-common $driver_pkg"; then
+    REBOOT_REQUIRED=1
+    echo "==> NVIDIA driver installed ($driver_pkg)"
+    return 0
+  fi
+
+  echo "==> Then reboot and re-run this installer:"
+  echo "    sudo apt-get update && sudo apt-get install -y ubuntu-drivers-common $driver_pkg"
+  echo "    sudo reboot"
+  return 1
+}
+
+ensure_vulkan_stack() {
+  # Loader is bundled in our release, but AMD/Intel need a Vulkan ICD from Mesa.
+  if [ "$HAS_AMD_GPU" -eq 1 ] || [ "$HAS_INTEL_GPU" -eq 1 ]; then
+    apt_install "mesa-vulkan-drivers libvulkan1" || true
+  fi
+}
+
+prepare_host() {
+  [ "$SKIP_DEPS" -eq 1 ] && return 0
+
+  echo "==> Detecting compute hardware"
+  detect_compute_hardware
+
+  if [ "$HAS_NVIDIA_GPU" -eq 1 ]; then
+    echo "==> NVIDIA GPU detected"
+    ensure_nvidia_driver || true
+  elif [ "$HAS_AMD_GPU" -eq 1 ]; then
+    echo "==> AMD GPU detected"
+    ensure_vulkan_stack
+  elif [ "$HAS_INTEL_GPU" -eq 1 ]; then
+    echo "==> Intel GPU detected"
+    ensure_vulkan_stack
+  else
+    echo "==> No discrete GPU detected — agent will use CPU inference if needed"
+  fi
+}
+
 remove_previous_install() {
   echo "==> Removing previous scalattice-agent install"
 
@@ -104,39 +273,20 @@ library_path_export() {
   fi
 }
 
-ensure_runtime_deps() {
+ensure_binary_deps() {
   bin="$INSTALL_DIR/$BIN_NAME"
   [ -x "$bin" ] || return 0
+  [ "$SKIP_DEPS" -eq 1 ] && return 0
+
+  missing="$(ldd "$bin" 2>/dev/null | awk '/not found/ {print $1}' || true)"
+  [ -n "$missing" ] || return 0
+
+  echo "$missing" | grep -q 'libcuda.so.1' && ensure_nvidia_driver || true
 
   apt_pkgs=""
-  while read -r lib; do
-    [ -n "$lib" ] || continue
-    case "$lib" in
-      libvulkan.so.1) apt_pkgs="$apt_pkgs libvulkan1" ;;
-      libcuda.so.1)
-        echo "==> NVIDIA driver required (libcuda.so.1 missing)" >&2
-        echo "    Install an NVIDIA driver package, e.g. sudo apt install -y nvidia-driver-550" >&2
-        ;;
-    esac
-  done <<EOF
-$(ldd "$bin" 2>/dev/null | awk '/not found/ {print $1}')
-EOF
-
+  echo "$missing" | grep -q 'libvulkan.so.1' && apt_pkgs="$apt_pkgs libvulkan1"
   apt_pkgs="$(printf '%s\n' $apt_pkgs | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
-  [ -n "$apt_pkgs" ] || return 0
-
-  echo "==> Missing system libraries for scalattice-agent"
-  if command -v apt-get >/dev/null 2>&1; then
-    echo "==> Installing: $apt_pkgs"
-    if sudo -n apt-get install -y $apt_pkgs >/dev/null 2>&1; then
-      echo "==> Installed runtime dependencies"
-      return 0
-    fi
-    echo "==> Run: sudo apt-get install -y $apt_pkgs"
-  else
-    echo "==> Install OS packages providing:$apt_pkgs"
-  fi
-  return 1
+  [ -n "$apt_pkgs" ] && apt_install "$apt_pkgs" || true
 }
 
 verify_binary() {
@@ -144,11 +294,20 @@ verify_binary() {
   if "$bin" --version >/dev/null 2>&1; then
     return 0
   fi
-  ensure_runtime_deps || true
+
+  ensure_binary_deps
+
+  if [ "$REBOOT_REQUIRED" -eq 1 ]; then
+    echo "==> Reboot required to load the NVIDIA driver, then re-run this installer"
+    return 1
+  fi
+
   if "$bin" --version >/dev/null 2>&1; then
     return 0
   fi
-  echo "==> Binary failed to start. Check: ldd $bin" >&2
+
+  echo "==> Binary failed to start. Diagnostics:"
+  ldd "$bin" 2>/dev/null | grep -E 'not found|cuda|vulkan' || ldd "$bin" || true
   return 1
 }
 
@@ -232,7 +391,21 @@ enable_boot_linger() {
   echo "    sudo loginctl enable-linger $USER_NAME"
 }
 
+if [ -z "${SCALATTICE_AUTO_REBOOT:-}" ]; then
+  :
+elif [ "$SCALATTICE_AUTO_REBOOT" = "1" ] || [ "$SCALATTICE_AUTO_REBOOT" = "true" ]; then
+  AUTO_REBOOT=1
+fi
+
+# Token installs are cloud-managed: reboot after NVIDIA driver setup unless opted out.
+if [ -n "$TOKEN" ] && [ "${NO_AUTO_REBOOT:-0}" -eq 0 ] && [ "${SCALATTICE_NO_AUTO_REBOOT:-}" != "1" ]; then
+  AUTO_REBOOT=1
+fi
+
 read_existing_token
+prepare_host
+maybe_reboot
+
 remove_previous_install
 
 echo "==> Installing scalattice-agent to $INSTALL_DIR"
@@ -275,20 +448,12 @@ if [ -n "$TOKEN" ]; then
 fi
 
 echo ""
-echo "Done. Next steps:"
-step=1
-if [ -z "$TOKEN" ]; then
-  echo "  $step. Create an agent token at https://scalattice.cloud/providers"
-  step=$((step + 1))
-  echo "  $step. Re-run this installer with --token slt_provider_..."
-  step=$((step + 1))
+echo "Done."
+if [ -n "$TOKEN" ]; then
+  echo "  This machine will appear on https://scalattice.cloud/providers within a minute."
+  echo "  Manage GPUs, models, demo mode, and schedules from the dashboard."
+else
+  echo "  1. Create a machine token at https://scalattice.cloud/providers"
+  echo "  2. Re-run: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…"
 fi
-if [ -n "$TOKEN" ] || [ -n "$needs_path" ]; then
-  echo "  $step. source $HOME/.config/scalattice/agent.env"
-  step=$((step + 1))
-fi
-echo "  $step. scalattice-agent status"
-step=$((step + 1))
-echo "  $step. scalattice-agent connect"
-echo ""
-echo "Debug in foreground: scalattice-agent connect --foreground"
+echo "  Check connection: scalattice-agent status"
