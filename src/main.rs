@@ -31,7 +31,7 @@ enum Commands {
     Connect {
         #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
         token: Option<String>,
-        /// Run in the foreground instead of the background systemd service
+        /// Follow background service logs (default when the service is already running)
         #[arg(long)]
         foreground: bool,
     },
@@ -73,6 +73,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Connect { token, foreground } => {
+            if foreground && service::service_active() {
+                println!("scalattice-agent is running in the background");
+                service::follow_service_logs()?;
+                return Ok(());
+            }
+
             let config = config::AgentConfig::from_env_and_cli(token)?;
             if foreground {
                 agent::run_agent(config).await?;
@@ -118,43 +124,5 @@ fn print_status() -> Result<()> {
 }
 
 fn agent_token_configured() -> bool {
-    if std::env::var("SCALATTICE_AGENT_TOKEN")
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-        .is_some()
-    {
-        return true;
-    }
-
-    let Ok(home) = std::env::var("HOME") else {
-        return false;
-    };
-
-    for name in ["agent.env", "agent.systemd.env"] {
-        let path = std::path::PathBuf::from(&home)
-            .join(".config/scalattice")
-            .join(name);
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-            let Some((key, value)) = assignment.split_once('=') else {
-                continue;
-            };
-            if key.trim() != "SCALATTICE_AGENT_TOKEN" {
-                continue;
-            }
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return true;
-            }
-        }
-    }
-
-    false
+    config::read_saved_agent_token().is_some()
 }

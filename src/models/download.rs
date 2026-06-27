@@ -1,7 +1,10 @@
-use crate::models::storage::{ensure_model_dir, is_download_complete, target_gguf_path};
+use crate::models::storage::{
+    ensure_model_dir, is_download_complete, target_gguf_path, weight_filenames,
+};
 use crate::protocol::{CatalogModel, ModelWeights};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
+use std::path::Path;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
@@ -22,6 +25,12 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
         .with_context(|| format!("request {url}"))?
         .error_for_status()
         .with_context(|| format!("download failed for {url}"))?;
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
 
     let tmp = dest.with_extension("part");
     if tmp.exists() {
@@ -45,21 +54,32 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
     Ok(())
 }
 
-pub async fn download_hf_gguf(
+fn mirror_url_for_filename(weights: &ModelWeights, repo_path: &str) -> Option<String> {
+    let mirror_url = weights.mirror_url.as_deref()?.trim();
+    if mirror_url.is_empty() {
+        return None;
+    }
+    let basename = Path::new(repo_path)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    let (prefix, _) = mirror_url.rsplit_once('/')?;
+    Some(format!("{prefix}/{basename}"))
+}
+
+fn weights_download_complete(runtime_model: &str, weights: &ModelWeights) -> bool {
+    weight_filenames(weights)
+        .iter()
+        .all(|filename| is_download_complete(&target_gguf_path(runtime_model, filename)))
+}
+
+async fn download_hf_file(
     runtime_model: &str,
     weights: &ModelWeights,
+    repo_path: &str,
     token: Option<&str>,
 ) -> Result<()> {
-    if weights.source != "huggingface" {
-        bail!("unsupported weight source: {}", weights.source);
-    }
-    if weights.repo.trim().is_empty() || weights.filename.trim().is_empty() {
-        bail!("incomplete Hugging Face weights manifest");
-    }
-
-    let dest = target_gguf_path(runtime_model, &weights.filename);
+    let dest = target_gguf_path(runtime_model, repo_path);
     if is_download_complete(&dest) {
-        info!("model already cached: {}", dest.display());
         return Ok(());
     }
 
@@ -74,39 +94,78 @@ pub async fn download_hf_gguf(
         "https://huggingface.co/{}/resolve/{}/{}",
         weights.repo.trim(),
         revision,
-        weights.filename.trim()
+        repo_path.trim()
     );
 
-    info!(
-        "downloading {} -> {}",
-        weights.repo.trim(),
-        dest.display()
-    );
+    info!("downloading {} -> {}", weights.repo.trim(), dest.display());
+    stream_url_to_file(&url, &dest, token).await
+}
 
-    stream_url_to_file(&url, &dest, token).await?;
+async fn download_mirror_file(
+    runtime_model: &str,
+    weights: &ModelWeights,
+    repo_path: &str,
+    mirror_url: &str,
+    agent_token: &str,
+) -> Result<()> {
+    let dest = target_gguf_path(runtime_model, repo_path);
+    if is_download_complete(&dest) {
+        return Ok(());
+    }
+
+    ensure_model_dir(runtime_model).context("create model cache directory")?;
+    info!("downloading from Scalattice mirror -> {}", dest.display());
+    stream_url_to_file(mirror_url, &dest, Some(agent_token)).await
+}
+
+pub async fn download_hf_gguf(
+    runtime_model: &str,
+    weights: &ModelWeights,
+    token: Option<&str>,
+) -> Result<()> {
+    if weights.source != "huggingface" {
+        bail!("unsupported weight source: {}", weights.source);
+    }
+    if weights.repo.trim().is_empty() || weights.filename.trim().is_empty() {
+        bail!("incomplete Hugging Face weights manifest");
+    }
+
+    if weights_download_complete(runtime_model, weights) {
+        info!("model already cached for {runtime_model}");
+        return Ok(());
+    }
+
+    for repo_path in weight_filenames(weights) {
+        download_hf_file(runtime_model, weights, repo_path, token).await?;
+    }
+
     write_manifest(runtime_model, weights)?;
-
-    info!("downloaded model weights to {}", dest.display());
+    info!("downloaded model weights for {runtime_model}");
     Ok(())
 }
 
 async fn download_mirror_gguf(
     runtime_model: &str,
     weights: &ModelWeights,
-    mirror_url: &str,
     agent_token: &str,
 ) -> Result<()> {
-    let dest = target_gguf_path(runtime_model, &weights.filename);
-    if is_download_complete(&dest) {
-        info!("model already cached: {}", dest.display());
+    if weights_download_complete(runtime_model, weights) {
+        info!("model already cached for {runtime_model}");
         return Ok(());
     }
 
-    ensure_model_dir(runtime_model).context("create model cache directory")?;
-    info!("downloading from Scalattice mirror -> {}", dest.display());
-    stream_url_to_file(mirror_url, &dest, Some(agent_token)).await?;
+    for repo_path in weight_filenames(weights) {
+        let dest = target_gguf_path(runtime_model, repo_path);
+        if is_download_complete(&dest) {
+            continue;
+        }
+        let mirror_url = mirror_url_for_filename(weights, repo_path)
+            .with_context(|| format!("derive mirror URL for {repo_path}"))?;
+        download_mirror_file(runtime_model, weights, repo_path, &mirror_url, agent_token).await?;
+    }
+
     write_manifest(runtime_model, weights)?;
-    info!("downloaded model weights to {}", dest.display());
+    info!("downloaded model weights for {runtime_model}");
     Ok(())
 }
 
@@ -116,6 +175,7 @@ fn write_manifest(runtime_model: &str, weights: &ModelWeights) -> Result<()> {
         "source": weights.source,
         "repo": weights.repo,
         "filename": weights.filename,
+        "companionFilenames": weights.companion_filenames,
         "revision": weights.revision,
         "mirrorUrl": weights.mirror_url,
     });
@@ -138,8 +198,8 @@ pub async fn download_catalog_model(
         model.runtime_model.as_str()
     };
 
-    if let Some(mirror_url) = weights.mirror_url.as_deref().filter(|u| !u.trim().is_empty()) {
-        match download_mirror_gguf(runtime_model, weights, mirror_url, agent_token).await {
+    if weights.mirror_url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+        match download_mirror_gguf(runtime_model, weights, agent_token).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 warn!("Scalattice mirror download failed, trying Hugging Face: {err:#}");

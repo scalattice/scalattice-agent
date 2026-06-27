@@ -14,6 +14,8 @@ pub struct ModelWeights {
     pub source: String,
     pub repo: String,
     pub filename: String,
+    #[serde(default, rename = "companionFilenames")]
+    pub companion_filenames: Vec<String>,
     #[serde(default)]
     pub revision: String,
     #[serde(rename = "mirrorUrl", default)]

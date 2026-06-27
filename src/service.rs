@@ -177,6 +177,40 @@ pub fn restart_user_service() -> Result<()> {
     verify_service_active()
 }
 
+/// Follow the background service log stream. Ctrl+C stops following only; the service keeps running.
+pub fn follow_service_logs() -> Result<()> {
+    if !systemd_available() {
+        anyhow::bail!("systemd is not available on this system");
+    }
+    if !service_active() {
+        anyhow::bail!(
+            "scalattice-agent service is not running; start it with `scalattice-agent connect` first"
+        );
+    }
+
+    let status = std::process::Command::new("journalctl")
+        .args([
+            "--user",
+            "-f",
+            "-u",
+            UNIT_NAME,
+            "-n",
+            "30",
+            "--no-pager",
+        ])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("failed to run journalctl")?;
+
+    match status.code() {
+        Some(130) | Some(0) => Ok(()),
+        Some(code) => anyhow::bail!("journalctl exited with status {code}"),
+        None => anyhow::bail!("journalctl terminated by signal"),
+    }
+}
+
 pub fn service_active() -> bool {
     if !systemd_available() {
         return false;
