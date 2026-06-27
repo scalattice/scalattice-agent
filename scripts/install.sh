@@ -118,6 +118,42 @@ detect_compute_hardware() {
   fi
 }
 
+describe_compute_hardware() {
+  detect_compute_hardware
+  echo "==> Compute hardware scan"
+  if [ "$HAS_NVIDIA_GPU" -eq 1 ]; then
+    echo "    NVIDIA GPU present"
+  fi
+  if [ "$HAS_AMD_GPU" -eq 1 ]; then
+    echo "    AMD GPU present"
+  fi
+  if [ "$HAS_INTEL_GPU" -eq 1 ]; then
+    echo "    Intel graphics present"
+  fi
+  if [ "$HAS_NVIDIA_GPU" -eq 0 ] && [ "$HAS_AMD_GPU" -eq 0 ] && [ "$HAS_INTEL_GPU" -eq 0 ]; then
+    echo "    No discrete GPU detected (CPU-only inference)"
+  fi
+}
+
+describe_driver_status() {
+  if [ "$HAS_NVIDIA_GPU" -eq 1 ]; then
+    if nvidia_driver_working; then
+      echo "    NVIDIA driver: ready ($(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '))"
+    elif libcuda_available; then
+      echo "    NVIDIA driver: libcuda found but nvidia-smi is not working (reboot or reinstall driver)"
+    else
+      echo "    NVIDIA driver: not installed"
+    fi
+  fi
+  if [ "$HAS_AMD_GPU" -eq 1 ]; then
+    if amd_driver_working; then
+      echo "    AMD ROCm: ready"
+    else
+      echo "    AMD ROCm: not detected (install ROCm for GPU inference)"
+    fi
+  fi
+}
+
 libcuda_available() {
   ldconfig -p 2>/dev/null | grep -q 'libcuda\.so' && return 0
   for p in \
@@ -136,6 +172,23 @@ libcuda_available() {
 
 nvidia_driver_working() {
   command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
+amd_driver_working() {
+  command -v rocm-smi >/dev/null 2>&1 && rocm-smi >/dev/null 2>&1
+}
+
+gpu_compute_ready() {
+  detect_compute_hardware
+  if [ "$HAS_NVIDIA_GPU" -eq 1 ]; then
+    nvidia_driver_working
+    return $?
+  fi
+  if [ "$HAS_AMD_GPU" -eq 1 ]; then
+    amd_driver_working
+    return $?
+  fi
+  return 0
 }
 
 apt_install() {
@@ -235,10 +288,14 @@ maybe_reboot() {
 
 ensure_nvidia_driver() {
   [ "$HAS_NVIDIA_GPU" -eq 1 ] || return 0
-  nvidia_driver_working && return 0
-  libcuda_available && return 0
+  if nvidia_driver_working; then
+    return 0
+  fi
 
-  echo "==> NVIDIA GPU detected but CUDA driver is not ready"
+  echo "==> NVIDIA GPU detected but driver is not ready"
+  if libcuda_available; then
+    echo "==> libcuda is present but nvidia-smi failed — driver may need a reboot or reinstall"
+  fi
 
   driver_pkg=""
   if command -v ubuntu-drivers >/dev/null 2>&1; then
@@ -269,21 +326,23 @@ ensure_vulkan_stack() {
 needs_nvidia_driver() {
   [ "$SKIP_DEPS" -eq 1 ] && return 1
   detect_compute_hardware
-  [ "$HAS_NVIDIA_GPU" -eq 1 ] && ! nvidia_driver_working && ! libcuda_available
+  [ "$HAS_NVIDIA_GPU" -eq 1 ] && ! nvidia_driver_working
 }
 
 ensure_gpu_host_ready() {
   [ "$SKIP_DEPS" -eq 1 ] && return 0
 
+  detect_compute_hardware
+  describe_driver_status
+
   if needs_nvidia_driver; then
-    echo "==> Setting up NVIDIA driver"
-    prepare_host
+    echo "==> Setting up NVIDIA driver before starting the agent"
+    ensure_nvidia_driver || true
     maybe_reboot
     return 0
   fi
 
   if ! binary_runs; then
-    detect_compute_hardware
     if [ "$HAS_AMD_GPU" -eq 1 ] || [ "$HAS_INTEL_GPU" -eq 1 ]; then
       echo "==> Setting up Vulkan stack"
       ensure_vulkan_stack
@@ -293,12 +352,15 @@ ensure_gpu_host_ready() {
 }
 
 prepare_host() {
+  detect_compute_hardware
   if [ "$HAS_NVIDIA_GPU" -eq 1 ]; then
-    echo "==> NVIDIA GPU detected"
     ensure_nvidia_driver || true
   elif [ "$HAS_AMD_GPU" -eq 1 ]; then
     echo "==> AMD GPU detected"
     ensure_vulkan_stack
+    if ! amd_driver_working; then
+      echo "==> Install ROCm for AMD GPU inference: https://rocm.docs.amd.com/"
+    fi
   elif [ "$HAS_INTEL_GPU" -eq 1 ]; then
     echo "==> Intel GPU detected"
     ensure_vulkan_stack
@@ -446,8 +508,17 @@ fi
 
 read_existing_token
 
+describe_compute_hardware
+describe_driver_status
+
 echo "==> Installing scalattice-agent to $INSTALL_DIR"
 stop_agent_service
+
+if needs_nvidia_driver; then
+  echo "==> NVIDIA driver required — installing before agent startup"
+  ensure_nvidia_driver || true
+  maybe_reboot
+fi
 
 if install_agent_binary; then
   :
@@ -458,6 +529,18 @@ fi
 ensure_gpu_host_ready
 
 verify_binary || true
+
+if ! gpu_compute_ready; then
+  echo ""
+  echo "==> Warning: GPU hardware was detected but compute drivers are not ready."
+  echo "    The agent may fall back to CPU until drivers are installed and the machine is rebooted."
+  if [ "$HAS_NVIDIA_GPU" -eq 1 ] && ! nvidia_driver_working; then
+    echo "    Fix: install NVIDIA drivers, reboot, then re-run this installer."
+  fi
+  if [ "$HAS_AMD_GPU" -eq 1 ] && ! amd_driver_working; then
+    echo "    Fix: install ROCm, then re-run this installer."
+  fi
+fi
 
 if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
   echo ""

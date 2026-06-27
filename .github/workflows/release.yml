@@ -79,11 +79,32 @@ jobs:
           echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
           /usr/local/cuda-12.6/bin/nvcc --version
 
+      # First tagged release per target: ~50 min (llama.cpp + CUDA/Vulkan compile).
+      # Later tags with the same deps: usually a few minutes (relink + changed crates only).
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.id }}
+          cache-targets: true
+          cache-workspace-crates: true
+          cache-on-failure: true
+          env-vars: |
+            CUDA_PATH
+            CMAKE_PREFIX_PATH
+            Vulkan_GLSLC_EXECUTABLE
+            CC
+            CXX
+            CFLAGS
+            CMAKE
+            RUST
+            CARGO
+
       - name: Build release binary
         env:
           CMAKE_PREFIX_PATH: /usr
           CUDA_PATH: /usr/local/cuda-12.6
           Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
+          CARGO_INCREMENTAL: "0"
         run: |
           set -euo pipefail
           args=(build --release --target "${{ matrix.target }}")

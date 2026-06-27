@@ -219,7 +219,7 @@ fn detect_nvidia_devices() -> Vec<ComputeDevice> {
 fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
     let Ok(output) = Command::new(bin)
         .args([
-            "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,driver_version",
+            "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -235,26 +235,62 @@ fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
     let mut devices = Vec::new();
 
     for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+        let parts = parse_csv_fields(line);
         if parts.len() < 5 {
             continue;
         }
-        let index = parts[0];
+        let index = parts[0].trim();
         devices.push(ComputeDevice {
             id: format!("nvidia:{index}"),
             kind: "discrete".to_string(),
-            name: parts[1].to_string(),
-            vram_gb: parts[2].parse::<f32>().ok().and_then(mb_to_gb),
-            vram_used_gb: parts[3].parse::<f32>().ok().and_then(mb_to_gb),
-            util_pct: parts[4]
-                .parse::<f32>()
-                .ok()
-                .map(|v| v.round().clamp(0.0, 100.0) as u8),
+            name: parts[1].trim().to_string(),
+            vram_gb: parse_nvidia_number(&parts[2]).and_then(mb_to_gb),
+            vram_used_gb: parse_nvidia_number(&parts[3]).and_then(mb_to_gb),
+            util_pct: parse_util_pct(&parts[4]),
             enabled: true,
         });
     }
 
     devices
+}
+
+fn parse_csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in line.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    fields.push(current.trim().to_string());
+    fields
+}
+
+fn parse_nvidia_number(raw: &str) -> Option<f32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("[N/A]") {
+        return None;
+    }
+    trimmed.parse::<f32>().ok()
+}
+
+fn parse_util_pct(raw: &str) -> Option<u8> {
+    let trimmed = raw.trim().trim_end_matches('%').trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("[N/A]") {
+        return None;
+    }
+    trimmed
+        .parse::<f32>()
+        .ok()
+        .map(|v| v.round().clamp(0.0, 100.0) as u8)
 }
 
 fn detect_amd_devices() -> Vec<ComputeDevice> {
@@ -281,6 +317,8 @@ fn detect_amd_devices() -> Vec<ComputeDevice> {
         }
     }
 
+    let util_by_index = detect_amd_util_by_index();
+
     names
         .into_iter()
         .enumerate()
@@ -290,10 +328,44 @@ fn detect_amd_devices() -> Vec<ComputeDevice> {
             name: format!("AMD {name}"),
             vram_gb: detect_amd_vram_gb(),
             vram_used_gb: None,
-            util_pct: None,
+            util_pct: util_by_index.get(&index).copied(),
             enabled: true,
         })
         .collect()
+}
+
+fn detect_amd_util_by_index() -> std::collections::HashMap<usize, u8> {
+    let Ok(output) = Command::new("rocm-smi").args(["--showuse"]).output() else {
+        return std::collections::HashMap::new();
+    };
+
+    if !output.status.success() {
+        return std::collections::HashMap::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut out = std::collections::HashMap::new();
+
+    for line in stdout.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("gpu use") || lower.contains("gpu utilization")) {
+            continue;
+        }
+        let index = line
+            .split('[')
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        let pct = line
+            .split(':')
+            .last()
+            .and_then(parse_util_pct);
+        if let (Some(index), Some(pct)) = (index, pct) {
+            out.insert(index, pct);
+        }
+    }
+
+    out
 }
 
 fn detect_integrated_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
@@ -592,5 +664,14 @@ mod tests {
         assert!(!is_integrated_pci_name(
             "NVIDIA Corporation GP107 [GeForce GTX 1650 SUPER]"
         ));
+    }
+
+    #[test]
+    fn csv_fields_handle_commas_in_gpu_names() {
+        let fields = parse_csv_fields(r#"0, "NVIDIA RTX A6000, v2", 49140, 1024, 37"#);
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[1], "NVIDIA RTX A6000, v2");
+        assert_eq!(parse_util_pct("37"), Some(37));
+        assert_eq!(parse_util_pct("[N/A]"), None);
     }
 }
