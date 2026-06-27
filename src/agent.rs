@@ -1,4 +1,4 @@
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_pong, parse_ready, parse_registered, CatalogModel,
     ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
@@ -200,9 +200,7 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
 async fn run_agent_session(config: &AgentConfig) -> Result<()> {
     let state = Arc::new(Mutex::new(SessionState::new()));
 
-    let mut request = config
-        .ws_url
-        .as_str()
+    let mut request = SCALATTICE_WS_URL
         .into_client_request()
         .context("invalid WebSocket URL")?;
     request
@@ -296,7 +294,7 @@ async fn handle_server_message(
                     if let Ok(engine) = state.lock().await.refresh_inference() {
                         let _ = crate::inference::warm_pool_devices(engine.pool()).await;
                     }
-                    let models = pick_models(&config.models, &ready.catalog);
+                    let models = catalog_model_ids(&ready.catalog);
                     let specs = {
                         let guard = state.lock().await;
                         guard.live_specs()
@@ -308,7 +306,6 @@ async fn handle_server_message(
                     };
                     let register = RegisterMessage {
                         kind: "register",
-                        region: config.region.clone(),
                         models,
                         gpu_name: specs.gpu_name.clone(),
                         vram_gb: specs.vram_gb,
@@ -381,16 +378,8 @@ async fn handle_server_message(
     Ok(true)
 }
 
-fn pick_models(requested: &[String], catalog: &[CatalogModel]) -> Vec<String> {
-    if requested.is_empty() {
-        return catalog.iter().map(|m| m.model_id.clone()).collect();
-    }
-    let allowed: std::collections::HashSet<_> = catalog.iter().map(|m| m.model_id.as_str()).collect();
-    requested
-        .iter()
-        .filter(|id| allowed.contains(id.as_str()))
-        .cloned()
-        .collect()
+fn catalog_model_ids(catalog: &[CatalogModel]) -> Vec<String> {
+    catalog.iter().map(|m| m.model_id.clone()).collect()
 }
 
 async fn respond_invoke(

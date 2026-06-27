@@ -70,7 +70,6 @@ pub struct PongMessage {
 pub struct RegisterMessage {
     #[serde(rename = "type")]
     pub kind: &'static str,
-    pub region: String,
     pub models: Vec<String>,
     #[serde(rename = "gpuName", skip_serializing_if = "Option::is_none")]
     pub gpu_name: Option<String>,

@@ -356,7 +356,6 @@ write_env_files() {
     fi
     if [ -n "$TOKEN" ]; then
       echo "export SCALATTICE_AGENT_TOKEN='$TOKEN'"
-      echo "export SCALATTICE_AGENT_WS='wss://api.scalattice.cloud/v1/operators/agent/ws'"
     fi
   } > "$ENV_FILE"
 
@@ -367,7 +366,6 @@ write_env_files() {
     fi
     if [ -n "$TOKEN" ]; then
       echo "SCALATTICE_AGENT_TOKEN=$TOKEN"
-      echo "SCALATTICE_AGENT_WS=wss://api.scalattice.cloud/v1/operators/agent/ws"
     fi
   } > "$SYSTEMD_ENV_FILE"
 

@@ -31,12 +31,6 @@ enum Commands {
     Connect {
         #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
         token: Option<String>,
-        #[arg(long, env = "SCALATTICE_AGENT_WS")]
-        ws: Option<String>,
-        #[arg(long, env = "SCALATTICE_AGENT_REGION", default_value = "auto")]
-        region: Option<String>,
-        #[arg(long, env = "SCALATTICE_AGENT_MODELS")]
-        models: Option<String>,
         /// Run in the foreground instead of the background systemd service
         #[arg(long)]
         foreground: bool,
@@ -78,14 +72,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Connect {
-            token,
-            ws,
-            region,
-            models,
-            foreground,
-        } => {
-            let config = config::AgentConfig::from_env_and_cli(token, ws, region, models)?;
+        Commands::Connect { token, foreground } => {
+            let config = config::AgentConfig::from_env_and_cli(token)?;
             if foreground {
                 agent::run_agent(config).await?;
             } else {
@@ -101,7 +89,7 @@ async fn main() -> Result<()> {
             ServiceCommands::Status => service::service_status()?,
         },
         Commands::SetToken { token } => {
-            let config = config::AgentConfig::from_env_and_cli(Some(token), None, None, None)?;
+            let config = config::AgentConfig::from_env_and_cli(Some(token))?;
             service::persist_agent_token(&config.token)?;
             if service::systemd_available() && service::service_active() {
                 service::restart_user_service()?;

@@ -24,12 +24,11 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 }
 ```
 
-2. **Client → server** `register`: declare region, models, and machine specs:
+2. **Client → server** `register`: send machine specs and runtime. **Region is not sent by the agent.** Scalattice detects each machine's region from its connection IP when it registers. Advertise catalog model ids from the `ready` message:
 
 ```json
 {
   "type": "register",
-  "region": "us",
   "models": ["mistral-large"],
   "gpuName": "NVIDIA RTX 4090",
   "vramGb": 24,
@@ -148,9 +147,8 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 | Variable | Description |
 |----------|-------------|
 | `SCALATTICE_AGENT_TOKEN` | Provider setup code (`slt_provider_…`) |
-| `SCALATTICE_AGENT_WS` | WebSocket URL (default `wss://api.scalattice.cloud/v1/operators/agent/ws`) |
-| `SCALATTICE_AGENT_REGION` | Region: `auto`, `us`, `eu`, or `ap` |
-| `SCALATTICE_AGENT_MODELS` | Comma-separated catalog model ids to advertise |
+
+The WebSocket endpoint is fixed at `wss://api.scalattice.cloud/v1/operators/agent/ws` (compiled into the agent). Each GPU machine's routing region is detected from its connection IP at register time — operators cannot set or override it.
 
 **Demo mode** is toggled per GPU on the Providers dashboard (off by default), not via environment variables.
 
@@ -170,6 +168,6 @@ The curl installer with `--token` writes `agent.env` and installs the background
 ## Implementation notes
 
 - Load model weights using `runtimeModel` from the catalog. Do not hardcode model names.
-- Advertise only models from the catalog your hardware can run.
+- Advertise all models from the `ready` catalog; the hypervisor filters routing by region and policy.
 - Stay connected and send heartbeats while online; the Providers dashboard shows live specs while you are connected.
 - Use your provider schedule in Scalattice Cloud to control when your GPU accepts paid work.

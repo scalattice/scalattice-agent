@@ -40,7 +40,7 @@ pub fn build_runtime(
     loaded_models: &[String],
     enabled_compute_devices: usize,
 ) -> AgentRuntime {
-    let ready = demo_mode || !loaded_models.is_empty();
+    let ready = enabled_compute_devices > 0 && (demo_mode || !loaded_models.is_empty());
     let status_label = status_label(
         demo_mode,
         ready,
