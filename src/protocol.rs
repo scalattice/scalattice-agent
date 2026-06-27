@@ -48,8 +48,6 @@ pub struct ReadyMessage {
     #[serde(rename = "nodeId")]
     pub node_id: String,
     pub catalog: Vec<CatalogModel>,
-    #[serde(rename = "demoMode", default)]
-    pub demo_mode: bool,
     #[serde(rename = "computeDevices", default)]
     pub compute_devices: Vec<ComputeDevicePolicy>,
     #[serde(rename = "huggingFaceToken", default)]
@@ -58,8 +56,6 @@ pub struct ReadyMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct PongMessage {
-    #[serde(rename = "demoMode")]
-    pub demo_mode: Option<bool>,
     #[serde(rename = "computeDevices", default)]
     pub compute_devices: Vec<ComputeDevicePolicy>,
     #[serde(rename = "huggingFaceToken", default)]

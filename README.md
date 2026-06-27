@@ -52,8 +52,6 @@ scalattice-agent connect
 
 The agent always connects to `wss://api.scalattice.cloud/v1/operators/agent/ws`. Region, models, and routing policy are assigned by Scalattice Cloud from your provider profile and the platform catalog — not from local flags or env vars.
 
-Demo mode is configured per GPU in the Scalattice Cloud **Providers** dashboard (off by default).
-
 ## Protocol
 
 See [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md) in this repository.

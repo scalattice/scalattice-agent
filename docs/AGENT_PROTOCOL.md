@@ -13,13 +13,12 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 
 ## Message flow
 
-1. **Server → client** `ready`: assigns `nodeId`, sends the model catalog, and the dashboard **demo mode** flag for this GPU:
+1. **Server → client** `ready`: assigns `nodeId`, sends the model catalog, compute device policy, and optional Hugging Face token:
 
 ```json
 {
   "type": "ready",
   "nodeId": "agent-uuid",
-  "demoMode": false,
   "catalog": [ ... ]
 }
 ```
@@ -45,16 +44,15 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
     "ramGb": 128
   },
   "runtime": {
-    "demoMode": false,
     "ready": false,
     "jobState": "idle",
-    "statusLabel": "Connected · no model runtime loaded",
+    "statusLabel": "Connected · waiting for model weights",
     "loadedModels": []
   }
 }
 ```
 
-`gpuName` and `vramGb` are kept for compatibility. Prefer sending the full `specs` object. Include `runtime` so the Providers dashboard can show demo mode, readiness, and active jobs.
+`gpuName` and `vramGb` are kept for compatibility. Prefer sending the full `specs` object. Include `runtime` so the Providers dashboard can show readiness and active jobs.
 
 3. **Server → client** `registered`: the machine is in the live operator pool.
 
@@ -66,10 +64,10 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 }
 ```
 
-4. **Client ↔ server** `heartbeat` / `pong` every ~25s. The server includes the current `demoMode` on each `pong` so dashboard toggles apply without reconnecting:
+4. **Client ↔ server** `heartbeat` / `pong` every ~25s. The server may include updated compute device policy and Hugging Face token on each `pong`:
 
 ```json
-{ "type": "pong", "demoMode": false }
+{ "type": "pong", "computeDevices": [ { "id": "gpu0", "enabled": true } ] }
 ```
 
 Heartbeats may refresh live machine specs:
@@ -90,11 +88,10 @@ Heartbeats may refresh live machine specs:
     "ramGb": 128
   },
   "runtime": {
-    "demoMode": true,
     "ready": true,
     "jobState": "idle",
-    "statusLabel": "Idle · demo mode (echo only)",
-    "loadedModels": []
+    "statusLabel": "Idle · ready for inference",
+    "loadedModels": ["mistralai/Mistral-Large-Instruct-2407"]
   }
 }
 ```
@@ -150,8 +147,6 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 
 The WebSocket endpoint is fixed at `wss://api.scalattice.cloud/v1/operators/agent/ws` (compiled into the agent). Each GPU machine's routing region is detected from its connection IP at register time — operators cannot set or override it.
 
-**Demo mode** is toggled per GPU on the Providers dashboard (off by default), not via environment variables.
-
 ## Background service (Linux + systemd)
 
 `scalattice-agent connect` starts (or ensures) a user systemd service by default.
@@ -169,5 +164,5 @@ The curl installer with `--token` writes `agent.env` and installs the background
 
 - Load model weights using `runtimeModel` from the catalog. Do not hardcode model names.
 - Advertise all models from the `ready` catalog; the hypervisor filters routing by region and policy.
-- Stay connected and send heartbeats while online; the Providers dashboard shows live specs while you are connected.
+- Stay connected and send heartbeats while online; the Providers dashboard shows live connection status and specs while you are connected.
 - Use your provider schedule in Scalattice Cloud to control when your GPU accepts paid work.

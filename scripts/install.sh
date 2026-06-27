@@ -449,7 +449,7 @@ echo ""
 echo "Done."
 if [ -n "$TOKEN" ]; then
   echo "  This machine will appear on https://scalattice.cloud/providers within a minute."
-  echo "  Manage GPUs, models, demo mode, and schedules from the dashboard."
+  echo "  Manage GPUs, models, and schedules from the dashboard."
 else
   echo "  1. Create a machine token at https://scalattice.cloud/providers"
   echo "  2. Run: scalattice-agent set-token --token slt_provider_…"

@@ -7,7 +7,6 @@ use crate::specs::ComputeDevice;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLocalState {
-    pub demo_mode: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,7 +29,6 @@ pub fn state_file_path() -> Option<PathBuf> {
 }
 
 pub fn update_connection_state(
-    demo_mode: bool,
     status_label: Option<String>,
     node_id: Option<String>,
     server_connected: bool,
@@ -47,7 +45,6 @@ pub fn update_connection_state(
     let _ = fs::create_dir_all(parent);
 
     let mut state = read_state().unwrap_or(AgentLocalState {
-        demo_mode: false,
         status_label: None,
         node_id: None,
         server_connected: false,
@@ -56,7 +53,6 @@ pub fn update_connection_state(
         last_error: None,
         updated_at_ms: 0,
     });
-    state.demo_mode = demo_mode;
     if let Some(label) = status_label {
         state.status_label = Some(label);
     }
@@ -91,7 +87,6 @@ pub fn mark_disconnected(error: Option<String>) {
         return;
     };
     let mut state = read_state().unwrap_or(AgentLocalState {
-        demo_mode: false,
         status_label: None,
         node_id: None,
         server_connected: false,
@@ -139,22 +134,6 @@ pub fn agent_session_recent() -> bool {
     read_state()
         .map(|s| is_recent(s.updated_at_ms) && s.server_registered)
         .unwrap_or(false)
-}
-
-pub fn demo_status_line() -> String {
-    let Some(state) = read_state() else {
-        return "unknown (not connected yet)".to_string();
-    };
-
-    if !is_recent(state.updated_at_ms) {
-        return "unknown (agent not connected - run: scalattice-agent connect)".to_string();
-    }
-
-    if state.demo_mode {
-        "on (echo only)".to_string()
-    } else {
-        "off".to_string()
-    }
 }
 
 pub fn cloud_connection_line() -> String {

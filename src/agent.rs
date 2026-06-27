@@ -29,7 +29,6 @@ type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 struct SessionState {
     registered: bool,
-    demo_mode: bool,
     compute_policy: Vec<(String, bool)>,
     job_state: JobState,
     active_job_id: Option<String>,
@@ -46,7 +45,6 @@ impl SessionState {
     fn new() -> Self {
         Self {
             registered: false,
-            demo_mode: false,
             compute_policy: Vec::new(),
             job_state: JobState::Idle,
             active_job_id: None,
@@ -90,10 +88,6 @@ impl SessionState {
         }
         info!("starting model weight downloads for {} catalog model(s)", self.catalog.len());
         spawn_catalog_sync(self.catalog.clone(), agent_token.to_string(), token);
-    }
-
-    fn set_demo_mode(&mut self, demo_mode: bool) {
-        self.demo_mode = demo_mode;
     }
 
     fn apply_compute_devices(&mut self, devices: &[ComputeDevicePolicy]) {
@@ -151,7 +145,6 @@ impl SessionState {
         let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
 
         build_runtime(
-            self.demo_mode,
             self.job_state,
             self.active_job_id.clone(),
             self.active_model_id.clone(),
@@ -164,7 +157,6 @@ impl SessionState {
         let runtime = self.runtime();
         let devices = self.enabled_devices().compute_devices;
         state::update_connection_state(
-            self.demo_mode,
             Some(runtime.status_label),
             self.node_id.clone(),
             true,
@@ -280,16 +272,12 @@ async fn handle_server_message(
                     {
                         let mut guard = state.lock().await;
                         guard.node_id = Some(ready.node_id.clone());
-                        guard.set_demo_mode(ready.demo_mode);
                         guard.apply_compute_devices(&ready.compute_devices);
                         guard.catalog = ready.catalog.clone();
                         guard.last_sync_token = None;
                         guard.weights_synced = false;
                         guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);
                         guard.persist_local_state();
-                        if ready.demo_mode {
-                            info!("demo mode enabled for this GPU (dashboard setting)");
-                        }
                     }
                     if let Ok(engine) = state.lock().await.refresh_inference() {
                         let _ = crate::inference::warm_pool_devices(engine.pool()).await;
@@ -340,15 +328,6 @@ async fn handle_server_message(
                 "pong" => {
                     if let Ok(pong) = parse_pong(data) {
                         let mut guard = state.lock().await;
-                        if let Some(demo_mode) = pong.demo_mode {
-                            if guard.demo_mode != demo_mode {
-                                guard.set_demo_mode(demo_mode);
-                                info!(
-                                    "demo mode {}",
-                                    if demo_mode { "enabled" } else { "disabled" }
-                                );
-                            }
-                        }
                         guard.apply_compute_devices(&pong.compute_devices);
                         if pong.hugging_face_token.is_some() && !guard.weights_synced {
                             guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
@@ -400,13 +379,11 @@ async fn respond_invoke(
     }
     send_heartbeat(state, write).await?;
 
-    let (demo_mode, engine) = {
+    let engine = {
         let guard = state.lock().await;
-        let demo_mode = guard.demo_mode;
-        let engine = guard
+        guard
             .refresh_inference()
-            .context("no enabled compute devices for inference")?;
-        (demo_mode, engine)
+            .context("no enabled compute devices for inference")?
     };
 
     let result = async {
@@ -416,7 +393,6 @@ async fn respond_invoke(
                 model_id: &invoke.model_id,
                 runtime_model: &invoke.runtime_model,
                 messages: &invoke.messages,
-                demo_mode,
             })
             .await
         {

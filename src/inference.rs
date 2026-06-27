@@ -11,7 +11,6 @@ pub struct InferenceRequest<'a> {
     pub model_id: &'a str,
     pub runtime_model: &'a str,
     pub messages: &'a [ChatMessage],
-    pub demo_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,59 +38,11 @@ impl InferenceEngine {
         list_cached_runtime_models()
     }
 
-    pub fn is_ready(&self, demo_mode: bool) -> bool {
-        demo_mode || !self.loaded_models().is_empty()
+    pub fn is_ready(&self) -> bool {
+        !self.loaded_models().is_empty()
     }
 
     pub async fn invoke(&self, req: InferenceRequest<'_>) -> Result<InferenceResult> {
-        if req.demo_mode {
-            return self.invoke_demo(req).await;
-        }
-        self.invoke_embedded(req).await
-    }
-
-    async fn invoke_demo(&self, req: InferenceRequest<'_>) -> Result<InferenceResult> {
-        let user = req
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
-
-        let pool_label = self.pool.display_name.clone();
-        let device_names: Vec<_> = self.pool.devices.iter().map(|d| d.name.as_str()).collect();
-
-        let shard_note = match self.pool.strategy {
-            PoolStrategy::TensorParallel => format!(
-                "embedded tensor-split {} across {}",
-                format_tensor_split(&self.pool.tensor_split),
-                device_names.join(" + ")
-            ),
-            PoolStrategy::GpuWithCpuOffload => format!(
-                "embedded GPU layers {} with CPU offload ({})",
-                self.pool.gpu_layer_budget,
-                device_names.join(" + ")
-            ),
-            PoolStrategy::CpuOnly => "embedded CPU inference pool".to_string(),
-            PoolStrategy::Single => device_names
-                .first()
-                .unwrap_or(&"device")
-                .to_string(),
-        };
-
-        let content = format!("[demo · {pool_label} · {shard_note}]\n{user}");
-        Ok(InferenceResult {
-            prompt_tokens: estimate_tokens(req.messages),
-            completion_tokens: estimate_tokens(&[ChatMessage {
-                role: "assistant".to_string(),
-                content: content.clone(),
-            }]),
-            content,
-        })
-    }
-
-    async fn invoke_embedded(&self, req: InferenceRequest<'_>) -> Result<InferenceResult> {
         let model_path = resolve_model_gguf(req.runtime_model)
             .with_context(|| {
                 format!(
@@ -126,11 +77,6 @@ impl InferenceEngine {
             completion_tokens: output.completion_tokens,
         })
     }
-}
-
-fn estimate_tokens(messages: &[ChatMessage]) -> u32 {
-    let chars: usize = messages.iter().map(|m| m.content.len()).sum();
-    ((chars / 4).max(1)) as u32
 }
 
 /// Optional health check: ping each CUDA device in the pool (no-op when unavailable).

@@ -17,8 +17,6 @@ impl JobState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRuntime {
-    #[serde(rename = "demoMode")]
-    pub demo_mode: bool,
     pub ready: bool,
     #[serde(rename = "jobState")]
     pub job_state: String,
@@ -33,16 +31,14 @@ pub struct AgentRuntime {
 }
 
 pub fn build_runtime(
-    demo_mode: bool,
     job_state: JobState,
     active_job_id: Option<String>,
     active_model_id: Option<String>,
     loaded_models: &[String],
     enabled_compute_devices: usize,
 ) -> AgentRuntime {
-    let ready = enabled_compute_devices > 0 && (demo_mode || !loaded_models.is_empty());
+    let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
     let status_label = status_label(
-        demo_mode,
         ready,
         job_state,
         active_model_id.as_deref(),
@@ -50,7 +46,6 @@ pub fn build_runtime(
     );
 
     AgentRuntime {
-        demo_mode,
         ready,
         job_state: job_state.as_str().to_string(),
         active_job_id: if job_state == JobState::Busy {
@@ -69,7 +64,6 @@ pub fn build_runtime(
 }
 
 fn status_label(
-    demo_mode: bool,
     ready: bool,
     job_state: JobState,
     active_model_id: Option<&str>,
@@ -82,12 +76,6 @@ fn status_label(
         }
         return format!("Running job · {model}");
     }
-    if demo_mode {
-        if enabled_compute_devices > 1 {
-            return format!("Idle · demo mode across {enabled_compute_devices} devices (echo only)");
-        }
-        return "Idle · demo mode (echo only)".to_string();
-    }
     if ready {
         if enabled_compute_devices > 1 {
             return format!("Idle · virtual card ready across {enabled_compute_devices} devices");
@@ -96,8 +84,8 @@ fn status_label(
     }
     if enabled_compute_devices > 1 {
         return format!(
-            "Connected · virtual {enabled_compute_devices}-device card · load model weights or enable demo"
+            "Connected · virtual {enabled_compute_devices}-device card · waiting for model weights"
         );
     }
-    "Connected · no model runtime loaded".to_string()
+    "Connected · waiting for model weights".to_string()
 }
