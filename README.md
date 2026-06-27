@@ -70,6 +70,14 @@ cargo build --release --no-default-features --features arm-gpu
 
 CI release binaries include **CUDA + Vulkan** on both x86_64 and aarch64.
 
+## Community
+
+| Document | Purpose |
+|----------|---------|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to report issues and when we accept changes |
+| [SECURITY.md](SECURITY.md) | Responsible disclosure for security issues |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards |
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
