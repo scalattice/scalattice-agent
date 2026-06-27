@@ -17,7 +17,7 @@ scalattice-agent connect   # background service (installed automatically with --
 
 Use `scalattice-agent connect --foreground` for debugging in the terminal.
 
-Install script downloads a self-contained release from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) (binary + bundled runtime libraries), or builds from source with Rust/Cargo.
+Install script downloads a self-contained release from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) (binary + bundled runtime libraries), or builds from source with Rust/Cargo. The install script itself lives in the **scalattice-server** repo (`frontend/public/install/agent`), not here.
 
 ### Hardware support
 

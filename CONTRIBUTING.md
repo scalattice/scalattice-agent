@@ -87,6 +87,10 @@ Release binaries are published on the
 [Releases](https://github.com/Robottik-Software/Scalattice-Client/releases) page
 and served via `https://scalattice.cloud/install/agent`.
 
+The curl installer script is maintained in **scalattice-server**
+(`frontend/public/install/agent`), not in this repo. Edit it there and deploy
+the server frontend — do not add a duplicate `scripts/install.sh` here.
+
 Do not push tags or publish releases unless you are an authorized maintainer.
 
 ## Community standards
