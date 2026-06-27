@@ -1,7 +1,7 @@
 use crate::config::{AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
-    parse_envelope, parse_error, parse_invoke, parse_pong, parse_ready, parse_registered, CatalogModel,
-    ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
+    parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
+    CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
 };
 use crate::inference::{InferenceEngine, InferenceRequest};
 use crate::models::spawn_catalog_sync;

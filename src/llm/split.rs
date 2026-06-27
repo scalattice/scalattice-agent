@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::{LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
