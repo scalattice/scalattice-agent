@@ -40,7 +40,7 @@ pub fn embedded_available() -> bool {
     true
 }
 
-fn backend() -> Result<&'static LlamaBackend> {
+pub(crate) fn backend() -> Result<&'static LlamaBackend> {
     BACKEND
         .get_or_init(|| LlamaBackend::init().map_err(|err| err.to_string()))
         .as_ref()
@@ -142,7 +142,7 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> String {
     out
 }
 
-fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelParams> {
+pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelParams> {
     let ggml_devices: Vec<usize> = pool
         .cuda_device_ids
         .iter()

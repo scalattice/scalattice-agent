@@ -1,5 +1,7 @@
 use crate::compute_pool::{format_tensor_split, PoolStrategy, VirtualCard};
-use crate::llm::{generate, GenerateConfig};
+use crate::llm::{
+    generate, split_lower, split_upper, GenerateConfig, SplitLowerConfig, SplitUpperConfig,
+};
 use crate::models::{list_cached_runtime_models, models_dir, resolve_model_gguf};
 use crate::protocol::ChatMessage;
 use crate::specs::ComputeDevice;
@@ -40,6 +42,70 @@ impl InferenceEngine {
 
     pub fn is_ready(&self) -> bool {
         !self.loaded_models().is_empty()
+    }
+
+    pub async fn invoke_split_lower(
+        &self,
+        runtime_model: &str,
+        prompt_token_ids: &[u32],
+    ) -> Result<crate::llm::SplitLowerOutput> {
+        let model_path = resolve_model_gguf(runtime_model).with_context(|| {
+            format!(
+                "model weights not found for {} in {}",
+                runtime_model,
+                models_dir().display()
+            )
+        })?;
+
+        let pool = self.pool.clone();
+        let ids = prompt_token_ids.to_vec();
+        let runtime_model = runtime_model.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            split_lower(&SplitLowerConfig {
+                model_path,
+                pool,
+                prompt_token_ids: ids,
+            })
+        })
+        .await
+        .context("split lower task failed")?
+    }
+
+    pub async fn invoke_split_upper(
+        &self,
+        runtime_model: &str,
+        state_b64: &str,
+        max_tokens: u32,
+    ) -> Result<InferenceResult> {
+        let model_path = resolve_model_gguf(runtime_model).with_context(|| {
+            format!(
+                "model weights not found for {} in {}",
+                runtime_model,
+                models_dir().display()
+            )
+        })?;
+
+        let pool = self.pool.clone();
+        let state_b64 = state_b64.to_string();
+        let runtime_model = runtime_model.to_string();
+
+        let output = tokio::task::spawn_blocking(move || {
+            split_upper(&SplitUpperConfig {
+                model_path,
+                pool,
+                state_b64,
+                max_tokens,
+            })
+        })
+        .await
+        .context("split upper task failed")??;
+
+        Ok(InferenceResult {
+            content: output.content,
+            prompt_tokens: output.prompt_tokens,
+            completion_tokens: output.completion_tokens,
+        })
     }
 
     pub async fn invoke(&self, req: InferenceRequest<'_>) -> Result<InferenceResult> {

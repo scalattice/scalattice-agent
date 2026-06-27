@@ -21,7 +21,6 @@ HAS_INTEL_GPU=0
 
 ENV_FILE="$HOME/.config/scalattice/agent.env"
 SYSTEMD_ENV_FILE="$HOME/.config/scalattice/agent.systemd.env"
-STATE_FILE="$HOME/.config/scalattice/agent.state.json"
 UNIT_FILE="$HOME/.config/systemd/user/scalattice-agent.service"
 
 while [ $# -gt 0 ]; do
@@ -112,7 +111,6 @@ detect_compute_hardware() {
     echo "$pci" | grep -Eiq 'intel.*graphics|8086:' && HAS_INTEL_GPU=1
   fi
 
-  # Jetson / Tegra often omit lspci labels — check platform and loaded driver.
   if [ "$HAS_NVIDIA_GPU" -eq 0 ]; then
     if [ -f /etc/nv_tegra_release ] || [ -d /sys/module/nvidia ]; then
       HAS_NVIDIA_GPU=1
@@ -168,12 +166,55 @@ apt_install() {
   return 1
 }
 
+human_bytes() {
+  n="$1"
+  [ -n "$n" ] || return 1
+  case "$n" in
+    *[!0-9]*) return 1 ;;
+  esac
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$n" 2>/dev/null
+  else
+    echo "${n} bytes"
+  fi
+}
+
+release_download_size() {
+  url="$1"
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+  curl -fsSLI "$url" 2>/dev/null \
+    | awk 'tolower($1)=="content-length:" {gsub(/\r/,"",$2); if ($2+0 > 0) size=$2} END {if (size) print size}'
+}
+
+download_file() {
+  url="$1"
+  dest="$2"
+
+  if command -v curl >/dev/null 2>&1; then
+    if [ -t 2 ]; then
+      curl -fL --progress-bar "$url" -o "$dest"
+    else
+      curl -fsSL "$url" -o "$dest"
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -t 2 ]; then
+      wget --progress=bar:force:noscroll -qO "$dest" "$url"
+    else
+      wget -qO "$dest" "$url"
+    fi
+  else
+    return 1
+  fi
+}
+
 maybe_reboot() {
   [ "$REBOOT_REQUIRED" -eq 1 ] || return 0
   echo ""
   echo "==> NVIDIA driver installed — reboot required"
   if [ "$AUTO_REBOOT" -eq 1 ]; then
-    echo "==> Rebooting now (SCALATTICE_AUTO_REBOOT=1)…"
+    echo "==> Rebooting now…"
     sudo reboot
     exit 0
   fi
@@ -220,18 +261,38 @@ ensure_nvidia_driver() {
 }
 
 ensure_vulkan_stack() {
-  # Loader is bundled in our release, but AMD/Intel need a Vulkan ICD from Mesa.
   if [ "$HAS_AMD_GPU" -eq 1 ] || [ "$HAS_INTEL_GPU" -eq 1 ]; then
     apt_install "mesa-vulkan-drivers libvulkan1" || true
   fi
 }
 
-prepare_host() {
+needs_nvidia_driver() {
+  [ "$SKIP_DEPS" -eq 1 ] && return 1
+  detect_compute_hardware
+  [ "$HAS_NVIDIA_GPU" -eq 1 ] && ! nvidia_driver_working && ! libcuda_available
+}
+
+ensure_gpu_host_ready() {
   [ "$SKIP_DEPS" -eq 1 ] && return 0
 
-  echo "==> Detecting compute hardware"
-  detect_compute_hardware
+  if needs_nvidia_driver; then
+    echo "==> Setting up NVIDIA driver"
+    prepare_host
+    maybe_reboot
+    return 0
+  fi
 
+  if ! binary_runs; then
+    detect_compute_hardware
+    if [ "$HAS_AMD_GPU" -eq 1 ] || [ "$HAS_INTEL_GPU" -eq 1 ]; then
+      echo "==> Setting up Vulkan stack"
+      ensure_vulkan_stack
+    fi
+    ensure_binary_deps
+  fi
+}
+
+prepare_host() {
   if [ "$HAS_NVIDIA_GPU" -eq 1 ]; then
     echo "==> NVIDIA GPU detected"
     ensure_nvidia_driver || true
@@ -241,30 +302,20 @@ prepare_host() {
   elif [ "$HAS_INTEL_GPU" -eq 1 ]; then
     echo "==> Intel GPU detected"
     ensure_vulkan_stack
-  else
-    echo "==> No discrete GPU detected — agent will use CPU inference if needed"
   fi
 }
 
-remove_previous_install() {
-  echo "==> Removing previous scalattice-agent install"
-
+stop_agent_service() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl --user stop scalattice-agent.service 2>/dev/null || true
-    systemctl --user disable scalattice-agent.service 2>/dev/null || true
-    systemctl --user daemon-reload 2>/dev/null || true
   fi
-
-  rm -f "$STATE_FILE" "$ENV_FILE" "$SYSTEMD_ENV_FILE" "$UNIT_FILE"
-  rm -rf "$LIB_DIR"
 }
 
 install_release_libs() {
   [ -d "$TMP/lib" ] || return 0
   [ -n "$(ls -A "$TMP/lib" 2>/dev/null)" ] || return 0
   mkdir -p "$LIB_DIR"
-  install -m 0755 "$TMP"/lib/* "$LIB_DIR/"
-  echo "==> Installed runtime libraries to $LIB_DIR"
+  install -m 0755 "$TMP/lib"/* "$LIB_DIR/"
 }
 
 library_path_export() {
@@ -289,9 +340,13 @@ ensure_binary_deps() {
   [ -n "$apt_pkgs" ] && apt_install "$apt_pkgs" || true
 }
 
-verify_binary() {
+binary_runs() {
   bin="$INSTALL_DIR/$BIN_NAME"
-  if "$bin" --version >/dev/null 2>&1; then
+  [ -x "$bin" ] && "$bin" --version >/dev/null 2>&1
+}
+
+verify_binary() {
+  if binary_runs; then
     return 0
   fi
 
@@ -302,12 +357,12 @@ verify_binary() {
     return 1
   fi
 
-  if "$bin" --version >/dev/null 2>&1; then
+  if binary_runs; then
     return 0
   fi
 
   echo "==> Binary failed to start. Diagnostics:"
-  ldd "$bin" 2>/dev/null | grep -E 'not found|cuda|vulkan' || ldd "$bin" || true
+  ldd "$INSTALL_DIR/$BIN_NAME" 2>/dev/null | grep -E 'not found|cuda|vulkan' || ldd "$INSTALL_DIR/$BIN_NAME" || true
   return 1
 }
 
@@ -318,14 +373,15 @@ download_release() {
     URL="https://github.com/$GITHUB_REPO/releases/download/${VERSION}/scalattice-agent-${ARCH}.tar.gz"
   fi
 
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$TMP/agent.tar.gz"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TMP/agent.tar.gz" "$URL"
+  size_bytes="$(release_download_size "$URL" 2>/dev/null || true)"
+  size_label="$(human_bytes "$size_bytes" 2>/dev/null || true)"
+  if [ -n "$size_label" ]; then
+    echo "==> Downloading release ($size_label)"
   else
-    return 1
+    echo "==> Downloading release from GitHub"
   fi
 
+  download_file "$URL" "$TMP/agent.tar.gz"
   tar -xzf "$TMP/agent.tar.gz" -C "$TMP"
   install -m 0755 "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
   install_release_libs
@@ -339,9 +395,17 @@ build_from_source() {
     exit 1
   fi
 
-  echo "==> Building scalattice-agent from source (this may take a few minutes)..."
+  echo "==> Building from source (may take several minutes)…"
   cargo install --git "https://github.com/${GITHUB_REPO}.git" --locked --root "$TMP/cargo-root" "$BIN_NAME"
   install -m 0755 "$TMP/cargo-root/bin/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+}
+
+install_agent_binary() {
+  if download_release 2>/dev/null; then
+    return 0
+  fi
+  echo "==> Release unavailable — building from source"
+  build_from_source
 }
 
 write_env_files() {
@@ -368,25 +432,6 @@ write_env_files() {
       echo "SCALATTICE_AGENT_TOKEN=$TOKEN"
     fi
   } > "$SYSTEMD_ENV_FILE"
-
-  echo "==> Wrote $ENV_FILE"
-}
-
-enable_boot_linger() {
-  USER_NAME="$(id -un)"
-  if ! command -v loginctl >/dev/null 2>&1; then
-    return 0
-  fi
-  if loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null | grep -q '^yes$'; then
-    echo "==> Boot without login: already enabled"
-    return 0
-  fi
-  if sudo -n loginctl enable-linger "$USER_NAME" 2>/dev/null; then
-    echo "==> Boot without login: enabled"
-    return 0
-  fi
-  echo "==> Boot without login: needs sudo - run once:"
-  echo "    sudo loginctl enable-linger $USER_NAME"
 }
 
 if [ -z "${SCALATTICE_AUTO_REBOOT:-}" ]; then
@@ -395,31 +440,26 @@ elif [ "$SCALATTICE_AUTO_REBOOT" = "1" ] || [ "$SCALATTICE_AUTO_REBOOT" = "true"
   AUTO_REBOOT=1
 fi
 
-# Token installs are cloud-managed: reboot after NVIDIA driver setup unless opted out.
 if [ -n "$TOKEN" ] && [ "${NO_AUTO_REBOOT:-0}" -eq 0 ] && [ "${SCALATTICE_NO_AUTO_REBOOT:-}" != "1" ]; then
   AUTO_REBOOT=1
 fi
 
 read_existing_token
-prepare_host
-maybe_reboot
-
-remove_previous_install
 
 echo "==> Installing scalattice-agent to $INSTALL_DIR"
+stop_agent_service
 
-if download_release 2>/dev/null; then
-  echo "==> Installed release binary"
+if install_agent_binary; then
+  :
 else
-  echo "==> Release download unavailable, falling back to source build..."
-  build_from_source
+  exit 1
 fi
+
+ensure_gpu_host_ready
 
 verify_binary || true
 
-needs_path=
 if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
-  needs_path=1
   echo ""
   echo "Add $INSTALL_DIR to your PATH:"
   echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
@@ -428,32 +468,22 @@ fi
 write_env_files
 
 if [ -n "$TOKEN" ] && command -v systemctl >/dev/null 2>&1; then
-  echo "==> Installing background service"
   export PATH="$INSTALL_DIR:$PATH"
   lib_path="$(library_path_export)"
   if [ -n "$lib_path" ]; then
     export LD_LIBRARY_PATH="$lib_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   fi
-  if "$INSTALL_DIR/$BIN_NAME" service install; then
-    echo "==> Agent is running in the background"
-  else
-    echo "==> Could not start background service - after sourcing agent.env, run: scalattice-agent connect"
-  fi
-fi
-
-if [ -n "$TOKEN" ]; then
-  enable_boot_linger
+  "$INSTALL_DIR/$BIN_NAME" service install || {
+    echo "==> Could not start background service — run: scalattice-agent connect"
+  }
 fi
 
 echo ""
 echo "Done."
 if [ -n "$TOKEN" ]; then
-  echo "  This machine will appear on https://scalattice.cloud/providers within a minute."
-  echo "  Manage GPUs, models, and schedules from the dashboard."
+  echo "  Dashboard: https://scalattice.cloud/providers"
 else
   echo "  1. Create a machine token at https://scalattice.cloud/providers"
-  echo "  2. Run: scalattice-agent set-token --token slt_provider_…"
-  echo "     or re-run: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…"
-  echo "  Without a token this machine will not appear on the dashboard."
+  echo "  2. Run: curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…"
 fi
-echo "  Check connection: scalattice-agent status"
+echo "  Status: scalattice-agent status"

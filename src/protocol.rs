@@ -87,6 +87,37 @@ pub struct RegisteredMessage {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct InvokeSplitMessage {
+    pub id: String,
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "runtimeModel")]
+    pub runtime_model: String,
+    pub segment: String,
+    #[serde(rename = "promptTokenIds", default)]
+    pub prompt_token_ids: Vec<u32>,
+    #[serde(rename = "stateB64", default)]
+    pub state_b64: String,
+    #[serde(rename = "maxTokens", default)]
+    pub max_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvokeSplitResultMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub id: String,
+    #[serde(rename = "stateB64", skip_serializing_if = "String::is_empty")]
+    pub state_b64: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content: String,
+    #[serde(rename = "promptTokens")]
+    pub prompt_tokens: u32,
+    #[serde(rename = "completionTokens")]
+    pub completion_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct InvokeMessage {
     pub id: String,
     #[serde(rename = "modelId")]
@@ -145,6 +176,10 @@ pub fn parse_pong(data: &[u8]) -> anyhow::Result<PongMessage> {
 }
 
 pub fn parse_registered(data: &[u8]) -> anyhow::Result<RegisteredMessage> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+pub fn parse_invoke_split(data: &[u8]) -> anyhow::Result<InvokeSplitMessage> {
     Ok(serde_json::from_slice(data)?)
 }
 

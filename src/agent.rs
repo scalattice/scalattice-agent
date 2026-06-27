@@ -325,6 +325,10 @@ async fn handle_server_message(
                     let invoke = parse_invoke(data)?;
                     respond_invoke(state, write, invoke).await?;
                 }
+                "invoke_split" => {
+                    let invoke = parse_invoke_split(data)?;
+                    respond_invoke_split(state, write, invoke).await?;
+                }
                 "pong" => {
                     if let Ok(pong) = parse_pong(data) {
                         let mut guard = state.lock().await;
@@ -436,4 +440,119 @@ async fn respond_invoke(
     send_heartbeat(state, write).await?;
 
     result
+}
+
+async fn respond_invoke_split(
+    state: &Arc<Mutex<SessionState>>,
+    write: &mut WsWrite,
+    invoke: crate::protocol::InvokeSplitMessage,
+) -> Result<()> {
+    info!(
+        "invoke_split {} · segment {} · model {}",
+        invoke.id, invoke.segment, invoke.model_id
+    );
+
+    {
+        let mut guard = state.lock().await;
+        guard.job_state = JobState::Busy;
+        guard.active_job_id = Some(invoke.id.clone());
+        guard.active_model_id = Some(invoke.model_id.clone());
+    }
+    send_heartbeat(state, write).await?;
+
+    let engine = {
+        let guard = state.lock().await;
+        guard
+            .refresh_inference()
+            .context("no enabled compute devices for inference")?
+    };
+
+    let segment = invoke.segment.to_lowercase();
+    let result = async {
+        match segment.as_str() {
+            "lower" => match engine
+                .invoke_split_lower(&invoke.runtime_model, &invoke.prompt_token_ids)
+                .await
+            {
+                Ok(output) => {
+                    let result = crate::protocol::InvokeSplitResultMessage {
+                        kind: "invoke_split_result",
+                        id: invoke.id,
+                        state_b64: output.state_b64,
+                        content: String::new(),
+                        prompt_tokens: output.prompt_tokens,
+                        completion_tokens: 0,
+                    };
+                    write
+                        .send(Message::Text(serde_json::to_string(&result)?))
+                        .await?;
+                    Ok(())
+                }
+                Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
+            },
+            "upper" => match engine
+                .invoke_split_upper(
+                    &invoke.runtime_model,
+                    &invoke.state_b64,
+                    invoke.max_tokens.max(1),
+                )
+                .await
+            {
+                Ok(output) => {
+                    let result = crate::protocol::InvokeSplitResultMessage {
+                        kind: "invoke_split_result",
+                        id: invoke.id,
+                        state_b64: String::new(),
+                        content: output.content,
+                        prompt_tokens: output.prompt_tokens,
+                        completion_tokens: output.completion_tokens,
+                    };
+                    write
+                        .send(Message::Text(serde_json::to_string(&result)?))
+                        .await?;
+                    Ok(())
+                }
+                Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
+            },
+            other => {
+                let err = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke.id,
+                    error: format!("unknown split segment: {other}"),
+                };
+                write
+                    .send(Message::Text(serde_json::to_string(&err)?))
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+    .await;
+
+    {
+        let mut guard = state.lock().await;
+        guard.job_state = JobState::Idle;
+        guard.active_job_id = None;
+        guard.active_model_id = None;
+    }
+    send_heartbeat(state, write).await?;
+
+    result
+}
+
+async fn send_invoke_split_error(
+    write: &mut WsWrite,
+    id: &str,
+    engine: &InferenceEngine,
+    err: anyhow::Error,
+) -> Result<()> {
+    let err = InvokeErrorMessage {
+        kind: "invoke_error",
+        id: id.to_string(),
+        error: format!("Virtual card {}: {err:#}", engine.pool().display_name),
+    };
+    write
+        .send(Message::Text(serde_json::to_string(&err)?))
+        .await?;
+    Ok(())
 }

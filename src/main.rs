@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
                 service::restart_user_service()?;
             }
             println!("token updated in agent.env");
-        },
+        }
     }
 
     Ok(())

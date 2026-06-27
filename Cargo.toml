@@ -1,6 +1,6 @@
 [package]
 name = "scalattice-agent"
-version = "1.0.26"
+version = "1.0.27"
 edition = "2021"
 description = "Open-source GPU machine agent for the Scalattice inference network"
 license = "MIT"
@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 llama-cpp-2 = { version = "0.1.150", default-features = false, features = ["openmp", "sampler"] }
@@ -43,3 +44,4 @@ rocm = ["llama-cpp-2/rocm"]
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
