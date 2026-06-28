@@ -3,12 +3,13 @@
 #
 # Usage:
 #   ./scripts/release.sh                 # bump patch, build both archs, publish
+#   ./scripts/release.sh --dev           # production release, x86_64 only (skip aarch64 CI)
 #   ./scripts/release.sh --skip-build    # reuse dist/ x86 tarball; still builds aarch64 in CI
-#   ./scripts/release.sh --skip-aarch64  # x86_64 only (not recommended)
+#   ./scripts/release.sh --skip-aarch64  # same as --dev (x86_64 only)
 #   ./scripts/release.sh --version 1.0.2
 #   ./scripts/release.sh --minor
 #
-# Requires: rust, CUDA 12.6 dev, gh auth login (see scripts/README.md).
+# Requires: rust, CUDA 12.6 dev; gh auth login for full release (see scripts/README.md).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -28,9 +29,12 @@ Usage: ./scripts/release.sh [options]
   Default: bump version, build x86_64 here, build aarch64 in GitHub Actions,
   upload both tarballs to one GitHub Release.
 
+  --dev: same full release to GitHub, but x86_64 only (skips aarch64 CI).
+
 Options:
+  --dev             Production release with x86_64 only (no aarch64 CI wait)
   --skip-build      Skip local x86_64 compile (use existing dist/ tarball)
-  --skip-aarch64    Skip CI aarch64 build (x86_64 only — install script expects both)
+  --skip-aarch64    Same as --dev
   --version X.Y.Z   Explicit version
   --minor           Bump minor instead of patch
   --no-push         Dry run (no push/release)
@@ -42,6 +46,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage 0 ;;
+    --dev) SKIP_AARCH64="true"; shift ;;
     --skip-build) SKIP_BUILD="true"; shift ;;
     --skip-aarch64) SKIP_AARCH64="true"; shift ;;
     --no-push) NO_PUSH="true"; shift ;;
@@ -192,7 +197,11 @@ if [[ "$(cargo_version)" != "$VERSION" ]]; then
   set_cargo_version "$VERSION"
 fi
 
-echo "==> Release ${TAG} (x86_64 local + aarch64 CI)"
+if [[ "$SKIP_AARCH64" == "true" ]]; then
+  echo "==> Release ${TAG} (x86_64 only — skipping aarch64 CI)"
+else
+  echo "==> Release ${TAG} (x86_64 local + aarch64 CI)"
+fi
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
   [[ -f "$X86_ARCHIVE" ]] || {
@@ -227,17 +236,21 @@ if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&
 fi
 
 echo "==> Creating GitHub release with x86_64 tarball"
+RELEASE_NOTES="Built via scripts/release.sh (x86_64 local, aarch64 GitHub Actions)."
+if [[ "$SKIP_AARCH64" == "true" ]]; then
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 only — dev release, no aarch64)."
+fi
 gh release create "$TAG" "$X86_ARCHIVE" \
   --target main \
   --title "$TAG" \
-  --notes "Built via scripts/release.sh (x86_64 local, aarch64 GitHub Actions)."
+  --notes "$RELEASE_NOTES"
 
 git fetch --tags "$REMOTE" 2>/dev/null || true
 
 if [[ "$SKIP_AARCH64" != "true" ]]; then
   build_aarch64_in_ci "$TAG"
 else
-  echo "==> Skipped aarch64 CI (--skip-aarch64)"
+  echo "==> Skipped aarch64 CI (--dev / --skip-aarch64)"
 fi
 
 verify_release_assets "$TAG" "$( [[ "$SKIP_AARCH64" == "true" ]] && echo false || echo true )"

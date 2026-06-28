@@ -2,18 +2,32 @@
 
 | Script | Purpose |
 |--------|---------|
-| **`release.sh`** | **Run this after code changes.** Full release: x86_64 + aarch64 → GitHub Releases. |
+| **`release.sh --dev`** | **Day-to-day releases.** Bump, build x86_64, publish to GitHub — skip aarch64 CI. |
+| **`release.sh`** | Full release: x86_64 + aarch64 → GitHub Releases. |
 | `build-release.sh` | Build one target locally (used by `release.sh` for x86_64). |
 | `bundle-release-libs.sh` | Internal — bundles shared libs into tarballs. |
 | `reset-releases.sh` | Wipe all tags/releases and reset semver (keeps commit history). |
 
-## Release workflow
+## Dev release (daily workflow)
+
+```bash
+./scripts/release.sh --dev
+```
+
+Same as a full production release, but **skips aarch64 CI** (~30–60 min saved):
+
+1. Bumps patch version
+2. Builds **x86_64** locally
+3. Commits, pushes `main`, creates GitHub Release with x86 tarball
+4. Skips aarch64 — ARM installs need a later full `./scripts/release.sh` or manual CI run
+
+Use this while iterating on x86 hardware. Run `./scripts/release.sh` (no flags) before you need ARM providers on the latest version.
+
+## Full release
 
 ```bash
 ./scripts/release.sh
 ```
-
-One command:
 
 1. Bumps patch version (or publishes current if not on GitHub yet)
 2. Builds **x86_64** on your machine (~minutes with cache)
@@ -28,8 +42,9 @@ The install script picks the right arch automatically:
 
 | Flag | When |
 |------|------|
-| `--skip-build` | Reuse existing `dist/` x86 tarball; still builds aarch64 in CI |
-| `--skip-aarch64` | x86 only (not recommended — breaks ARM installs) |
+| `--dev` | Production release, x86_64 only (no aarch64 CI) |
+| `--skip-build` | Reuse existing `dist/` x86 tarball |
+| `--skip-aarch64` | Same as `--dev` |
 | `--version 1.0.2` | Pin version |
 | `--minor` | Bump minor instead of patch |
 | `--no-push` | Dry run |
@@ -49,10 +64,10 @@ git push origin main
 ./scripts/release.sh --version 1.0.0
 ```
 
-### Fix v1.0.1 (x86 only, missing aarch64)
+### Add aarch64 to an existing x86-only release
 
 ```bash
 gh workflow run .github/workflows/release.yml --ref main \
-  -f tag=v1.0.1 -f targets=aarch64-only
+  -f tag=v1.0.2 -f targets=aarch64-only
 gh run watch   # pick the run id from gh run list
 ```
