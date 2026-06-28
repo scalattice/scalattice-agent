@@ -39,6 +39,8 @@ pub struct MachineSpecs {
     pub cpu_model: Option<String>,
     #[serde(rename = "ramGb", skip_serializing_if = "Option::is_none")]
     pub ram_gb: Option<u32>,
+    #[serde(rename = "ramUsedGb", skip_serializing_if = "Option::is_none")]
+    pub ram_used_gb: Option<u32>,
     #[serde(rename = "computeDevices", skip_serializing_if = "Vec::is_empty")]
     pub compute_devices: Vec<ComputeDevice>,
 }
@@ -147,6 +149,7 @@ pub fn build_specs_from_devices(
         hostname,
         cpu_model,
         ram_gb,
+        ram_used_gb: detect_ram_used_gb(),
         compute_devices: devices.to_vec(),
     }
 }
@@ -641,14 +644,23 @@ pub fn detect_ram_gb() -> Option<u32> {
     detect_linux_memtotal_gb()
 }
 
-fn detect_linux_memtotal_gb() -> Option<u32> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb = info
-        .lines()
-        .find(|line| line.starts_with("MemTotal:"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u64>().ok())?;
+pub fn detect_ram_used_gb() -> Option<u32> {
+    let total_kb = read_meminfo_kb("MemTotal:")?;
+    let available_kb = read_meminfo_kb("MemAvailable:")?;
+    let used_kb = total_kb.saturating_sub(available_kb);
+    Some(((used_kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
+}
 
+fn read_meminfo_kb(prefix: &str) -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    info.lines()
+        .find(|line| line.starts_with(prefix))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn detect_linux_memtotal_gb() -> Option<u32> {
+    let kb = read_meminfo_kb("MemTotal:")?;
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
 }
 

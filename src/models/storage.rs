@@ -75,6 +75,33 @@ pub fn resolve_model_gguf(runtime_model: &str) -> Option<PathBuf> {
     Some(target_gguf_path(runtime_model, primary))
 }
 
+pub fn models_cache_disk_gb() -> u32 {
+    dir_size_gb(&models_dir())
+}
+
+fn dir_size_gb(path: &Path) -> u32 {
+    let bytes = dir_size_bytes(path);
+    ((bytes as f64) / 1024.0 / 1024.0 / 1024.0).round() as u32
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(meta) = path.metadata() {
+                total = total.saturating_add(meta.len());
+            }
+        } else if path.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&path));
+        }
+    }
+    total
+}
+
 pub fn list_cached_runtime_models() -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(models_dir()) else {
         return Vec::new();

@@ -367,6 +367,7 @@ impl SessionState {
             enabled_count,
             downloading.as_deref(),
             blocked_models,
+            crate::models::storage::models_cache_disk_gb(),
         )
     }
 

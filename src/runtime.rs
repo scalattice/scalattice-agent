@@ -30,6 +30,8 @@ pub struct AgentRuntime {
     pub downloading_model: Option<String>,
     #[serde(rename = "loadedModels", skip_serializing_if = "Vec::is_empty")]
     pub loaded_models: Vec<String>,
+    #[serde(rename = "modelsDiskGb", skip_serializing_if = "Option::is_none")]
+    pub models_disk_gb: Option<u32>,
 }
 
 pub fn build_runtime(
@@ -40,6 +42,7 @@ pub fn build_runtime(
     enabled_compute_devices: usize,
     downloading_model: Option<&str>,
     blocked_enabled_models: usize,
+    models_disk_gb: u32,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
     let status_label = status_label(
@@ -67,6 +70,11 @@ pub fn build_runtime(
         status_label,
         downloading_model: downloading_model.map(str::to_string),
         loaded_models: loaded_models.to_vec(),
+        models_disk_gb: if models_disk_gb > 0 {
+            Some(models_disk_gb)
+        } else {
+            None
+        },
     }
 }
 
