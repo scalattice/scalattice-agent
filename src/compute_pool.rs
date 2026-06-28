@@ -58,7 +58,15 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
         });
     }
 
-    let total_vram_gb: u32 = pool_devices.iter().map(|d| d.vram_gb).sum();
+    let total_vram_gb: u32 = if !discrete_vram.is_empty() {
+        discrete_vram.iter().copied().sum()
+    } else {
+        pool_devices
+            .iter()
+            .filter(|d| d.kind != "cpu")
+            .map(|d| d.vram_gb)
+            .sum()
+    };
     let display_name = if pool_devices.len() == 1 {
         pool_devices[0].name.clone()
     } else {

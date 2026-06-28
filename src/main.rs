@@ -27,22 +27,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Connect to Scalattice and accept inference jobs (background service by default)
-    Connect {
+    /// Run in the foreground (for debugging — stops the background agent first)
+    Foreground {
         #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
         token: Option<String>,
-        /// Follow background service logs (default when the service is already running)
-        #[arg(long)]
-        foreground: bool,
     },
-    /// Show whether this machine is connected to Scalattice Cloud
+    /// Show connection status and whether the background agent is running
     Status,
-    /// Install or manage a background systemd user service
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommands,
-    },
-    /// Update the machine token in agent.env and restart the background service
+    /// Save the machine token and start (or restart) the background agent
     SetToken {
         #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
         token: String,
@@ -58,16 +50,6 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
-enum ServiceCommands {
-    /// Write and enable a user systemd unit (auto-restart on disconnect)
-    Install,
-    /// Disable and remove the user systemd unit
-    Uninstall,
-    /// Show whether the background service is installed and running
-    Status,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -81,35 +63,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Connect { token, foreground } => {
-            if foreground && service::service_active() {
-                println!("scalattice-agent is running in the background");
-                service::follow_service_logs()?;
-                return Ok(());
+        Commands::Foreground { token } => {
+            if service::systemd_available() && service::service_active() {
+                service::stop_user_service()?;
+                println!("stopped background agent — running in foreground (Ctrl+C to exit)");
             }
-
             let config = config::AgentConfig::from_env_and_cli(token)?;
-            if foreground {
-                agent::run_agent(config).await?;
-            } else {
-                service::ensure_service_running(&config)?;
-            }
+            agent::run_agent(config).await?;
         }
         Commands::Status => {
             print_status()?;
         }
-        Commands::Service { command } => match command {
-            ServiceCommands::Install => service::install_user_service()?,
-            ServiceCommands::Uninstall => service::uninstall_user_service()?,
-            ServiceCommands::Status => service::service_status()?,
-        },
         Commands::SetToken { token } => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
             service::persist_agent_token(&config.token)?;
-            if service::systemd_available() && service::service_active() {
-                service::restart_user_service()?;
+            if service::systemd_available() {
+                service::ensure_service_running(&config)?;
+                println!("token saved — agent running in background");
+            } else {
+                println!("token saved — run: scalattice-agent foreground");
             }
-            println!("token updated in agent.env");
         }
         Commands::Uninstall { yes, purge } => {
             service::uninstall_agent(&service::UninstallOptions {
@@ -131,6 +104,22 @@ fn print_status() -> Result<()> {
         println!("set token: scalattice-agent set-token --token slt_provider_…");
     } else {
         println!("token: set");
+    }
+
+    if service::systemd_available() {
+        match service::background_status() {
+            service::BackgroundStatus::Running => println!("background: running"),
+            service::BackgroundStatus::Stopped => println!("background: not running"),
+            service::BackgroundStatus::NotInstalled => {
+                println!("background: not started — run: scalattice-agent set-token --token …");
+            }
+        }
+    } else {
+        println!("background: systemd not available (use: scalattice-agent foreground)");
+    }
+
+    if agent_token_configured() {
+        println!("activity: {}", state::server_status_line());
     }
 
     println!("dashboard: https://scalattice.cloud/providers");

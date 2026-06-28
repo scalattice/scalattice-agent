@@ -36,6 +36,7 @@ pub fn build_runtime(
     active_model_id: Option<String>,
     loaded_models: &[String],
     enabled_compute_devices: usize,
+    downloading_model: Option<&str>,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
     let status_label = status_label(
@@ -43,6 +44,7 @@ pub fn build_runtime(
         job_state,
         active_model_id.as_deref(),
         enabled_compute_devices,
+        downloading_model,
     );
 
     AgentRuntime {
@@ -68,6 +70,7 @@ fn status_label(
     job_state: JobState,
     active_model_id: Option<&str>,
     enabled_compute_devices: usize,
+    downloading_model: Option<&str>,
 ) -> String {
     if job_state == JobState::Busy {
         let model = active_model_id.unwrap_or("inference");
@@ -75,6 +78,9 @@ fn status_label(
             return format!("Running job across {enabled_compute_devices} devices · {model}");
         }
         return format!("Running job · {model}");
+    }
+    if let Some(model) = downloading_model {
+        return format!("Downloading {model}");
     }
     if ready {
         if enabled_compute_devices > 1 {

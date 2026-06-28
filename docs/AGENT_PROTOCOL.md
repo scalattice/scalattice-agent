@@ -147,20 +147,20 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 
 The WebSocket endpoint is fixed at `wss://api.scalattice.cloud/v1/operators/agent/ws` (compiled into the agent). Each GPU machine's routing region is detected from its connection IP at register time — operators cannot set or override it.
 
-## Background service (Linux + systemd)
+## Background agent (Linux + systemd)
 
-`scalattice-agent connect` starts (or ensures) a user systemd service by default.
+`scalattice-agent set-token` saves the machine token and starts (or restarts) a user systemd unit automatically.
 
 ```bash
-scalattice-agent connect              # background service (default)
-scalattice-agent connect --foreground # blocking terminal, for debugging
-scalattice-agent service status
-scalattice-agent uninstall --yes      # remove agent, service, and config
-scalattice-agent uninstall --yes --purge  # also delete cached model weights
-sudo loginctl enable-linger $USER     # optional: start at boot without login
+scalattice-agent set-token --token slt_provider_…  # background (default after install)
+scalattice-agent foreground                        # blocking terminal, for debugging
+scalattice-agent status
+scalattice-agent uninstall --yes                   # remove agent, service, and config
+scalattice-agent uninstall --yes --purge           # also delete cached model weights
+sudo loginctl enable-linger $USER                  # optional: start at boot without login
 ```
 
-The curl installer with `--token` writes `agent.env` and installs the background service automatically.
+The curl installer with `--token` writes `agent.env` and starts the background agent automatically.
 
 ## Implementation notes
 

@@ -6,9 +6,41 @@ use std::process::Command;
 
 const UNIT_NAME: &str = "scalattice-agent.service";
 
+pub enum BackgroundStatus {
+    Running,
+    Stopped,
+    NotInstalled,
+}
+
+pub fn background_status() -> BackgroundStatus {
+    if !systemd_available() {
+        return BackgroundStatus::NotInstalled;
+    }
+    let home = match home_dir() {
+        Ok(h) => h,
+        Err(_) => return BackgroundStatus::NotInstalled,
+    };
+    if !systemd_user_unit_path(&home).is_file() {
+        return BackgroundStatus::NotInstalled;
+    }
+    if service_active() {
+        BackgroundStatus::Running
+    } else {
+        BackgroundStatus::Stopped
+    }
+}
+
+pub fn stop_user_service() -> Result<()> {
+    if !systemd_available() {
+        return Ok(());
+    }
+    let _ = run_systemctl(&["--user", "stop", UNIT_NAME]);
+    Ok(())
+}
+
 pub fn ensure_service_running(config: &AgentConfig) -> Result<()> {
     if !systemd_available() {
-        bail!("systemd is required for background mode - use: scalattice-agent connect --foreground");
+        bail!("systemd is required for background mode - use: scalattice-agent foreground");
     }
 
     let home = home_dir()?;
@@ -137,7 +169,7 @@ Wants=network-online.target
 Type=simple
 Environment=PATH={path}
 EnvironmentFile={env}
-ExecStart={bin} connect --foreground
+ExecStart={bin} foreground
 Restart=always
 RestartSec=5
 
@@ -287,13 +319,14 @@ pub fn restart_user_service() -> Result<()> {
 }
 
 /// Follow the background service log stream. Ctrl+C stops following only; the service keeps running.
+#[allow(dead_code)]
 pub fn follow_service_logs() -> Result<()> {
     if !systemd_available() {
         anyhow::bail!("systemd is not available on this system");
     }
     if !service_active() {
         anyhow::bail!(
-            "scalattice-agent service is not running; start it with `scalattice-agent connect` first"
+            "scalattice-agent is not running; save your token with `scalattice-agent set-token` first"
         );
     }
 
@@ -327,35 +360,6 @@ pub fn service_active() -> bool {
     run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok()
 }
 
-pub fn service_status() -> Result<()> {
-    if !systemd_available() {
-        println!("systemd: not available on this system");
-        return Ok(());
-    }
-
-    let home = home_dir()?;
-    let unit_path = systemd_user_unit_path(&home);
-    if unit_path.is_file() {
-        println!("unit file: {}", unit_path.display());
-    } else {
-        println!("unit file: not installed (run: scalattice-agent connect)");
-    }
-
-    if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok() {
-        println!("service: active");
-    } else {
-        println!("service: not running");
-    }
-
-    if run_systemctl(&["--user", "is-enabled", UNIT_NAME]).is_ok() {
-        println!("boot: enabled (starts after login unless lingering is on)");
-    } else {
-        println!("boot: disabled");
-    }
-
-    Ok(())
-}
-
 fn verify_service_active() -> Result<()> {
     if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok() {
         println!("scalattice-agent is running in the background");
@@ -367,7 +371,7 @@ fn verify_service_active() -> Result<()> {
         .args(["--user", "status", UNIT_NAME, "--no-pager", "-n", "15"])
         .status();
 
-    bail!("scalattice-agent service is not running - try: scalattice-agent connect --foreground");
+    bail!("scalattice-agent is not running - try: scalattice-agent foreground");
 }
 
 fn sync_systemd_env_file(home: &Path) -> Result<()> {

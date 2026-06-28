@@ -12,10 +12,10 @@ From any machine with `curl`:
 curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_YOUR_TOKEN
 source ~/.config/scalattice/agent.env
 scalattice-agent status
-scalattice-agent connect   # background service (installed automatically with --token)
+scalattice-agent status   # background agent starts automatically with --token
 ```
 
-Use `scalattice-agent connect --foreground` for debugging in the terminal.
+Use `scalattice-agent foreground` for debugging in the terminal.
 
 To remove the agent, service, and local config:
 
@@ -49,7 +49,12 @@ We cannot bundle NVIDIA's `libcuda.so` (license). Machines without a GPU driver 
 curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_…
 source ~/.config/scalattice/agent.env
 scalattice-agent status
-scalattice-agent connect
+```
+
+The install script saves your token and starts the background agent automatically. To change the token later:
+
+```bash
+scalattice-agent set-token --token slt_provider_…
 ```
 
 ## Environment

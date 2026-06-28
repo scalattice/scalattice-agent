@@ -2,6 +2,7 @@ use crate::compute_pool::VirtualCard;
 use crate::models::capacity::can_host_model;
 use crate::models::download::download_catalog_model;
 use crate::protocol::CatalogModel;
+use crate::state;
 use tracing::{info, warn};
 
 pub fn spawn_catalog_sync(
@@ -33,14 +34,17 @@ pub fn spawn_catalog_sync(
                 );
                 continue;
             }
-            if let Err(err) =
-                download_catalog_model(&model, &agent_token, hf_token.as_deref()).await
-            {
+            state::set_downloading_model(Some(&model.model_id));
+            let result =
+                download_catalog_model(&model, &agent_token, hf_token.as_deref()).await;
+            state::set_downloading_model(None);
+            if let Err(err) = result {
                 warn!(
                     "model download failed for {}: {err:#}",
                     model.model_id
                 );
             }
         }
+        state::set_downloading_model(None);
     });
 }

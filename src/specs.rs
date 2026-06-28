@@ -116,7 +116,12 @@ pub fn build_specs_from_devices(
         None
     };
 
-    let vram_gb = sum_option(enabled.iter().filter_map(|d| d.vram_gb));
+    let vram_gb = sum_option(
+        enabled
+            .iter()
+            .filter(|d| d.kind == "discrete" || d.kind == "integrated")
+            .filter_map(|d| d.vram_gb),
+    );
     let vram_used_gb = sum_option(enabled.iter().filter_map(|d| d.vram_used_gb));
     let gpu_util_pct = enabled
         .iter()
@@ -509,12 +514,11 @@ fn detect_cpu_device() -> Vec<ComputeDevice> {
     let Some(cpu_model) = detect_cpu_model() else {
         return Vec::new();
     };
-    let ram_gb = detect_ram_gb();
     vec![ComputeDevice {
         id: "cpu:0".to_string(),
         kind: "cpu".to_string(),
         name: cpu_model,
-        vram_gb: ram_gb,
+        vram_gb: None,
         vram_used_gb: None,
         util_pct: None,
         enabled: false,
@@ -634,6 +638,17 @@ pub fn detect_cpu_model() -> Option<String> {
 }
 
 pub fn detect_ram_gb() -> Option<u32> {
+    let linux = detect_linux_memtotal_gb();
+    let host = detect_wsl_host_ram_gb();
+    match (linux, host) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn detect_linux_memtotal_gb() -> Option<u32> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kb = info
         .lines()
@@ -642,6 +657,47 @@ pub fn detect_ram_gb() -> Option<u32> {
         .and_then(|value| value.parse::<u64>().ok())?;
 
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
+}
+
+fn detect_wsl_host_ram_gb() -> Option<u32> {
+    if !std::path::Path::new("/usr/lib/wsl/lib").is_dir() {
+        return None;
+    }
+
+    for (bin, args) in [
+        (
+            "powershell.exe",
+            vec![
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+            ],
+        ),
+        (
+            "powershell.exe",
+            vec![
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum",
+            ],
+        ),
+    ] {
+        let output = std::process::Command::new(bin).args(args).output().ok()?;
+        if !output.status.success() {
+            continue;
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let bytes = raw
+            .split_whitespace()
+            .filter_map(|token| token.parse::<u64>().ok())
+            .max()?;
+        if bytes == 0 {
+            continue;
+        }
+        return Some(((bytes as f64) / 1024.0 / 1024.0 / 1024.0).round().max(1.0) as u32);
+    }
+
+    None
 }
 
 pub fn detect_cuda_version() -> Option<String> {

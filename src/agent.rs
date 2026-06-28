@@ -212,6 +212,7 @@ impl SessionState {
             .map(|engine| engine.loaded_models())
             .unwrap_or_default();
         let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
+        let downloading = crate::state::downloading_model();
 
         build_runtime(
             self.job_state,
@@ -219,6 +220,7 @@ impl SessionState {
             self.active_model_id.clone(),
             &loaded_models,
             enabled_count,
+            downloading.as_deref(),
         )
     }
 

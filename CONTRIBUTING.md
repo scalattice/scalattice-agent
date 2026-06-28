@@ -55,7 +55,7 @@ Run locally (requires a provider token from [scalattice.cloud/providers](https:/
 
 ```bash
 export SCALATTICE_AGENT_TOKEN='slt_provider_…'
-cargo run --release --features gpu -- connect --foreground
+cargo run --release --features gpu -- foreground
 ```
 
 Protocol details: [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md).

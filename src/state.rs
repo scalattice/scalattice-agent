@@ -10,6 +10,8 @@ pub struct AgentLocalState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloading_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     #[serde(default)]
     pub server_connected: bool,
@@ -46,6 +48,7 @@ pub fn update_connection_state(
 
     let mut state = read_state().unwrap_or(AgentLocalState {
         status_label: None,
+        downloading_model: None,
         node_id: None,
         server_connected: false,
         server_registered: false,
@@ -54,7 +57,9 @@ pub fn update_connection_state(
         updated_at_ms: 0,
     });
     if let Some(label) = status_label {
-        state.status_label = Some(label);
+        if state.downloading_model.is_none() {
+            state.status_label = Some(label);
+        }
     }
     if let Some(id) = node_id {
         state.node_id = Some(id);
@@ -88,6 +93,7 @@ pub fn mark_disconnected(error: Option<String>) {
     };
     let mut state = read_state().unwrap_or(AgentLocalState {
         status_label: None,
+        downloading_model: None,
         node_id: None,
         server_connected: false,
         server_registered: false,
@@ -98,11 +104,46 @@ pub fn mark_disconnected(error: Option<String>) {
     state.server_connected = false;
     state.server_registered = false;
     state.status_label = None;
+    state.downloading_model = None;
     if let Some(err) = error {
         state.last_error = Some(err);
     }
     state.updated_at_ms = now_ms();
     write_state(&state);
+}
+
+pub fn set_downloading_model(model_id: Option<&str>) {
+    let Some(path) = state_file_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let _ = fs::create_dir_all(parent);
+
+    let mut state = read_state().unwrap_or(AgentLocalState {
+        status_label: None,
+        downloading_model: None,
+        node_id: None,
+        server_connected: false,
+        server_registered: false,
+        compute_devices: Vec::new(),
+        last_error: None,
+        updated_at_ms: 0,
+    });
+
+    state.downloading_model = model_id.map(str::to_string);
+    if let Some(id) = model_id {
+        state.status_label = Some(format!("Downloading {id}"));
+    }
+    state.updated_at_ms = now_ms();
+    write_state(&state);
+}
+
+pub fn downloading_model() -> Option<String> {
+    read_state()
+        .filter(|state| is_recent(state.updated_at_ms))
+        .and_then(|state| state.downloading_model)
 }
 
 pub fn read_state() -> Option<AgentLocalState> {
@@ -177,7 +218,7 @@ pub fn server_status_line() -> String {
         if service_hint() {
             return "not connected (background service running but not registered - check: journalctl --user -u scalattice-agent -n 30)".to_string();
         }
-        return "not connected (run: scalattice-agent connect)".to_string();
+        return "not connected (save token with: scalattice-agent set-token --token …)".to_string();
     }
 
     if state.server_registered {
