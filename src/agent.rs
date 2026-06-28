@@ -445,7 +445,8 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
                 let registered = {
                     let mut guard = state.lock().await;
                     if guard.registered {
-                        guard.sync_model_weights(guard.hf_token.clone(), &config.token);
+                        let hf_token = guard.hf_token.clone();
+                        guard.sync_model_weights(hf_token, &config.token);
                     }
                     guard.registered
                 };
@@ -532,7 +533,7 @@ async fn handle_server_message(
                     if let Ok(engine) = state.lock().await.refresh_inference() {
                         let _ = crate::inference::warm_pool_devices(engine.pool()).await;
                     }
-                    send_register_message(&state, &mut write).await?;
+                    send_register_message(state, write).await?;
                 }
                 "registered" => {
                     let reg = parse_registered(data)?;
