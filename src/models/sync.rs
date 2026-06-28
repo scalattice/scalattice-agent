@@ -1,9 +1,13 @@
+use crate::compute_pool::VirtualCard;
+use crate::models::capacity::can_host_model;
 use crate::models::download::download_catalog_model;
 use crate::protocol::CatalogModel;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub fn spawn_catalog_sync(
     catalog: Vec<CatalogModel>,
+    card: VirtualCard,
+    ram_gb: u32,
     agent_token: String,
     hf_token: Option<String>,
 ) {
@@ -13,8 +17,20 @@ pub fn spawn_catalog_sync(
 
     tokio::spawn(async move {
         let hf_token = hf_token.or_else(|| std::env::var("SCALATTICE_HF_TOKEN").ok());
+
         for model in catalog {
             if model.weights.is_none() {
+                continue;
+            }
+            if !can_host_model(&model, &card, ram_gb) {
+                info!(
+                    "skipping {} — needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM)",
+                    model.model_id,
+                    model.min_vram_gb.unwrap_or(0),
+                    model.min_ram_gb.unwrap_or(0),
+                    card.total_vram_gb,
+                    ram_gb
+                );
                 continue;
             }
             if let Err(err) =

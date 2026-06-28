@@ -169,7 +169,8 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
             if !ggml_devices.is_empty() {
                 model_params = model_params
                     .with_devices(std::slice::from_ref(&ggml_devices[0]))
-                    .context("configure GPU for CPU offload path")?;
+                    .context("configure GPU for CPU offload path")?
+                    .with_use_mmap(true);
             }
             model_params = model_params.with_n_gpu_layers(pool.gpu_layer_budget);
         }

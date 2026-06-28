@@ -1,9 +1,12 @@
 use crate::config::{AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
-    CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, RegisterMessage,
+    CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, ModelPolicyEntry,
+    RegisterMessage,
 };
+use crate::compute_pool::build_virtual_card;
 use crate::inference::{InferenceEngine, InferenceRequest};
+use crate::models::capacity::can_host_model;
 use crate::models::spawn_catalog_sync;
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::{
@@ -30,6 +33,7 @@ type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 struct SessionState {
     registered: bool,
     compute_policy: Vec<(String, bool)>,
+    model_policy: Vec<(String, bool)>,
     job_state: JobState,
     active_job_id: Option<String>,
     active_model_id: Option<String>,
@@ -46,6 +50,7 @@ impl SessionState {
         Self {
             registered: false,
             compute_policy: Vec::new(),
+            model_policy: Vec::new(),
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
@@ -67,17 +72,21 @@ impl SessionState {
     }
 
     fn sync_model_weights(&mut self, server_token: Option<String>, agent_token: &str) {
-        if self.catalog.is_empty() || self.weights_synced {
+        if self.weights_synced {
+            return;
+        }
+        let eligible = self.eligible_catalog_models();
+        if eligible.is_empty() {
             return;
         }
         let token = self.effective_hf_token(server_token);
-        let can_mirror = self.catalog.iter().any(|m| {
+        let can_mirror = eligible.iter().any(|m| {
             m.weights
                 .as_ref()
                 .and_then(|w| w.mirror_url.as_deref())
                 .is_some_and(|url| !url.trim().is_empty())
         });
-        if token.is_none() && !can_mirror && self.catalog.iter().any(|m| m.weights.is_some()) {
+        if token.is_none() && !can_mirror && eligible.iter().any(|m| m.weights.is_some()) {
             warn!("model downloads are not configured on the server yet (contact Scalattice support)");
             return;
         }
@@ -86,8 +95,68 @@ impl SessionState {
         if let Some(token) = token.clone() {
             self.hf_token = Some(token);
         }
-        info!("starting model weight downloads for {} catalog model(s)", self.catalog.len());
-        spawn_catalog_sync(self.catalog.clone(), agent_token.to_string(), token);
+        let specs = self.enabled_devices();
+        let ram_gb = specs.ram_gb.unwrap_or(detect_ram_gb());
+        let card = match build_virtual_card(&specs.compute_devices) {
+            Ok(card) => card,
+            Err(err) => {
+                warn!("model downloads skipped: {err:#}");
+                return;
+            }
+        };
+        info!(
+            "starting model weight downloads for {} eligible model(s)",
+            eligible.len()
+        );
+        spawn_catalog_sync(eligible, card, ram_gb, agent_token.to_string(), token);
+    }
+
+    fn apply_model_policy(&mut self, models: &[ModelPolicyEntry]) {
+        if models.is_empty() {
+            return;
+        }
+        let next: Vec<(String, bool)> = models
+            .iter()
+            .map(|model| (model.model_id.clone(), model.enabled))
+            .collect();
+        if self.model_policy != next {
+            self.model_policy = next;
+            self.weights_synced = false;
+        }
+    }
+
+    fn is_model_enabled(&self, model_id: &str) -> bool {
+        if self.model_policy.is_empty() {
+            return true;
+        }
+        self.model_policy
+            .iter()
+            .find(|(id, _)| id == model_id)
+            .map(|(_, enabled)| *enabled)
+            .unwrap_or(false)
+    }
+
+    fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
+        let specs = self.enabled_devices();
+        let ram_gb = specs.ram_gb.unwrap_or(detect_ram_gb());
+        let card = match build_virtual_card(&specs.compute_devices) {
+            Ok(card) => card,
+            Err(_) => return Vec::new(),
+        };
+
+        self.catalog
+            .iter()
+            .filter(|model| self.is_model_enabled(&model.model_id))
+            .filter(|model| can_host_model(model, &card, ram_gb))
+            .cloned()
+            .collect()
+    }
+
+    fn register_model_ids(&self) -> Vec<String> {
+        self.eligible_catalog_models()
+            .iter()
+            .map(|m| m.model_id.clone())
+            .collect()
     }
 
     fn apply_compute_devices(&mut self, devices: &[ComputeDevicePolicy]) {
@@ -273,6 +342,7 @@ async fn handle_server_message(
                         let mut guard = state.lock().await;
                         guard.node_id = Some(ready.node_id.clone());
                         guard.apply_compute_devices(&ready.compute_devices);
+                        guard.apply_model_policy(&ready.enabled_models);
                         guard.catalog = ready.catalog.clone();
                         guard.last_sync_token = None;
                         guard.weights_synced = false;
@@ -282,7 +352,10 @@ async fn handle_server_message(
                     if let Ok(engine) = state.lock().await.refresh_inference() {
                         let _ = crate::inference::warm_pool_devices(engine.pool()).await;
                     }
-                    let models = catalog_model_ids(&ready.catalog);
+                    let models = {
+                        let guard = state.lock().await;
+                        guard.register_model_ids()
+                    };
                     let specs = {
                         let guard = state.lock().await;
                         guard.live_specs()
@@ -333,8 +406,11 @@ async fn handle_server_message(
                     if let Ok(pong) = parse_pong(data) {
                         let mut guard = state.lock().await;
                         guard.apply_compute_devices(&pong.compute_devices);
+                        guard.apply_model_policy(&pong.enabled_models);
                         if pong.hugging_face_token.is_some() && !guard.weights_synced {
                             guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
+                        } else if !guard.weights_synced {
+                            guard.sync_model_weights(None, &config.token);
                         }
                         guard.persist_local_state();
                     }
@@ -359,10 +435,6 @@ async fn handle_server_message(
         _ => {}
     }
     Ok(true)
-}
-
-fn catalog_model_ids(catalog: &[CatalogModel]) -> Vec<String> {
-    catalog.iter().map(|m| m.model_id.clone()).collect()
 }
 
 async fn respond_invoke(

@@ -34,8 +34,22 @@ pub struct CatalogModel {
     pub max_context_tokens: u32,
     #[serde(default)]
     pub regions: Vec<String>,
+    #[serde(rename = "weightSizeGb", default)]
+    pub weight_size_gb: Option<u32>,
+    #[serde(rename = "minVramGb", default)]
+    pub min_vram_gb: Option<u32>,
+    #[serde(rename = "minRamGb", default)]
+    pub min_ram_gb: Option<u32>,
     #[serde(default)]
     pub weights: Option<ModelWeights>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelPolicyEntry {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +66,8 @@ pub struct ReadyMessage {
     pub catalog: Vec<CatalogModel>,
     #[serde(rename = "computeDevices", default)]
     pub compute_devices: Vec<ComputeDevicePolicy>,
+    #[serde(rename = "enabledModels", default)]
+    pub enabled_models: Vec<ModelPolicyEntry>,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
 }
@@ -60,6 +76,8 @@ pub struct ReadyMessage {
 pub struct PongMessage {
     #[serde(rename = "computeDevices", default)]
     pub compute_devices: Vec<ComputeDevicePolicy>,
+    #[serde(rename = "enabledModels", default)]
+    pub enabled_models: Vec<ModelPolicyEntry>,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
 }

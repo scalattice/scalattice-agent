@@ -40,8 +40,6 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     let mut pool_devices = Vec::new();
     let mut cuda_ids = Vec::new();
     let mut discrete_vram = Vec::new();
-    let mut has_cpu = false;
-    let mut has_integrated = false;
 
     for device in enabled {
         let vram_gb = device.vram_gb.unwrap_or(0).max(1);
@@ -49,12 +47,6 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
         if device.kind == "discrete" && cuda_index.is_some() {
             cuda_ids.push(cuda_index.unwrap());
             discrete_vram.push(vram_gb);
-        }
-        if device.kind == "cpu" {
-            has_cpu = true;
-        }
-        if device.kind == "integrated" {
-            has_integrated = true;
         }
 
         pool_devices.push(PoolDevice {
@@ -77,12 +69,17 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
         )
     };
 
-    let strategy = if cuda_ids.len() > 1 {
-        PoolStrategy::TensorParallel
-    } else if cuda_ids.len() == 1 && (has_cpu || has_integrated) {
-        PoolStrategy::GpuWithCpuOffload
-    } else if cuda_ids.is_empty() {
+    let total_discrete_vram: u32 = discrete_vram.iter().copied().sum();
+
+    let strategy = if cuda_ids.is_empty() {
         PoolStrategy::CpuOnly
+    } else if cuda_ids.len() > 1 && total_discrete_vram >= 48 {
+        PoolStrategy::TensorParallel
+    } else if total_discrete_vram < 48 {
+        // Laptops / single-GPU hosts: offload layers to CPU RAM instead of OOM on load.
+        PoolStrategy::GpuWithCpuOffload
+    } else if cuda_ids.len() > 1 {
+        PoolStrategy::TensorParallel
     } else {
         PoolStrategy::Single
     };
@@ -97,9 +94,8 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     let gpu_layer_budget = match strategy {
         PoolStrategy::CpuOnly => 0,
         PoolStrategy::GpuWithCpuOffload => {
-            // Bias most layers to GPU, leave headroom for CPU RAM on old laptops.
-            let ratio = gpu_vram as f32 / total_vram_gb.max(1) as f32;
-            (ratio * 80.0).round().clamp(8.0, 80.0) as u32
+            // ~1 transformer block per 300 MiB VRAM (conservative for large quant models).
+            ((gpu_vram as f32 * 1024.0) / 300.0).round().clamp(1.0, 80.0) as u32
         }
         _ => 999,
     };

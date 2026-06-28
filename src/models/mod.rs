@@ -1,3 +1,4 @@
+mod capacity;
 mod download;
 mod storage;
 mod sync;
