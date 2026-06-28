@@ -121,7 +121,8 @@ pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
 
     let max_tokens = config.max_tokens.max(1).min(2048);
     let last = *restored.last().context("restored context missing last token")?;
-    let mut position = restored.len().saturating_sub(1) as i32;
+    // After state_load, KV ends at position (len - 1). Replay must start at len (= X + 1).
+    let mut position = restored.len() as i32;
 
     let mut batch = LlamaBatch::new(1, 1);
     batch
