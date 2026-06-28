@@ -1,7 +1,7 @@
 use crate::compute_pool::VirtualCard;
 use crate::models::capacity::can_host_model;
 use crate::models::download::download_catalog_model;
-use crate::models::storage::purge_incomplete_model_weights;
+use crate::models::storage::{model_weights_ready, purge_incomplete_model_weights};
 use crate::protocol::CatalogModel;
 use crate::state;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,7 @@ pub fn spawn_catalog_sync(
     agent_token: String,
     hf_token: Option<String>,
     cancel: Arc<AtomicBool>,
+    sync_in_flight: Arc<AtomicBool>,
     enabled_model_ids: std::collections::HashSet<String>,
 ) {
     if catalog.is_empty() {
@@ -27,9 +28,14 @@ pub fn spawn_catalog_sync(
         for model in catalog {
             if cancel.load(Ordering::Relaxed) {
                 state::set_downloading_model(None);
+                sync_in_flight.store(false, Ordering::Relaxed);
                 return;
             }
             if model.weights.is_none() {
+                continue;
+            }
+            let runtime_model = runtime_model_id(&model);
+            if model_weights_ready(runtime_model) {
                 continue;
             }
             if !enabled_model_ids.contains(&model.model_id) {
@@ -53,8 +59,8 @@ pub fn spawn_catalog_sync(
                 download_catalog_model(&model, &agent_token, hf_token.as_deref()).await;
             state::set_downloading_model(None);
             if cancel.load(Ordering::Relaxed) {
-                let runtime_model = runtime_model_id(&model);
                 purge_incomplete_model_weights(runtime_model);
+                sync_in_flight.store(false, Ordering::Relaxed);
                 return;
             }
             if let Err(err) = result {
@@ -67,6 +73,7 @@ pub fn spawn_catalog_sync(
             }
         }
         state::set_downloading_model(None);
+        sync_in_flight.store(false, Ordering::Relaxed);
     });
 }
 

@@ -42,8 +42,9 @@ struct SessionState {
     catalog: Vec<CatalogModel>,
     hf_token: Option<String>,
     last_sync_token: Option<String>,
-    weights_synced: bool,
     download_cancel: Arc<AtomicBool>,
+    sync_in_flight: Arc<AtomicBool>,
+    logged_download_blockers: bool,
 }
 
 impl SessionState {
@@ -60,8 +61,9 @@ impl SessionState {
             catalog: Vec::new(),
             hf_token: None,
             last_sync_token: None,
-            weights_synced: false,
             download_cancel: Arc::new(AtomicBool::new(false)),
+            sync_in_flight: Arc::new(AtomicBool::new(false)),
+            logged_download_blockers: false,
         }
     }
 
@@ -73,26 +75,48 @@ impl SessionState {
             .filter(|token| !token.is_empty())
     }
 
+    fn pending_weight_downloads(&self) -> Vec<CatalogModel> {
+        self.eligible_catalog_models()
+            .into_iter()
+            .filter(|model| model.weights.is_some())
+            .filter(|model| {
+                let runtime_model = if model.runtime_model.trim().is_empty() {
+                    model.model_id.as_str()
+                } else {
+                    model.runtime_model.as_str()
+                };
+                !model_weights_ready(runtime_model)
+            })
+            .collect()
+    }
+
+    fn needs_reregister(&self) -> bool {
+        self.register_model_ids() != self.advertised_models
+    }
+
     fn sync_model_weights(&mut self, server_token: Option<String>, agent_token: &str) {
-        if self.weights_synced {
+        let pending = self.pending_weight_downloads();
+        if pending.is_empty() {
+            if !self.logged_download_blockers {
+                self.log_download_blockers();
+                self.logged_download_blockers = true;
+            }
             return;
         }
-        let eligible = self.eligible_catalog_models();
-        if eligible.is_empty() {
+        if self.sync_in_flight.load(Ordering::Relaxed) {
             return;
         }
         let token = self.effective_hf_token(server_token);
-        let can_mirror = eligible.iter().any(|m| {
+        let can_mirror = pending.iter().any(|m| {
             m.weights
                 .as_ref()
                 .and_then(|w| w.mirror_url.as_deref())
                 .is_some_and(|url| !url.trim().is_empty())
         });
-        if token.is_none() && !can_mirror && eligible.iter().any(|m| m.weights.is_some()) {
+        if token.is_none() && !can_mirror {
             warn!("model downloads are not configured on the server yet (contact Scalattice support)");
             return;
         }
-        self.weights_synced = true;
         self.last_sync_token = token.clone();
         if let Some(token) = token.clone() {
             self.hf_token = Some(token);
@@ -108,26 +132,70 @@ impl SessionState {
         };
         info!(
             "starting model weight downloads for {} eligible model(s)",
-            eligible.len()
+            pending.len()
         );
-        let enabled_ids: std::collections::HashSet<String> = eligible
+        let enabled_ids: std::collections::HashSet<String> = pending
             .iter()
             .map(|model| model.model_id.clone())
             .collect();
+        self.sync_in_flight.store(true, Ordering::Relaxed);
         spawn_catalog_sync(
-            eligible,
+            pending,
             card,
             ram_gb,
             agent_token.to_string(),
             token,
             self.download_cancel.clone(),
+            self.sync_in_flight.clone(),
             enabled_ids,
         );
+    }
+
+    fn log_download_blockers(&self) {
+        let enabled: Vec<&CatalogModel> = self
+            .catalog
+            .iter()
+            .filter(|model| self.is_model_enabled(&model.model_id))
+            .filter(|model| model.weights.is_some())
+            .collect();
+        if enabled.is_empty() {
+            return;
+        }
+        let specs = self.enabled_devices();
+        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
+        let card = match build_virtual_card(&specs.compute_devices) {
+            Ok(card) => card,
+            Err(err) => {
+                warn!("model downloads blocked: {err:#}");
+                return;
+            }
+        };
+        for model in enabled {
+            let runtime_model = if model.runtime_model.trim().is_empty() {
+                model.model_id.as_str()
+            } else {
+                model.runtime_model.as_str()
+            };
+            if model_weights_ready(runtime_model) {
+                continue;
+            }
+            if !can_host_model(model, &card, ram_gb) {
+                warn!(
+                    "model {} cannot run on this machine (needs {} GB VRAM / {} GB RAM; virtual card has {} GB VRAM, {} GB RAM)",
+                    model.model_id,
+                    model.min_vram_gb.unwrap_or(0),
+                    model.min_ram_gb.unwrap_or(0),
+                    card.total_vram_gb,
+                    ram_gb
+                );
+            }
+        }
     }
 
     fn cancel_active_downloads(&mut self) {
         self.download_cancel.store(true, Ordering::Relaxed);
         self.download_cancel = Arc::new(AtomicBool::new(false));
+        self.sync_in_flight.store(false, Ordering::Relaxed);
         state::set_downloading_model(None);
     }
 
@@ -156,7 +224,7 @@ impl SessionState {
         if self.model_policy != next {
             self.cancel_active_downloads();
             self.model_policy = next;
-            self.weights_synced = false;
+            self.logged_download_blockers = false;
             self.prune_disabled_model_weights();
         }
     }
@@ -250,6 +318,32 @@ impl SessionState {
         Ok(engine)
     }
 
+    fn count_blocked_enabled_models(&self) -> usize {
+        let specs = self.enabled_devices();
+        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
+        let card = match build_virtual_card(&specs.compute_devices) {
+            Ok(card) => card,
+            Err(_) => return 0,
+        };
+
+        self.catalog
+            .iter()
+            .filter(|model| self.is_model_enabled(&model.model_id))
+            .filter(|model| model.weights.is_some())
+            .filter(|model| {
+                let runtime_model = if model.runtime_model.trim().is_empty() {
+                    model.model_id.as_str()
+                } else {
+                    model.runtime_model.as_str()
+                };
+                if model_weights_ready(runtime_model) {
+                    return false;
+                }
+                !can_host_model(model, &card, ram_gb)
+            })
+            .count()
+    }
+
     fn runtime(&self) -> crate::runtime::AgentRuntime {
         let specs = self.enabled_devices();
         let loaded_models = InferenceEngine::new(&specs.compute_devices)
@@ -257,6 +351,13 @@ impl SessionState {
             .unwrap_or_default();
         let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
         let downloading = crate::state::downloading_model();
+        let blocked_models = if downloading.is_some() || !loaded_models.is_empty() {
+            0
+        } else if self.pending_weight_downloads().is_empty() {
+            self.count_blocked_enabled_models()
+        } else {
+            0
+        };
 
         build_runtime(
             self.job_state,
@@ -265,6 +366,7 @@ impl SessionState {
             &loaded_models,
             enabled_count,
             downloading.as_deref(),
+            blocked_models,
         )
     }
 
@@ -340,9 +442,20 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
                 }
             }
             _ = heartbeat.tick() => {
-                let registered = state.lock().await.registered;
+                let registered = {
+                    let mut guard = state.lock().await;
+                    if guard.registered {
+                        guard.sync_model_weights(guard.hf_token.clone(), &config.token);
+                    }
+                    guard.registered
+                };
                 if registered {
-                    send_heartbeat(&state, &mut write).await?;
+                    let reregister = state.lock().await.needs_reregister();
+                    if reregister {
+                        send_register_message(&state, &mut write).await?;
+                    } else {
+                        send_heartbeat(&state, &mut write).await?;
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -352,6 +465,28 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -> Result<()> {
+    let register = {
+        let mut guard = state.lock().await;
+        let models = guard.register_model_ids();
+        guard.advertised_models = models.clone();
+        let specs = guard.live_specs();
+        let runtime = guard.runtime();
+        RegisterMessage {
+            kind: "register",
+            models,
+            gpu_name: specs.gpu_name.clone(),
+            vram_gb: specs.vram_gb,
+            specs: Some(specs),
+            runtime: Some(runtime),
+        }
+    };
+    write
+        .send(Message::Text(serde_json::to_string(&register)?))
+        .await?;
     Ok(())
 }
 
@@ -391,37 +526,13 @@ async fn handle_server_message(
                         guard.apply_model_policy(&ready.enabled_models);
                         guard.catalog = ready.catalog.clone();
                         guard.last_sync_token = None;
-                        guard.weights_synced = false;
                         guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);
                         guard.persist_local_state();
                     }
                     if let Ok(engine) = state.lock().await.refresh_inference() {
                         let _ = crate::inference::warm_pool_devices(engine.pool()).await;
                     }
-                    let models = {
-                        let guard = state.lock().await;
-                        guard.register_model_ids()
-                    };
-                    let specs = {
-                        let guard = state.lock().await;
-                        guard.live_specs()
-                    };
-                    let runtime = {
-                        let mut guard = state.lock().await;
-                        guard.advertised_models = models.clone();
-                        guard.runtime()
-                    };
-                    let register = RegisterMessage {
-                        kind: "register",
-                        models,
-                        gpu_name: specs.gpu_name.clone(),
-                        vram_gb: specs.vram_gb,
-                        specs: Some(specs),
-                        runtime: Some(runtime),
-                    };
-                    write
-                        .send(Message::Text(serde_json::to_string(&register)?))
-                        .await?;
+                    send_register_message(&state, &mut write).await?;
                 }
                 "registered" => {
                     let reg = parse_registered(data)?;
@@ -453,9 +564,7 @@ async fn handle_server_message(
                         let mut guard = state.lock().await;
                         guard.apply_compute_devices(&pong.compute_devices);
                         guard.apply_model_policy(&pong.enabled_models);
-                        if !guard.weights_synced {
-                            guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
-                        }
+                        guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
                         guard.persist_local_state();
                     }
                 }

@@ -178,18 +178,6 @@ pub fn cloud_connection_line() -> String {
     "Scalattice Cloud: not connected".to_string()
 }
 
-pub fn server_status_line() -> String {
-    agent_activity_summary()
-        .map(|summary| {
-            if let Some(node) = summary.node_id {
-                format!("{} · node {node}", summary.status)
-            } else {
-                summary.status
-            }
-        })
-        .unwrap_or_else(|| "not connected".to_string())
-}
-
 pub struct AgentActivitySummary {
     pub status: String,
     pub node_id: Option<String>,

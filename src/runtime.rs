@@ -39,6 +39,7 @@ pub fn build_runtime(
     loaded_models: &[String],
     enabled_compute_devices: usize,
     downloading_model: Option<&str>,
+    blocked_enabled_models: usize,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
     let status_label = status_label(
@@ -47,6 +48,7 @@ pub fn build_runtime(
         active_model_id.as_deref(),
         enabled_compute_devices,
         downloading_model,
+        blocked_enabled_models,
     );
 
     AgentRuntime {
@@ -74,6 +76,7 @@ fn status_label(
     active_model_id: Option<&str>,
     enabled_compute_devices: usize,
     downloading_model: Option<&str>,
+    blocked_enabled_models: usize,
 ) -> String {
     if job_state == JobState::Busy {
         let model = active_model_id.unwrap_or("inference");
@@ -87,6 +90,12 @@ fn status_label(
     }
     if ready {
         return "Ready for inference".to_string();
+    }
+    if blocked_enabled_models > 0 {
+        if blocked_enabled_models == 1 {
+            return "Enabled model won't fit this machine".to_string();
+        }
+        return format!("{blocked_enabled_models} enabled models won't fit this machine");
     }
     if enabled_compute_devices > 1 {
         return format!("Waiting for model weights ({enabled_compute_devices} devices)");

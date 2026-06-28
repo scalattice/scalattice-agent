@@ -638,14 +638,7 @@ pub fn detect_cpu_model() -> Option<String> {
 }
 
 pub fn detect_ram_gb() -> Option<u32> {
-    let linux = detect_linux_memtotal_gb();
-    let host = detect_wsl_host_ram_gb();
-    match (linux, host) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    detect_linux_memtotal_gb()
 }
 
 fn detect_linux_memtotal_gb() -> Option<u32> {
@@ -657,47 +650,6 @@ fn detect_linux_memtotal_gb() -> Option<u32> {
         .and_then(|value| value.parse::<u64>().ok())?;
 
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
-}
-
-fn detect_wsl_host_ram_gb() -> Option<u32> {
-    if !std::path::Path::new("/usr/lib/wsl/lib").is_dir() {
-        return None;
-    }
-
-    for (bin, args) in [
-        (
-            "powershell.exe",
-            vec![
-                "-NoProfile",
-                "-Command",
-                "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
-            ],
-        ),
-        (
-            "powershell.exe",
-            vec![
-                "-NoProfile",
-                "-Command",
-                "(Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum",
-            ],
-        ),
-    ] {
-        let output = std::process::Command::new(bin).args(args).output().ok()?;
-        if !output.status.success() {
-            continue;
-        }
-        let raw = String::from_utf8_lossy(&output.stdout);
-        let bytes = raw
-            .split_whitespace()
-            .filter_map(|token| token.parse::<u64>().ok())
-            .max()?;
-        if bytes == 0 {
-            continue;
-        }
-        return Some(((bytes as f64) / 1024.0 / 1024.0 / 1024.0).round().max(1.0) as u32);
-    }
-
-    None
 }
 
 pub fn detect_cuda_version() -> Option<String> {
