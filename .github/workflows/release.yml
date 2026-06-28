@@ -174,7 +174,7 @@ jobs:
       - name: Local release already published
         if: needs.meta.outputs.local == 'true'
         run: |
-          echo "Prebuilt tarballs were uploaded by scripts/publish-release.sh — nothing to compile."
+          echo "Prebuilt tarballs were uploaded by scripts/release.sh — nothing to compile."
 
       - uses: actions/download-artifact@v4
         if: needs.meta.outputs.local != 'true'
