@@ -171,6 +171,115 @@ pub fn uninstall_user_service() -> Result<()> {
     Ok(())
 }
 
+pub struct UninstallOptions {
+    pub yes: bool,
+    pub purge_models: bool,
+}
+
+pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
+    let home = home_dir()?;
+    let install_dir = install_dir(&home);
+    let lib_dir = lib_dir(&home);
+    let config_dir = home.join(".config/scalattice");
+    let models_dir = home.join(".cache/scalattice/models");
+    let cache_dir = home.join(".cache/scalattice");
+
+    let mut targets: Vec<PathBuf> = vec![
+        install_dir.join("scalattice-agent"),
+        lib_dir.clone(),
+        config_dir.join("agent.env"),
+        config_dir.join("agent.systemd.env"),
+        config_dir.join("agent.state.json"),
+        systemd_user_unit_path(&home),
+    ];
+
+    if opts.purge_models {
+        targets.push(models_dir);
+    }
+
+    if !opts.yes {
+        println!("This will remove Scalattice agent from this machine:");
+        if systemd_available() {
+            println!("  - stop and disable user systemd service ({UNIT_NAME})");
+        }
+        for path in &targets {
+            println!("  - {}", path.display());
+        }
+        if !opts.purge_models {
+            println!("  (model weights in {} are kept — add --purge to delete them)", models_dir.display());
+        }
+        bail!("Re-run with --yes to confirm: scalattice-agent uninstall --yes");
+    }
+
+    if systemd_available() {
+        uninstall_user_service()?;
+    }
+
+    for path in &targets {
+        remove_path_quiet(path);
+    }
+
+    if config_dir.is_dir() && is_dir_empty(&config_dir) {
+        let _ = fs::remove_dir(&config_dir);
+    }
+
+    if opts.purge_models && cache_dir.is_dir() && is_dir_empty(&cache_dir) {
+        let _ = fs::remove_dir(&cache_dir);
+    }
+
+    println!("Scalattice agent uninstalled.");
+    if !opts.purge_models && models_dir.is_dir() {
+        println!(
+            "Model weights kept at {} (re-run with --purge to delete)",
+            models_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn install_dir(home: &Path) -> PathBuf {
+    if let Ok(dir) = std::env::var("SCALATTICE_INSTALL_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    home.join(".local/bin")
+}
+
+fn lib_dir(home: &Path) -> PathBuf {
+    if let Ok(dir) = std::env::var("SCALATTICE_LIB_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    home.join(".local/lib/scalattice")
+}
+
+fn remove_path_quiet(path: &Path) {
+    if path.is_dir() {
+        match fs::remove_dir_all(path) {
+            Ok(()) => println!("Removed {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!("Warning: could not remove {}: {err}", path.display()),
+        }
+        return;
+    }
+
+    match fs::remove_file(path) {
+        Ok(()) => println!("Removed {}", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!("Warning: could not remove {}: {err}", path.display()),
+    }
+}
+
+fn is_dir_empty(path: &Path) -> bool {
+    fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+}
+
 pub fn restart_user_service() -> Result<()> {
     run_systemctl(&["--user", "daemon-reload"])?;
     run_systemctl(&["--user", "restart", UNIT_NAME])?;

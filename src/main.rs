@@ -47,6 +47,15 @@ enum Commands {
         #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
         token: String,
     },
+    /// Remove the agent, background service, config, and bundled libraries
+    Uninstall {
+        /// Confirm removal (required)
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Also delete downloaded model weights (~/.cache/scalattice/models)
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -101,6 +110,12 @@ async fn main() -> Result<()> {
                 service::restart_user_service()?;
             }
             println!("token updated in agent.env");
+        }
+        Commands::Uninstall { yes, purge } => {
+            service::uninstall_agent(&service::UninstallOptions {
+                yes,
+                purge_models: purge,
+            })?;
         }
     }
 
