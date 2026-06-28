@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     name = "scalattice-agent",
-    about = "Scalattice GPU operator agent (open source)",
+    about = "Scalattice GPU operator agent",
     version
 )]
 struct Cli {
@@ -75,9 +75,9 @@ async fn main() -> Result<()> {
             service::persist_agent_token(&config.token)?;
             if service::systemd_available() {
                 service::start_background_from_config(&config)?;
-                println!("token saved — agent running in background");
+                println!("Token saved. Background agent running.");
             } else {
-                println!("token saved — run: scalattice-agent foreground");
+                println!("Token saved. Run: scalattice-agent foreground");
             }
         }
         Commands::Uninstall { yes, purge } => {
@@ -128,7 +128,7 @@ fn maybe_start_background_from_saved_token() -> Result<()> {
         service::BackgroundStatus::Stopped | service::BackgroundStatus::NotInstalled => {
             let config = config::AgentConfig::from_env_and_cli(None)?;
             service::start_background_from_config(&config)?;
-            println!("background: started");
+            println!("Background agent started.");
             Ok(())
         }
     }
@@ -136,33 +136,44 @@ fn maybe_start_background_from_saved_token() -> Result<()> {
 
 fn print_status() -> Result<()> {
     println!("scalattice-agent {}", env!("CARGO_PKG_VERSION"));
-    println!("{}", state::cloud_connection_line());
+    println!();
 
-    if !agent_token_configured() {
-        println!("token: not set — create one at https://scalattice.cloud/providers");
-        println!("set token: scalattice-agent set-token --token slt_provider_…");
+    let cloud_line = state::cloud_connection_line();
+    let cloud = cloud_line
+        .strip_prefix("Scalattice Cloud: ")
+        .unwrap_or(cloud_line.as_str());
+    println!("Cloud    {cloud}");
+
+    if agent_token_configured() {
+        println!("Token    set");
     } else {
-        println!("token: set");
+        println!("Token    not set");
+        println!("         Create one at https://scalattice.cloud/providers");
+        println!("         scalattice-agent set-token --token slt_provider_…");
     }
 
     if service::systemd_available() {
-        match service::background_status() {
-            service::BackgroundStatus::Running => println!("background: running"),
-            service::BackgroundStatus::Stopped => println!("background: not running"),
-            service::BackgroundStatus::NotInstalled => {
-                println!("background: not started — run: scalattice-agent set-token --token …");
-            }
-        }
+        let service = match service::background_status() {
+            service::BackgroundStatus::Running => "running",
+            service::BackgroundStatus::Stopped => "stopped",
+            service::BackgroundStatus::NotInstalled => "not configured",
+        };
+        println!("Service  {service}");
     } else {
-        println!("background: systemd not available (use: scalattice-agent foreground)");
+        println!("Service  systemd unavailable (use: scalattice-agent foreground)");
     }
 
     if agent_token_configured() {
-        println!("activity: {}", state::server_status_line());
+        if let Some(summary) = state::agent_activity_summary() {
+            println!("Status   {}", summary.status);
+            if let Some(node) = summary.node_id {
+                println!("Node     {node}");
+            }
+        }
     }
 
-    println!("dashboard: https://scalattice.cloud/providers");
-    println!("manage GPUs, models, and jobs in the provider dashboard");
+    println!();
+    println!("Dashboard https://scalattice.cloud/providers");
     Ok(())
 }
 

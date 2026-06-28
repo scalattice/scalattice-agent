@@ -58,7 +58,6 @@ pub fn ensure_service_running(config: &AgentConfig) -> Result<()> {
     } else if !was_active {
         run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
     } else {
-        println!("scalattice-agent is running in the background");
         return Ok(());
     }
 
@@ -333,12 +332,19 @@ pub fn service_active() -> bool {
     if !systemd_available() {
         return false;
     }
-    run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok()
+    systemctl_success(&["--user", "is-active", UNIT_NAME])
+}
+
+fn systemctl_success(args: &[&str]) -> bool {
+    Command::new("systemctl")
+        .args(args)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn verify_service_active() -> Result<()> {
-    if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok() {
-        println!("scalattice-agent is running in the background");
+    if systemctl_success(&["--user", "is-active", UNIT_NAME]) {
         return Ok(());
     }
 
@@ -446,10 +452,6 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
         .output()
         .context("failed to run systemctl")?;
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !stdout.is_empty() {
-            println!("{stdout}");
-        }
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

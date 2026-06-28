@@ -26,6 +26,8 @@ pub struct AgentRuntime {
     pub active_model_id: Option<String>,
     #[serde(rename = "statusLabel")]
     pub status_label: String,
+    #[serde(rename = "downloadingModel", skip_serializing_if = "Option::is_none")]
+    pub downloading_model: Option<String>,
     #[serde(rename = "loadedModels", skip_serializing_if = "Vec::is_empty")]
     pub loaded_models: Vec<String>,
 }
@@ -61,6 +63,7 @@ pub fn build_runtime(
             None
         },
         status_label,
+        downloading_model: downloading_model.map(str::to_string),
         loaded_models: loaded_models.to_vec(),
     }
 }
@@ -75,23 +78,18 @@ fn status_label(
     if job_state == JobState::Busy {
         let model = active_model_id.unwrap_or("inference");
         if enabled_compute_devices > 1 {
-            return format!("Running job across {enabled_compute_devices} devices · {model}");
+            return format!("Running {model} across {enabled_compute_devices} devices");
         }
-        return format!("Running job · {model}");
+        return format!("Running {model}");
     }
     if let Some(model) = downloading_model {
         return format!("Downloading {model}");
     }
     if ready {
-        if enabled_compute_devices > 1 {
-            return format!("Idle · virtual card ready across {enabled_compute_devices} devices");
-        }
-        return "Idle · ready for inference".to_string();
+        return "Ready for inference".to_string();
     }
     if enabled_compute_devices > 1 {
-        return format!(
-            "Connected · virtual {enabled_compute_devices}-device card · waiting for model weights"
-        );
+        return format!("Waiting for model weights ({enabled_compute_devices} devices)");
     }
-    "Connected · waiting for model weights".to_string()
+    "Waiting for model weights".to_string()
 }

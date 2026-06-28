@@ -179,40 +179,79 @@ pub fn cloud_connection_line() -> String {
 }
 
 pub fn server_status_line() -> String {
-    let Some(state) = read_state() else {
-        return "not connected (no active agent session)".to_string();
-    };
+    agent_activity_summary()
+        .map(|summary| {
+            if let Some(node) = summary.node_id {
+                format!("{} · node {node}", summary.status)
+            } else {
+                summary.status
+            }
+        })
+        .unwrap_or_else(|| "not connected".to_string())
+}
+
+pub struct AgentActivitySummary {
+    pub status: String,
+    pub node_id: Option<String>,
+}
+
+pub fn agent_activity_summary() -> Option<AgentActivitySummary> {
+    let state = read_state()?;
 
     if let Some(err) = &state.last_error {
         if !is_recent(state.updated_at_ms) {
-            return format!("not connected ({err})");
+            return Some(AgentActivitySummary {
+                status: format!("not connected ({err})"),
+                node_id: None,
+            });
         }
     }
 
     if !is_recent(state.updated_at_ms) {
         if service_hint() {
-            return "not connected (background service running but not registered - check: journalctl --user -u scalattice-agent -n 30)".to_string();
+            return Some(AgentActivitySummary {
+                status: "not registered (check: journalctl --user -u scalattice-agent -n 30)".to_string(),
+                node_id: state.node_id,
+            });
         }
-        return "not connected (save token with: scalattice-agent set-token --token …)".to_string();
+        return Some(AgentActivitySummary {
+            status: "not connected".to_string(),
+            node_id: None,
+        });
     }
 
     if state.server_registered {
-        let node = state
-            .node_id
-            .as_deref()
-            .unwrap_or("unknown");
-        let runtime = state
+        let status = state
             .status_label
             .as_deref()
-            .unwrap_or("registered");
-        return format!("connected · {runtime} · node {node}");
+            .map(normalize_status_label)
+            .unwrap_or_else(|| "registered".to_string());
+        return Some(AgentActivitySummary {
+            status,
+            node_id: state.node_id,
+        });
     }
 
     if state.server_connected {
-        return "connecting (waiting for server registration)".to_string();
+        return Some(AgentActivitySummary {
+            status: "connecting".to_string(),
+            node_id: state.node_id,
+        });
     }
 
-    "not connected".to_string()
+    Some(AgentActivitySummary {
+        status: "not connected".to_string(),
+        node_id: None,
+    })
+}
+
+fn normalize_status_label(label: &str) -> String {
+    let trimmed = label.trim();
+    let stripped = trimmed
+        .strip_prefix("Connected · ")
+        .or_else(|| trimmed.strip_prefix("Connected - "))
+        .unwrap_or(trimmed);
+    stripped.to_string()
 }
 
 fn service_hint() -> bool {
