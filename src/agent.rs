@@ -6,8 +6,7 @@ use crate::protocol::{
 };
 use crate::compute_pool::build_virtual_card;
 use crate::inference::{InferenceEngine, InferenceRequest};
-use crate::models::can_host_model;
-use crate::models::spawn_catalog_sync;
+use crate::models::{can_host_model, model_weights_ready, purge_incomplete_model_weights, spawn_catalog_sync};
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::{
     apply_compute_policy, build_specs_from_devices, detect_all_compute_devices, detect_cpu_model,
@@ -18,6 +17,7 @@ use crate::state;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -43,6 +43,7 @@ struct SessionState {
     hf_token: Option<String>,
     last_sync_token: Option<String>,
     weights_synced: bool,
+    download_cancel: Arc<AtomicBool>,
 }
 
 impl SessionState {
@@ -60,6 +61,7 @@ impl SessionState {
             hf_token: None,
             last_sync_token: None,
             weights_synced: false,
+            download_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -108,7 +110,39 @@ impl SessionState {
             "starting model weight downloads for {} eligible model(s)",
             eligible.len()
         );
-        spawn_catalog_sync(eligible, card, ram_gb, agent_token.to_string(), token);
+        let enabled_ids: std::collections::HashSet<String> = eligible
+            .iter()
+            .map(|model| model.model_id.clone())
+            .collect();
+        spawn_catalog_sync(
+            eligible,
+            card,
+            ram_gb,
+            agent_token.to_string(),
+            token,
+            self.download_cancel.clone(),
+            enabled_ids,
+        );
+    }
+
+    fn cancel_active_downloads(&mut self) {
+        self.download_cancel.store(true, Ordering::Relaxed);
+        self.download_cancel = Arc::new(AtomicBool::new(false));
+        state::set_downloading_model(None);
+    }
+
+    fn prune_disabled_model_weights(&self) {
+        for model in &self.catalog {
+            if self.is_model_enabled(&model.model_id) {
+                continue;
+            }
+            let runtime_model = if model.runtime_model.trim().is_empty() {
+                model.model_id.as_str()
+            } else {
+                model.runtime_model.as_str()
+            };
+            purge_incomplete_model_weights(runtime_model);
+        }
     }
 
     fn apply_model_policy(&mut self, models: &[ModelPolicyEntry]) {
@@ -120,8 +154,10 @@ impl SessionState {
             .map(|model| (model.model_id.clone(), model.enabled))
             .collect();
         if self.model_policy != next {
+            self.cancel_active_downloads();
             self.model_policy = next;
             self.weights_synced = false;
+            self.prune_disabled_model_weights();
         }
     }
 
@@ -155,6 +191,14 @@ impl SessionState {
     fn register_model_ids(&self) -> Vec<String> {
         self.eligible_catalog_models()
             .iter()
+            .filter(|model| {
+                let runtime_model = if model.runtime_model.trim().is_empty() {
+                    model.model_id.as_str()
+                } else {
+                    model.runtime_model.as_str()
+                };
+                model_weights_ready(runtime_model)
+            })
             .map(|m| m.model_id.clone())
             .collect()
     }
@@ -409,10 +453,8 @@ async fn handle_server_message(
                         let mut guard = state.lock().await;
                         guard.apply_compute_devices(&pong.compute_devices);
                         guard.apply_model_policy(&pong.enabled_models);
-                        if pong.hugging_face_token.is_some() && !guard.weights_synced {
+                        if !guard.weights_synced {
                             guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
-                        } else if !guard.weights_synced {
-                            guard.sync_model_weights(None, &config.token);
                         }
                         guard.persist_local_state();
                     }

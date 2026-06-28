@@ -56,7 +56,7 @@ pub fn model_weights_ready(runtime_model: &str) -> bool {
     };
     filenames
         .iter()
-        .all(|filename| is_download_complete(&target_gguf_path(runtime_model, filename)))
+        .all(|filename| is_manifest_weight_file(runtime_model, &target_gguf_path(runtime_model, filename)))
 }
 
 pub fn resolve_model_gguf(runtime_model: &str) -> Option<PathBuf> {
@@ -125,4 +125,44 @@ pub fn weight_filenames(weights: &crate::protocol::ModelWeights) -> Vec<&str> {
 
 pub fn is_download_complete(path: &Path) -> bool {
     path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// A weight file counts as cached only when listed in the model manifest.
+pub fn is_manifest_weight_file(runtime_model: &str, path: &Path) -> bool {
+    if !is_download_complete(path) {
+        return false;
+    }
+    let Some(filenames) = read_manifest_filenames(runtime_model) else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    filenames.iter().any(|filename| {
+        Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|basename| basename == name)
+    })
+}
+
+pub fn purge_incomplete_model_weights(runtime_model: &str) {
+    let dir = model_cache_dir(runtime_model);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("part") {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("manifest.json") {
+            continue;
+        }
+        if path.is_file() && !is_manifest_weight_file(runtime_model, &path) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }

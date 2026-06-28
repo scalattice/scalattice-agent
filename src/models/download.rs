@@ -1,5 +1,5 @@
 use crate::models::storage::{
-    ensure_model_dir, is_download_complete, target_gguf_path, weight_filenames,
+    ensure_model_dir, is_manifest_weight_file, target_gguf_path, weight_filenames,
 };
 use crate::protocol::{CatalogModel, ModelWeights};
 use anyhow::{bail, Context, Result};
@@ -36,9 +36,6 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
     if tmp.exists() {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
-    if dest.exists() && !is_download_complete(&dest) {
-        let _ = tokio::fs::remove_file(dest).await;
-    }
 
     let mut file = tokio::fs::File::create(&tmp)
         .await
@@ -72,7 +69,7 @@ fn mirror_url_for_filename(weights: &ModelWeights, repo_path: &str) -> Option<St
 fn weights_download_complete(runtime_model: &str, weights: &ModelWeights) -> bool {
     weight_filenames(weights)
         .iter()
-        .all(|filename| is_download_complete(&target_gguf_path(runtime_model, filename)))
+        .all(|filename| is_manifest_weight_file(runtime_model, &target_gguf_path(runtime_model, filename)))
 }
 
 async fn download_hf_file(
@@ -82,8 +79,11 @@ async fn download_hf_file(
     token: Option<&str>,
 ) -> Result<()> {
     let dest = target_gguf_path(runtime_model, repo_path);
-    if is_download_complete(&dest) {
+    if is_manifest_weight_file(runtime_model, &dest) {
         return Ok(());
+    }
+    if dest.exists() {
+        let _ = tokio::fs::remove_file(&dest).await;
     }
 
     ensure_model_dir(runtime_model).context("create model cache directory")?;
@@ -112,8 +112,11 @@ async fn download_mirror_file(
     agent_token: &str,
 ) -> Result<()> {
     let dest = target_gguf_path(runtime_model, repo_path);
-    if is_download_complete(&dest) {
+    if is_manifest_weight_file(runtime_model, &dest) {
         return Ok(());
+    }
+    if dest.exists() {
+        let _ = tokio::fs::remove_file(&dest).await;
     }
 
     ensure_model_dir(runtime_model).context("create model cache directory")?;
@@ -159,7 +162,7 @@ async fn download_mirror_gguf(
 
     for repo_path in weight_filenames(weights) {
         let dest = target_gguf_path(runtime_model, repo_path);
-        if is_download_complete(&dest) {
+        if is_manifest_weight_file(runtime_model, &dest) {
             continue;
         }
         let mirror_url = mirror_url_for_filename(weights, repo_path)
