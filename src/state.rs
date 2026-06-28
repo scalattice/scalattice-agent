@@ -88,9 +88,9 @@ pub fn touch_connection_state() {
 }
 
 pub fn mark_disconnected(error: Option<String>) {
-    let Some(path) = state_file_path() else {
+    if state_file_path().is_none() {
         return;
-    };
+    }
     let mut state = read_state().unwrap_or(AgentLocalState {
         status_label: None,
         downloading_model: None,
@@ -150,31 +150,6 @@ pub fn read_state() -> Option<AgentLocalState> {
     let path = state_file_path()?;
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
-}
-
-pub fn effective_machine_specs() -> crate::specs::MachineSpecs {
-    if let Some(state) = read_state() {
-        if is_recent(state.updated_at_ms) && !state.compute_devices.is_empty() {
-            return crate::specs::MachineSpecs {
-                compute_devices: state.compute_devices.clone(),
-                ..crate::specs::build_specs_from_devices(
-                    &state.compute_devices,
-                    crate::specs::detect_hostname(),
-                    crate::specs::detect_cpu_model(),
-                    crate::specs::detect_ram_gb(),
-                    crate::specs::detect_driver_version(),
-                    crate::specs::detect_cuda_version(),
-                )
-            };
-        }
-    }
-    crate::specs::detect_machine_specs()
-}
-
-pub fn agent_session_recent() -> bool {
-    read_state()
-        .map(|s| is_recent(s.updated_at_ms) && s.server_registered)
-        .unwrap_or(false)
 }
 
 pub fn cloud_connection_line() -> String {

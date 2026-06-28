@@ -75,7 +75,7 @@ pub fn detect_machine_specs() -> MachineSpecs {
     let hostname = detect_hostname();
     let cpu_model = detect_cpu_model();
     let ram_gb = detect_ram_gb();
-    let mut devices = detect_all_compute_devices();
+    let devices = detect_all_compute_devices();
     if devices.is_empty() {
         return MachineSpecs {
             hostname,

@@ -1,4 +1,4 @@
-use crate::compute_pool::{format_tensor_split, PoolStrategy, VirtualCard};
+use crate::compute_pool::VirtualCard;
 use crate::llm::{
     generate, split_lower, split_upper, GenerateConfig, SplitLowerConfig, SplitUpperConfig,
 };
@@ -40,10 +40,6 @@ impl InferenceEngine {
         list_cached_runtime_models()
     }
 
-    pub fn is_ready(&self) -> bool {
-        !self.loaded_models().is_empty()
-    }
-
     pub async fn invoke_split_lower(
         &self,
         runtime_model: &str,
@@ -59,7 +55,6 @@ impl InferenceEngine {
 
         let pool = self.pool.clone();
         let ids = prompt_token_ids.to_vec();
-        let runtime_model = runtime_model.to_string();
 
         tokio::task::spawn_blocking(move || {
             split_lower(&SplitLowerConfig {
@@ -88,7 +83,6 @@ impl InferenceEngine {
 
         let pool = self.pool.clone();
         let state_b64 = state_b64.to_string();
-        let runtime_model = runtime_model.to_string();
 
         let output = tokio::task::spawn_blocking(move || {
             split_upper(&SplitUpperConfig {
@@ -120,7 +114,6 @@ impl InferenceEngine {
 
         let pool = self.pool.clone();
         let messages = req.messages.to_vec();
-        let runtime_model = req.runtime_model.to_string();
 
         let output = tokio::task::spawn_blocking(move || {
             generate(&GenerateConfig {
@@ -134,7 +127,12 @@ impl InferenceEngine {
         .context("embedded inference task failed")??;
 
         if output.content.is_empty() {
-            anyhow::bail!("embedded inference returned empty output for {runtime_model}");
+            anyhow::bail!(
+                "embedded inference returned empty output for {} / {} (job {})",
+                req.model_id,
+                req.runtime_model,
+                req.job_id
+            );
         }
 
         Ok(InferenceResult {

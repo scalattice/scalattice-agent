@@ -106,7 +106,7 @@ async fn download_hf_file(
 
 async fn download_mirror_file(
     runtime_model: &str,
-    weights: &ModelWeights,
+    _weights: &ModelWeights,
     repo_path: &str,
     mirror_url: &str,
     agent_token: &str,

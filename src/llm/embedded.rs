@@ -8,8 +8,9 @@ use llama_cpp_2::LogOptions;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -36,8 +37,11 @@ pub fn init_backend() -> Result<()> {
     backend().map(|_| ())
 }
 
-pub fn embedded_available() -> bool {
-    true
+pub(crate) fn decode_token(model: &LlamaModel, token: LlamaToken) -> Result<String> {
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    model
+        .token_to_piece(token, &mut decoder, true, None)
+        .context("decode generated token")
 }
 
 pub(crate) fn backend() -> Result<&'static LlamaBackend> {
@@ -103,9 +107,7 @@ pub fn generate(config: &GenerateConfig) -> Result<GenerateOutput> {
             break;
         }
 
-        let piece = model
-            .token_to_str(token, Special::Tokenize)
-            .context("decode generated token")?;
+        let piece = decode_token(&model, token)?;
         content.push_str(&piece);
 
         batch.clear();

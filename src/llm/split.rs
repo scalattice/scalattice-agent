@@ -5,13 +5,13 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{LlamaModel, Special};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
-use super::embedded::{backend, model_params_for_pool, GenerateOutput};
+use super::embedded::{backend, decode_token, model_params_for_pool, GenerateOutput};
 
 #[derive(Debug, Clone)]
 pub struct SplitLowerConfig {
@@ -145,9 +145,7 @@ pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
             break;
         }
 
-        let piece = model
-            .token_to_str(token, Special::Tokenize)
-            .context("decode generated token")?;
+        let piece = decode_token(&model, token)?;
         content.push_str(&piece);
 
         batch.clear();

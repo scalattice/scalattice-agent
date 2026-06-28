@@ -1166,6 +1166,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "encoding_rs",
  "futures-util",
  "llama-cpp-2",
  "reqwest",

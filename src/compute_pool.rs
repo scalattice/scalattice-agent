@@ -2,6 +2,7 @@ use crate::specs::ComputeDevice;
 use anyhow::{bail, Result};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PoolDevice {
     pub id: String,
     pub kind: String,
@@ -25,6 +26,7 @@ pub struct VirtualCard {
     pub display_name: String,
     pub total_vram_gb: u32,
     /// Fraction of model tensors per CUDA device (sums to 1.0). Empty when CPU-only.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub tensor_split: Vec<f32>,
     pub cuda_device_ids: Vec<u32>,
     /// Layers to keep on GPU when CPU offload is active (0 = CPU-only path).
@@ -117,14 +119,6 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
         cuda_device_ids: cuda_ids,
         gpu_layer_budget,
     })
-}
-
-pub fn format_tensor_split(split: &[f32]) -> String {
-    split
-        .iter()
-        .map(|value| format!("{:.3}", value))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 pub fn format_vram(gb: u32) -> String {
