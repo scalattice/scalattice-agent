@@ -82,22 +82,14 @@ We may close PRs that bypass this process without review.
 
 ## Releases
 
-Maintainers publish from a build machine with `./scripts/release.sh` (see
-[scripts/README.md](scripts/README.md)). That bumps the version, compiles locally,
-uploads tarballs to GitHub Releases, and tags with `[local]` so CI skips the
-~1h compile job.
+After code changes, from a machine with Rust + CUDA dev tools:
 
 ```bash
-./scripts/release.sh              # full release
-./scripts/release.sh --skip-build   # upload an existing dist/ tarball
+./scripts/release.sh
 ```
 
-Binaries live on the
-[Releases](https://github.com/Robottik-Software/Scalattice-Client/releases) page
-and are served via `https://scalattice.cloud/install/agent`.
-
-The curl installer script is maintained in **scalattice-server**
-(`frontend/public/install/agent`), not in this repo.
+That builds x86_64 locally, aarch64 in GitHub Actions, and publishes both tarballs.
+See [scripts/README.md](scripts/README.md).
 
 Do not push tags or publish releases unless you are an authorized maintainer.
 

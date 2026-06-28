@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One-command release: bump version, build, commit, push, publish to GitHub.
+# One-command release: x86_64 locally + aarch64 via GitHub Actions → one GitHub Release.
 #
 # Usage:
-#   ./scripts/release.sh                 # publish current or next patch version
-#   ./scripts/release.sh --skip-build    # upload existing dist/ tarball (same version)
-#   ./scripts/release.sh --version 1.0.32
-#   ./scripts/release.sh --minor         # bump minor instead of patch
-#   ./scripts/release.sh --extra dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz
+#   ./scripts/release.sh                 # bump patch, build both archs, publish
+#   ./scripts/release.sh --skip-build    # reuse dist/ x86 tarball; still builds aarch64 in CI
+#   ./scripts/release.sh --skip-aarch64  # x86_64 only (not recommended)
+#   ./scripts/release.sh --version 1.0.2
+#   ./scripts/release.sh --minor
 #
 # Requires: rust, CUDA 12.6 dev, gh auth login (see scripts/README.md).
 set -euo pipefail
@@ -17,11 +17,25 @@ REMOTE="origin"
 BUMP="patch"
 EXPLICIT_VERSION=""
 SKIP_BUILD="false"
+SKIP_AARCH64="false"
 NO_PUSH="false"
-EXTRA_ASSETS=()
+WORKFLOW_FILE=".github/workflows/release.yml"
 
 usage() {
-  sed -n '2,12p' "$0" | tr -d '#'
+  cat <<'EOF'
+Usage: ./scripts/release.sh [options]
+
+  Default: bump version, build x86_64 here, build aarch64 in GitHub Actions,
+  upload both tarballs to one GitHub Release.
+
+Options:
+  --skip-build      Skip local x86_64 compile (use existing dist/ tarball)
+  --skip-aarch64    Skip CI aarch64 build (x86_64 only — install script expects both)
+  --version X.Y.Z   Explicit version
+  --minor           Bump minor instead of patch
+  --no-push         Dry run (no push/release)
+  -h, --help
+EOF
   exit "${1:-0}"
 }
 
@@ -29,6 +43,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage 0 ;;
     --skip-build) SKIP_BUILD="true"; shift ;;
+    --skip-aarch64) SKIP_AARCH64="true"; shift ;;
     --no-push) NO_PUSH="true"; shift ;;
     --minor) BUMP="minor"; shift ;;
     --patch) BUMP="patch"; shift ;;
@@ -40,10 +55,6 @@ while [[ $# -gt 0 ]]; do
       REMOTE="${2:?--remote requires name}"
       shift 2
       ;;
-    --extra)
-      EXTRA_ASSETS+=("${2:?--extra requires a tarball path}")
-      shift 2
-      ;;
     *)
       echo "Unknown option: $1" >&2
       usage 1
@@ -52,10 +63,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
+  command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
     exit 1
-  fi
+  }
 }
 
 cargo_version() {
@@ -72,9 +83,7 @@ version_gt() {
 }
 
 bump_version() {
-  local ver="$1"
-  local kind="$2"
-  local major minor patch
+  local ver="$1" kind="$2" major minor patch
   IFS=. read -r major minor patch <<< "$ver"
   case "$kind" in
     minor) echo "${major}.$((minor + 1)).0" ;;
@@ -84,15 +93,11 @@ bump_version() {
 }
 
 latest_tag_version() {
-  git tag -l 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null \
-    | sed 's/^v//' \
-    | sort -V \
-    | tail -1
+  git tag -l 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | sed 's/^v//' | sort -V | tail -1
 }
 
 release_published() {
-  local tag="$1"
-  gh release view "$tag" >/dev/null 2>&1
+  gh release view "$1" >/dev/null 2>&1
 }
 
 resolve_version() {
@@ -100,22 +105,65 @@ resolve_version() {
     echo "$EXPLICIT_VERSION"
     return
   fi
-
-  local cargo_tag latest published_ver next
+  local cargo_tag latest published_ver
   cargo_tag="$(cargo_version)"
   latest="$(latest_tag_version)"
-
   if [[ -n "$latest" ]] && version_gt "$latest" "$cargo_tag"; then
     published_ver="$latest"
   else
     published_ver="$cargo_tag"
   fi
-
   if release_published "v${cargo_tag}"; then
-    next="$(bump_version "$published_ver" "$BUMP")"
-    echo "$next"
+    bump_version "$published_ver" "$BUMP"
   else
     echo "$cargo_tag"
+  fi
+}
+
+build_aarch64_in_ci() {
+  local tag="$1"
+  echo ""
+  echo "==> Building aarch64 in GitHub Actions (tag ${tag})"
+  echo "    This is ~30–60 min on a cold cache; the script waits until it finishes."
+
+  gh workflow run "$WORKFLOW_FILE" \
+    --ref main \
+    -f "tag=${tag}" \
+    -f "targets=aarch64-only"
+
+  local run_id=""
+  for _ in $(seq 1 30); do
+    sleep 2
+    run_id="$(gh run list --workflow="$WORKFLOW_FILE" --limit 5 --json databaseId,status -q \
+      '.[] | select(.status=="queued" or .status=="in_progress") | .databaseId' | head -1)"
+    [[ -n "$run_id" ]] && break
+  done
+
+  if [[ -z "$run_id" ]]; then
+    echo "Could not find started workflow run." >&2
+    exit 1
+  fi
+
+  echo "==> Watching run ${run_id}"
+  gh run watch "$run_id" --exit-status
+}
+
+verify_release_assets() {
+  local tag="$1"
+  local need_aarch64="$2"
+  local assets x86 aarch
+
+  assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
+  x86="$(echo "$assets" | grep -c 'x86_64' || true)"
+  aarch="$(echo "$assets" | grep -c 'aarch64' || true)"
+
+  if [[ "$x86" -lt 1 ]]; then
+    echo "Release ${tag} is missing x86_64 tarball." >&2
+    exit 1
+  fi
+  if [[ "$need_aarch64" == "true" && "$aarch" -lt 1 ]]; then
+    echo "Release ${tag} is missing aarch64 tarball." >&2
+    exit 1
   fi
 }
 
@@ -137,32 +185,24 @@ fi
 
 VERSION="$(resolve_version)"
 TAG="v${VERSION}"
-ARCHIVE="dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz"
+X86_ARCHIVE="dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz"
 
 if [[ "$(cargo_version)" != "$VERSION" ]]; then
   echo "==> Bumping Cargo.toml: $(cargo_version) → ${VERSION}"
   set_cargo_version "$VERSION"
 fi
 
-echo "==> Release ${TAG}"
+echo "==> Release ${TAG} (x86_64 local + aarch64 CI)"
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
-  if [[ ! -f "$ARCHIVE" ]]; then
-    echo "Missing ${ARCHIVE} — drop --skip-build to compile first." >&2
+  [[ -f "$X86_ARCHIVE" ]] || {
+    echo "Missing ${X86_ARCHIVE} — drop --skip-build to compile." >&2
     exit 1
-  fi
-  echo "==> Skipping build (using existing ${ARCHIVE})"
+  }
+  echo "==> Using existing ${X86_ARCHIVE}"
 else
   ./scripts/build-release.sh x86_64-unknown-linux-gnu
 fi
-
-ASSETS=("$ARCHIVE" "${EXTRA_ASSETS[@]}")
-for asset in "${ASSETS[@]}"; do
-  if [[ ! -f "$asset" ]]; then
-    echo "Missing release asset: ${asset}" >&2
-    exit 1
-  fi
-done
 
 if [[ -n "$(git status --porcelain Cargo.toml Cargo.lock 2>/dev/null)" ]]; then
   echo "==> Committing version files"
@@ -172,35 +212,39 @@ if [[ -n "$(git status --porcelain Cargo.toml Cargo.lock 2>/dev/null)" ]]; then
 fi
 
 if [[ "$NO_PUSH" == "true" ]]; then
-  echo "==> --no-push: stopping before push/release"
-  echo "    Would publish: ${TAG}"
-  echo "    Assets: ${ASSETS[*]}"
+  echo "==> --no-push: stopping before publish"
   exit 0
 fi
 
 echo "==> Pushing main"
 git push "$REMOTE" main
 
-if git rev-parse "$TAG" >/dev/null 2>&1; then
-  echo "==> Replacing existing tag ${TAG}"
-  git tag -d "$TAG"
+if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&1; then
+  echo "==> Replacing existing ${TAG}"
+  git tag -d "$TAG" 2>/dev/null || true
   git push "$REMOTE" ":refs/tags/${TAG}" 2>/dev/null || true
   gh release delete "$TAG" --yes 2>/dev/null || true
 fi
 
-echo "==> Creating GitHub release (${TAG} — tag push will not trigger CI compile)"
-# Upload assets first, then create tag on GitHub. Do not git push tag before this.
-gh release create "$TAG" "${ASSETS[@]}" \
+echo "==> Creating GitHub release with x86_64 tarball"
+gh release create "$TAG" "$X86_ARCHIVE" \
   --target main \
   --title "$TAG" \
-  --notes "[local] Published via scripts/release.sh"
+  --notes "Built via scripts/release.sh (x86_64 local, aarch64 GitHub Actions)."
 
-git fetch --tags "$REMOTE"
-git tag -d "$TAG" 2>/dev/null || true
-git fetch --tags "$REMOTE" "$TAG"
+git fetch --tags "$REMOTE" 2>/dev/null || true
+
+if [[ "$SKIP_AARCH64" != "true" ]]; then
+  build_aarch64_in_ci "$TAG"
+else
+  echo "==> Skipped aarch64 CI (--skip-aarch64)"
+fi
+
+verify_release_assets "$TAG" "$( [[ "$SKIP_AARCH64" == "true" ]] && echo false || echo true )"
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 echo ""
-echo "Done."
-echo "  Release: https://github.com/${REPO}/releases/tag/${TAG}"
-echo "  Asset:   https://github.com/${REPO}/releases/download/${TAG}/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz"
+echo "Done — ${TAG} published with:"
+gh release view "$TAG" --json assets -q '.assets[].name' | sed 's/^/  - /'
+echo ""
+echo "  https://github.com/${REPO}/releases/tag/${TAG}"

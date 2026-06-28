@@ -2,62 +2,57 @@
 
 | Script | Purpose |
 |--------|---------|
-| **`release.sh`** | **Start here.** Bump version, build, commit, push, and publish to GitHub Releases. |
-| `build-release.sh` | Build + package one Linux target (called by `release.sh`; use alone to compile only). |
-| `bundle-release-libs.sh` | Internal helper — copies shared libs into the release tarball. Not run directly. |
+| **`release.sh`** | **Run this after code changes.** Full release: x86_64 + aarch64 → GitHub Releases. |
+| `build-release.sh` | Build one target locally (used by `release.sh` for x86_64). |
+| `bundle-release-libs.sh` | Internal — bundles shared libs into tarballs. |
+| `reset-releases.sh` | Wipe all tags/releases and reset semver (keeps commit history). |
 
-## Release (maintainers)
-
-One command after setup:
+## Release workflow
 
 ```bash
 ./scripts/release.sh
 ```
 
-That will:
+One command:
 
-1. Pick the version (publish current `Cargo.toml` if not on GitHub yet, otherwise bump patch)
-2. Build the x86_64 tarball (~30 min first time, faster after)
-3. Commit `Cargo.toml` / `Cargo.lock`
-4. Push `main`, upload tarball, create GitHub release (CI only verifies — no compile)
+1. Bumps patch version (or publishes current if not on GitHub yet)
+2. Builds **x86_64** on your machine (~minutes with cache)
+3. Commits, pushes `main`, creates GitHub Release with x86 tarball
+4. Triggers **aarch64** build in GitHub Actions and **waits** for it
+5. Verifies both tarballs are on the release
 
-**Already built?** Skip recompile:
+The install script picks the right arch automatically:
+`scalattice-agent-x86_64-unknown-linux-gnu.tar.gz` or `scalattice-agent-aarch64-unknown-linux-gnu.tar.gz`.
 
-```bash
-./scripts/release.sh --skip-build
-```
+### Options
 
-**Options:** `--version 1.0.32` · `--minor` · `--extra dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz` · `--no-push` (dry run)
+| Flag | When |
+|------|------|
+| `--skip-build` | Reuse existing `dist/` x86 tarball; still builds aarch64 in CI |
+| `--skip-aarch64` | x86 only (not recommended — breaks ARM installs) |
+| `--version 1.0.2` | Pin version |
+| `--minor` | Bump minor instead of patch |
+| `--no-push` | Dry run |
 
-### Prerequisites (Ubuntu 24.04 x86_64)
+### Prerequisites (your build machine)
 
 - Rust: https://rustup.rs
 - GitHub CLI: `sudo apt install gh && gh auth login`
-- Build deps: `clang cmake build-essential pkg-config patchelf glslc libvulkan-dev libshaderc-dev spirv-tools`
-- CUDA 12.6 dev: see error output from `build-release.sh` or `.github/workflows/release.yml`
+- CUDA 12.6 dev + Vulkan (see `build-release.sh` error output if missing)
 
-### aarch64
-
-Build on ARM hardware, then attach to the same release:
+### Reset semver
 
 ```bash
-./scripts/build-release.sh aarch64-unknown-linux-gnu
-./scripts/release.sh --skip-build --extra dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz
-```
-
-(Use `--version` if you already published x86_64 for that tag.)
-
-### Reset tag/release history (keep commits)
-
-To wipe all `v*` tags and GitHub Releases and start semver at **1.0.0** again
-without rewriting `main`:
-
-```bash
-./scripts/reset-releases.sh --confirm --dry-run   # preview
-./scripts/reset-releases.sh --confirm             # delete tags/releases, set Cargo.toml to 1.0.0
+./scripts/reset-releases.sh --confirm --dry-run
+./scripts/reset-releases.sh --confirm
 git push origin main
-./scripts/release.sh --version 1.0.0              # must rebuild (old tarballs embed old version)
+./scripts/release.sh --version 1.0.0
 ```
 
-**Note:** Anyone using `releases/latest` or an old `v1.0.31` URL must reinstall after
-the new `v1.0.0` is published.
+### Fix v1.0.1 (x86 only, missing aarch64)
+
+```bash
+gh workflow run .github/workflows/release.yml --ref main \
+  -f tag=v1.0.1 -f targets=aarch64-only
+gh run watch   # pick the run id from gh run list
+```
