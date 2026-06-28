@@ -188,15 +188,16 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
   gh release delete "$TAG" --yes 2>/dev/null || true
 fi
 
-echo "==> Creating GitHub release (${TAG}, [local] tag — CI skips compile)"
-git tag -a "$TAG" -m "${TAG} [local]" -m "Published via scripts/release.sh"
-
-echo "==> Pushing tag ${TAG}"
-git push "$REMOTE" "$TAG"
-
+echo "==> Creating GitHub release (${TAG} — tag push will not trigger CI compile)"
+# Upload assets first, then create tag on GitHub. Do not git push tag before this.
 gh release create "$TAG" "${ASSETS[@]}" \
-  --generate-notes \
-  --title "$TAG"
+  --target main \
+  --title "$TAG" \
+  --notes "[local] Published via scripts/release.sh"
+
+git fetch --tags "$REMOTE"
+git tag -d "$TAG" 2>/dev/null || true
+git fetch --tags "$REMOTE" "$TAG"
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 echo ""

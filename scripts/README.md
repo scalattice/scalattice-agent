@@ -19,7 +19,7 @@ That will:
 1. Pick the version (publish current `Cargo.toml` if not on GitHub yet, otherwise bump patch)
 2. Build the x86_64 tarball (~30 min first time, faster after)
 3. Commit `Cargo.toml` / `Cargo.lock`
-4. Push `main`, create the GitHub release, push tag `vX.Y.Z [local]`
+4. Push `main`, upload tarball, create GitHub release (CI only verifies — no compile)
 
 **Already built?** Skip recompile:
 

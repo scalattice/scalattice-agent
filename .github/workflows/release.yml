@@ -4,69 +4,55 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      ci_build:
+        description: 'Compile release binaries in CI (~1h). Leave off when using scripts/release.sh'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  meta:
+  # Tag pushes from scripts/release.sh always upload assets first — never compile here.
+  verify:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    outputs:
-      local: ${{ steps.detect.outputs.local }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Detect local (prebuilt) release
-        id: detect
+      - name: Verify maintainer release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          LOCAL="false"
+          echo "Verifying release ${TAG} (no CI compile on tag push)."
 
-          SUBJECT="$(git tag -l --format='%(contents:subject)' "$TAG" 2>/dev/null || true)"
-          BODY="$(git tag -l --format='%(contents:body)' "$TAG" 2>/dev/null || true)"
-          echo "Tag subject: ${SUBJECT:-<empty>}"
-          echo "Tag body: ${BODY:-<empty>}"
-
-          if [[ "${SUBJECT}${BODY}" == *"[local]"* ]]; then
-            LOCAL="true"
-            echo "Matched [local] in tag message — skipping CI compile."
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "No GitHub release found for ${TAG}." >&2
+            exit 1
           fi
 
-          if [[ "$LOCAL" != "true" ]]; then
-            ASSET_COUNT="$(gh release view "$TAG" --json assets -q '.assets | length' 2>/dev/null || echo 0)"
-            if [[ "${ASSET_COUNT:-0}" -gt 0 ]]; then
-              LOCAL="true"
-              echo "Release already has ${ASSET_COUNT} asset(s) — skipping CI compile."
-            fi
+          ASSET_COUNT="$(gh release view "$TAG" --json assets -q '.assets | length')"
+          if [[ "${ASSET_COUNT:-0}" -lt 1 ]]; then
+            echo "Release ${TAG} has no uploaded assets." >&2
+            echo "Publish with: ./scripts/release.sh" >&2
+            exit 1
           fi
 
-          if [[ "$LOCAL" != "true" ]]; then
-            echo "CI will compile release binaries."
-          fi
-
-          echo "local=${LOCAL}" >> "$GITHUB_OUTPUT"
+          echo "Release ${TAG} has ${ASSET_COUNT} asset(s) — OK."
 
   build:
-    needs: meta
-    if: needs.meta.outputs.local != 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.ci_build == true
     strategy:
       fail-fast: false
       matrix:
         include:
-          # NVIDIA CUDA + AMD/Intel Vulkan; installer ships bundled runtime libs
           - id: x86_64-gpu
             target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             features: gpu
             no_default_features: false
             cuda_repo: ubuntu2404/x86_64
-
-          # Native ARM: NVIDIA SBSA CUDA + Vulkan (Jetson, Graviton, Mali, Adreno)
           - id: aarch64-gpu
             target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
@@ -86,23 +72,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang \
-            libclang-dev \
-            cmake \
-            build-essential \
-            pkg-config \
-            wget \
-            glslc \
-            libvulkan-dev \
-            spirv-headers \
-            libshaderc-dev \
-            spirv-tools \
-            libvulkan1 \
-            patchelf \
-            mesa-vulkan-drivers
-          echo "=== GPU build tools ==="
-          glslc --version
-          pkg-config --modversion vulkan || true
+            clang libclang-dev cmake build-essential pkg-config wget glslc \
+            libvulkan-dev spirv-headers libshaderc-dev spirv-tools libvulkan1 \
+            patchelf mesa-vulkan-drivers
 
       - name: Install CUDA toolkit (dev only, no driver)
         run: |
@@ -112,20 +84,12 @@ jobs:
           sudo dpkg -i "${keyring}"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cuda-nvcc-12-6 \
-            cuda-cudart-dev-12-6 \
-            cuda-nvrtc-dev-12-6 \
-            cuda-cccl-12-6 \
-            libcublas-dev-12-6 \
-            libcurand-dev-12-6
+            cuda-nvcc-12-6 cuda-cudart-dev-12-6 cuda-nvrtc-dev-12-6 \
+            cuda-cccl-12-6 libcublas-dev-12-6 libcurand-dev-12-6
           echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
           echo "PATH=/usr/local/cuda-12.6/bin:${PATH}" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
-          /usr/local/cuda-12.6/bin/nvcc --version
 
-      # First tagged release per target: ~50 min (llama.cpp + CUDA/Vulkan compile).
-      # Commit Cargo.lock and reuse tags with [local] for maintainer-built binaries instead.
-      # Later CI tags with unchanged deps: usually a few minutes (relink + changed crates only).
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -133,16 +97,6 @@ jobs:
           cache-targets: true
           cache-workspace-crates: true
           cache-on-failure: true
-          env-vars: |
-            CUDA_PATH
-            CMAKE_PREFIX_PATH
-            Vulkan_GLSLC_EXECUTABLE
-            CC
-            CXX
-            CFLAGS
-            CMAKE
-            RUST
-            CARGO
 
       - name: Build release binary
         env:
@@ -157,7 +111,6 @@ jobs:
             args+=(--no-default-features)
           fi
           args+=(--features "${{ matrix.features }}")
-          echo "cargo ${args[*]}"
           cargo "${args[@]}"
 
       - name: Package tarball
@@ -175,34 +128,23 @@ jobs:
           else
             tar -czf "dist/scalattice-agent-${TARGET}.tar.gz" -C dist scalattice-agent
           fi
-          echo "=== bundled libraries ==="
-          tar -tzf "dist/scalattice-agent-${TARGET}.tar.gz"
-          echo "=== dynamic deps (should be glibc + libcuda only) ==="
-          ldd dist/scalattice-agent || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: scalattice-agent-${{ matrix.target }}
           path: dist/scalattice-agent-${{ matrix.target }}.tar.gz
 
-  release:
-    needs: [meta, build]
-    if: always() && !cancelled() && (needs.meta.outputs.local == 'true' || needs.build.result == 'success')
+  release-ci:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.ci_build == true
     runs-on: ubuntu-latest
     steps:
-      - name: Local release already published
-        if: needs.meta.outputs.local == 'true'
-        run: |
-          echo "Prebuilt tarballs were uploaded by scripts/release.sh — nothing to compile."
-
       - uses: actions/download-artifact@v4
-        if: needs.meta.outputs.local != 'true'
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub release
-        if: needs.meta.outputs.local != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*.tar.gz
