@@ -93,9 +93,12 @@ jobs:
         run: choco install vulkan-sdk innosetup -y --no-progress
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-gpu
+          shared-key: release-windows-gpu-v2
           cache-targets: true
           cache-workspace-crates: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - name: Build + package
         shell: pwsh
         env:
