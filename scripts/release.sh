@@ -191,11 +191,12 @@ fi
 echo "==> Creating GitHub release (${TAG}, [local] tag — CI skips compile)"
 git tag -a "$TAG" -m "${TAG} [local]" -m "Published via scripts/release.sh"
 
+echo "==> Pushing tag ${TAG}"
+git push "$REMOTE" "$TAG"
+
 gh release create "$TAG" "${ASSETS[@]}" \
   --generate-notes \
   --title "$TAG"
-
-git push "$REMOTE" "$TAG"
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 echo ""

@@ -17,20 +17,39 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Detect local (prebuilt) release
         id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
+          LOCAL="false"
+
           SUBJECT="$(git tag -l --format='%(contents:subject)' "$TAG" 2>/dev/null || true)"
           BODY="$(git tag -l --format='%(contents:body)' "$TAG" 2>/dev/null || true)"
+          echo "Tag subject: ${SUBJECT:-<empty>}"
+          echo "Tag body: ${BODY:-<empty>}"
+
           if [[ "${SUBJECT}${BODY}" == *"[local]"* ]]; then
-            echo "local=true" >> "$GITHUB_OUTPUT"
-            echo "Local release tag — skipping CI compile."
-          else
-            echo "local=false" >> "$GITHUB_OUTPUT"
+            LOCAL="true"
+            echo "Matched [local] in tag message — skipping CI compile."
+          fi
+
+          if [[ "$LOCAL" != "true" ]]; then
+            ASSET_COUNT="$(gh release view "$TAG" --json assets -q '.assets | length' 2>/dev/null || echo 0)"
+            if [[ "${ASSET_COUNT:-0}" -gt 0 ]]; then
+              LOCAL="true"
+              echo "Release already has ${ASSET_COUNT} asset(s) — skipping CI compile."
+            fi
+          fi
+
+          if [[ "$LOCAL" != "true" ]]; then
             echo "CI will compile release binaries."
           fi
+
+          echo "local=${LOCAL}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: meta
