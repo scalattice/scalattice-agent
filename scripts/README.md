@@ -69,8 +69,7 @@ Install scripts pick the right artifact automatically:
 
 - Rust stable + Visual Studio C++ build tools
 - CUDA 12.6+ (`CUDA_PATH` if not in default location)
-- Vulkan SDK
-- Run: `.\scripts\build-release.ps1`
+- Run: `.\scripts\build-release.ps1` (builds with `win-gpu`: CUDA only)
 
 ### Reset semver
 

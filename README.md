@@ -41,12 +41,12 @@ Install scripts download self-contained releases from [GitHub](https://github.co
 
 ### Hardware support
 
-Release builds include **CUDA** (NVIDIA) and **Vulkan** (AMD/Intel/ARM) backends. The installer ships every library we are allowed to redistribute (Vulkan loader, llama.cpp modules, etc.) — no `apt install libvulkan1` or similar.
+Release builds include **CUDA** (NVIDIA) and **Vulkan** (AMD/Intel/ARM) backends on Linux. Windows releases use **CUDA only** (NVIDIA). The installer ships redistributable runtime libraries where allowed — no `apt install libvulkan1` or similar on Linux.
 
 | Hardware | What the host needs |
 |----------|---------------------|
-| NVIDIA GTX/RTX | NVIDIA driver installed (provides `libcuda.so`; standard on GPU workstations) |
-| AMD / Intel GPU | Vulkan ICD from the vendor (usually already present with GPU drivers) |
+| NVIDIA GTX/RTX | NVIDIA driver installed (provides `libcuda.so` / CUDA on Windows; standard on GPU workstations) |
+| AMD / Intel GPU | Vulkan ICD from the vendor (Linux releases only; usually already present with GPU drivers) |
 | CPU only | Nothing extra — agent connects; inference uses CPU backend |
 
 We cannot bundle NVIDIA's `libcuda.so` (license). Machines without a GPU driver still run the agent; GPU inference activates when the driver is present.
@@ -92,11 +92,11 @@ cargo build --release --no-default-features --features arm-gpu
 ```
 
 ```powershell
-# x86_64 Windows (NVIDIA CUDA + Vulkan) — run in PowerShell
+# x86_64 Windows (NVIDIA CUDA) — run in PowerShell
 .\scripts\build-release.ps1
 ```
 
-CI release binaries include **CUDA + Vulkan** on x86_64 Linux, aarch64 Linux, and x86_64 Windows.
+CI release binaries: **CUDA + Vulkan** on x86_64 and aarch64 Linux; **CUDA only** on x86_64 Windows.
 
 ## Community
 

@@ -3,10 +3,10 @@
 # Usage (PowerShell):
 #   .\scripts\build-release.ps1
 #
-# Requires: Rust stable, Visual Studio C++ build tools, CUDA 12.6+, Vulkan SDK
+# Requires: Rust stable, Visual Studio C++ build tools, CUDA 12.6+
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
-    [string]$Features = "gpu"
+    [string]$Features = "win-gpu"
 )
 
 $ErrorActionPreference = "Stop"

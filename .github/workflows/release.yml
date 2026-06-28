@@ -89,11 +89,11 @@ jobs:
         with:
           cuda: '12.6.3'
           method: 'network'
-      - name: Install Vulkan SDK + Inno Setup
-        run: choco install vulkan-sdk innosetup -y --no-progress
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-gpu-v2
+          shared-key: release-windows-gpu-v3
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -106,13 +106,6 @@ jobs:
           CARGO_INCREMENTAL: "0"
         run: |
           $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
-          $vulkanRoot = Get-ChildItem 'C:\VulkanSDK' -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending |
-            Select-Object -First 1
-          if ($vulkanRoot) {
-            $env:VULKAN_SDK = $vulkanRoot.FullName
-            $env:PATH = "$($vulkanRoot.FullName)\Bin;$env:PATH"
-          }
           .\scripts\build-release.ps1
       - uses: actions/upload-artifact@v4
         with:
