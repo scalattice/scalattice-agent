@@ -82,10 +82,36 @@ We may close PRs that bypass this process without review.
 
 ## Releases
 
-Tagged releases (`v*`) are cut by maintainers and built by GitHub Actions.
-Release binaries are published on the
+Tagged releases (`v*`) are cut by maintainers. Binaries are published on the
 [Releases](https://github.com/Robottik-Software/Scalattice-Client/releases) page
 and served via `https://scalattice.cloud/install/agent`.
+
+### Fast path (recommended): build on your machine
+
+CI compiles llama.cpp with CUDA/Vulkan from source — about an hour on a cold cache.
+**Do not commit binaries to git.** Upload them to GitHub Releases instead:
+
+```bash
+# bump version in Cargo.toml, commit, then:
+chmod +x scripts/build-release.sh scripts/publish-release.sh
+./scripts/publish-release.sh v1.0.31
+```
+
+That builds x86_64 locally, uploads tarballs, tags with `[local]`, and skips the
+CI compile job. For aarch64, build on ARM hardware first:
+
+```bash
+./scripts/build-release.sh aarch64-unknown-linux-gnu
+./scripts/publish-release.sh v1.0.31 origin dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz
+```
+
+Commit `Cargo.lock` after the first local build — it keeps CI cache hits high when
+you do let Actions compile.
+
+### Slow path: CI build on tag push
+
+Push a tag **without** `[local]` in the tag message (see `scripts/release-v1.0.*.sh`)
+and wait for GitHub Actions to compile both targets.
 
 The curl installer script is maintained in **scalattice-server**
 (`frontend/public/install/agent`), not in this repo. Edit it there and deploy

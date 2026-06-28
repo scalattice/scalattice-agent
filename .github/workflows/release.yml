@@ -9,7 +9,32 @@ permissions:
   contents: write
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      local: ${{ steps.detect.outputs.local }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect local (prebuilt) release
+        id: detect
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          SUBJECT="$(git tag -l --format='%(contents:subject)' "$TAG" 2>/dev/null || true)"
+          BODY="$(git tag -l --format='%(contents:body)' "$TAG" 2>/dev/null || true)"
+          if [[ "${SUBJECT}${BODY}" == *"[local]"* ]]; then
+            echo "local=true" >> "$GITHUB_OUTPUT"
+            echo "Local release tag — skipping CI compile."
+          else
+            echo "local=false" >> "$GITHUB_OUTPUT"
+            echo "CI will compile release binaries."
+          fi
+
   build:
+    needs: meta
+    if: needs.meta.outputs.local != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -80,7 +105,8 @@ jobs:
           /usr/local/cuda-12.6/bin/nvcc --version
 
       # First tagged release per target: ~50 min (llama.cpp + CUDA/Vulkan compile).
-      # Later tags with the same deps: usually a few minutes (relink + changed crates only).
+      # Commit Cargo.lock and reuse tags with [local] for maintainer-built binaries instead.
+      # Later CI tags with unchanged deps: usually a few minutes (relink + changed crates only).
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -141,15 +167,23 @@ jobs:
           path: dist/scalattice-agent-${{ matrix.target }}.tar.gz
 
   release:
-    needs: build
+    needs: [meta, build]
+    if: always() && !cancelled() && (needs.meta.outputs.local == 'true' || needs.build.result == 'success')
     runs-on: ubuntu-latest
     steps:
+      - name: Local release already published
+        if: needs.meta.outputs.local == 'true'
+        run: |
+          echo "Prebuilt tarballs were uploaded by scripts/publish-release.sh — nothing to compile."
+
       - uses: actions/download-artifact@v4
+        if: needs.meta.outputs.local != 'true'
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub release
+        if: needs.meta.outputs.local != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*.tar.gz
