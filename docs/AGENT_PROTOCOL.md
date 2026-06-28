@@ -153,8 +153,8 @@ The WebSocket endpoint is fixed at `wss://api.scalattice.cloud/v1/operators/agen
 
 ```bash
 scalattice-agent set-token --token slt_provider_…  # background (default after install)
-scalattice-agent foreground                        # blocking terminal, for debugging
-scalattice-agent status
+scalattice-agent foreground                        # follow live logs (Ctrl+C stops watching only)
+scalattice-agent status                            # also starts background if stopped
 scalattice-agent uninstall --yes                   # remove agent, service, and config
 scalattice-agent uninstall --yes --purge           # also delete cached model weights
 sudo loginctl enable-linger $USER                  # optional: start at boot without login

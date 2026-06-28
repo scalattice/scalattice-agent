@@ -46,20 +46,22 @@ pub fn ensure_service_running(config: &AgentConfig) -> Result<()> {
     let home = home_dir()?;
     let unit_path = systemd_user_unit_path(&home);
     let token_changed = persist_agent_token(&config.token)?;
+    let unit_changed = write_user_unit(&home)?;
 
     if !unit_path.is_file() {
-        install_user_service()?;
+        bail!("failed to write {}", unit_path.display());
+    }
+
+    sync_systemd_env_file(&home)?;
+    run_systemctl(&["--user", "daemon-reload"])?;
+
+    if token_changed || unit_changed {
+        let _ = run_systemctl(&["--user", "restart", UNIT_NAME]);
+    } else if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_err() {
+        run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
     } else {
-        sync_systemd_env_file(&home)?;
-        run_systemctl(&["--user", "daemon-reload"])?;
-        if token_changed {
-            let _ = run_systemctl(&["--user", "restart", UNIT_NAME]);
-        } else if run_systemctl(&["--user", "is-active", UNIT_NAME]).is_err() {
-            run_systemctl(&["--user", "start", UNIT_NAME])?;
-        } else {
-            println!("scalattice-agent is running in the background");
-            return Ok(());
-        }
+        println!("scalattice-agent is running in the background");
+        return Ok(());
     }
 
     verify_service_active()
@@ -119,9 +121,7 @@ pub fn persist_agent_token(token: &str) -> Result<bool> {
 
 pub fn install_user_service() -> Result<()> {
     let home = home_dir()?;
-    let unit_path = systemd_user_unit_path(&home);
     let env_file = home.join(".config/scalattice/agent.env");
-    let bin = resolve_agent_binary()?;
 
     if !env_file.is_file() {
         bail!(
@@ -150,15 +150,29 @@ pub fn install_user_service() -> Result<()> {
         );
     }
 
+    write_user_unit(&home)?;
     sync_systemd_env_file(&home)?;
 
-    let systemd_env = systemd_env_path(&home);
+    let unit_path = systemd_user_unit_path(&home);
+    println!("Wrote {}", unit_path.display());
+
+    run_systemctl(&["--user", "daemon-reload"])?;
+    run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
+    verify_service_active()?;
+    try_enable_linger(&home);
+    Ok(())
+}
+
+/// Write or refresh the user systemd unit. Returns true when the unit file changed.
+fn write_user_unit(home: &Path) -> Result<bool> {
+    let unit_path = systemd_user_unit_path(home);
+    let bin = resolve_agent_binary()?;
+    let systemd_env = systemd_env_path(home);
     let path_prefix = format!(
         "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         bin.parent().unwrap_or(Path::new("/usr/local/bin")).display()
     );
 
-    fs::create_dir_all(unit_path.parent().context("unit path parent")?)?;
     let unit = format!(
         r#"[Unit]
 Description=Scalattice GPU Agent
@@ -180,14 +194,32 @@ WantedBy=default.target
         env = systemd_env.display(),
         bin = bin.display(),
     );
-    fs::write(&unit_path, unit)?;
-    println!("Wrote {}", unit_path.display());
 
-    run_systemctl(&["--user", "daemon-reload"])?;
-    run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
-    verify_service_active()?;
-    try_enable_linger(&home);
-    Ok(())
+    let changed = if unit_path.is_file() {
+        let existing = fs::read_to_string(&unit_path).unwrap_or_default();
+        existing != unit
+    } else {
+        true
+    };
+
+    fs::create_dir_all(unit_path.parent().context("unit path parent")?)?;
+    fs::write(&unit_path, unit)?;
+    Ok(changed)
+}
+
+pub fn invoked_by_systemd() -> bool {
+    std::env::var("INVOCATION_ID").is_ok() || std::env::var("JOURNAL_STREAM").is_ok()
+}
+
+pub fn unit_installed() -> bool {
+    home_dir()
+        .ok()
+        .map(|home| systemd_user_unit_path(&home).is_file())
+        .unwrap_or(false)
+}
+
+pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
+    ensure_service_running(config)
 }
 
 pub fn uninstall_user_service() -> Result<()> {
@@ -319,7 +351,6 @@ pub fn restart_user_service() -> Result<()> {
 }
 
 /// Follow the background service log stream. Ctrl+C stops following only; the service keeps running.
-#[allow(dead_code)]
 pub fn follow_service_logs() -> Result<()> {
     if !systemd_available() {
         anyhow::bail!("systemd is not available on this system");
@@ -371,7 +402,7 @@ fn verify_service_active() -> Result<()> {
         .args(["--user", "status", UNIT_NAME, "--no-pager", "-n", "15"])
         .status();
 
-    bail!("scalattice-agent is not running - try: scalattice-agent foreground");
+    bail!("scalattice-agent is not running - try: scalattice-agent set-token --token …");
 }
 
 fn sync_systemd_env_file(home: &Path) -> Result<()> {

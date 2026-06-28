@@ -15,7 +15,7 @@ scalattice-agent status
 scalattice-agent status   # background agent starts automatically with --token
 ```
 
-Use `scalattice-agent foreground` for debugging in the terminal.
+Use `scalattice-agent foreground` to watch live logs from the background agent (Ctrl+C stops watching only).
 
 To remove the agent, service, and local config:
 

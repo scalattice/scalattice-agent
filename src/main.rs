@@ -27,9 +27,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run in the foreground (for debugging — stops the background agent first)
+    /// Follow live logs from the background agent (Ctrl+C stops watching only)
     Foreground {
-        #[arg(long, env = "SCALATTICE_AGENT_TOKEN")]
+        #[arg(long, env = "SCALATTICE_AGENT_TOKEN", hide = true)]
         token: Option<String>,
     },
     /// Show connection status and whether the background agent is running
@@ -64,21 +64,17 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Foreground { token } => {
-            if service::systemd_available() && service::service_active() {
-                service::stop_user_service()?;
-                println!("stopped background agent — running in foreground (Ctrl+C to exit)");
-            }
-            let config = config::AgentConfig::from_env_and_cli(token)?;
-            agent::run_agent(config).await?;
+            run_foreground(token).await?;
         }
         Commands::Status => {
             print_status()?;
+            maybe_start_background_from_saved_token()?;
         }
         Commands::SetToken { token } => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
             service::persist_agent_token(&config.token)?;
             if service::systemd_available() {
-                service::ensure_service_running(&config)?;
+                service::start_background_from_config(&config)?;
                 println!("token saved — agent running in background");
             } else {
                 println!("token saved — run: scalattice-agent foreground");
@@ -93,6 +89,49 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_foreground(token: Option<String>) -> Result<()> {
+    // systemd ExecStart — this process IS the background agent.
+    if service::invoked_by_systemd() {
+        let config = config::AgentConfig::from_env_and_cli(token)?;
+        return agent::run_agent(config).await;
+    }
+
+    // User command — watch the running agent without touching it.
+    if service::systemd_available() {
+        if !service::service_active() {
+            maybe_start_background_from_saved_token()?;
+        }
+        if service::service_active() {
+            println!("following background agent (Ctrl+C to stop watching only)");
+            return service::follow_service_logs();
+        }
+        anyhow::bail!("agent not running — run: scalattice-agent set-token --token slt_provider_…");
+    }
+
+    // No systemd (dev machines): run the agent in this terminal.
+    let config = config::AgentConfig::from_env_and_cli(token)?;
+    agent::run_agent(config).await
+}
+
+/// If a token is saved but the background unit is missing or stopped, start it.
+fn maybe_start_background_from_saved_token() -> Result<()> {
+    if !service::systemd_available() {
+        return Ok(());
+    }
+    if !agent_token_configured() {
+        return Ok(());
+    }
+    match service::background_status() {
+        service::BackgroundStatus::Running => Ok(()),
+        service::BackgroundStatus::Stopped | service::BackgroundStatus::NotInstalled => {
+            let config = config::AgentConfig::from_env_and_cli(None)?;
+            service::start_background_from_config(&config)?;
+            println!("background: started");
+            Ok(())
+        }
+    }
 }
 
 fn print_status() -> Result<()> {
