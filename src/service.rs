@@ -194,7 +194,7 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
     ];
 
     if opts.purge_models {
-        targets.push(models_dir);
+        targets.push(models_dir.clone());
     }
 
     if !opts.yes {
