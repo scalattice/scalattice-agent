@@ -283,6 +283,8 @@ fn sync_systemd_env_file(home: &Path) -> Result<()> {
         bail!("no variables found in {}", env_file.display());
     }
 
+    append_wsl_ld_library_path(&mut lines);
+
     fs::create_dir_all(systemd_env.parent().context("systemd env parent")?)?;
     fs::write(&systemd_env, format!("{}\n", lines.join("\n")))?;
     Ok(())
@@ -300,6 +302,25 @@ fn home_dir() -> Result<PathBuf> {
 
 fn systemd_user_unit_path(home: &Path) -> PathBuf {
     home.join(".config/systemd/user").join(UNIT_NAME)
+}
+
+fn append_wsl_ld_library_path(lines: &mut Vec<String>) {
+    const WSL_LIB: &str = "/usr/lib/wsl/lib";
+    if !Path::new(WSL_LIB).is_dir() {
+        return;
+    }
+
+    for line in lines.iter_mut() {
+        if let Some(value) = line.strip_prefix("LD_LIBRARY_PATH=") {
+            if value.split(':').any(|part| part == WSL_LIB) {
+                return;
+            }
+            *line = format!("LD_LIBRARY_PATH={WSL_LIB}:{value}");
+            return;
+        }
+    }
+
+    lines.push(format!("LD_LIBRARY_PATH={WSL_LIB}"));
 }
 
 fn resolve_agent_binary() -> Result<PathBuf> {

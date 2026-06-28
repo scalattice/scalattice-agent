@@ -200,24 +200,89 @@ fn sum_option(values: impl Iterator<Item = u32>) -> Option<u32> {
 }
 
 fn detect_nvidia_devices() -> Vec<ComputeDevice> {
-    for bin in [
+    for bin in nvidia_smi_bins() {
+        let devices = detect_nvidia_devices_from(bin);
+        if !devices.is_empty() {
+            return devices;
+        }
+    }
+    detect_nvidia_devices_from_procfs()
+}
+
+fn nvidia_smi_bins() -> Vec<&'static str> {
+    vec![
+        "/usr/lib/wsl/lib/nvidia-smi",
         "/usr/lib/nvidia/bin/nvidia-smi",
         "/usr/bin/nvidia-smi",
         "/usr/sbin/nvidia-smi",
         "/usr/local/bin/nvidia-smi",
         "/usr/local/cuda/bin/nvidia-smi",
         "nvidia-smi",
-    ] {
-        let devices = detect_nvidia_devices_from(bin);
-        if !devices.is_empty() {
-            return devices;
-        }
+    ]
+}
+
+fn wsl_nvidia_lib_dir() -> Option<&'static str> {
+    if std::path::Path::new("/usr/lib/wsl/lib").is_dir() {
+        Some("/usr/lib/wsl/lib")
+    } else {
+        None
     }
-    Vec::new()
+}
+
+fn configure_nvidia_smi_command(bin: &str) -> Command {
+    let mut cmd = Command::new(bin);
+    if let Some(wsl_lib) = wsl_nvidia_lib_dir() {
+        let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        let path = if existing.is_empty() {
+            wsl_lib.to_string()
+        } else if existing.split(':').any(|part| part == wsl_lib) {
+            existing
+        } else {
+            format!("{wsl_lib}:{existing}")
+        };
+        cmd.env("LD_LIBRARY_PATH", path);
+    }
+    cmd
+}
+
+fn detect_nvidia_devices_from_procfs() -> Vec<ComputeDevice> {
+    let root = std::path::Path::new("/proc/driver/nvidia/gpus");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    let mut devices = Vec::new();
+    for (index, entry) in entries.flatten().enumerate() {
+        let info_path = entry.path().join("information");
+        let Ok(raw) = std::fs::read_to_string(info_path) else {
+            continue;
+        };
+        let mut name = None;
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("Model:") {
+                let trimmed = rest.trim();
+                if !trimmed.is_empty() {
+                    name = Some(trimmed.to_string());
+                }
+            }
+        }
+        let Some(name) = name else { continue };
+        devices.push(ComputeDevice {
+            id: format!("nvidia:{index}"),
+            kind: "discrete".to_string(),
+            name,
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        });
+    }
+
+    devices
 }
 
 fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
-    let Ok(output) = Command::new(bin)
+    let Ok(output) = configure_nvidia_smi_command(bin)
         .args([
             "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
             "--format=csv,noheader,nounits",
@@ -580,13 +645,8 @@ pub fn detect_ram_gb() -> Option<u32> {
 }
 
 pub fn detect_cuda_version() -> Option<String> {
-    for bin in [
-        "/usr/bin/nvidia-smi",
-        "/usr/sbin/nvidia-smi",
-        "/usr/local/bin/nvidia-smi",
-        "nvidia-smi",
-    ] {
-        let output = match Command::new(bin)
+    for bin in nvidia_smi_bins() {
+        let output = match configure_nvidia_smi_command(bin)
             .args(["--query-gpu=cuda_version", "--format=csv,noheader"])
             .output()
         {
@@ -613,13 +673,8 @@ pub fn detect_cuda_version() -> Option<String> {
 }
 
 pub fn detect_driver_version() -> Option<String> {
-    for bin in [
-        "/usr/bin/nvidia-smi",
-        "/usr/sbin/nvidia-smi",
-        "/usr/local/bin/nvidia-smi",
-        "nvidia-smi",
-    ] {
-        let output = match Command::new(bin)
+    for bin in nvidia_smi_bins() {
+        let output = match configure_nvidia_smi_command(bin)
             .args(["--query-gpu=driver_version", "--format=csv,noheader"])
             .output()
         {

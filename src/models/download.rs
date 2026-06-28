@@ -34,7 +34,10 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
 
     let tmp = dest.with_extension("part");
     if tmp.exists() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    if dest.exists() && !is_download_complete(&dest) {
+        let _ = tokio::fs::remove_file(dest).await;
     }
 
     let mut file = tokio::fs::File::create(&tmp)
