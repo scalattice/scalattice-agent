@@ -54,6 +54,29 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-/usr}"
 export CUDA_PATH="${CUDA_PATH:-/usr/local/cuda-12.6}"
 export Vulkan_GLSLC_EXECUTABLE="${Vulkan_GLSLC_EXECUTABLE:-/usr/bin/glslc}"
+
+NVCC="${CUDA_PATH}/bin/nvcc"
+if [[ ! -x "$NVCC" ]]; then
+  cat >&2 <<EOF
+CUDA toolkit not found at ${CUDA_PATH}/bin/nvcc
+
+Install CUDA 12.6 dev packages (Ubuntu 24.04 x86_64), then re-run this script:
+
+  cd /tmp
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+  sudo dpkg -i cuda-keyring_1.1-1_all.deb
+  sudo apt-get update
+  sudo apt-get install -y --no-install-recommends \\
+    cuda-nvcc-12-6 cuda-cudart-dev-12-6 cuda-nvrtc-dev-12-6 \\
+    cuda-cccl-12-6 libcublas-dev-12-6 libcurand-dev-12-6
+  /usr/local/cuda-12.6/bin/nvcc --version
+
+Or set CUDA_PATH if nvcc is installed elsewhere.
+EOF
+  exit 1
+fi
+export PATH="${CUDA_PATH}/bin:${PATH}"
+
 cargo "${args[@]}"
 
 RELEASE="target/${TARGET}/release"
