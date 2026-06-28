@@ -4,11 +4,14 @@ mod config;
 mod inference;
 mod llm;
 mod models;
+mod paths;
 mod protocol;
 mod runtime;
 mod service;
 mod specs;
 mod state;
+#[cfg(windows)]
+mod tray;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -48,6 +51,9 @@ enum Commands {
         #[arg(long)]
         purge: bool,
     },
+    /// Windows only: run the notification-area control panel
+    #[cfg(windows)]
+    Tray,
 }
 
 #[tokio::main]
@@ -73,7 +79,7 @@ async fn main() -> Result<()> {
         Commands::SetToken { token } => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
             service::persist_agent_token(&config.token)?;
-            if service::systemd_available() {
+            if service::background_service_available() {
                 service::start_background_from_config(&config)?;
                 println!("Token saved. Background agent running.");
             } else {
@@ -86,20 +92,22 @@ async fn main() -> Result<()> {
                 purge_models: purge,
             })?;
         }
+        #[cfg(windows)]
+        Commands::Tray => {
+            tray::run()?;
+        }
     }
 
     Ok(())
 }
 
 async fn run_foreground(token: Option<String>) -> Result<()> {
-    // systemd ExecStart — this process IS the background agent.
-    if service::invoked_by_systemd() {
+    if service::invoked_by_systemd() || service::invoked_by_background_service() {
         let config = config::AgentConfig::from_env_and_cli(token)?;
         return agent::run_agent(config).await;
     }
 
-    // User command — watch the running agent without touching it.
-    if service::systemd_available() {
+    if service::background_service_available() {
         if !service::service_active() {
             maybe_start_background_from_saved_token()?;
         }
@@ -107,17 +115,15 @@ async fn run_foreground(token: Option<String>) -> Result<()> {
             println!("following background agent (Ctrl+C to stop watching only)");
             return service::follow_service_logs();
         }
-        anyhow::bail!("agent not running — run: scalattice-agent set-token --token slt_provider_…");
+        anyhow::bail!("agent not running. Run: scalattice-agent set-token --token slt_provider_…");
     }
 
-    // No systemd (dev machines): run the agent in this terminal.
     let config = config::AgentConfig::from_env_and_cli(token)?;
     agent::run_agent(config).await
 }
 
-/// If a token is saved but the background unit is missing or stopped, start it.
 fn maybe_start_background_from_saved_token() -> Result<()> {
-    if !service::systemd_available() {
+    if !service::background_service_available() {
         return Ok(());
     }
     if !agent_token_configured() {
@@ -152,15 +158,20 @@ fn print_status() -> Result<()> {
         println!("         scalattice-agent set-token --token slt_provider_…");
     }
 
-    if service::systemd_available() {
-        let service = match service::background_status() {
+    if service::background_service_available() {
+        let service_line = match service::background_status() {
             service::BackgroundStatus::Running => "running",
             service::BackgroundStatus::Stopped => "stopped",
             service::BackgroundStatus::NotInstalled => "not configured",
         };
-        println!("Service  {service}");
+        println!("Service  {service_line}");
     } else {
+        #[cfg(unix)]
         println!("Service  systemd unavailable (use: scalattice-agent foreground)");
+        #[cfg(windows)]
+        println!("Service  task scheduler unavailable (use: scalattice-agent foreground)");
+        #[cfg(not(any(unix, windows)))]
+        println!("Service  background mode unavailable (use: scalattice-agent foreground)");
     }
 
     if agent_token_configured() {

@@ -6,26 +6,38 @@ Connects to Scalattice Cloud over WebSocket, registers your GPU, and accepts inf
 
 ## Install
 
+### Linux
+
 From any machine with `curl`:
 
 ```bash
 curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provider_YOUR_TOKEN
 source ~/.config/scalattice/agent.env
 scalattice-agent status
-scalattice-agent status   # background agent starts automatically with --token
 ```
 
-Use `scalattice-agent foreground` to watch live logs from the background agent (Ctrl+C stops watching only).
+### Windows
 
-To remove the agent, service, and local config:
+Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/Robottik-Software/Scalattice-Client/releases/latest/download/ScalatticeAgentSetup-x86_64.exe)** from GitHub Releases (or use **Download Windows installer** on the Providers dashboard).
+
+1. Run the setup wizard (approve SmartScreen if prompted)
+2. Paste your `slt_provider_…` token when asked
+3. Finish. The installer adds Scalattice to your PATH and starts the background agent.
+
+Setup guide: https://scalattice.cloud/install/agent-setup
+
+The agent runs as a logon scheduled task. Use the notification area icon for status, token changes, and live logs. Log file: `%LOCALAPPDATA%\Scalattice\logs\agent.log`.
+
+To remove the agent, background service, and local config:
 
 ```bash
-scalattice-agent uninstall --yes
+scalattice-agent uninstall --yes          # Linux
+scalattice-agent uninstall --yes          # Windows (same command)
 ```
 
 Add `--purge` to also delete cached model weights.
 
-Install script downloads a self-contained release from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) (binary + bundled runtime libraries), or builds from source with Rust/Cargo. The install script itself lives in the **scalattice-server** repo (`frontend/public/install/agent`), not here.
+Install scripts download self-contained releases from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) (binary + bundled runtime libraries), or build from source with Rust/Cargo. The Linux install script lives in **scalattice-server** (`frontend/public/install/agent`); Windows uses `ScalatticeAgentSetup-x86_64.exe` from GitHub Releases. After install, use the notification area icon for status, token changes, and live logs.
 
 ### Hardware support
 
@@ -79,7 +91,12 @@ cargo build --release --features gpu
 cargo build --release --no-default-features --features arm-gpu
 ```
 
-CI release binaries include **CUDA + Vulkan** on both x86_64 and aarch64.
+```powershell
+# x86_64 Windows (NVIDIA CUDA + Vulkan) — run in PowerShell
+.\scripts\build-release.ps1
+```
+
+CI release binaries include **CUDA + Vulkan** on x86_64 Linux, aarch64 Linux, and x86_64 Windows.
 
 ## Community
 

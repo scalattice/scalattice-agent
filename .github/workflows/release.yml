@@ -1,6 +1,6 @@
 name: Release
 
-# Called automatically by scripts/release.sh for aarch64.
+# Called automatically by scripts/release.sh (windows-only for --dev, full otherwise).
 # Can also be run manually from the Actions tab.
 on:
   workflow_dispatch:
@@ -13,66 +13,24 @@ on:
         description: 'Build targets'
         required: true
         type: choice
-        default: aarch64-only
+        default: full
         options:
           - aarch64-only
-          - both
+          - windows-only
+          - full
 
 permissions:
   contents: write
 
 jobs:
   build-x86_64:
-    if: inputs.targets == 'both'
+    if: false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
-      - name: Install build deps + CUDA
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev cmake build-essential pkg-config wget glslc \
-            libvulkan-dev spirv-headers libshaderc-dev spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
-          keyring="cuda-keyring_1.1-1_all.deb"
-          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/${keyring}"
-          sudo dpkg -i "${keyring}"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cuda-nvcc-12-6 cuda-cudart-dev-12-6 cuda-nvrtc-dev-12-6 \
-            cuda-cccl-12-6 libcublas-dev-12-6 libcurand-dev-12-6
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-x86_64-gpu
-          cache-targets: true
-          cache-workspace-crates: true
-      - name: Build + package
-        env:
-          CUDA_PATH: /usr/local/cuda-12.6
-          CMAKE_PREFIX_PATH: /usr
-          Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
-          CARGO_INCREMENTAL: "0"
-        run: |
-          set -euo pipefail
-          export PATH="/usr/local/cuda-12.6/bin:$PATH"
-          cargo build --release --target x86_64-unknown-linux-gnu --features gpu
-          mkdir -p dist
-          cp target/x86_64-unknown-linux-gnu/release/scalattice-agent dist/
-          chmod +x scripts/bundle-release-libs.sh
-          scripts/bundle-release-libs.sh dist/scalattice-agent dist target/x86_64-unknown-linux-gnu/release
-          if [ -d dist/lib ]; then
-            tar -czf dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz -C dist scalattice-agent lib
-          else
-            tar -czf dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz -C dist scalattice-agent
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: x86_64
-          path: dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz
+      - run: echo "x86_64 Linux is built locally by scripts/release.sh"
 
   build-aarch64:
-    if: inputs.targets == 'aarch64-only' || inputs.targets == 'both'
+    if: inputs.targets == 'aarch64-only' || inputs.targets == 'full'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -120,11 +78,51 @@ jobs:
           name: aarch64
           path: dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz
 
+  build-windows:
+    if: inputs.targets == 'windows-only' || inputs.targets == 'full'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Jimver/cuda-toolkit@v0.2.29
+        id: cuda
+        with:
+          cuda: '12.6.3'
+          method: 'network'
+      - name: Install Vulkan SDK + Inno Setup
+        run: choco install vulkan-sdk innosetup -y --no-progress
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows-gpu
+          cache-targets: true
+          cache-workspace-crates: true
+      - name: Build + package
+        shell: pwsh
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.cuda_path }}
+          CARGO_INCREMENTAL: "0"
+        run: |
+          $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+          $vulkanRoot = Get-ChildItem 'C:\VulkanSDK' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          if ($vulkanRoot) {
+            $env:VULKAN_SDK = $vulkanRoot.FullName
+            $env:PATH = "$($vulkanRoot.FullName)\Bin;$env:PATH"
+          }
+          .\scripts\build-release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/scalattice-agent-x86_64-pc-windows-msvc.zip
+            dist/ScalatticeAgentSetup-x86_64.exe
+
   upload:
-    needs: [build-x86_64, build-aarch64]
+    needs: [build-aarch64, build-windows]
     if: |
       always() && !cancelled() &&
-      (needs.build-aarch64.result == 'success' || needs.build-x86_64.result == 'success')
+      (needs.build-aarch64.result == 'success' || needs.build-windows.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -143,8 +141,8 @@ jobs:
             exit 1
           }
           shopt -s nullglob
-          files=(artifacts/**/*.tar.gz)
-          [[ ${#files[@]} -gt 0 ]] || { echo "No tarballs built." >&2; exit 1; }
+          files=(artifacts/**/*.tar.gz artifacts/**/*.zip artifacts/**/*.exe)
+          [[ ${#files[@]} -gt 0 ]] || { echo "No release archives built." >&2; exit 1; }
           for f in "${files[@]}"; do
             echo "Uploading $(basename "$f")"
             gh release upload "$TAG" "$f" --clobber

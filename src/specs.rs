@@ -218,15 +218,26 @@ fn detect_nvidia_devices() -> Vec<ComputeDevice> {
 }
 
 fn nvidia_smi_bins() -> Vec<&'static str> {
-    vec![
-        "/usr/lib/wsl/lib/nvidia-smi",
-        "/usr/lib/nvidia/bin/nvidia-smi",
-        "/usr/bin/nvidia-smi",
-        "/usr/sbin/nvidia-smi",
-        "/usr/local/bin/nvidia-smi",
-        "/usr/local/cuda/bin/nvidia-smi",
-        "nvidia-smi",
-    ]
+    #[cfg(windows)]
+    {
+        return vec!["nvidia-smi"];
+    }
+    #[cfg(unix)]
+    {
+        return vec![
+            "/usr/lib/wsl/lib/nvidia-smi",
+            "/usr/lib/nvidia/bin/nvidia-smi",
+            "/usr/bin/nvidia-smi",
+            "/usr/sbin/nvidia-smi",
+            "/usr/local/bin/nvidia-smi",
+            "/usr/local/cuda/bin/nvidia-smi",
+            "nvidia-smi",
+        ];
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        vec!["nvidia-smi"]
+    }
 }
 
 fn wsl_nvidia_lib_dir() -> Option<&'static str> {
@@ -254,39 +265,46 @@ fn configure_nvidia_smi_command(bin: &str) -> Command {
 }
 
 fn detect_nvidia_devices_from_procfs() -> Vec<ComputeDevice> {
-    let root = std::path::Path::new("/proc/driver/nvidia/gpus");
-    let Ok(entries) = std::fs::read_dir(root) else {
+    #[cfg(not(unix))]
+    {
         return Vec::new();
-    };
-
-    let mut devices = Vec::new();
-    for (index, entry) in entries.flatten().enumerate() {
-        let info_path = entry.path().join("information");
-        let Ok(raw) = std::fs::read_to_string(info_path) else {
-            continue;
+    }
+    #[cfg(unix)]
+    {
+        let root = std::path::Path::new("/proc/driver/nvidia/gpus");
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
         };
-        let mut name = None;
-        for line in raw.lines() {
-            if let Some(rest) = line.strip_prefix("Model:") {
-                let trimmed = rest.trim();
-                if !trimmed.is_empty() {
-                    name = Some(trimmed.to_string());
+
+        let mut devices = Vec::new();
+        for (index, entry) in entries.flatten().enumerate() {
+            let info_path = entry.path().join("information");
+            let Ok(raw) = std::fs::read_to_string(info_path) else {
+                continue;
+            };
+            let mut name = None;
+            for line in raw.lines() {
+                if let Some(rest) = line.strip_prefix("Model:") {
+                    let trimmed = rest.trim();
+                    if !trimmed.is_empty() {
+                        name = Some(trimmed.to_string());
+                    }
                 }
             }
+            let Some(name) = name else { continue };
+            devices.push(ComputeDevice {
+                id: format!("nvidia:{index}"),
+                kind: "discrete".to_string(),
+                name,
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            });
         }
-        let Some(name) = name else { continue };
-        devices.push(ComputeDevice {
-            id: format!("nvidia:{index}"),
-            kind: "discrete".to_string(),
-            name,
-            vram_gb: None,
-            vram_used_gb: None,
-            util_pct: None,
-            enabled: true,
-        });
-    }
 
-    devices
+        devices
+    }
 }
 
 fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
@@ -442,6 +460,22 @@ fn detect_amd_util_by_index() -> std::collections::HashMap<usize, u8> {
 }
 
 fn detect_integrated_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
+    #[cfg(windows)]
+    {
+        return detect_integrated_windows_devices(existing);
+    }
+    #[cfg(unix)]
+    {
+        return detect_integrated_linux_pci_devices(existing);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(unix)]
+fn detect_integrated_linux_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
     let output = match Command::new("lspci").output() {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
@@ -490,6 +524,54 @@ fn detect_integrated_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevic
                 id: format!("pci:{index}"),
                 kind: "integrated".to_string(),
                 name,
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: false,
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn detect_integrated_windows_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+        ])
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let known_names: HashSet<String> = existing
+        .iter()
+        .map(|d| d.name.to_ascii_lowercase())
+        .collect();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+        .filter_map(|(index, raw)| {
+            if known_names.contains(&raw.to_ascii_lowercase()) {
+                return None;
+            }
+            if !is_integrated_pci_name(raw) {
+                return None;
+            }
+            Some(ComputeDevice {
+                id: format!("pci:{index}"),
+                kind: "integrated".to_string(),
+                name: raw.to_string(),
                 vram_gb: None,
                 vram_used_gb: None,
                 util_pct: None,
@@ -611,10 +693,13 @@ fn clean_pci_gpu_name(raw: &str) -> String {
 }
 
 pub fn detect_hostname() -> Option<String> {
-    if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
-        let trimmed = host.trim().to_string();
-        if !trimmed.is_empty() {
-            return Some(trimmed);
+    #[cfg(unix)]
+    {
+        if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
+            let trimmed = host.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
         }
     }
 
@@ -628,29 +713,94 @@ pub fn detect_hostname() -> Option<String> {
 }
 
 pub fn detect_cpu_model() -> Option<String> {
+    #[cfg(unix)]
+    {
+        return detect_cpu_model_linux();
+    }
+    #[cfg(windows)]
+    {
+        return detect_cpu_model_windows();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn detect_cpu_model_linux() -> Option<String> {
     let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-    let model = info
-        .lines()
+    info.lines()
         .find(|line| line.starts_with("model name"))
         .and_then(|line| line.split(':').nth(1))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)?;
+        .map(str::to_string)
+}
 
-    Some(model)
+#[cfg(windows)]
+fn detect_cpu_model_windows() -> Option<String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 pub fn detect_ram_gb() -> Option<u32> {
-    detect_linux_memtotal_gb()
+    #[cfg(unix)]
+    {
+        return detect_linux_memtotal_gb();
+    }
+    #[cfg(windows)]
+    {
+        return detect_windows_memtotal_gb();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 pub fn detect_ram_used_gb() -> Option<u32> {
-    let total_kb = read_meminfo_kb("MemTotal:")?;
-    let available_kb = read_meminfo_kb("MemAvailable:")?;
-    let used_kb = total_kb.saturating_sub(available_kb);
-    Some(((used_kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
+    #[cfg(unix)]
+    {
+        let total_kb = read_meminfo_kb("MemTotal:")?;
+        let available_kb = read_meminfo_kb("MemAvailable:")?;
+        let used_kb = total_kb.saturating_sub(available_kb);
+        return Some(((used_kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32);
+    }
+    #[cfg(windows)]
+    {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 0)",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let used = String::from_utf8_lossy(&output.stdout).trim().parse::<u32>().ok()?;
+        return Some(used.max(1));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
+#[cfg(unix)]
 fn read_meminfo_kb(prefix: &str) -> Option<u64> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
     info.lines()
@@ -659,9 +809,27 @@ fn read_meminfo_kb(prefix: &str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+#[cfg(unix)]
 fn detect_linux_memtotal_gb() -> Option<u32> {
     let kb = read_meminfo_kb("MemTotal:")?;
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
+}
+
+#[cfg(windows)]
+fn detect_windows_memtotal_gb() -> Option<u32> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let gb = String::from_utf8_lossy(&output.stdout).trim().parse::<u32>().ok()?;
+    Some(gb.max(1))
 }
 
 pub fn detect_cuda_version() -> Option<String> {

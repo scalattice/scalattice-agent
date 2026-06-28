@@ -1,6 +1,6 @@
+use crate::paths::{agent_env_path, config_dir};
 use anyhow::{bail, Context, Result};
 use std::env;
-use std::path::PathBuf;
 
 /// Hard-coded Scalattice Cloud operator WebSocket endpoint (not configurable).
 pub const SCALATTICE_WS_URL: &str = "wss://api.scalattice.cloud/v1/operators/agent/ws";
@@ -39,14 +39,20 @@ pub fn read_saved_agent_token() -> Option<String> {
         }
     }
 
-    let home = env::var("HOME").ok()?;
+    let config = config_dir().ok()?;
     for name in ["agent.env", "agent.systemd.env"] {
-        let path = PathBuf::from(&home)
-            .join(".config/scalattice")
-            .join(name);
+        let path = config.join(name);
         let raw = std::fs::read_to_string(path).ok()?;
         if let Some(token) = parse_token_from_env_file(&raw) {
             return Some(token);
+        }
+    }
+
+    if let Ok(path) = agent_env_path() {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Some(token) = parse_token_from_env_file(&raw) {
+                return Some(token);
+            }
         }
     }
 

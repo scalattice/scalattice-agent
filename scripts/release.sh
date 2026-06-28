@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./scripts/release.sh                 # bump patch, build both archs, publish
-#   ./scripts/release.sh --dev           # production release, x86_64 only (skip aarch64 CI)
+#   ./scripts/release.sh --dev           # x86_64 Linux local + Windows CI (skip aarch64)
 #   ./scripts/release.sh --skip-build    # reuse dist/ x86 tarball; still builds aarch64 in CI
 #   ./scripts/release.sh --skip-aarch64  # same as --dev (x86_64 only)
 #   ./scripts/release.sh --version 1.0.2
@@ -29,12 +29,12 @@ Usage: ./scripts/release.sh [options]
   Default: bump version, build x86_64 here, build aarch64 in GitHub Actions,
   upload both tarballs to one GitHub Release.
 
-  --dev: same full release to GitHub, but x86_64 only (skips aarch64 CI).
+  --dev: x86_64 Linux local + Windows CI (skips aarch64 only).
 
 Options:
-  --dev             Production release with x86_64 only (no aarch64 CI wait)
+  --dev             Day-to-day release: x86_64 Linux + Windows (no aarch64 CI)
   --skip-build      Skip local x86_64 compile (use existing dist/ tarball)
-  --skip-aarch64    Same as --dev
+  --skip-aarch64    Same as --dev (Windows CI still runs)
   --version X.Y.Z   Explicit version
   --minor           Bump minor instead of patch
   --no-push         Dry run (no push/release)
@@ -125,16 +125,17 @@ resolve_version() {
   fi
 }
 
-build_aarch64_in_ci() {
+build_ci_assets() {
   local tag="$1"
+  local targets="$2"
   echo ""
-  echo "==> Building aarch64 in GitHub Actions (tag ${tag})"
-  echo "    This is ~30–60 min on a cold cache; the script waits until it finishes."
+  echo "==> Building ${targets} in GitHub Actions (tag ${tag})"
+  echo "    This is ~30–90 min on a cold cache; the script waits until it finishes."
 
   gh workflow run "$WORKFLOW_FILE" \
     --ref main \
     -f "tag=${tag}" \
-    -f "targets=aarch64-only"
+    -f "targets=${targets}"
 
   local run_id=""
   for _ in $(seq 1 30); do
@@ -153,21 +154,31 @@ build_aarch64_in_ci() {
   gh run watch "$run_id" --exit-status
 }
 
+build_aarch64_in_ci() {
+  build_ci_assets "$1" "aarch64-only"
+}
+
 verify_release_assets() {
   local tag="$1"
   local need_aarch64="$2"
-  local assets x86 aarch
+  local need_windows="$3"
+  local assets x86 aarch win
 
   assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
-  x86="$(echo "$assets" | grep -c 'x86_64' || true)"
+  x86="$(echo "$assets" | grep -c 'x86_64-unknown-linux-gnu' || true)"
   aarch="$(echo "$assets" | grep -c 'aarch64' || true)"
+  win="$(echo "$assets" | grep -cE 'pc-windows-msvc|ScalatticeAgentSetup' || true)"
 
   if [[ "$x86" -lt 1 ]]; then
-    echo "Release ${tag} is missing x86_64 tarball." >&2
+    echo "Release ${tag} is missing x86_64 Linux tarball." >&2
     exit 1
   fi
   if [[ "$need_aarch64" == "true" && "$aarch" -lt 1 ]]; then
     echo "Release ${tag} is missing aarch64 tarball." >&2
+    exit 1
+  fi
+  if [[ "$need_windows" == "true" && "$win" -lt 1 ]]; then
+    echo "Release ${tag} is missing Windows installer (.exe or zip)." >&2
     exit 1
   fi
 }
@@ -198,9 +209,9 @@ if [[ "$(cargo_version)" != "$VERSION" ]]; then
 fi
 
 if [[ "$SKIP_AARCH64" == "true" ]]; then
-  echo "==> Release ${TAG} (x86_64 only — skipping aarch64 CI)"
+  echo "==> Release ${TAG} (x86_64 Linux local + Windows CI, skipping aarch64)"
 else
-  echo "==> Release ${TAG} (x86_64 local + aarch64 CI)"
+  echo "==> Release ${TAG} (x86_64 local + aarch64 + Windows CI)"
 fi
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
@@ -236,9 +247,10 @@ if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&
 fi
 
 echo "==> Creating GitHub release with x86_64 tarball"
-RELEASE_NOTES="Built via scripts/release.sh (x86_64 local, aarch64 GitHub Actions)."
 if [[ "$SKIP_AARCH64" == "true" ]]; then
-  RELEASE_NOTES="Built via scripts/release.sh (x86_64 only — dev release, no aarch64)."
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local + Windows CI, dev release, no aarch64)."
+else
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local, aarch64 + Windows via GitHub Actions)."
 fi
 gh release create "$TAG" "$X86_ARCHIVE" \
   --target main \
@@ -247,17 +259,21 @@ gh release create "$TAG" "$X86_ARCHIVE" \
 
 git fetch --tags "$REMOTE" 2>/dev/null || true
 
-if [[ "$SKIP_AARCH64" != "true" ]]; then
-  build_aarch64_in_ci "$TAG"
+if [[ "$SKIP_AARCH64" == "true" ]]; then
+  build_ci_assets "$TAG" "windows-only"
 else
-  echo "==> Skipped aarch64 CI (--dev / --skip-aarch64)"
+  build_ci_assets "$TAG" "full"
 fi
 
-verify_release_assets "$TAG" "$( [[ "$SKIP_AARCH64" == "true" ]] && echo false || echo true )"
+if [[ "$SKIP_AARCH64" == "true" ]]; then
+  verify_release_assets "$TAG" false true
+else
+  verify_release_assets "$TAG" true true
+fi
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 echo ""
-echo "Done — ${TAG} published with:"
+echo "Done. ${TAG} published with:"
 gh release view "$TAG" --json assets -q '.assets[].name' | sed 's/^/  - /'
 echo ""
 echo "  https://github.com/${REPO}/releases/tag/${TAG}"

@@ -25,9 +25,7 @@ pub struct AgentLocalState {
 }
 
 pub fn state_file_path() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".config/scalattice/agent.state.json"))
+    crate::paths::agent_state_path().ok()
 }
 
 pub fn update_connection_state(
@@ -197,8 +195,14 @@ pub fn agent_activity_summary() -> Option<AgentActivitySummary> {
 
     if !is_recent(state.updated_at_ms) {
         if service_hint() {
+            #[cfg(unix)]
+            let status = "not registered (check: journalctl --user -u scalattice-agent -n 30)".to_string();
+            #[cfg(windows)]
+            let status = "not registered (open the tray icon and check the live log)".to_string();
+            #[cfg(not(any(unix, windows)))]
+            let status = "not registered".to_string();
             return Some(AgentActivitySummary {
-                status: "not registered (check: journalctl --user -u scalattice-agent -n 30)".to_string(),
+                status,
                 node_id: state.node_id,
             });
         }
@@ -243,11 +247,22 @@ fn normalize_status_label(label: &str) -> String {
 }
 
 fn service_hint() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "scalattice-agent.service"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        return std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "scalattice-agent.service"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    }
+    #[cfg(windows)]
+    {
+        return crate::service::service_active();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 fn is_recent(updated_at_ms: u64) -> bool {
