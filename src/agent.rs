@@ -6,7 +6,7 @@ use crate::protocol::{
 };
 use crate::compute_pool::build_virtual_card;
 use crate::inference::{InferenceEngine, InferenceRequest};
-use crate::models::capacity::can_host_model;
+use crate::models::can_host_model;
 use crate::models::spawn_catalog_sync;
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::{
@@ -96,7 +96,7 @@ impl SessionState {
             self.hf_token = Some(token);
         }
         let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.unwrap_or(detect_ram_gb());
+        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let card = match build_virtual_card(&specs.compute_devices) {
             Ok(card) => card,
             Err(err) => {
@@ -138,7 +138,7 @@ impl SessionState {
 
     fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
         let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.unwrap_or(detect_ram_gb());
+        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let card = match build_virtual_card(&specs.compute_devices) {
             Ok(card) => card,
             Err(_) => return Vec::new(),
