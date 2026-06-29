@@ -126,196 +126,6 @@ function Set-SystemRustEnv {
     return $true
 }
 
-function Get-ChocolateyRustPathEntries {
-    return @(
-        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools"),
-        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools\bin")
-    )
-}
-
-function Remove-ChocolateyRustFromPath {
-    $block = Get-ChocolateyRustPathEntries
-    $parts = @($env:PATH -split ';' | Where-Object { $_ -and ($block -notcontains $_) })
-    $env:PATH = ($parts -join ';')
-}
-
-function Invoke-IcaclsGrant {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Grant,
-        [switch]$Recurse
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $args = @(
-            $Path,
-            '/grant',
-            $Grant,
-            '/C',
-            '/Q'
-        )
-        if ($Recurse) { $args += '/T' }
-        & icacls @args 1>$null 2>$null
-    } finally {
-        $ErrorActionPreference = $prev
-    }
-}
-
-function Ensure-RustToolchainPermissions {
-    if (-not (Test-Admin)) { return }
-
-    $root = "C:\Rust"
-    New-Item -ItemType Directory -Force -Path $root, (Get-SystemCargoHome), (Get-SystemRustupHome), (Get-SystemRustCargoBin) | Out-Null
-
-    foreach ($dir in @($root, (Get-SystemCargoHome), (Get-SystemRustupHome), (Get-SystemRustCargoBin))) {
-        # (OI)(CI) inherits to new files/dirs without walking broken rustup proxy links.
-        Invoke-IcaclsGrant $dir "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"
-        Invoke-IcaclsGrant $dir "BUILTIN\Administrators:(OI)(CI)F"
-    }
-    Write-Host "==> Rust toolchain permissions set for runner service"
-}
-
-function Set-SystemRustSessionEnv {
-    $env:RUSTUP_HOME = Get-SystemRustupHome
-    $env:CARGO_HOME = Get-SystemCargoHome
-    $env:RUSTUP_INIT_SKIP_PATH_CHECK = "yes"
-
-    $rustBin = Get-SystemRustCargoBin
-    if ($env:PATH -notlike "$rustBin*") {
-        $env:PATH = "$rustBin;$env:PATH"
-    }
-    Remove-ChocolateyRustFromPath
-}
-
-function Test-SystemRustExecutable {
-    param(
-        [string]$Exe,
-        [switch]$Quiet
-    )
-
-    if (-not (Test-Path -LiteralPath $Exe)) {
-        if (-not $Quiet) {
-            Write-Host "==> Missing executable: $Exe"
-        }
-        return $false
-    }
-
-    Set-SystemRustSessionEnv
-    try {
-        $output = & $Exe --version 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            if (-not $Quiet) {
-                Write-Host "==> $Exe --version failed (exit $LASTEXITCODE): $output"
-            }
-            return $false
-        }
-        return $true
-    } catch {
-        if (-not $Quiet) {
-            Write-Host "==> $Exe --version threw: $_"
-        }
-        return $false
-    }
-}
-
-function Reinstall-SystemRustToolchain {
-    Set-SystemRustSessionEnv
-
-    $cargoHome = Get-SystemCargoHome
-    $rustupHome = Get-SystemRustupHome
-    New-Item -ItemType Directory -Force -Path (Join-Path $cargoHome "bin"), $rustupHome | Out-Null
-    [Environment]::SetEnvironmentVariable("RUSTUP_HOME", $rustupHome, "Machine")
-    [Environment]::SetEnvironmentVariable("CARGO_HOME", $cargoHome, "Machine")
-
-    Write-Host "==> Reinstalling system-wide Rust at C:\Rust"
-    $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
-    Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
-    & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "==> rustup-init failed (exit $LASTEXITCODE)"
-        return $false
-    }
-
-    $rustc = Join-Path (Get-SystemRustCargoBin) "rustc.exe"
-    return (Test-SystemRustExecutable $rustc)
-}
-
-function Repair-SystemRustToolchain {
-    Set-SystemRustSessionEnv
-
-    $rustBin = Get-SystemRustCargoBin
-    $rustup = Join-Path $rustBin "rustup.exe"
-    $rustc = Join-Path $rustBin "rustc.exe"
-    $cargo = Join-Path $rustBin "cargo.exe"
-
-    if (-not (Test-Path -LiteralPath $rustup)) {
-        Write-Host "==> rustup.exe missing at $rustup"
-        return (Reinstall-SystemRustToolchain)
-    }
-
-    if (Test-SystemRustExecutable $rustc -Quiet) {
-        return $true
-    }
-
-    Write-Host "==> Repairing system Rust toolchain"
-    Write-Host "    rustc exists: $(Test-Path -LiteralPath $rustc)"
-    Write-Host "    cargo works:  $(Test-SystemRustExecutable $cargo -Quiet)"
-    Write-Host "    RUSTUP_HOME:  $($env:RUSTUP_HOME)"
-    Write-Host "    CARGO_HOME:   $($env:CARGO_HOME)"
-
-    & $rustup self repair 2>&1 | Out-Host
-    & $rustup toolchain install stable --force --profile default -y 2>&1 | Out-Host
-    & $rustup default stable 2>&1 | Out-Host
-    & $rustup component add rustc cargo rust-std 2>&1 | Out-Host
-
-    if (Test-SystemRustExecutable $rustc -Quiet) {
-        return $true
-    }
-
-    Write-Host "==> rustup repair incomplete; running rustup-init against C:\Rust"
-    return (Reinstall-SystemRustToolchain)
-}
-
-function Assert-SystemRustToolchain {
-    param([switch]$ExportForCi)
-
-    if (-not (Prioritize-SystemRustOnPath -ExportForCi:$ExportForCi)) {
-        throw "System Rust not configured at C:\Rust\cargo\bin"
-    }
-
-    $rustBin = Get-SystemRustCargoBin
-    $rustc = Join-Path $rustBin "rustc.exe"
-    $cargo = Join-Path $rustBin "cargo.exe"
-    $rustup = Join-Path $rustBin "rustup.exe"
-
-    if (-not (Test-SystemRustExecutable $rustc)) {
-        if (-not (Repair-SystemRustToolchain)) {
-            throw @"
-rustc is missing or cannot run at $rustc
-
-Run once as Administrator on the Windows build machine:
-  scripts\setup-windows-build.cmd
-"@
-        }
-    }
-
-    if (-not (Test-SystemRustExecutable $cargo)) {
-        throw "cargo cannot run at $cargo"
-    }
-
-    Write-Host "==> RUSTUP_HOME=$($env:RUSTUP_HOME)"
-    Write-Host "==> CARGO_HOME=$($env:CARGO_HOME)"
-    Write-Host "==> rustc: $rustc"
-    & $rustc --version
-    Write-Host "==> cargo: $cargo"
-    & $cargo --version
-    & $rustup show
-}
-
 function Prioritize-SystemRustOnPath {
     param([switch]$ExportForCi)
 
@@ -328,13 +138,10 @@ function Prioritize-SystemRustOnPath {
         return $false
     }
 
-    $rustc = Join-Path $rustBin "rustc.exe"
-    $cargo = Join-Path $rustBin "cargo.exe"
-    if (-not (Test-Path -LiteralPath $cargo)) {
-        return $false
-    }
-
-    $block = Get-ChocolateyRustPathEntries
+    $block = @(
+        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools"),
+        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools\bin")
+    )
     $parts = @($env:PATH -split ';' | Where-Object {
             $_ -and ($_ -ne $rustBin) -and ($block -notcontains $_)
         })
@@ -402,10 +209,16 @@ function Install-SystemWideRust {
     $cargoHome = Join-Path $rustRoot "cargo"
     $rustupHome = Join-Path $rustRoot "rustup"
     $cargoExe = Join-Path $cargoHome "bin\cargo.exe"
+    $rustupExe = Join-Path $cargoHome "bin\rustup.exe"
+    $rustcExe = Join-Path $cargoHome "bin\rustc.exe"
 
-    if (Test-Path $cargoExe) {
+    if ((Test-Path $cargoExe) -and (Test-Path $rustupExe) -and (Test-Path $rustcExe)) {
         Write-Host "==> System-wide Rust: $cargoExe"
         return
+    }
+
+    if (Test-Path $cargoExe) {
+        Write-Host "==> Repairing incomplete C:\Rust installation"
     }
 
     Write-Host "==> Installing system-wide Rust at $rustRoot (for GHA runner service account)"
@@ -419,15 +232,15 @@ function Install-SystemWideRust {
 
     $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
     Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
-    & $rustupInit -y --default-toolchain stable --no-modify-path *> $null
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
+    $ErrorActionPreference = $prev
     if ($LASTEXITCODE -ne 0) {
         throw "rustup-init failed (exit $LASTEXITCODE)"
     }
     if (-not (Test-Path $cargoExe)) {
         throw "rustup-init completed but cargo.exe missing at $cargoExe"
-    }
-    if (-not (Test-Path (Join-Path $cargoHome "bin\rustc.exe"))) {
-        & (Join-Path $cargoHome "bin\rustup.exe") toolchain install stable --profile minimal -y *> $null
     }
     Write-Host "==> System-wide Rust installed: $cargoExe"
 }
@@ -697,8 +510,8 @@ function Ensure-ShortBuildDirs {
   New-Item -ItemType Directory -Force -Path $root, $target | Out-Null
 
   # Runner service (NETWORK SERVICE) must write CUDA/CMake artifacts here.
-  Invoke-IcaclsGrant $root "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"
-  Invoke-IcaclsGrant $root "BUILTIN\Administrators:(OI)(CI)F"
+  & icacls $root /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T 2>$null | Out-Null
+  & icacls $root /grant "BUILTIN\Administrators:(OI)(CI)F" /T 2>$null | Out-Null
   Write-Host "==> Short build dir ready: $target"
 }
 

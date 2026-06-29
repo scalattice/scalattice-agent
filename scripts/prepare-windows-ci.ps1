@@ -8,13 +8,24 @@ if ($paths.Count -gt 0) {
     $env:PATH = (($paths -join ';') + ';' + $env:PATH)
 }
 Remove-GitUsrBinFromPath
-Remove-ChocolateyRustFromPath
 
-try {
-    Assert-SystemRustToolchain -ExportForCi
-} catch {
-    Write-Error $_.Exception.Message
+if (-not (Prioritize-SystemRustOnPath -ExportForCi)) {
+    Write-Error @"
+System Rust not found at C:\Rust\cargo\bin.
+
+Run once as Administrator on the Windows build machine:
+  scripts\setup-windows-build.cmd
+"@
 }
+
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Error "cargo not found on PATH after Rust bootstrap"
+}
+
+$rustBin = Get-SystemRustCargoBin
+& (Join-Path $rustBin "rustc.exe") --version
+& (Join-Path $rustBin "cargo.exe") --version
+& (Join-Path $rustBin "rustup.exe") show
 
 $clang = Find-LibClangDir
 if (-not $clang) {
