@@ -24,6 +24,19 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-RegisteredRunnerId {
+    param(
+        [string]$Repository,
+        [string]$Name
+    )
+    $json = gh api "repos/$Repository/actions/runners" 2>$null
+    if (-not $json) { return $null }
+    $data = $json | ConvertFrom-Json
+    $match = @($data.runners | Where-Object { $_.name -eq $Name }) | Select-Object -First 1
+    if ($match) { return $match.id }
+    return $null
+}
+
 if (-not (Test-Admin)) {
     Write-Error "Run as Administrator."
 }
@@ -55,7 +68,7 @@ if (-not (Test-Path ".\config.cmd")) {
     Remove-Item $zipName -Force
 }
 
-$existing = gh api "repos/$Repo/actions/runners" --jq ".runners[] | select(.name==`"$RunnerName`") | .id" 2>$null
+$existing = Get-RegisteredRunnerId -Repository $Repo -Name $RunnerName
 if ($existing) {
     Write-Host "==> Removing existing runner registration for $RunnerName"
     $removeToken = gh api --method POST "repos/$Repo/actions/runners/remove-token" -q .token
