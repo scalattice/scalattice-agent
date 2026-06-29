@@ -443,14 +443,15 @@ impl eframe::App for TrayApp {
                                 .color(egui::Color32::WHITE),
                         );
                         ui.horizontal(|ui| {
+                            let token_empty = self.token_input.is_empty();
                             let mut edit = egui::TextEdit::singleline(&mut self.token_input)
                                 .desired_width(ui.available_width() - 72.0)
                                 .hint_text("slt_provider_…");
-                            if !self.token_revealed && !self.token_input.is_empty() {
+                            if !self.token_revealed && !token_empty {
                                 edit = edit.password(true);
                             }
                             ui.add(edit);
-                            if !self.token_input.is_empty() {
+                            if !token_empty {
                                 let label = if self.token_revealed { "Hide" } else { "Show" };
                                 if ui.button(label).clicked() {
                                     self.token_revealed = !self.token_revealed;
