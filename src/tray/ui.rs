@@ -641,7 +641,8 @@ fn detach_console() {
 fn open_dashboard_url(url: &str) -> Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::{ShellExecuteW, SW_SHOW};
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
     let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
     let op: Vec<u16> = "open\0".encode_utf16().collect();
@@ -654,8 +655,9 @@ fn open_dashboard_url(url: &str) -> Result<()> {
             std::ptr::null(),
             SW_SHOW,
         );
-        if (rc as isize) <= 32 {
-            anyhow::bail!("ShellExecute failed ({rc})");
+        let code = rc as isize;
+        if code <= 32 {
+            anyhow::bail!("ShellExecute failed (code {code})");
         }
     }
     Ok(())
