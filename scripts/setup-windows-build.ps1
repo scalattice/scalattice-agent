@@ -56,9 +56,14 @@ if (-not $hasVcTools) {
 Install-CudaToolkit
 
 # Rust may land on PATH only in new shells; refresh common locations.
-$rustBin = "$env:USERPROFILE\.cargo\bin"
-if ((Test-Path $rustBin) -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    $env:PATH = "$rustBin;$env:PATH"
+$rustBins = @(
+    (Get-SystemRustCargoBin),
+    "$env:USERPROFILE\.cargo\bin"
+)
+foreach ($rustBin in $rustBins) {
+    if ((Test-Path $rustBin) -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        $env:PATH = "$rustBin;$env:PATH"
+    }
 }
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {

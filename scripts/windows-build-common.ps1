@@ -59,6 +59,10 @@ function Add-MachinePathEntry {
     Write-Host "==> Added to Machine PATH: $Dir"
 }
 
+function Get-SystemRustCargoBin {
+    return "C:\Rust\cargo\bin"
+}
+
 function Install-SystemWideRust {
     $rustRoot = "C:\Rust"
     $cargoHome = Join-Path $rustRoot "cargo"
@@ -67,7 +71,7 @@ function Install-SystemWideRust {
 
     if (Test-Path $cargoExe) {
         Write-Host "==> System-wide Rust: $cargoExe"
-        return $cargoHome
+        return
     }
 
     Write-Host "==> Installing system-wide Rust at $rustRoot (for GHA runner service account)"
@@ -75,17 +79,20 @@ function Install-SystemWideRust {
 
     $env:RUSTUP_HOME = $rustupHome
     $env:CARGO_HOME = $cargoHome
+    $env:RUSTUP_INIT_SKIP_PATH_CHECK = "yes"
     [Environment]::SetEnvironmentVariable("RUSTUP_HOME", $rustupHome, "Machine")
     [Environment]::SetEnvironmentVariable("CARGO_HOME", $cargoHome, "Machine")
 
     $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
     Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
-    & $rustupInit -y --default-toolchain stable --no-modify-path
+    & $rustupInit -y --default-toolchain stable --no-modify-path *> $null
     if ($LASTEXITCODE -ne 0) {
         throw "rustup-init failed (exit $LASTEXITCODE)"
     }
-
-    return $cargoHome
+    if (-not (Test-Path $cargoExe)) {
+        throw "rustup-init completed but cargo.exe missing at $cargoExe"
+    }
+    Write-Host "==> System-wide Rust installed: $cargoExe"
 }
 
 function Get-WindowsBuildPathEntries {
@@ -95,7 +102,7 @@ function Get-WindowsBuildPathEntries {
             "${env:ProgramData}\chocolatey\bin",
             "${env:ProgramFiles}\Git\bin",
             "${env:ProgramFiles}\Git\usr\bin",
-            "C:\Rust\cargo\bin",
+            (Get-SystemRustCargoBin),
             "$env:USERPROFILE\.cargo\bin"
         )) {
         if ((Test-Path $dir) -and ($paths -notcontains $dir)) {
@@ -119,10 +126,8 @@ function Ensure-BuildMachinePath {
     Add-MachinePathEntry "${env:ProgramFiles}\Git\bin"
     Add-MachinePathEntry "${env:ProgramFiles}\Git\usr\bin"
 
-    $cargoHome = Install-SystemWideRust
-    if ($cargoHome) {
-        Add-MachinePathEntry (Join-Path $cargoHome "bin")
-    }
+    Install-SystemWideRust
+    Add-MachinePathEntry (Get-SystemRustCargoBin)
 
     $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
     if (Test-Path "$cuda\bin") {
