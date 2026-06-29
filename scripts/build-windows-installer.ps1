@@ -1,6 +1,6 @@
 # Compile ScalatticeAgentSetup-x86_64.exe with Inno Setup 6.
 param(
-    # Avoid the name "Version" — PowerShell splatting can bind it incorrectly.
+    # Avoid the name "Version": PowerShell splatting can bind it incorrectly.
     [string]$AppVersion = "",
     [Alias("PackageVersion")]
     [string]$LegacyPackageVersion = ""
@@ -42,7 +42,7 @@ if (-not (Test-Path $iscc)) {
 
 $iss = Join-Path $Root "installer\windows\scalattice-agent.iss"
 Write-Host "==> Compiling Windows setup (v$AppVersion)"
-# Quoted define — unquoted /DMyAppVersion=1.0.21 can break; never pass a bare "-Version" token.
+# Quoted define: unquoted /DMyAppVersion=1.0.21 can break; never pass a bare "-Version" token.
 & $iscc "/DMyAppVersion=$AppVersion" $iss
 
 $setup = Join-Path $Root "dist\ScalatticeAgentSetup-x86_64.exe"

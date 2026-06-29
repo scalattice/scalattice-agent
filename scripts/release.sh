@@ -5,7 +5,7 @@
 #   ./scripts/release.sh --dev      # x86_64 Linux here + Windows on self-hosted runner
 #   ./scripts/release.sh            # above + aarch64 on GitHub ARM runners
 #
-# First-time Windows setup (once, on a Windows PC — Admin PowerShell):
+# First-time Windows setup (once, on a Windows PC, Admin PowerShell):
 #   .\scripts\setup-windows-build.ps1
 #   .\scripts\install-windows-runner.ps1
 #
@@ -274,7 +274,7 @@ fi
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
   [[ -f "$X86_ARCHIVE" ]] || {
-    echo "Missing ${X86_ARCHIVE} — drop --skip-build to compile." >&2
+    echo "Missing ${X86_ARCHIVE}; drop --skip-build to compile." >&2
     exit 1
   }
   echo "==> Using existing ${X86_ARCHIVE}"

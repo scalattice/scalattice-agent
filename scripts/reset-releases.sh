@@ -24,7 +24,7 @@ Delete all v* tags and GitHub Releases. Commit history on main is unchanged.
   ./scripts/reset-releases.sh --confirm --dry-run
   ./scripts/reset-releases.sh --confirm --no-reset-cargo   # only delete tags/releases
 
-Then publish fresh 1.0.0 (rebuild — embedded version comes from Cargo.toml):
+Then publish fresh 1.0.0 (rebuild; embedded version comes from Cargo.toml):
   ./scripts/release.sh --version 1.0.0
 
 Requires: gh auth login
@@ -75,7 +75,7 @@ fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
   echo ""
-  echo "Dry run — nothing changed."
+  echo "Dry run: nothing changed."
   [[ "$RESET_CARGO" == "true" ]] && echo "Would set Cargo.toml version to 1.0.0"
   exit 0
 fi
@@ -117,4 +117,4 @@ echo "Done. Tags and releases cleared; commit history unchanged."
 echo ""
 echo "Next:"
 echo "  git push ${REMOTE} main          # if version commit was created"
-echo "  ./scripts/release.sh --version 1.0.0   # rebuild — do not --skip-build old tarball"
+echo "  ./scripts/release.sh --version 1.0.0   # rebuild; do not --skip-build old tarball"

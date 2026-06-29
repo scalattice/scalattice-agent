@@ -1,5 +1,5 @@
 @echo off
-rem Debug launcher — shows tray startup errors in this console window.
+rem Debug launcher: shows tray startup errors in this console window.
 setlocal
 set "INSTALL=%~dp0"
 set "LIB=%LOCALAPPDATA%\Scalattice\lib"

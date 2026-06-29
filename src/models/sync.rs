@@ -45,7 +45,7 @@ pub fn spawn_catalog_sync(
             }
             if !can_host_model(&model, &card, ram_gb) {
                 info!(
-                    "skipping {} — needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM)",
+                    "skipping {}: needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM)",
                     model.model_id,
                     model.min_vram_gb.unwrap_or(0),
                     model.min_ram_gb.unwrap_or(0),

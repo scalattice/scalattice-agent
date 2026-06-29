@@ -8,10 +8,10 @@ BUILD_ROOT="${3:-$(dirname "$BINARY")}"
 LIB_DIR="$OUT_DIR/lib"
 mkdir -p "$LIB_DIR"
 
-# glibc + base toolchain — always on Linux; never bundle.
+# glibc + base toolchain: always on Linux; never bundle.
 SKIP_RE='/(libc\.so|libm\.so|libpthread|libdl\.so|librt\.so|libresolv\.so|libstdc\+\+|libgcc_s|ld-linux)'
 
-# NVIDIA user-space driver — must come from the host GPU driver, not our tarball.
+# NVIDIA user-space driver: must come from the host GPU driver, not our tarball.
 SKIP_RE="${SKIP_RE}|libcuda\.so|libnvidia"
 
 bundle_from() {

@@ -31,12 +31,12 @@ case "$TARGET" in
 esac
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "cargo not found — install Rust stable: https://rustup.rs" >&2
+  echo "cargo not found; install Rust stable: https://rustup.rs" >&2
   exit 1
 fi
 
 if [[ ! -f Cargo.lock ]]; then
-  echo "==> Generating Cargo.lock (commit this file — it keeps CI cache warm)"
+  echo "==> Generating Cargo.lock (commit this file; it keeps CI cache warm)"
   cargo generate-lockfile
 fi
 
@@ -49,7 +49,7 @@ fi
 args+=(--features "$FEATURES")
 
 echo "==> cargo ${args[*]}"
-echo "    (llama.cpp + CUDA/Vulkan dominate build time — clap is seconds, not an hour)"
+echo "    (llama.cpp + CUDA/Vulkan dominate build time; clap is seconds, not an hour)"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-/usr}"
 export CUDA_PATH="${CUDA_PATH:-/usr/local/cuda-12.6}"

@@ -101,7 +101,7 @@ async fn run_async(cli: Cli) -> Result<()> {
         None => {
             #[cfg(not(windows))]
             anyhow::bail!(
-                "no command specified — try: scalattice-agent status | foreground | set-token"
+                "no command specified; try: scalattice-agent status | foreground | set-token"
             );
             #[cfg(windows)]
             unreachable!("tray handled in main")

@@ -93,7 +93,7 @@ Step "CLI status (via scalattice-run.cmd)" {
     if (Test-Path $run) {
         & $run status
     } else {
-        Write-Host "    scalattice-run.cmd missing — cannot run status"
+        Write-Host "    scalattice-run.cmd missing; cannot run status"
     }
 }
 

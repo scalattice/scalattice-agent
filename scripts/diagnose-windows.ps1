@@ -63,7 +63,7 @@ $trayLog = Join-Path $logs "tray.log"
 if (Test-Path $trayLog) {
     Get-Content $trayLog -Tail 20 | ForEach-Object { Write-Host "  $_" }
 } else {
-    Write-Host "  (no tray.log — tray has never started successfully)"
+    Write-Host "  (no tray.log; tray has never started successfully)"
 }
 
 Section "Autostart"

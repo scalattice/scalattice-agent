@@ -1,7 +1,7 @@
 name: Release
 
 # Linux x86_64: built locally by scripts/release.sh
-# Windows: self-hosted runner (label scalattice-release) — see scripts/install-windows-runner.ps1
+# Windows: self-hosted runner (label scalattice-release). See scripts/install-windows-runner.ps1
 # aarch64: GitHub-hosted ARM runner (full release only)
 on:
   workflow_dispatch:

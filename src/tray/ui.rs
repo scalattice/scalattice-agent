@@ -99,7 +99,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
     }));
 
     let _tray = TrayIconBuilder::new()
-        .with_tooltip("Scalattice Agent — click to open")
+        .with_tooltip("Scalattice Agent: click to open")
         .with_icon(icon)
         .with_menu(Box::new(tray_menu))
         .build()
@@ -161,6 +161,7 @@ struct TrayApp {
     status_refresh_inflight: bool,
     panel_hidden: bool,
     token_input: String,
+    token_revealed: bool,
     status_lines: Vec<String>,
     action_message: String,
     logs: String,
@@ -180,6 +181,7 @@ impl TrayApp {
         panel_hidden: bool,
     ) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
+        let token_revealed = token_input.is_empty();
         let log_path = agent_log_path().ok();
         Self {
             event_rx,
@@ -190,6 +192,7 @@ impl TrayApp {
             status_refresh_inflight: false,
             panel_hidden,
             token_input,
+            token_revealed,
             status_lines: Vec::new(),
             action_message: String::new(),
             logs: String::new(),
@@ -323,6 +326,7 @@ impl TrayApp {
                     self.action_message = format!("Could not save token: {err}");
                     return;
                 }
+                self.token_revealed = false;
                 match service::restart_background_from_config(&config) {
                     Ok(()) => {
                         self.action_message =
@@ -438,11 +442,21 @@ impl eframe::App for TrayApp {
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.token_input)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("slt_provider_…"),
-                        );
+                        ui.horizontal(|ui| {
+                            let mut edit = egui::TextEdit::singleline(&mut self.token_input)
+                                .desired_width(ui.available_width() - 72.0)
+                                .hint_text("slt_provider_…");
+                            if !self.token_revealed && !self.token_input.is_empty() {
+                                edit = edit.password(true);
+                            }
+                            ui.add(edit);
+                            if !self.token_input.is_empty() {
+                                let label = if self.token_revealed { "Hide" } else { "Show" };
+                                if ui.button(label).clicked() {
+                                    self.token_revealed = !self.token_revealed;
+                                }
+                            }
+                        });
 
                         ui.horizontal(|ui| {
                             if ui.button("Save token").clicked() {
@@ -619,7 +633,7 @@ fn acquire_tray_instance(force: bool) -> Result<bool> {
     match try_acquire_tray_mutex() {
         Ok(true) => return Ok(true),
         Ok(false) => {
-            write_tray_log("second tray launch — activating existing window");
+            write_tray_log("second tray launch: activating existing window");
             if activate_tray_window() {
                 return Ok(false);
             }
