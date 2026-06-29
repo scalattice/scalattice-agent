@@ -8,13 +8,17 @@ if ($paths.Count -gt 0) {
     $env:PATH = (($paths -join ';') + ';' + $env:PATH)
 }
 Remove-GitUsrBinFromPath
+Ensure-ShortBuildDirsForCi
+Ensure-RunnerRustToolchain -ExportForCi
 
 if (-not (Prioritize-SystemRustOnPath -ExportForCi)) {
+    Show-SystemRustDiagnostics
     Write-Error @"
-System Rust not found at C:\Rust\cargo\bin.
+Rust toolchain not available (checked C:\Rust and C:\ar\rust).
 
-Run once as Administrator on the Windows build machine:
-  scripts\setup-windows-build.cmd
+If this is the self-hosted runner, either:
+  1. Run scripts\setup-windows-build.cmd as Administrator (preferred), or
+  2. Re-run setup once so NETWORK SERVICE can write under C:\ar
 "@
 }
 

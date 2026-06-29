@@ -88,16 +88,100 @@ function Add-MachinePathEntry {
     Write-Host "==> Added to Machine PATH: $Dir"
 }
 
-function Get-SystemRustCargoBin {
+function Get-PrimaryRustCargoBin {
     return "C:\Rust\cargo\bin"
 }
 
+function Get-RunnerRustRoot {
+    return "C:\ar\rust"
+}
+
+function Get-RunnerRustCargoBin {
+    return Join-Path (Get-RunnerRustRoot) "cargo\bin"
+}
+
+function Get-SystemRustCargoBin {
+    $primary = Get-PrimaryRustCargoBin
+    if (Test-Path (Join-Path $primary "cargo.exe")) {
+        return $primary
+    }
+    return Get-RunnerRustCargoBin
+}
+
 function Get-SystemRustupHome {
-    return "C:\Rust\rustup"
+    return Join-Path (Split-Path (Get-SystemCargoHome) -Parent) "rustup"
 }
 
 function Get-SystemCargoHome {
-    return "C:\Rust\cargo"
+    return Split-Path (Get-SystemRustCargoBin) -Parent
+}
+
+function Invoke-IcaclsGrant {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Grant
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & icacls $Path /grant $Grant /C /Q 1>$null 2>$null
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+function Ensure-RunnerRustToolchain {
+    param([switch]$ExportForCi)
+
+    $primaryCargo = Join-Path (Get-PrimaryRustCargoBin) "cargo.exe"
+    if (Test-Path -LiteralPath $primaryCargo) {
+        return
+    }
+
+    $runnerRoot = Get-RunnerRustRoot
+    $cargoHome = Join-Path $runnerRoot "cargo"
+    $rustupHome = Join-Path $runnerRoot "rustup"
+    $cargoExe = Join-Path $cargoHome "bin\cargo.exe"
+    $rustupExe = Join-Path $cargoHome "bin\rustup.exe"
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $cargoHome "bin"), $rustupHome | Out-Null
+    $env:RUSTUP_HOME = $rustupHome
+    $env:CARGO_HOME = $cargoHome
+    $env:RUSTUP_INIT_SKIP_PATH_CHECK = "yes"
+
+    if (-not (Test-Path -LiteralPath $cargoExe)) {
+        Write-Host "==> Installing runner-local Rust at $runnerRoot (C:\Rust unavailable)"
+        $rustupInit = Join-Path $env:TEMP "rustup-init-runner.exe"
+        Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
+        $ErrorActionPreference = $prev
+        if (-not (Test-Path -LiteralPath $cargoExe)) {
+            throw "rustup-init failed to install cargo at $cargoExe"
+        }
+    }
+
+    if (Test-Path -LiteralPath $rustupExe) {
+        & $rustupExe target add x86_64-pc-windows-msvc 2>&1 | Out-Host
+    }
+
+    if ($ExportForCi -and $env:GITHUB_ENV) {
+        "CARGO_HOME=$cargoHome" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "RUSTUP_HOME=$rustupHome" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    }
+}
+
+function Show-SystemRustDiagnostics {
+    Write-Host "==> Rust diagnostics:"
+    Write-Host "    primary cargo: $(Test-Path (Join-Path (Get-PrimaryRustCargoBin) 'cargo.exe'))"
+    Write-Host "    runner cargo:  $(Test-Path (Join-Path (Get-RunnerRustCargoBin) 'cargo.exe'))"
+    Write-Host "    active bin:    $(Get-SystemRustCargoBin)"
+    Write-Host "    CARGO_HOME:    $($env:CARGO_HOME)"
+    Write-Host "    RUSTUP_HOME:   $($env:RUSTUP_HOME)"
 }
 
 function Set-SystemRustEnv {
@@ -181,7 +265,7 @@ function Get-SystemRustTool {
         return $resolved
     }
 
-    throw "$Name.exe missing under C:\Rust and rustup which $Name failed"
+    throw "$Name.exe missing under $(Get-SystemRustCargoBin) and rustup which $Name failed"
 }
 
 function Prioritize-SystemRustOnPath {
@@ -423,7 +507,7 @@ function Ensure-BuildMachinePath {
     Add-MachinePathEntry "${env:ProgramFiles}\Git\bin"
 
     Install-SystemWideRust
-    Add-MachinePathEntry (Get-SystemRustCargoBin)
+    Add-MachinePathEntry (Get-PrimaryRustCargoBin)
 
     $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
     if (Test-Path "$cuda\bin") {
@@ -566,16 +650,22 @@ function Get-CargoTargetRoot {
 }
 
 function Ensure-ShortBuildDirs {
-  if (-not (Test-Admin)) { return }
-
-  $root = Split-Path (Get-ShortCargoTargetRoot) -Parent
+  $root = "C:\ar"
   $target = Get-ShortCargoTargetRoot
-  New-Item -ItemType Directory -Force -Path $root, $target | Out-Null
+  $runnerRust = Get-RunnerRustRoot
+  New-Item -ItemType Directory -Force -Path $root, $target, $runnerRust | Out-Null
 
-  # Runner service (NETWORK SERVICE) must write CUDA/CMake artifacts here.
-  & icacls $root /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T 2>$null | Out-Null
-  & icacls $root /grant "BUILTIN\Administrators:(OI)(CI)F" /T 2>$null | Out-Null
-  Write-Host "==> Short build dir ready: $target"
+  if (Test-Admin) {
+    Invoke-IcaclsGrant $root "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"
+    Invoke-IcaclsGrant $root "BUILTIN\Administrators:(OI)(CI)F"
+    Write-Host "==> Short build dir ready: $target (runner Rust: $runnerRust)"
+  } else {
+    Write-Host "==> Short build dir ready: $target"
+  }
+}
+
+function Ensure-ShortBuildDirsForCi {
+  New-Item -ItemType Directory -Force -Path "C:\ar", (Get-ShortCargoTargetRoot), (Get-RunnerRustRoot) -ErrorAction SilentlyContinue | Out-Null
 }
 
 function Set-ShortCargoTargetDir {
