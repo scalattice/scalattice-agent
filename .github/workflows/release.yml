@@ -90,10 +90,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Sync Cargo.toml to release tag
-        shell: pwsh
+        shell: cmd
         env:
           SCALATTICE_VERSION: ${{ inputs.tag }}
-        run: ./scripts/sync-cargo-version.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-cargo-version.ps1
       - name: Prepare build environment
         shell: cmd
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-windows-ci.ps1
@@ -130,10 +130,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Sync Cargo.toml to release tag
-        shell: pwsh
+        shell: cmd
         env:
           SCALATTICE_VERSION: ${{ inputs.tag }}
-        run: ./scripts/sync-cargo-version.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-cargo-version.ps1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda
@@ -151,15 +151,15 @@ jobs:
         with:
           arch: x64
       - name: Build + package
-        shell: pwsh
+        shell: cmd
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda_path }}
           CARGO_INCREMENTAL: "0"
           CARGO_BUILD_JOBS: "4"
           SCALATTICE_VERSION: ${{ inputs.tag }}
         run: |
-          $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
-          .\scripts\build-release.ps1
+          set "PATH=%CUDA_PATH%\bin;%PATH%"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: windows
