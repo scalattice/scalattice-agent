@@ -90,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Prepare build environment
-        shell: pwsh
+        shell: powershell
         run: .\scripts\prepare-windows-ci.ps1
       - uses: Swatinem/rust-cache@v2
         with:
@@ -98,7 +98,7 @@ jobs:
           cache-targets: true
           cache-workspace-crates: true
       - name: Build + package
-        shell: pwsh
+        shell: powershell
         env:
           CARGO_INCREMENTAL: "0"
         run: .\scripts\build-release.ps1
