@@ -12,6 +12,8 @@ if (-not (Test-Admin)) {
     Write-Error "Run this script in an elevated (Administrator) PowerShell."
 }
 
+Ensure-PowerShellExecutionPolicy
+
 Ensure-Chocolatey
 
 Write-Host "==> Installing build dependencies (skips already-installed packages)"

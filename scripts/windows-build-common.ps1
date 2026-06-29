@@ -1,5 +1,15 @@
 # Shared helpers for Windows setup scripts (dot-sourced).
 
+function Ensure-PowerShellExecutionPolicy {
+    if (-not (Test-Admin)) { return }
+
+    $current = Get-ExecutionPolicy -Scope LocalMachine
+    if ($current -eq 'Restricted' -or $current -eq 'Undefined') {
+        Write-Host "==> Setting PowerShell execution policy to RemoteSigned (LocalMachine)"
+        Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+    }
+}
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p = New-Object Security.Principal.WindowsPrincipal($id)
