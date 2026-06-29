@@ -5,11 +5,12 @@ $ErrorActionPreference = "Stop"
 
 $paths = Get-WindowsBuildPathEntries
 if ($paths.Count -gt 0) {
-    $extra = ($paths -join ';')
-    if ($env:GITHUB_PATH) {
-        "PATH=$extra;$env:PATH" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-    }
-    $env:PATH = "$extra;$env:PATH"
+    $env:PATH = (($paths -join ';') + ';' + $env:PATH)
+}
+Remove-GitUsrBinFromPath
+
+if ($env:GITHUB_ENV) {
+    "PATH=$($env:PATH)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 }
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {

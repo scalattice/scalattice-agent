@@ -210,7 +210,6 @@ function Get-WindowsBuildPathEntries {
     foreach ($dir in @(
             "${env:ProgramData}\chocolatey\bin",
             "${env:ProgramFiles}\Git\bin",
-            "${env:ProgramFiles}\Git\usr\bin",
             (Get-SystemRustCargoBin),
             "$env:USERPROFILE\.cargo\bin"
         )) {
@@ -238,7 +237,6 @@ function Get-WindowsBuildPathEntries {
 function Ensure-BuildMachinePath {
     Add-MachinePathEntry "${env:ProgramData}\chocolatey\bin"
     Add-MachinePathEntry "${env:ProgramFiles}\Git\bin"
-    Add-MachinePathEntry "${env:ProgramFiles}\Git\usr\bin"
 
     Install-SystemWideRust
     Add-MachinePathEntry (Get-SystemRustCargoBin)
@@ -254,9 +252,28 @@ function Ensure-BuildMachinePath {
     Set-LibClangEnv -Dir (Install-LibClang)
 }
 
+function Remove-GitUsrBinFromPath {
+    $block = @(
+        (Join-Path ${env:ProgramFiles} "Git\usr\bin"),
+        (Join-Path ${env:ProgramFiles(x86)} "Git\usr\bin")
+    )
+    $parts = @($env:PATH -split ';' | Where-Object { $_ -and ($block -notcontains $_) })
+    $env:PATH = ($parts -join ';')
+}
+
+function Test-MsvcLinkerOnPath {
+    $link = Get-Command link.exe -ErrorAction SilentlyContinue
+    if (-not $link) { return $false }
+    return $link.Source -notmatch '\\Git\\usr\\bin\\'
+}
+
 function Import-VsDevEnvironment {
-    if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
-        Write-Host "==> MSVC already on PATH: $((Get-Command cl.exe).Source)"
+    Remove-GitUsrBinFromPath
+
+    if ((Get-Command cl.exe -ErrorAction SilentlyContinue) -and (Test-MsvcLinkerOnPath)) {
+        Write-Host "==> MSVC toolchain on PATH"
+        Write-Host "    cl:   $((Get-Command cl.exe).Source)"
+        Write-Host "    link: $((Get-Command link.exe).Source)"
         return
     }
 
@@ -290,7 +307,11 @@ function Import-VsDevEnvironment {
     if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
         Write-Error "MSVC cl.exe not found after VsDevCmd.bat"
     }
-    Write-Host "==> MSVC: $((Get-Command cl.exe).Source)"
+    if (-not (Test-MsvcLinkerOnPath)) {
+        Write-Error "MSVC link.exe not found after VsDevCmd.bat (check PATH for Git usr\bin conflicts)"
+    }
+    Write-Host "==> MSVC cl:   $((Get-Command cl.exe).Source)"
+    Write-Host "==> MSVC link: $((Get-Command link.exe).Source)"
 }
 
 function Find-Nvcc {
