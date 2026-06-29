@@ -1,9 +1,11 @@
 # Build and package scalattice-agent for Windows x86_64 (same output as CI).
 #
 # Usage (PowerShell):
-#   .\scripts\build-release.ps1
+#   ./scripts/build-release.ps1
 #
-# Requires: Rust stable, Visual Studio C++ build tools, CUDA 12.6+
+# CI entry point for Windows releases (called from .github/workflows/release.yml).
+# For local Windows builds only: Rust stable, VS C++ tools, CUDA 12.6+.
+# On Linux, use ./scripts/release.sh --dev (Windows builds in GitHub Actions).
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$Features = "win-gpu"
@@ -60,8 +62,9 @@ if ($env:CUDA_PATH) {
     $env:PATH = "$($env:CUDA_PATH)\bin;$env:PATH"
 }
 
-Write-Host "==> cargo build --release --target $Target --features $Features"
-cargo build --release --target $Target --features $Features
+# default = ["gpu"] includes vulkan; win-gpu must replace defaults, not add to them
+Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
+cargo build --release --target $Target --no-default-features --features $Features
 
 $releaseDir = Join-Path "target" (Join-Path $Target "release")
 $bin = Join-Path $releaseDir "scalattice-agent.exe"

@@ -3,9 +3,9 @@
 #
 # Usage:
 #   ./scripts/release.sh                 # bump patch, build both archs, publish
-#   ./scripts/release.sh --dev           # x86_64 Linux local + Windows CI (skip aarch64)
-#   ./scripts/release.sh --skip-build    # reuse dist/ x86 tarball; still builds aarch64 in CI
-#   ./scripts/release.sh --skip-aarch64  # same as --dev (x86_64 only)
+#   ./scripts/release.sh --dev           # x86_64 Linux local + Windows in GitHub Actions (skip aarch64)
+#   ./scripts/release.sh --skip-build    # reuse dist/ x86 tarball; still builds CI targets below
+#   ./scripts/release.sh --skip-aarch64  # same as --dev (Windows still built in GitHub Actions)
 #   ./scripts/release.sh --version 1.0.2
 #   ./scripts/release.sh --minor
 #
@@ -18,7 +18,7 @@ REMOTE="origin"
 BUMP="patch"
 EXPLICIT_VERSION=""
 SKIP_BUILD="false"
-SKIP_AARCH64="false"
+DEV_RELEASE="false"
 NO_PUSH="false"
 WORKFLOW_FILE=".github/workflows/release.yml"
 
@@ -29,12 +29,12 @@ Usage: ./scripts/release.sh [options]
   Default: bump version, build x86_64 here, build aarch64 in GitHub Actions,
   upload both tarballs to one GitHub Release.
 
-  --dev: x86_64 Linux local + Windows CI (skips aarch64 only).
+  --dev: x86_64 Linux local; Windows installer built in GitHub Actions (aarch64 skipped).
 
 Options:
-  --dev             Day-to-day release: x86_64 Linux + Windows (no aarch64 CI)
+  --dev             Day-to-day: x86_64 Linux local + Windows via GitHub Actions (no aarch64)
   --skip-build      Skip local x86_64 compile (use existing dist/ tarball)
-  --skip-aarch64    Same as --dev (Windows CI still runs)
+  --skip-aarch64    Same as --dev (Windows still built in GitHub Actions)
   --version X.Y.Z   Explicit version
   --minor           Bump minor instead of patch
   --no-push         Dry run (no push/release)
@@ -46,9 +46,9 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage 0 ;;
-    --dev) SKIP_AARCH64="true"; shift ;;
+    --dev) DEV_RELEASE="true"; shift ;;
     --skip-build) SKIP_BUILD="true"; shift ;;
-    --skip-aarch64) SKIP_AARCH64="true"; shift ;;
+    --skip-aarch64) DEV_RELEASE="true"; shift ;;
     --no-push) NO_PUSH="true"; shift ;;
     --minor) BUMP="minor"; shift ;;
     --patch) BUMP="patch"; shift ;;
@@ -154,8 +154,14 @@ build_ci_assets() {
   gh run watch "$run_id" --exit-status
 }
 
-build_aarch64_in_ci() {
-  build_ci_assets "$1" "aarch64-only"
+# Windows is never built on the release host — always GitHub Actions (windows-2022).
+# Dev releases skip aarch64 only; full releases build aarch64 + Windows in CI.
+resolve_ci_targets() {
+  if [[ "$DEV_RELEASE" == "true" ]]; then
+    echo "windows-only"
+  else
+    echo "full"
+  fi
 }
 
 verify_release_assets() {
@@ -208,11 +214,14 @@ if [[ "$(cargo_version)" != "$VERSION" ]]; then
   set_cargo_version "$VERSION"
 fi
 
-if [[ "$SKIP_AARCH64" == "true" ]]; then
-  echo "==> Release ${TAG} (x86_64 Linux local + Windows CI, skipping aarch64)"
+if [[ "$DEV_RELEASE" == "true" ]]; then
+  echo "==> Release ${TAG} (x86_64 Linux local + Windows via GitHub Actions; skipping aarch64)"
 else
-  echo "==> Release ${TAG} (x86_64 local + aarch64 + Windows CI)"
+  echo "==> Release ${TAG} (x86_64 local + aarch64 + Windows via GitHub Actions)"
 fi
+
+CI_TARGETS="$(resolve_ci_targets)"
+echo "==> CI targets: ${CI_TARGETS} (Windows .exe always built on GitHub Actions, not onsite)"
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
   [[ -f "$X86_ARCHIVE" ]] || {
@@ -247,10 +256,10 @@ if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&
 fi
 
 echo "==> Creating GitHub release with x86_64 tarball"
-if [[ "$SKIP_AARCH64" == "true" ]]; then
-  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local + Windows CI, dev release, no aarch64)."
+if [[ "$DEV_RELEASE" == "true" ]]; then
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local + Windows via GitHub Actions; dev release, no aarch64)."
 else
-  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local, aarch64 + Windows via GitHub Actions)."
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; aarch64 + Windows via GitHub Actions)."
 fi
 gh release create "$TAG" "$X86_ARCHIVE" \
   --target main \
@@ -259,13 +268,9 @@ gh release create "$TAG" "$X86_ARCHIVE" \
 
 git fetch --tags "$REMOTE" 2>/dev/null || true
 
-if [[ "$SKIP_AARCH64" == "true" ]]; then
-  build_ci_assets "$TAG" "windows-only"
-else
-  build_ci_assets "$TAG" "full"
-fi
+build_ci_assets "$TAG" "$CI_TARGETS"
 
-if [[ "$SKIP_AARCH64" == "true" ]]; then
+if [[ "$DEV_RELEASE" == "true" ]]; then
   verify_release_assets "$TAG" false true
 else
   verify_release_assets "$TAG" true true

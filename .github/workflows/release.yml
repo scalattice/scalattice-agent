@@ -93,7 +93,7 @@ jobs:
         run: choco install innosetup -y --no-progress
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-gpu-v3
+          shared-key: release-windows-gpu-v4
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -118,7 +118,11 @@ jobs:
     needs: [build-aarch64, build-windows]
     if: |
       always() && !cancelled() &&
-      (needs.build-aarch64.result == 'success' || needs.build-windows.result == 'success')
+      (
+        (inputs.targets == 'windows-only' && needs.build-windows.result == 'success') ||
+        (inputs.targets == 'aarch64-only' && needs.build-aarch64.result == 'success') ||
+        (inputs.targets == 'full' && needs.build-aarch64.result == 'success' && needs.build-windows.result == 'success')
+      )
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
