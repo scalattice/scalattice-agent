@@ -28,7 +28,13 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 
 & (Get-SystemRustTool rustc) --version
 & (Get-SystemRustTool cargo) --version
-& (Get-SystemRustTool rustup) show
+$prev = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & (Get-SystemRustTool rustup) show
+} finally {
+    $ErrorActionPreference = $prev
+}
 
 $clang = Find-LibClangDir
 if (-not $clang) {

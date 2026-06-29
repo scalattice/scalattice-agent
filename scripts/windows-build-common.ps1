@@ -133,6 +133,22 @@ function Invoke-IcaclsGrant {
     }
 }
 
+function Invoke-NativeTool {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$ToolArgs
+    )
+
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Exe @ToolArgs *>&1 | ForEach-Object { Write-Host $_ }
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 function Ensure-RunnerRustToolchain {
     param([switch]$ExportForCi)
 
@@ -156,17 +172,17 @@ function Ensure-RunnerRustToolchain {
         Write-Host "==> Installing runner-local Rust at $runnerRoot (C:\Rust unavailable)"
         $rustupInit = Join-Path $env:TEMP "rustup-init-runner.exe"
         Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
-        $prev = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
-        $ErrorActionPreference = $prev
+        Invoke-NativeTool $rustupInit -y --default-toolchain stable --no-modify-path | Out-Null
         if (-not (Test-Path -LiteralPath $cargoExe)) {
             throw "rustup-init failed to install cargo at $cargoExe"
         }
     }
 
     if (Test-Path -LiteralPath $rustupExe) {
-        & $rustupExe target add x86_64-pc-windows-msvc 2>&1 | Out-Host
+        $code = Invoke-NativeTool $rustupExe target add x86_64-pc-windows-msvc
+        if ($code -ne 0) {
+            throw "rustup target add x86_64-pc-windows-msvc failed (exit $code)"
+        }
     }
 
     if ($ExportForCi -and $env:GITHUB_ENV) {
@@ -225,10 +241,7 @@ function Repair-SystemRustProxies {
     Write-Host "==> Recreating missing rustup proxies in $rustBin"
     $rustupInit = Join-Path $env:TEMP "rustup-init-repair.exe"
     Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
-    $ErrorActionPreference = $prev
+    Invoke-NativeTool $rustupInit -y --default-toolchain stable --no-modify-path | Out-Null
     return (Test-Path -LiteralPath $rustc)
 }
 
@@ -325,12 +338,18 @@ function Ensure-RustTarget {
     Write-Host "==> CARGO_HOME=$($env:CARGO_HOME)"
     Write-Host "==> rustc: $rustc"
     Write-Host "==> rustup target add $Target"
-    & $rustup target add $Target
-    if ($LASTEXITCODE -ne 0) {
-        throw "rustup target add $Target failed (exit $LASTEXITCODE)"
+    $code = Invoke-NativeTool $rustup target add $Target
+    if ($code -ne 0) {
+        throw "rustup target add $Target failed (exit $code)"
     }
 
-    $installed = @(& $rustup target list --installed)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $installed = @(& $rustup target list --installed)
+    } finally {
+        $ErrorActionPreference = $prev
+    }
     if ($installed -notcontains $Target) {
         & $rustup show
         throw "Rust target not installed: $Target"
@@ -379,12 +398,9 @@ function Install-SystemWideRust {
 
     $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
     Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
-    $ErrorActionPreference = $prev
-    if ($LASTEXITCODE -ne 0) {
-        throw "rustup-init failed (exit $LASTEXITCODE)"
+    $code = Invoke-NativeTool $rustupInit -y --default-toolchain stable --no-modify-path
+    if ($code -ne 0) {
+        throw "rustup-init failed (exit $code)"
     }
     if (-not (Test-Path $cargoExe)) {
         throw "rustup-init completed but cargo.exe missing at $cargoExe"
