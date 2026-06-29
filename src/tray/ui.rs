@@ -41,6 +41,7 @@ pub fn activate_existing_panel() -> bool {
 }
 
 fn run_tray_ui_inner(force: bool) -> Result<()> {
+    std::env::set_var("SCALATTICE_TRAY", "1");
     if force {
         clear_stale_tray_pid()?;
     }
@@ -59,6 +60,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
 
     let show_window = Arc::new(AtomicBool::new(interactive));
     let icon = load_tray_icon()?;
+    let viewport_icon = load_viewport_icon();
 
     let (event_tx, event_rx) = mpsc::channel();
     TrayIconEvent::set_event_handler(Some(move |event| {
@@ -101,10 +103,11 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 520.0])
-            .with_min_inner_size([560.0, 400.0])
+            .with_inner_size([760.0, 520.0])
+            .with_min_inner_size([640.0, 420.0])
             .with_title(WINDOW_TITLE)
-            .with_visible(interactive),
+            .with_visible(interactive)
+            .with_icon(viewport_icon),
         ..Default::default()
     };
 
@@ -113,7 +116,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
         WINDOW_TITLE,
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
+            cc.egui_ctx.set_visuals(scalattice_visuals());
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || {
                 loop {
@@ -279,16 +282,14 @@ impl TrayApp {
                     self.action_message = format!("Could not save token: {err}");
                     return;
                 }
-                match service::start_background_from_config(&config) {
+                match service::restart_background_from_config(&config) {
                     Ok(()) => {
                         self.action_message =
-                            "Token saved. Background agent started.".to_string();
-                        self.log_offset = 0;
-                        self.logs.clear();
+                            "Token saved. Background agent restarted.".to_string();
                     }
                     Err(err) => {
                         self.action_message = format!(
-                            "Token saved. Start issue (agent may still run at logon): {err}"
+                            "Token saved. Background restart issue: {err}"
                         );
                     }
                 }
@@ -308,119 +309,132 @@ impl TrayApp {
 
 impl eframe::App for TrayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         self.poll_tray(ctx);
         self.refresh_status();
         self.refresh_logs();
 
-        let panel_fill = egui::Color32::from_rgb(250, 250, 252);
-        let border = egui::Color32::from_rgb(220, 222, 228);
+        let panel_fill = egui::Color32::from_rgb(17, 17, 17);
+        let border = egui::Color32::from_rgba_premultiplied(255, 255, 255, 31);
+        let muted = egui::Color32::from_rgba_premultiplied(255, 255, 255, 140);
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(egui::Color32::WHITE)
+                    .fill(egui::Color32::BLACK)
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ctx, |ui| {
-                ui.heading("Scalattice Agent");
-                ui.label(
-                    egui::RichText::new("Provider machine control panel")
-                        .color(egui::Color32::from_rgb(90, 90, 95)),
+                ui.heading(
+                    egui::RichText::new("Scalattice Agent")
+                        .color(egui::Color32::WHITE)
+                        .size(22.0),
                 );
+                ui.label(egui::RichText::new("Provider machine control panel").color(muted));
                 ui.add_space(10.0);
 
-                ui.horizontal(|ui| {
-                    let left_width = ui.available_width() * 0.42;
-                    let right_width = ui.available_width();
+                ui.columns(2, |columns| {
+                    columns[0].set_min_width(300.0);
+                    columns[0].set_max_width(320.0);
 
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(left_width, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            egui::Frame::group(ui.style())
-                                .fill(panel_fill)
-                                .stroke(egui::Stroke::new(1.0, border))
-                                .inner_margin(egui::Margin::same(12))
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("Status & token").strong());
-                                    ui.add_space(6.0);
+                    columns[0].group(|ui| {
+                        egui::Frame::group(ui.style())
+                            .fill(panel_fill)
+                            .stroke(egui::Stroke::new(1.0, border))
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Status & token")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.add_space(6.0);
 
-                                    for line in &self.status_lines {
-                                        ui.label(
-                                            egui::RichText::new(line)
-                                                .size(13.0)
-                                                .family(egui::FontFamily::Proportional),
-                                        );
-                                    }
-
-                                    ui.add_space(10.0);
-                                    ui.separator();
-                                    ui.add_space(8.0);
-
-                                    ui.label(egui::RichText::new("Provider token").strong());
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.token_input)
-                                            .desired_width(f32::INFINITY)
-                                            .hint_text("slt_provider_…"),
+                                for line in &self.status_lines {
+                                    ui.label(
+                                        egui::RichText::new(line)
+                                            .size(13.0)
+                                            .color(egui::Color32::from_rgb(220, 220, 220)),
                                     );
+                                }
 
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Save token").clicked() {
-                                            self.save_token();
-                                        }
-                                        if ui.button("Open dashboard").clicked() {
-                                            self.open_dashboard();
-                                        }
-                                    });
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(8.0);
 
-                                    if !self.action_message.is_empty() {
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            egui::RichText::new(&self.action_message)
-                                                .color(egui::Color32::from_rgb(40, 90, 160)),
-                                        );
+                                ui.label(
+                                    egui::RichText::new("Provider token")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.token_input)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("slt_provider_…"),
+                                );
+
+                                ui.horizontal(|ui| {
+                                    if ui.button("Save token").clicked() {
+                                        self.save_token();
+                                    }
+                                    if ui.button("Open dashboard").clicked() {
+                                        self.open_dashboard();
                                     }
                                 });
-                        },
-                    );
 
-                    ui.add_space(8.0);
+                                if !self.action_message.is_empty() {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(&self.action_message)
+                                            .color(egui::Color32::from_rgb(99, 179, 237)),
+                                    );
+                                }
+                            });
+                    });
 
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(right_width, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            egui::Frame::group(ui.style())
-                                .fill(panel_fill)
-                                .stroke(egui::Stroke::new(1.0, border))
-                                .inner_margin(egui::Margin::same(12))
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("Live log").strong());
-                                    ui.add_space(4.0);
-                                    egui::ScrollArea::vertical()
-                                        .stick_to_bottom(true)
-                                        .auto_shrink([false; 2])
-                                        .show(ui, |ui| {
-                                            ui.add(
-                                                egui::TextEdit::multiline(&mut self.logs)
-                                                    .desired_width(f32::INFINITY)
-                                                    .desired_rows(18)
-                                                    .interactive(false)
-                                                    .font(egui::TextStyle::Monospace),
-                                            );
-                                        });
-                                });
-                        },
-                    );
+                    columns[1].group(|ui| {
+                        egui::Frame::group(ui.style())
+                            .fill(panel_fill)
+                            .stroke(egui::Stroke::new(1.0, border))
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Live log")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.add_space(4.0);
+                                egui::ScrollArea::vertical()
+                                    .stick_to_bottom(true)
+                                    .auto_shrink([false; 2])
+                                    .max_height(ui.available_height() - 8.0)
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(ui.available_width());
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&self.logs)
+                                                    .monospace()
+                                                    .size(12.0)
+                                                    .color(egui::Color32::from_rgb(200, 200, 200)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                            });
+                    });
                 });
 
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(
-                        "Right-click the notification icon for the menu. The agent keeps running in the background.",
+                        "Closing this window hides the panel — the tray icon and background agent keep running.",
                     )
                     .size(12.0)
-                    .color(egui::Color32::from_rgb(110, 110, 115)),
+                    .color(muted),
                 );
             });
 
@@ -428,12 +442,44 @@ impl eframe::App for TrayApp {
     }
 }
 
-fn load_tray_icon() -> Result<Icon> {
+fn scalattice_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = egui::Color32::BLACK;
+    visuals.window_fill = egui::Color32::BLACK;
+    visuals.extreme_bg_color = egui::Color32::BLACK;
+    visuals.faint_bg_color = egui::Color32::from_rgb(17, 17, 17);
+    visuals.widgets.noninteractive.fg_stroke.color =
+        egui::Color32::from_rgba_premultiplied(255, 255, 255, 180);
+    visuals.widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
+    visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+    visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(26, 26, 26);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 38, 38);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(48, 48, 48);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(99, 179, 237);
+    visuals
+}
+
+fn load_viewport_icon() -> egui::IconData {
+    let rgba = decode_icon_rgba();
+    egui::IconData {
+        width: rgba.0,
+        height: rgba.1,
+        rgba: rgba.2,
+    }
+}
+
+fn decode_icon_rgba() -> (u32, u32, Vec<u8>) {
     let bytes = include_bytes!("../../installer/windows/scalattice.ico");
-    let image = image::load_from_memory(bytes).context("failed to decode tray icon")?;
+    let image = image::load_from_memory(bytes).expect("tray icon bytes");
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
-    Icon::from_rgba(rgba.into_raw(), width, height).context("failed to build tray icon")
+    (width, height, rgba.into_raw())
+}
+
+fn load_tray_icon() -> Result<Icon> {
+    let (width, height, rgba) = decode_icon_rgba();
+    Icon::from_rgba(rgba, width, height).context("failed to build tray icon")
 }
 
 /// Returns `true` when this process should start the tray UI; `false` when an existing instance was activated.
@@ -593,9 +639,24 @@ fn detach_console() {
 }
 
 fn open_dashboard_url(url: &str) -> Result<()> {
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .context("failed to open browser")?;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteW, SW_SHOW};
+
+    let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    unsafe {
+        let rc = ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            url_wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOW,
+        );
+        if (rc as isize) <= 32 {
+            anyhow::bail!("ShellExecute failed ({rc})");
+        }
+    }
     Ok(())
 }

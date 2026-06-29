@@ -30,6 +30,10 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     ensure_service_running(config)
 }
 
+pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
+    ensure_service_running(config)
+}
+
 pub fn invoked_by_systemd() -> bool {
     std::env::var("INVOCATION_ID").is_ok() || std::env::var("JOURNAL_STREAM").is_ok()
 }

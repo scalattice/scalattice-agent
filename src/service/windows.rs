@@ -1,5 +1,5 @@
 use crate::config::AgentConfig;
-use crate::paths::{agent_binary_name, agent_log_path, install_dir, lib_dir, resolve_agent_binary};
+use crate::paths::{agent_log_path, install_dir, lib_dir, resolve_agent_binary};
 use crate::service::BackgroundStatus;
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -25,7 +25,17 @@ pub fn background_status() -> BackgroundStatus {
 }
 
 pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
-    ensure_background_task(config)
+    ensure_background_task(config, false)
+}
+
+pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
+    ensure_background_task(config, true)
+}
+
+pub fn in_tray_process() -> bool {
+    std::env::var("SCALATTICE_TRAY")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 pub fn invoked_by_systemd() -> bool {
@@ -43,17 +53,7 @@ pub fn background_service_available() -> bool {
 }
 
 pub fn service_active() -> bool {
-    let output = Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {}", agent_binary_name()), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.contains(agent_binary_name())
-        }
-        _ => false,
-    }
+    background_agent_running()
 }
 
 pub fn follow_service_logs() -> Result<()> {
@@ -115,10 +115,8 @@ pub fn remove_background_service() -> Result<()> {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     remove_startup_shortcuts();
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", agent_binary_name()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    stop_background_agent_only();
+    stop_tray_agent_only();
     Ok(())
 }
 
@@ -150,7 +148,7 @@ pub fn autostart_method_line() -> Option<String> {
     Some(format!("{agent}; {tray}"))
 }
 
-fn ensure_background_task(config: &AgentConfig) -> Result<()> {
+fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     let token_changed = crate::service::persist_agent_token(&config.token)?;
     let runner_changed = write_background_runner()?;
     sync_launch_scripts()?;
@@ -159,14 +157,58 @@ fn ensure_background_task(config: &AgentConfig) -> Result<()> {
 
     if needs_register {
         register_agent_autostart()?;
-    } else if !service_active() {
+    }
+
+    if token_changed || !background_agent_running() {
+        if background_agent_running() {
+            stop_background_agent_only();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
         spawn_background_detached()?;
     }
 
-    register_tray_autostart()?;
-    launch_tray_if_needed()?;
+    if !skip_tray && !in_tray_process() {
+        register_tray_autostart()?;
+        launch_tray_if_needed()?;
+    }
 
     Ok(())
+}
+
+fn background_agent_running() -> bool {
+    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
+  Where-Object { $_.CommandLine -match 'foreground' } |
+  Select-Object -First 1 -ExpandProperty ProcessId"#;
+    match Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn stop_background_agent_only() {
+    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
+  Where-Object { $_.CommandLine -match 'foreground' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+fn stop_tray_agent_only() {
+    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
+  Where-Object { $_.CommandLine -match '\s+tray(\s|$)' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 fn write_background_runner() -> Result<bool> {

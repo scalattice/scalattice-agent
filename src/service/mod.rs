@@ -36,6 +36,15 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::start_background_from_config(config)
 }
 
+pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
+    platform::restart_background_from_config(config)
+}
+
+#[cfg(windows)]
+pub fn in_tray_process() -> bool {
+    platform::in_tray_process()
+}
+
 pub fn invoked_by_systemd() -> bool {
     platform::invoked_by_systemd()
 }
