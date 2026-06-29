@@ -4,6 +4,7 @@ use crate::service;
 use crate::state;
 use anyhow::{Context, Result};
 use eframe::egui;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -14,7 +15,7 @@ use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    FindWindowW, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
 const DASHBOARD_URL: &str = "https://scalattice.cloud/providers";
@@ -117,6 +118,19 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
     };
 
     let show_for_app = show_window.clone();
+
+    let (status_tx, status_rx) = mpsc::channel();
+    let (status_req_tx, status_req_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while status_req_rx.recv().is_ok() {
+            let log_path = agent_log_path().ok();
+            let lines = gather_status_lines(&log_path);
+            if status_tx.send(lines).is_err() {
+                break;
+            }
+        }
+    });
+
     eframe::run_native(
         WINDOW_TITLE,
         options,
@@ -126,7 +140,8 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
                 event_rx,
                 show_rx,
                 show_for_app,
-                interactive,
+                status_rx,
+                status_req_tx,
             )))
         }),
     )
@@ -140,7 +155,9 @@ struct TrayApp {
     event_rx: mpsc::Receiver<TrayIconEvent>,
     show_rx: mpsc::Receiver<()>,
     show_window: Arc<AtomicBool>,
-    panel_visible: bool,
+    status_rx: mpsc::Receiver<Vec<String>>,
+    status_req_tx: mpsc::Sender<()>,
+    status_refresh_inflight: bool,
     token_input: String,
     status_lines: Vec<String>,
     action_message: String,
@@ -148,6 +165,7 @@ struct TrayApp {
     log_path: Option<PathBuf>,
     log_offset: u64,
     next_data_poll: Instant,
+    last_outer_rect: Option<egui::Rect>,
 }
 
 impl TrayApp {
@@ -155,7 +173,8 @@ impl TrayApp {
         event_rx: mpsc::Receiver<TrayIconEvent>,
         show_rx: mpsc::Receiver<()>,
         show_window: Arc<AtomicBool>,
-        panel_visible: bool,
+        status_rx: mpsc::Receiver<Vec<String>>,
+        status_req_tx: mpsc::Sender<()>,
     ) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let log_path = agent_log_path().ok();
@@ -163,7 +182,9 @@ impl TrayApp {
             event_rx,
             show_rx,
             show_window,
-            panel_visible,
+            status_rx,
+            status_req_tx,
+            status_refresh_inflight: false,
             token_input,
             status_lines: Vec::new(),
             action_message: String::new(),
@@ -171,6 +192,7 @@ impl TrayApp {
             log_path,
             log_offset: 0,
             next_data_poll: Instant::now(),
+            last_outer_rect: None,
         }
     }
 
@@ -198,59 +220,42 @@ impl TrayApp {
     }
 
     fn reveal_window(&mut self, ctx: &egui::Context) {
-        self.panel_visible = true;
         self.next_data_poll = Instant::now();
         activate_tray_window();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        self.kick_status_refresh();
         ctx.request_repaint();
     }
 
-    fn refresh_status(&mut self) -> bool {
-        let mut lines = vec![format!("Version {}", env!("CARGO_PKG_VERSION"))];
-        lines.push(state::cloud_connection_line());
-
-        if crate::config::read_saved_agent_token().is_some() {
-            lines.push("Token: set".to_string());
-        } else {
-            lines.push("Token: not set".to_string());
+    fn kick_status_refresh(&mut self) {
+        if self.status_refresh_inflight {
+            return;
         }
-
-        let service_line = match service::background_status() {
-            service::BackgroundStatus::Running => "Agent: running",
-            service::BackgroundStatus::Stopped => "Agent: stopped (will start at logon)",
-            service::BackgroundStatus::NotInstalled => "Agent: not configured",
-        };
-        lines.push(service_line.to_string());
-
-        #[cfg(windows)]
-        if let Some(method) = service::autostart_method_line() {
-            lines.push(format!("Autostart: {method}"));
+        if self.status_req_tx.send(()).is_ok() {
+            self.status_refresh_inflight = true;
         }
+    }
 
-        if let Ok(bin) = install_dir() {
-            lines.push(format!("Bin: {}", bin.display()));
-        }
-        if let Ok(lib) = lib_dir() {
-            lines.push(format!("Lib: {}", lib.display()));
-        }
-        if let Some(log) = self.log_path.as_ref() {
-            lines.push(format!("Log: {}", log.display()));
-        }
-
-        if let Some(summary) = state::agent_activity_summary() {
-            lines.push(format!("Status: {}", summary.status));
-            if let Some(node) = summary.node_id {
-                lines.push(format!("Node: {node}"));
+    fn poll_status_results(&mut self, ctx: &egui::Context) {
+        while let Ok(lines) = self.status_rx.try_recv() {
+            self.status_refresh_inflight = false;
+            if lines != self.status_lines {
+                self.status_lines = lines;
+                ctx.request_repaint();
             }
         }
+    }
 
-        if lines == self.status_lines {
-            return false;
-        }
-        self.status_lines = lines;
-        true
+    fn window_in_motion(&mut self, ctx: &egui::Context) -> bool {
+        let outer = ctx.input(|i| i.viewport().outer_rect);
+        let moving = matches!(
+            (self.last_outer_rect, outer),
+            (Some(prev), Some(cur)) if prev != cur
+        );
+        self.last_outer_rect = outer;
+        moving
     }
 
     fn refresh_logs(&mut self) -> bool {
@@ -279,11 +284,18 @@ impl TrayApp {
             0
         };
 
-        let Ok(raw) = std::fs::read(path) else {
+        let Ok(mut file) = std::fs::File::open(path) else {
             return false;
         };
-        let slice = &raw[read_from as usize..];
-        let chunk = strip_ansi_escapes(&String::from_utf8_lossy(slice));
+        if file.seek(SeekFrom::Start(read_from)).is_err() {
+            return false;
+        }
+        let to_read = (len - read_from) as usize;
+        let mut buf = vec![0u8; to_read];
+        if file.read_exact(&mut buf).is_err() {
+            return false;
+        }
+        let chunk = strip_ansi_escapes(&String::from_utf8_lossy(&buf));
         self.logs.push_str(&chunk);
         if self.logs.len() > 48_000 {
             let drop_by = self.logs.len().saturating_sub(40_000);
@@ -310,11 +322,13 @@ impl TrayApp {
                     Ok(()) => {
                         self.action_message =
                             "Token saved. Background agent restarted.".to_string();
+                        self.kick_status_refresh();
                     }
                     Err(err) => {
                         self.action_message = format!(
                             "Token saved. Background restart issue: {err}"
                         );
+                        self.kick_status_refresh();
                     }
                 }
             }
@@ -336,20 +350,37 @@ impl eframe::App for TrayApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.panel_visible = false;
         }
 
         self.poll_tray(ctx);
 
-        if !self.panel_visible {
+        let native_visible = native_window_visible();
+        let viewport_visible = ctx.input(|i| i.viewport().visible.unwrap_or(true));
+
+        if !viewport_visible && native_visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            self.next_data_poll = Instant::now();
+            self.kick_status_refresh();
+        }
+
+        if !viewport_visible && !native_visible {
             ctx.request_repaint_after(Duration::from_millis(400));
             return;
         }
 
+        self.poll_status_results(ctx);
+
+        let window_moving = self.window_in_motion(ctx);
         let pointer_busy = ctx.input(|i| i.pointer.any_down());
-        if !pointer_busy && Instant::now() >= self.next_data_poll {
-            self.next_data_poll = Instant::now() + Duration::from_secs(2);
-            if self.refresh_status() | self.refresh_logs() {
+
+        if self.status_lines.is_empty() && !self.status_refresh_inflight {
+            self.kick_status_refresh();
+        }
+
+        if !window_moving && !pointer_busy && Instant::now() >= self.next_data_poll {
+            self.next_data_poll = Instant::now() + Duration::from_secs(3);
+            self.kick_status_refresh();
+            if self.refresh_logs() {
                 ctx.request_repaint();
             }
         }
@@ -458,7 +489,7 @@ impl eframe::App for TrayApp {
                     });
             });
 
-        if !pointer_busy {
+        if !window_moving && !pointer_busy {
             let until_poll = self
                 .next_data_poll
                 .saturating_duration_since(Instant::now());
@@ -466,6 +497,56 @@ impl eframe::App for TrayApp {
                 ctx.request_repaint_after(until_poll);
             }
         }
+    }
+}
+
+fn gather_status_lines(log_path: &Option<PathBuf>) -> Vec<String> {
+    let mut lines = vec![format!("Version {}", env!("CARGO_PKG_VERSION"))];
+    lines.push(state::cloud_connection_line());
+
+    if crate::config::read_saved_agent_token().is_some() {
+        lines.push("Token: set".to_string());
+    } else {
+        lines.push("Token: not set".to_string());
+    }
+
+    let service_line = match service::background_status() {
+        service::BackgroundStatus::Running => "Agent: running",
+        service::BackgroundStatus::Stopped => "Agent: stopped (will start at logon)",
+        service::BackgroundStatus::NotInstalled => "Agent: not configured",
+    };
+    lines.push(service_line.to_string());
+
+    #[cfg(windows)]
+    if let Some(method) = service::autostart_method_line() {
+        lines.push(format!("Autostart: {method}"));
+    }
+
+    if let Ok(bin) = install_dir() {
+        lines.push(format!("Bin: {}", bin.display()));
+    }
+    if let Ok(lib) = lib_dir() {
+        lines.push(format!("Lib: {}", lib.display()));
+    }
+    if let Some(log) = log_path {
+        lines.push(format!("Log: {}", log.display()));
+    }
+
+    if let Some(summary) = state::agent_activity_summary() {
+        lines.push(format!("Status: {}", summary.status));
+        if let Some(node) = summary.node_id {
+            lines.push(format!("Node: {node}"));
+        }
+    }
+
+    lines
+}
+
+fn native_window_visible() -> bool {
+    let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        !hwnd.is_null() && IsWindowVisible(hwnd) != 0
     }
 }
 
