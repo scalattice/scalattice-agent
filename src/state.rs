@@ -152,16 +152,25 @@ pub fn read_state() -> Option<AgentLocalState> {
 
 pub fn cloud_connection_line() -> String {
     let Some(state) = read_state() else {
+        if service_hint() {
+            return "Scalattice Cloud: unknown (agent running — see agent.log)".to_string();
+        }
         return "Scalattice Cloud: not connected".to_string();
     };
 
     if let Some(err) = &state.last_error {
-        if !is_recent(state.updated_at_ms) {
+        if !is_recent(state.updated_at_ms) && !service_hint() {
             return format!("Scalattice Cloud: not connected ({err})");
         }
     }
 
     if !is_recent(state.updated_at_ms) {
+        if state.server_registered && service_hint() {
+            if let Some(node) = &state.node_id {
+                return format!("Scalattice Cloud: connected (node {node})");
+            }
+            return "Scalattice Cloud: connected (agent running)".to_string();
+        }
         return "Scalattice Cloud: not connected".to_string();
     }
 
@@ -194,6 +203,17 @@ pub fn agent_activity_summary() -> Option<AgentActivitySummary> {
     }
 
     if !is_recent(state.updated_at_ms) {
+        if state.server_registered && service_hint() {
+            let status = state
+                .status_label
+                .as_deref()
+                .map(normalize_status_label)
+                .unwrap_or_else(|| "registered (agent running)".to_string());
+            return Some(AgentActivitySummary {
+                status,
+                node_id: state.node_id,
+            });
+        }
         if service_hint() {
             #[cfg(unix)]
             let status = "not registered (check: journalctl --user -u scalattice-agent -n 30)".to_string();

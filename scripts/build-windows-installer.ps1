@@ -1,11 +1,16 @@
 # Compile ScalatticeAgentSetup-x86_64.exe with Inno Setup 6.
 param(
-    [string]$Version = ""
+    [string]$Version = "",
+    [string]$PackageVersion = ""
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
+
+if (-not $Version -and $PackageVersion) {
+    $Version = $PackageVersion.TrimStart('v')
+}
 
 $distExe = Join-Path $Root "dist\scalattice-agent.exe"
 if (-not (Test-Path $distExe)) {

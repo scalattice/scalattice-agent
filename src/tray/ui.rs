@@ -5,73 +5,154 @@ use crate::state;
 use anyhow::{Context, Result};
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+};
 
 const DASHBOARD_URL: &str = "https://scalattice.cloud/providers";
+const WINDOW_TITLE: &str = "Scalattice Agent";
+const TRAY_MUTEX: &str = "ScalatticeAgentTray";
 
-pub fn run_tray_ui() -> Result<()> {
-    detach_console();
-    ensure_single_tray_instance()?;
+pub fn run_tray_ui(force: bool) -> Result<()> {
+    write_tray_log(&format!(
+        "tray starting pid={} force={force}",
+        std::process::id()
+    ));
+    if let Err(err) = run_tray_ui_inner(force) {
+        write_tray_log(&format!("tray exited with error: {err:#}"));
+        eprintln!("Scalattice tray error: {err:#}");
+        return Err(err);
+    }
+    write_tray_log("tray exited normally");
+    Ok(())
+}
 
+/// If the tray app is already running, bring its window forward.
+pub fn activate_existing_panel() -> bool {
+    activate_tray_window()
+}
+
+fn run_tray_ui_inner(force: bool) -> Result<()> {
+    if force {
+        clear_stale_tray_pid()?;
+    }
+    write_tray_pid()?;
+
+    let interactive = has_attached_console() && !launched_hidden();
+    maybe_detach_console();
+
+    if !acquire_tray_instance(force)? {
+        if interactive {
+            println!("Activated existing Scalattice tray window.");
+        }
+        clear_tray_pid();
+        return Ok(());
+    }
+
+    let show_window = Arc::new(AtomicBool::new(interactive));
     let icon = load_tray_icon()?;
+
     let (event_tx, event_rx) = mpsc::channel();
     TrayIconEvent::set_event_handler(Some(move |event| {
         let _ = event_tx.send(event);
     }));
 
+    let show_for_menu = show_window.clone();
+    let tray_menu = Menu::new();
+    let open_item = MenuItem::new("Open panel", true, None);
+    let quit_item = MenuItem::new("Quit tray", true, None);
+    tray_menu
+        .append(&open_item)
+        .context("failed to build tray menu")?;
+    tray_menu
+        .append(&PredefinedMenuItem::separator())
+        .context("failed to build tray menu")?;
+    tray_menu
+        .append(&quit_item)
+        .context("failed to build tray menu")?;
+
+    let open_id = open_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    MenuEvent::set_event_handler(Some(move |event| {
+        if event.id == open_id {
+            show_for_menu.store(true, Ordering::SeqCst);
+        } else if event.id == quit_id {
+            write_tray_log("tray quit from menu");
+            std::process::exit(0);
+        }
+    }));
+
     let _tray = TrayIconBuilder::new()
         .with_tooltip("Scalattice Agent — click to open")
         .with_icon(icon)
+        .with_menu(Box::new(tray_menu))
         .build()
         .context("failed to create tray icon")?;
+
+    write_tray_log("tray started");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 520.0])
             .with_min_inner_size([560.0, 400.0])
-            .with_title("Scalattice Agent")
-            .with_visible(false),
+            .with_title(WINDOW_TITLE)
+            .with_visible(interactive),
         ..Default::default()
     };
 
+    let show_for_app = show_window.clone();
     eframe::run_native(
-        "Scalattice Agent",
+        WINDOW_TITLE,
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(TrayApp::new(event_rx)))
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(200));
+                    ctx.request_repaint();
+                }
+            });
+            Ok(Box::new(TrayApp::new(event_rx, show_for_app)))
         }),
     )
-    .map_err(|err| anyhow::anyhow!("tray UI exited: {err}"))
+    .map_err(|err| anyhow::anyhow!("tray UI exited: {err}"))?;
+
+    clear_tray_pid();
+    Ok(())
 }
 
 struct TrayApp {
     event_rx: mpsc::Receiver<TrayIconEvent>,
+    show_window: Arc<AtomicBool>,
     token_input: String,
     status_lines: Vec<String>,
     action_message: String,
     logs: String,
-    show_window: bool,
     log_path: Option<PathBuf>,
     log_offset: u64,
     last_refresh: Instant,
 }
 
 impl TrayApp {
-    fn new(event_rx: mpsc::Receiver<TrayIconEvent>) -> Self {
+    fn new(event_rx: mpsc::Receiver<TrayIconEvent>, show_window: Arc<AtomicBool>) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let log_path = agent_log_path().ok();
         Self {
             event_rx,
+            show_window,
             token_input,
             status_lines: Vec::new(),
             action_message: String::new(),
             logs: String::new(),
-            show_window: false,
             log_path,
             log_offset: 0,
             last_refresh: Instant::now() - Duration::from_secs(1),
@@ -79,16 +160,28 @@ impl TrayApp {
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
+        if self.show_window.swap(false, Ordering::SeqCst) {
+            self.reveal_window(ctx);
+        }
+
         while let Ok(event) = self.event_rx.try_recv() {
-            if matches!(
-                event,
-                TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. }
-            ) {
-                self.show_window = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            match event {
+                TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                }
+                | TrayIconEvent::DoubleClick { .. } => {
+                    self.reveal_window(ctx);
+                }
+                _ => {}
             }
         }
+    }
+
+    fn reveal_window(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     }
 
     fn refresh_status(&mut self) {
@@ -219,10 +312,6 @@ impl eframe::App for TrayApp {
         self.refresh_status();
         self.refresh_logs();
 
-        if !self.show_window {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-
         let panel_fill = egui::Color32::from_rgb(250, 250, 252);
         let border = egui::Color32::from_rgb(220, 222, 228);
 
@@ -328,7 +417,7 @@ impl eframe::App for TrayApp {
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(
-                        "Click the notification area icon to hide this window. The agent keeps running in the background.",
+                        "Right-click the notification icon for the menu. The agent keeps running in the background.",
                     )
                     .size(12.0)
                     .color(egui::Color32::from_rgb(110, 110, 115)),
@@ -347,8 +436,32 @@ fn load_tray_icon() -> Result<Icon> {
     Icon::from_rgba(rgba.into_raw(), width, height).context("failed to build tray icon")
 }
 
-fn ensure_single_tray_instance() -> Result<()> {
-    let name: Vec<u16> = "ScalatticeAgentTray\0".encode_utf16().collect();
+/// Returns `true` when this process should start the tray UI; `false` when an existing instance was activated.
+fn acquire_tray_instance(force: bool) -> Result<bool> {
+    match try_acquire_tray_mutex() {
+        Ok(true) => return Ok(true),
+        Ok(false) => {
+            write_tray_log("second tray launch — activating existing window");
+            if activate_tray_window() {
+                return Ok(false);
+            }
+            if force {
+                clear_stale_tray_pid()?;
+                if try_acquire_tray_mutex()? {
+                    return Ok(true);
+                }
+            }
+            anyhow::bail!(
+                "Scalattice tray is already running but its window could not be found. \
+                 Stop extra scalattice-agent tray processes or run: scalattice-agent tray --force"
+            );
+        }
+        Err(err) => return Err(err),
+    }
+}
+
+fn try_acquire_tray_mutex() -> Result<bool> {
+    let name: Vec<u16> = format!("{TRAY_MUTEX}\0").encode_utf16().collect();
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
         if handle.is_null() {
@@ -356,10 +469,119 @@ fn ensure_single_tray_instance() -> Result<()> {
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             CloseHandle(handle);
-            anyhow::bail!("Scalattice tray is already running");
+            return Ok(false);
         }
     }
+    Ok(true)
+}
+
+fn tray_pid_path() -> Result<PathBuf> {
+    Ok(install_dir()?.join("tray.pid"))
+}
+
+fn write_tray_pid() -> Result<()> {
+    let path = tray_pid_path()?;
+    std::fs::write(path, std::process::id().to_string())?;
     Ok(())
+}
+
+fn clear_tray_pid() {
+    if let Ok(path) = tray_pid_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn clear_stale_tray_pid() -> Result<()> {
+    let path = tray_pid_path()?;
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(pid) = raw.trim().parse::<u32>() else {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    };
+    if pid != std::process::id() && process_exists(pid) {
+        write_tray_log(&format!("stopping stale tray pid {pid}"));
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+fn process_exists(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+        })
+        .unwrap_or(false)
+}
+
+fn launched_hidden() -> bool {
+    std::env::var("SCALATTICE_TRAY_HIDDEN")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn has_attached_console() -> bool {
+    unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() != 0 }
+}
+
+fn maybe_detach_console() {
+    if launched_hidden() {
+        detach_console();
+    }
+}
+
+fn activate_tray_window() -> bool {
+    let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd == 0 {
+            return false;
+        }
+        ShowWindow(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        true
+    }
+}
+
+fn write_tray_log(message: &str) {
+    let Ok(agent_log) = agent_log_path() else {
+        return;
+    };
+    let Some(parent) = agent_log.parent() else {
+        return;
+    };
+    let log_path = parent.join("tray.log");
+    let timestamp = chrono_lite_timestamp();
+    let line = format!("{timestamp} {message}\n");
+    let _ = std::fs::create_dir_all(parent);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(line.as_bytes())
+        });
+}
+
+fn chrono_lite_timestamp() -> String {
+    use std::time::SystemTime;
+    let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return "0".to_string();
+    };
+    format!("{}", duration.as_secs())
 }
 
 fn detach_console() {

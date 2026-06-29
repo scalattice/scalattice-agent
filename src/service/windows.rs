@@ -240,6 +240,7 @@ install = fso.GetParentFolderName(WScript.ScriptFullName)
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
+env("SCALATTICE_TRAY_HIDDEN") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
 "#;
@@ -472,6 +473,7 @@ fn spawn_background_detached() -> Result<()> {
 
 fn launch_tray_if_needed() -> Result<()> {
     if tray_instance_running() {
+        activate_tray_window();
         return Ok(());
     }
 
@@ -482,6 +484,21 @@ fn launch_tray_if_needed() -> Result<()> {
         .spawn()
         .context("failed to launch tray")?;
     Ok(())
+}
+
+fn activate_tray_window() {
+    let title: Vec<u16> = "Scalattice Agent\0".encode_utf16().collect();
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+        };
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
 }
 
 fn tray_instance_running() -> bool {

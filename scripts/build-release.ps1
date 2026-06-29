@@ -68,6 +68,7 @@ Copy-Item -LiteralPath $bin -Destination "dist\scalattice-agent.exe" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\scalattice-run.cmd") -Destination "dist\scalattice-run.cmd" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-tray.vbs") -Destination "dist\launch-tray.vbs" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-background.vbs") -Destination "dist\launch-background.vbs" -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\open-tray-debug.cmd") -Destination "dist\open-tray-debug.cmd" -Force
 & (Join-Path $PSScriptRoot "bundle-release-windows.ps1") -Binary "dist\scalattice-agent.exe" -OutDir "dist" -BuildRoot $releaseDir
 
 Write-Host ""
@@ -104,7 +105,7 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 if ((Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -or (Test-Path "${env:ProgramFiles}\Inno Setup 6\ISCC.exe")) {
     $installerArgs = @()
     if ($PackageVersion) {
-        $installerArgs += "-PackageVersion"
+        $installerArgs += "-Version"
         $installerArgs += $PackageVersion
     }
     & (Join-Path $PSScriptRoot "build-windows-installer.ps1") @installerArgs

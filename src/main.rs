@@ -13,7 +13,7 @@ mod state;
 #[cfg(windows)]
 mod tray;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -53,30 +53,66 @@ enum Commands {
     },
     /// Windows only: run the notification-area control panel
     #[cfg(windows)]
-    Tray,
+    Tray {
+        /// Start even if another tray instance appears stuck (kills stale tray PID file)
+        #[arg(long, hide = true)]
+        force: bool,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
-
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .init();
+fn main() -> Result<()> {
+    init_crypto()?;
+    init_logging();
 
     let cli = Cli::parse();
 
+    #[cfg(windows)]
+    if should_run_tray_ui(&cli) {
+        let force = matches!(&cli.command, Some(Commands::Tray { force: true }));
+        return tray::open_panel(force);
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_async(cli))
+}
+
+#[cfg(windows)]
+fn should_run_tray_ui(cli: &Cli) -> bool {
+    matches!(cli.command, None | Some(Commands::Tray { .. }))
+}
+
+fn init_crypto() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))
+}
+
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .init();
+}
+
+async fn run_async(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Foreground { token } => {
+        None => {
+            #[cfg(not(windows))]
+            anyhow::bail!(
+                "no command specified — try: scalattice-agent status | foreground | set-token"
+            );
+            #[cfg(windows)]
+            unreachable!("tray handled in main")
+        }
+        Some(Commands::Foreground { token }) => {
             run_foreground(token).await?;
         }
-        Commands::Status => {
+        Some(Commands::Status) => {
             print_status()?;
             maybe_start_background_from_saved_token()?;
         }
-        Commands::SetToken { token } => {
+        Some(Commands::SetToken { token }) => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
             service::persist_agent_token(&config.token)?;
             match service::start_background_from_config(&config) {
@@ -93,27 +129,30 @@ async fn main() -> Result<()> {
                 }
             }
             #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                let vbs = crate::paths::install_dir()?.join("launch-tray.vbs");
-                let _ = std::process::Command::new("wscript.exe")
-                    .args(["//nologo", &vbs.display().to_string()])
-                    .creation_flags(0x0800_0000)
-                    .spawn();
-            }
+            spawn_tray_hidden()?;
         }
-        Commands::Uninstall { yes, purge } => {
+        Some(Commands::Uninstall { yes, purge }) => {
             service::uninstall_agent(&service::UninstallOptions {
                 yes,
                 purge_models: purge,
             })?;
         }
         #[cfg(windows)]
-        Commands::Tray => {
-            tray::run()?;
-        }
+        Some(Commands::Tray { .. }) => unreachable!("tray handled in main"),
     }
 
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_tray_hidden() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let vbs = crate::paths::install_dir()?.join("launch-tray.vbs");
+    std::process::Command::new("wscript.exe")
+        .args(["//nologo", &vbs.display().to_string()])
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .context("failed to launch tray")?;
     Ok(())
 }
 
@@ -220,11 +259,17 @@ fn print_status() -> Result<()> {
     }
     if let Ok(log) = crate::paths::agent_log_path() {
         println!("Log      {}", log.display());
+        if let Some(parent) = log.parent() {
+            let tray_log = parent.join("tray.log");
+            if tray_log.is_file() {
+                println!("Tray log {}", tray_log.display());
+            }
+        }
     }
     println!();
     println!("Dashboard https://scalattice.cloud/providers");
     #[cfg(windows)]
-    println!("Control panel: click the Scalattice icon in the notification area, or run launch-tray.vbs");
+    println!("Control panel: scalattice-agent tray  (or click the notification-area icon)");
     Ok(())
 }
 

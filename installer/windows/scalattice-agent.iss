@@ -47,10 +47,11 @@ Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ign
 Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\open-tray-debug.cmd"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\launch-tray.vbs"; Comment: "Open status, token, and live log panel"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\scalattice-run.cmd"; Parameters: "tray"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open status, token, and live log panel"
 Name: "{autoprograms}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Comment: "Manage GPUs and models"
 Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Tasks: desktopicon
 
