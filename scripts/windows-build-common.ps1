@@ -126,6 +126,64 @@ function Set-SystemRustEnv {
     return $true
 }
 
+function Repair-SystemRustProxies {
+    $rustBin = Get-SystemRustCargoBin
+    $rustc = Join-Path $rustBin "rustc.exe"
+    if (Test-Path -LiteralPath $rustc) {
+        return $true
+    }
+
+    $rustup = Join-Path $rustBin "rustup.exe"
+    if (-not (Test-Path -LiteralPath $rustup)) {
+        return $false
+    }
+
+    Write-Host "==> Recreating missing rustup proxies in $rustBin"
+    $rustupInit = Join-Path $env:TEMP "rustup-init-repair.exe"
+    Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
+    $ErrorActionPreference = $prev
+    return (Test-Path -LiteralPath $rustc)
+}
+
+function Get-SystemRustTool {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('rustc', 'cargo', 'rustup')]
+        [string]$Name
+    )
+
+    Set-SystemRustEnv | Out-Null
+
+    $rustBin = Get-SystemRustCargoBin
+    $exe = Join-Path $rustBin "$Name.exe"
+    if (Test-Path -LiteralPath $exe) {
+        return $exe
+    }
+
+    if ($Name -eq 'rustup') {
+        throw "rustup.exe missing at $exe"
+    }
+
+    if (Repair-SystemRustProxies) {
+        return (Join-Path $rustBin "$Name.exe")
+    }
+
+    $rustup = Join-Path $rustBin "rustup.exe"
+    if (-not (Test-Path -LiteralPath $rustup)) {
+        throw "$Name.exe missing and rustup.exe not found at $rustup"
+    }
+
+    $resolved = (& $rustup which $Name).Trim()
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $resolved)) {
+        return $resolved
+    }
+
+    throw "$Name.exe missing under C:\Rust and rustup which $Name failed"
+}
+
 function Prioritize-SystemRustOnPath {
     param([switch]$ExportForCi)
 
@@ -147,8 +205,12 @@ function Prioritize-SystemRustOnPath {
         })
     $env:PATH = ($rustBin + ';' + ($parts -join ';'))
 
-    $rustc = Join-Path $rustBin "rustc.exe"
-    $cargo = Join-Path $rustBin "cargo.exe"
+    try {
+        $rustc = Get-SystemRustTool rustc
+        $cargo = Get-SystemRustTool cargo
+    } catch {
+        return $false
+    }
     $env:RUSTC = $rustc
     $env:CARGO = $cargo
 
@@ -171,8 +233,9 @@ function Ensure-RustTarget {
     }
 
     $rustBin = Get-SystemRustCargoBin
-    $rustup = Join-Path $rustBin "rustup.exe"
-    $rustc = Join-Path $rustBin "rustc.exe"
+    $rustup = Get-SystemRustTool rustup
+    $rustc = Get-SystemRustTool rustc
+    $env:RUSTC = $rustc
 
     Write-Host "==> RUSTUP_HOME=$($env:RUSTUP_HOME)"
     Write-Host "==> CARGO_HOME=$($env:CARGO_HOME)"

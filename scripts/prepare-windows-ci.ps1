@@ -22,10 +22,9 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo not found on PATH after Rust bootstrap"
 }
 
-$rustBin = Get-SystemRustCargoBin
-& (Join-Path $rustBin "rustc.exe") --version
-& (Join-Path $rustBin "cargo.exe") --version
-& (Join-Path $rustBin "rustup.exe") show
+& (Get-SystemRustTool rustc) --version
+& (Get-SystemRustTool cargo) --version
+& (Get-SystemRustTool rustup) show
 
 $clang = Find-LibClangDir
 if (-not $clang) {
