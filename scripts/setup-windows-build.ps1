@@ -35,6 +35,8 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Host "==> Rust/cargo already installed"
 }
 
+Ensure-BuildMachinePath
+
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $hasVcTools = $false
 if (Test-Path $vswhere) {

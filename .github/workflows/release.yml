@@ -89,7 +89,9 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare build environment
+        shell: pwsh
+        run: .\scripts\prepare-windows-ci.ps1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-windows-self-hosted-v1
