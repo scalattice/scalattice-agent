@@ -122,14 +122,12 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(scalattice_visuals());
-            let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_millis(200));
-                    ctx.request_repaint();
-                }
-            });
-            Ok(Box::new(TrayApp::new(event_rx, show_rx, show_for_app)))
+            Ok(Box::new(TrayApp::new(
+                event_rx,
+                show_rx,
+                show_for_app,
+                interactive,
+            )))
         }),
     )
     .map_err(|err| anyhow::anyhow!("tray UI exited: {err}"))?;
@@ -142,13 +140,14 @@ struct TrayApp {
     event_rx: mpsc::Receiver<TrayIconEvent>,
     show_rx: mpsc::Receiver<()>,
     show_window: Arc<AtomicBool>,
+    panel_visible: bool,
     token_input: String,
     status_lines: Vec<String>,
     action_message: String,
     logs: String,
     log_path: Option<PathBuf>,
     log_offset: u64,
-    last_refresh: Instant,
+    next_data_poll: Instant,
 }
 
 impl TrayApp {
@@ -156,6 +155,7 @@ impl TrayApp {
         event_rx: mpsc::Receiver<TrayIconEvent>,
         show_rx: mpsc::Receiver<()>,
         show_window: Arc<AtomicBool>,
+        panel_visible: bool,
     ) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let log_path = agent_log_path().ok();
@@ -163,13 +163,14 @@ impl TrayApp {
             event_rx,
             show_rx,
             show_window,
+            panel_visible,
             token_input,
             status_lines: Vec::new(),
             action_message: String::new(),
             logs: String::new(),
             log_path,
             log_offset: 0,
-            last_refresh: Instant::now() - Duration::from_secs(1),
+            next_data_poll: Instant::now(),
         }
     }
 
@@ -196,7 +197,9 @@ impl TrayApp {
         }
     }
 
-    fn reveal_window(&self, ctx: &egui::Context) {
+    fn reveal_window(&mut self, ctx: &egui::Context) {
+        self.panel_visible = true;
+        self.next_data_poll = Instant::now();
         activate_tray_window();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -204,12 +207,7 @@ impl TrayApp {
         ctx.request_repaint();
     }
 
-    fn refresh_status(&mut self) {
-        if self.last_refresh.elapsed() < Duration::from_millis(750) {
-            return;
-        }
-        self.last_refresh = Instant::now();
-
+    fn refresh_status(&mut self) -> bool {
         let mut lines = vec![format!("Version {}", env!("CARGO_PKG_VERSION"))];
         lines.push(state::cloud_connection_line());
 
@@ -248,23 +246,31 @@ impl TrayApp {
             }
         }
 
+        if lines == self.status_lines {
+            return false;
+        }
         self.status_lines = lines;
+        true
     }
 
-    fn refresh_logs(&mut self) {
+    fn refresh_logs(&mut self) -> bool {
         let Some(path) = self.log_path.as_ref() else {
-            return;
+            return false;
         };
         let Ok(meta) = std::fs::metadata(path) else {
-            self.logs = "Log file not created yet. The agent may still be starting.".to_string();
-            return;
+            let message = "Log file not created yet. The agent may still be starting.".to_string();
+            if self.logs == message {
+                return false;
+            }
+            self.logs = message;
+            return true;
         };
         let len = meta.len();
         if len < self.log_offset {
             self.log_offset = 0;
         }
         if len == self.log_offset {
-            return;
+            return false;
         }
 
         let read_from = if len > self.log_offset {
@@ -274,7 +280,7 @@ impl TrayApp {
         };
 
         let Ok(raw) = std::fs::read(path) else {
-            return;
+            return false;
         };
         let slice = &raw[read_from as usize..];
         let chunk = strip_ansi_escapes(&String::from_utf8_lossy(slice));
@@ -284,7 +290,7 @@ impl TrayApp {
             self.logs.drain(..drop_by);
         }
         self.log_offset = len;
-        self.logs = strip_ansi_escapes(&self.logs);
+        true
     }
 
     fn save_token(&mut self) {
@@ -330,11 +336,23 @@ impl eframe::App for TrayApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.panel_visible = false;
         }
 
         self.poll_tray(ctx);
-        self.refresh_status();
-        self.refresh_logs();
+
+        if !self.panel_visible {
+            ctx.request_repaint_after(Duration::from_millis(400));
+            return;
+        }
+
+        let pointer_busy = ctx.input(|i| i.pointer.any_down());
+        if !pointer_busy && Instant::now() >= self.next_data_poll {
+            self.next_data_poll = Instant::now() + Duration::from_secs(2);
+            if self.refresh_status() | self.refresh_logs() {
+                ctx.request_repaint();
+            }
+        }
 
         let panel_fill = egui::Color32::from_rgb(17, 17, 17);
         let border = egui::Color32::from_rgba_premultiplied(255, 255, 255, 31);
@@ -440,7 +458,14 @@ impl eframe::App for TrayApp {
                     });
             });
 
-        ctx.request_repaint_after(Duration::from_millis(500));
+        if !pointer_busy {
+            let until_poll = self
+                .next_data_poll
+                .saturating_duration_since(Instant::now());
+            if !until_poll.is_zero() {
+                ctx.request_repaint_after(until_poll);
+            }
+        }
     }
 }
 
