@@ -1,12 +1,12 @@
 # Register this Windows machine as a GitHub Actions self-hosted runner for Scalattice releases.
-# Requires: Admin PowerShell, gh CLI logged in (gh auth login), setup-windows-build.ps1 done.
+# Requires: Admin, gh CLI logged in (gh auth login), setup-windows-build done.
 #
-# Usage (Admin PowerShell):
-#   gh auth login
+# Usage (Admin cmd or PowerShell):
+#   scripts\install-windows-runner.cmd
+#
+# Or PowerShell:
+#   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\scripts\install-windows-runner.ps1
-#
-# Optional:
-#   .\scripts\install-windows-runner.ps1 -Repo Robottik-Software/Scalattice-Client -RunnerName my-pc
 
 param(
     [string]$Repo = "Robottik-Software/Scalattice-Client",

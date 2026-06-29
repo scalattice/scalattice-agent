@@ -24,14 +24,21 @@
 
 ## One-time Windows setup
 
-On a Windows PC or VM (Administrator PowerShell):
+On a Windows PC or VM (**Administrator** — cmd or PowerShell):
 
-```powershell
+```cmd
 git clone https://github.com/Robottik-Software/Scalattice-Client.git
 cd Scalattice-Client
 gh auth login
-.\scripts\setup-windows-build.ps1      # ~30–60 min first time
-.\scripts\install-windows-runner.ps1   # registers runner service
+scripts\setup-windows-build.cmd
+scripts\install-windows-runner.cmd
+```
+
+If PowerShell blocks `.ps1` files (`running scripts is disabled`), use the `.cmd` wrappers above, or run:
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\scripts\setup-windows-build.ps1
 ```
 
 The runner installs as a Windows service (`C:\actions-runner-scalattice`) and stays online for future releases.

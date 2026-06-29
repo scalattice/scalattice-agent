@@ -1,7 +1,10 @@
 # One-time Windows build host setup (Visual Studio C++, CUDA 12.6, Inno Setup, Rust).
-# Run as Administrator before install-windows-runner.ps1.
+# Run as Administrator.
 #
-# Usage (Admin PowerShell):
+# Usage (Admin PowerShell or cmd):
+#   scripts\setup-windows-build.cmd
+#
+# Or in PowerShell:
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\scripts\setup-windows-build.ps1
 
