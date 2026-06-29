@@ -8,7 +8,8 @@
 # Then copy dist/ScalatticeAgentSetup-x86_64.exe (+ zip) to your Linux release host.
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
-    [string]$Features = "win-gpu"
+    [string]$Features = "win-gpu",
+    [string]$PackageVersion = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,15 +66,26 @@ if (-not (Test-Path $bin)) {
 New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 Copy-Item -LiteralPath $bin -Destination "dist\scalattice-agent.exe" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\scalattice-run.cmd") -Destination "dist\scalattice-run.cmd" -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-tray.vbs") -Destination "dist\launch-tray.vbs" -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-background.vbs") -Destination "dist\launch-background.vbs" -Force
 & (Join-Path $PSScriptRoot "bundle-release-windows.ps1") -Binary "dist\scalattice-agent.exe" -OutDir "dist" -BuildRoot $releaseDir
+
+Write-Host ""
+Write-Host "==> Bundled runtime libraries"
+Get-ChildItem dist\lib -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    lib\$($_.Name)" }
+Get-ChildItem dist\*.dll -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $($_.Name)" }
+
+if (-not $PackageVersion -and $env:SCALATTICE_VERSION) {
+    $PackageVersion = $env:SCALATTICE_VERSION.TrimStart('v')
+}
 
 $archive = "dist\scalattice-agent-$Target.zip"
 if (Test-Path $archive) { Remove-Item $archive -Force }
 
 if (Test-Path "dist\lib") {
-    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd", "dist\lib" -DestinationPath $archive -Force
+    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd", "dist\launch-tray.vbs", "dist\launch-background.vbs", "dist\lib" -DestinationPath $archive -Force
 } else {
-    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd" -DestinationPath $archive -Force
+    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd", "dist\launch-tray.vbs", "dist\launch-background.vbs" -DestinationPath $archive -Force
 }
 
 Write-Host ""
@@ -90,7 +102,12 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 }
 
 if ((Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -or (Test-Path "${env:ProgramFiles}\Inno Setup 6\ISCC.exe")) {
-    & (Join-Path $PSScriptRoot "build-windows-installer.ps1")
+    $installerArgs = @()
+    if ($PackageVersion) {
+        $installerArgs += "-PackageVersion"
+        $installerArgs += $PackageVersion
+    }
+    & (Join-Path $PSScriptRoot "build-windows-installer.ps1") @installerArgs
 } else {
     Write-Warning "Inno Setup not found - zip built but GUI installer skipped (install Inno Setup 6 and re-run)"
 }

@@ -79,11 +79,27 @@ async fn main() -> Result<()> {
         Commands::SetToken { token } => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
             service::persist_agent_token(&config.token)?;
-            if service::background_service_available() {
-                service::start_background_from_config(&config)?;
-                println!("Token saved. Background agent running.");
-            } else {
-                println!("Token saved. Run: scalattice-agent foreground");
+            match service::start_background_from_config(&config) {
+                Ok(()) => {
+                    if service::service_active() {
+                        println!("Token saved. Background agent running.");
+                    } else {
+                        println!("Token saved. Agent will start at next logon (Startup folder).");
+                    }
+                }
+                Err(err) => {
+                    println!("Token saved.");
+                    eprintln!("Note: {err}");
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let vbs = crate::paths::install_dir()?.join("launch-tray.vbs");
+                let _ = std::process::Command::new("wscript.exe")
+                    .args(["//nologo", &vbs.display().to_string()])
+                    .creation_flags(0x0800_0000)
+                    .spawn();
             }
         }
         Commands::Uninstall { yes, purge } => {
@@ -129,12 +145,20 @@ fn maybe_start_background_from_saved_token() -> Result<()> {
     if !agent_token_configured() {
         return Ok(());
     }
+    if service::service_active() {
+        return Ok(());
+    }
     match service::background_status() {
         service::BackgroundStatus::Running => Ok(()),
         service::BackgroundStatus::Stopped | service::BackgroundStatus::NotInstalled => {
             let config = config::AgentConfig::from_env_and_cli(None)?;
-            service::start_background_from_config(&config)?;
-            println!("Background agent started.");
+            if let Err(err) = service::start_background_from_config(&config) {
+                if !service::service_active() {
+                    eprintln!("Note: could not auto-start background agent: {err}");
+                }
+            } else if service::service_active() {
+                println!("Background agent started.");
+            }
             Ok(())
         }
     }
@@ -165,6 +189,10 @@ fn print_status() -> Result<()> {
             service::BackgroundStatus::NotInstalled => "not configured",
         };
         println!("Service  {service_line}");
+        #[cfg(windows)]
+        if let Some(method) = service::autostart_method_line() {
+            println!("Autostart {method}");
+        }
     } else {
         #[cfg(unix)]
         println!("Service  systemd unavailable (use: scalattice-agent foreground)");
@@ -184,7 +212,19 @@ fn print_status() -> Result<()> {
     }
 
     println!();
+    if let Ok(bin) = crate::paths::install_dir() {
+        println!("Bin      {}", bin.display());
+    }
+    if let Ok(lib) = crate::paths::lib_dir() {
+        println!("Lib      {}", lib.display());
+    }
+    if let Ok(log) = crate::paths::agent_log_path() {
+        println!("Log      {}", log.display());
+    }
+    println!();
     println!("Dashboard https://scalattice.cloud/providers");
+    #[cfg(windows)]
+    println!("Control panel: click the Scalattice icon in the notification area, or run launch-tray.vbs");
     Ok(())
 }
 

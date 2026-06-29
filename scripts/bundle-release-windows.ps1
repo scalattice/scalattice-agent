@@ -70,7 +70,10 @@ if (Test-Path $BuildRoot) {
 }
 
 function Copy-CudaRuntimeLibs {
-    param([string]$DestDir)
+    param(
+        [string]$DestDir,
+        [string]$AlsoDestDir = ""
+    )
 
     $cuda = $env:CUDA_PATH
     if (-not $cuda) {
@@ -79,7 +82,7 @@ function Copy-CudaRuntimeLibs {
     $cudaBin = Join-Path $cuda "bin"
     if (-not (Test-Path $cudaBin)) {
         Write-Warning "CUDA bin not found at $cudaBin - CUDA runtime DLLs not bundled"
-        return
+        return @()
     }
 
     # ggml-cuda loads these at runtime; dumpbin does not see them on the main exe.
@@ -91,23 +94,42 @@ function Copy-CudaRuntimeLibs {
         "nvrtc64_12*.dll"
     )
 
-    $copied = 0
+    $bundled = @()
     foreach ($pattern in $patterns) {
         Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
             $dest = Join-Path $DestDir $_.Name
             Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
             Copy-DependencyTree -Path $dest
-            $copied++
+            $bundled += $_.Name
             Write-Host "    bundled $($_.Name)"
+
+            if ($AlsoDestDir) {
+                Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $AlsoDestDir $_.Name) -Force
+            }
         }
     }
 
-    if ($copied -eq 0) {
+    if ($bundled.Count -eq 0) {
         Write-Warning "No CUDA 12 runtime DLLs found under $cudaBin"
     }
+    return $bundled | Select-Object -Unique
 }
 
-Copy-CudaRuntimeLibs -DestDir $LibDir
+$requiredCuda = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+$cudaBundled = Copy-CudaRuntimeLibs -DestDir $LibDir -AlsoDestDir $OutDir
+$missingCuda = @($requiredCuda | Where-Object { $_ -notin $cudaBundled })
+if ($missingCuda.Count -gt 0) {
+    $cudaRoot = $env:CUDA_PATH
+    if (-not $cudaRoot) {
+        $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+    }
+    throw @"
+CUDA runtime DLLs missing from bundle: $($missingCuda -join ', ')
+
+The Windows build machine needs CUDA 12.6 toolkit installed (not just the NVIDIA driver).
+Expected under: $(Join-Path $cudaRoot 'bin')
+"@
+}
 
 if (-not (Get-ChildItem -Path $LibDir -ErrorAction SilentlyContinue)) {
     Remove-Item -Path $LibDir -Force -ErrorAction SilentlyContinue

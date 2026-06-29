@@ -56,6 +56,11 @@ pub fn follow_service_logs() -> Result<()> {
     platform::follow_service_logs()
 }
 
+#[cfg(windows)]
+pub fn autostart_method_line() -> Option<String> {
+    platform::autostart_method_line()
+}
+
 pub fn persist_agent_token(token: &str) -> Result<bool> {
     let env_file = agent_env_path()?;
     fs::create_dir_all(env_file.parent().context("agent env parent")?)?;
@@ -129,6 +134,10 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
     #[cfg(windows)]
     {
         targets.push(platform::background_runner_path()?);
+        let install = install_dir()?;
+        targets.push(install.join("scalattice-run.cmd"));
+        targets.push(install.join("launch-tray.vbs"));
+        targets.push(install.join("launch-background.vbs"));
     }
 
     if opts.purge_models {

@@ -33,7 +33,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
-CloseApplications=force
+CloseApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -42,13 +42,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut to open the provider dashboard"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
+; Install bundled DLLs before the exe so CloseApplications / post-install can load them.
 Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\scalattice-run.cmd"; Parameters: "tray"; Comment: "Open status, token, and live log panel"
-Name: "{autoprograms}\{#MyAppName} Status"; Filename: "{app}\scalattice-run.cmd"; Parameters: "status"; Comment: "Show agent status in a terminal"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\launch-tray.vbs"; Comment: "Open status, token, and live log panel"
 Name: "{autoprograms}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Comment: "Manage GPUs and models"
 Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Tasks: desktopicon
 
@@ -128,32 +130,43 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
-  Token, AppDir, PathEntries: String;
+  SetTokenResult: Integer;
+  Token, AppDir: String;
 begin
   if CurStep = ssPostInstall then
   begin
     AppDir := ExpandConstant('{app}');
-    PathEntries := AppDir + ';' + LibDir;
-    if NeedsAddPath(AppDir) or NeedsAddPath(LibDir) then
+    if NeedsAddPath(AppDir) then
     begin
-      AddToUserPath(PathEntries);
+      AddToUserPath(AppDir);
+      BroadcastEnvironmentChange;
+    end;
+    if NeedsAddPath(LibDir) then
+    begin
+      AddToUserPath(LibDir);
       BroadcastEnvironmentChange;
     end;
 
     Token := Trim(TokenPage.Values[0]);
-    Exec(AppDir + '\{#MyAppExeName}',
+    Exec(AppDir + '\scalattice-run.cmd',
       'set-token --token "' + Token + '"',
-      AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
 
-    if ResultCode <> 0 then
+    Exec('wscript.exe', '//nologo "' + AppDir + '\launch-tray.vbs"',
+      AppDir, SW_HIDE, ewNoWait, ResultCode);
+
+    if SetTokenResult <> 0 then
       MsgBox('Scalattice Agent was installed, but starting the background service failed.' + #13#10 +
-        'Open Command Prompt and run: scalattice-agent set-token --token YOUR_TOKEN',
+        'Open Command Prompt and run:' + #13#10 +
+        '  scalattice-run.cmd set-token --token YOUR_TOKEN' + #13#10 + #13#10 +
+        'If you see missing cudart64_12.dll / cublas64_12.dll, the installer build did not bundle CUDA libs.' + #13#10 +
+        'Check %LOCALAPPDATA%\Scalattice\lib on this machine.',
         mbInformation, MB_OK);
   end;
 end;
 
 [UninstallRun]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "uninstall --yes"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{app}\scalattice-run.cmd"; Parameters: "uninstall --yes"; Flags: runhidden waituntilterminated skipifdoesntexist
 
 [UninstallDelete]
 Type: files; Name: "{localappdata}\Scalattice\lib\*"

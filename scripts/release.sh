@@ -246,6 +246,7 @@ fi
 
 VERSION="$(resolve_version)"
 TAG="v${VERSION}"
+set_cargo_version "$VERSION"
 X86_ARCHIVE="dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz"
 CI_TARGETS="$(resolve_ci_targets)"
 WIN_RUNNER="$(windows_runner_input)"

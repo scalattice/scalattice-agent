@@ -1,5 +1,5 @@
 use crate::config::AgentConfig;
-use crate::paths::agent_log_path;
+use crate::paths::{agent_log_path, install_dir, lib_dir};
 use crate::service;
 use crate::state;
 use anyhow::{Context, Result};
@@ -24,15 +24,15 @@ pub fn run_tray_ui() -> Result<()> {
     }));
 
     let _tray = TrayIconBuilder::new()
-        .with_tooltip("Scalattice Agent")
+        .with_tooltip("Scalattice Agent — click to open")
         .with_icon(icon)
         .build()
         .context("failed to create tray icon")?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([440.0, 560.0])
-            .with_min_inner_size([360.0, 420.0])
+            .with_inner_size([720.0, 520.0])
+            .with_min_inner_size([560.0, 400.0])
             .with_title("Scalattice Agent")
             .with_visible(false),
         ..Default::default()
@@ -41,7 +41,10 @@ pub fn run_tray_ui() -> Result<()> {
     eframe::run_native(
         "Scalattice Agent",
         options,
-        Box::new(move |_cc| Ok(Box::new(TrayApp::new(event_rx)))),
+        Box::new(move |cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
+            Ok(Box::new(TrayApp::new(event_rx)))
+        }),
     )
     .map_err(|err| anyhow::anyhow!("tray UI exited: {err}"))
 }
@@ -94,7 +97,7 @@ impl TrayApp {
         }
         self.last_refresh = Instant::now();
 
-        let mut lines = vec![format!("Agent {}", env!("CARGO_PKG_VERSION"))];
+        let mut lines = vec![format!("Version {}", env!("CARGO_PKG_VERSION"))];
         lines.push(state::cloud_connection_line());
 
         if crate::config::read_saved_agent_token().is_some() {
@@ -104,11 +107,26 @@ impl TrayApp {
         }
 
         let service_line = match service::background_status() {
-            service::BackgroundStatus::Running => "Background service: running",
-            service::BackgroundStatus::Stopped => "Background service: stopped",
-            service::BackgroundStatus::NotInstalled => "Background service: not configured",
+            service::BackgroundStatus::Running => "Agent: running",
+            service::BackgroundStatus::Stopped => "Agent: stopped (will start at logon)",
+            service::BackgroundStatus::NotInstalled => "Agent: not configured",
         };
         lines.push(service_line.to_string());
+
+        #[cfg(windows)]
+        if let Some(method) = service::autostart_method_line() {
+            lines.push(format!("Autostart: {method}"));
+        }
+
+        if let Ok(bin) = install_dir() {
+            lines.push(format!("Bin: {}", bin.display()));
+        }
+        if let Ok(lib) = lib_dir() {
+            lines.push(format!("Lib: {}", lib.display()));
+        }
+        if let Some(log) = self.log_path.as_ref() {
+            lines.push(format!("Log: {}", log.display()));
+        }
 
         if let Some(summary) = state::agent_activity_summary() {
             lines.push(format!("Status: {}", summary.status));
@@ -170,12 +188,15 @@ impl TrayApp {
                 }
                 match service::start_background_from_config(&config) {
                     Ok(()) => {
-                        self.action_message = "Token saved. Background agent restarted.".to_string();
+                        self.action_message =
+                            "Token saved. Background agent started.".to_string();
                         self.log_offset = 0;
                         self.logs.clear();
                     }
                     Err(err) => {
-                        self.action_message = format!("Token saved but restart failed: {err}");
+                        self.action_message = format!(
+                            "Token saved. Start issue (agent may still run at logon): {err}"
+                        );
                     }
                 }
             }
@@ -202,60 +223,117 @@ impl eframe::App for TrayApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Scalattice Agent");
-            ui.add_space(8.0);
+        let panel_fill = egui::Color32::from_rgb(250, 250, 252);
+        let border = egui::Color32::from_rgb(220, 222, 228);
 
-            ui.label(egui::RichText::new("Status").strong());
-            for line in &self.status_lines {
-                ui.label(line);
-            }
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                ui.heading("Scalattice Agent");
+                ui.label(
+                    egui::RichText::new("Provider machine control panel")
+                        .color(egui::Color32::from_rgb(90, 90, 95)),
+                );
+                ui.add_space(10.0);
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let left_width = ui.available_width() * 0.42;
+                    let right_width = ui.available_width();
 
-            ui.label(egui::RichText::new("Provider token").strong());
-            ui.add(
-                egui::TextEdit::singleline(&mut self.token_input)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("slt_provider_…"),
-            );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_width, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            egui::Frame::group(ui.style())
+                                .fill(panel_fill)
+                                .stroke(egui::Stroke::new(1.0, border))
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Status & token").strong());
+                                    ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                if ui.button("Save token").clicked() {
-                    self.save_token();
-                }
-                if ui.button("Open dashboard").clicked() {
-                    self.open_dashboard();
-                }
-            });
+                                    for line in &self.status_lines {
+                                        ui.label(
+                                            egui::RichText::new(line)
+                                                .size(13.0)
+                                                .family(egui::FontFamily::Proportional),
+                                        );
+                                    }
 
-            if !self.action_message.is_empty() {
-                ui.add_space(6.0);
-                ui.label(&self.action_message);
-            }
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
+                                    ui.label(egui::RichText::new("Provider token").strong());
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.token_input)
+                                            .desired_width(f32::INFINITY)
+                                            .hint_text("slt_provider_…"),
+                                    );
 
-            ui.label(egui::RichText::new("Live log").strong());
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.logs)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false)
-                            .font(egui::TextStyle::Monospace),
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Save token").clicked() {
+                                            self.save_token();
+                                        }
+                                        if ui.button("Open dashboard").clicked() {
+                                            self.open_dashboard();
+                                        }
+                                    });
+
+                                    if !self.action_message.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(&self.action_message)
+                                                .color(egui::Color32::from_rgb(40, 90, 160)),
+                                        );
+                                    }
+                                });
+                        },
+                    );
+
+                    ui.add_space(8.0);
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(right_width, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            egui::Frame::group(ui.style())
+                                .fill(panel_fill)
+                                .stroke(egui::Stroke::new(1.0, border))
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Live log").strong());
+                                    ui.add_space(4.0);
+                                    egui::ScrollArea::vertical()
+                                        .stick_to_bottom(true)
+                                        .auto_shrink([false; 2])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut self.logs)
+                                                    .desired_width(f32::INFINITY)
+                                                    .desired_rows(18)
+                                                    .interactive(false)
+                                                    .font(egui::TextStyle::Monospace),
+                                            );
+                                        });
+                                });
+                        },
                     );
                 });
 
-            ui.add_space(8.0);
-            ui.label("Click the notification area icon to hide this window. The agent keeps running in the background.");
-        });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Click the notification area icon to hide this window. The agent keeps running in the background.",
+                    )
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(110, 110, 115)),
+                );
+            });
 
         ctx.request_repaint_after(Duration::from_millis(500));
     }

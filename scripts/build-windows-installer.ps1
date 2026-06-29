@@ -12,6 +12,9 @@ if (-not (Test-Path $distExe)) {
     Write-Error "Missing $distExe - run scripts/build-release.ps1 first"
 }
 
+if (-not $Version -and $env:SCALATTICE_VERSION) {
+    $Version = $env:SCALATTICE_VERSION.TrimStart('v')
+}
 if (-not $Version) {
     $line = Select-String -Path (Join-Path $Root "Cargo.toml") -Pattern '^version = ' | Select-Object -First 1
     if ($line) {
@@ -19,7 +22,7 @@ if (-not $Version) {
     }
 }
 if (-not $Version) {
-    Write-Error "Could not determine version from Cargo.toml"
+    Write-Error "Could not determine version (set SCALATTICE_VERSION or Cargo.toml version)"
 }
 
 $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"

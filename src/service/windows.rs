@@ -3,23 +3,24 @@ use crate::paths::{agent_binary_name, agent_log_path, install_dir, lib_dir, reso
 use crate::service::BackgroundStatus;
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const TASK_NAME: &str = "ScalatticeAgent";
 const TRAY_TASK_NAME: &str = "ScalatticeAgentTray";
+const STARTUP_AGENT_VBS: &str = "ScalatticeAgent.vbs";
+const STARTUP_TRAY_VBS: &str = "ScalatticeAgentTray.vbs";
 
 pub fn background_status() -> BackgroundStatus {
-    if !background_service_available() {
-        return BackgroundStatus::NotInstalled;
-    }
-    if !task_exists() {
-        return BackgroundStatus::NotInstalled;
-    }
     if service_active() {
-        BackgroundStatus::Running
-    } else {
+        return BackgroundStatus::Running;
+    }
+    if autostart_configured() {
         BackgroundStatus::Stopped
+    } else {
+        BackgroundStatus::NotInstalled
     }
 }
 
@@ -38,16 +39,13 @@ pub fn invoked_by_background_service() -> bool {
 }
 
 pub fn background_service_available() -> bool {
-    Command::new("schtasks")
-        .arg("/?")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    schtasks_available() || startup_dir().map(|d| d.is_dir()).unwrap_or(false)
 }
 
 pub fn service_active() -> bool {
     let output = Command::new("tasklist")
         .args(["/FI", &format!("IMAGENAME eq {}", agent_binary_name()), "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     match output {
         Ok(output) if output.status.success() => {
@@ -102,18 +100,24 @@ pub fn sync_background_env() -> Result<()> {
 pub fn remove_background_service() -> Result<()> {
     let _ = Command::new("schtasks")
         .args(["/End", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = Command::new("schtasks")
         .args(["/End", "/TN", TRAY_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", TASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", TRAY_TASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
+    remove_startup_shortcuts();
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", agent_binary_name()])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     Ok(())
 }
@@ -126,19 +130,41 @@ pub fn systemd_unit_path() -> Result<PathBuf> {
     background_runner_path()
 }
 
+pub fn autostart_method_line() -> Option<String> {
+    let agent = if task_exists() {
+        "agent: scheduled task"
+    } else if startup_agent_shortcut_exists() {
+        "agent: Startup folder"
+    } else {
+        return None;
+    };
+
+    let tray = if tray_task_exists() {
+        "tray: scheduled task"
+    } else if startup_tray_shortcut_exists() {
+        "tray: Startup folder"
+    } else {
+        "tray: not configured"
+    };
+
+    Some(format!("{agent}; {tray}"))
+}
+
 fn ensure_background_task(config: &AgentConfig) -> Result<()> {
     let token_changed = crate::service::persist_agent_token(&config.token)?;
     let runner_changed = write_background_runner()?;
+    sync_launch_scripts()?;
 
-    if !task_exists() || token_changed || runner_changed {
-        create_or_update_task()?;
+    let needs_register = !autostart_configured() || token_changed || runner_changed;
+
+    if needs_register {
+        register_agent_autostart()?;
     } else if !service_active() {
-        run_task_now()?;
+        spawn_background_detached()?;
     }
 
-    sync_tray_runner()?;
-    ensure_tray_task()?;
-    run_tray_now()?;
+    register_tray_autostart()?;
+    launch_tray_if_needed()?;
 
     Ok(())
 }
@@ -177,31 +203,127 @@ cd /d \"{install}\"\r\n\
     Ok(changed)
 }
 
-fn sync_tray_runner() -> Result<()> {
+fn sync_launch_scripts() -> Result<()> {
     let install = install_dir()?;
     fs::create_dir_all(&install)?;
-    let runner = install.join("scalattice-run.cmd");
-    let script = "@echo off\r\n\
+
+    let run_cmd = "@echo off\r\n\
 setlocal\r\n\
 set \"INSTALL=%~dp0\"\r\n\
 set \"LIB=%LOCALAPPDATA%\\Scalattice\\lib\"\r\n\
 if not exist \"%LIB%\" set \"LIB=%INSTALL%lib\"\r\n\
 set \"PATH=%INSTALL%;%LIB%;%PATH%\"\r\n\
 cd /d \"%INSTALL%\"\r\n\
+if /I \"%~1\"==\"tray\" (\r\n\
+  if exist \"%INSTALL%launch-tray.vbs\" (\r\n\
+    wscript.exe //nologo \"%INSTALL%launch-tray.vbs\"\r\n\
+    exit /b 0\r\n\
+  )\r\n\
+)\r\n\
 \"%INSTALL%scalattice-agent.exe\" %*\r\n";
-    fs::write(&runner, script)?;
+
+    fs::write(install.join("scalattice-run.cmd"), run_cmd)?;
+
+    for (name, content) in [
+        ("launch-tray.vbs", LAUNCH_TRAY_VBS),
+        ("launch-background.vbs", LAUNCH_BACKGROUND_VBS),
+    ] {
+        fs::write(install.join(name), content)?;
+    }
+
     Ok(())
 }
 
-fn task_exists() -> bool {
+const LAUNCH_TRAY_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+install = fso.GetParentFolderName(WScript.ScriptFullName)
+lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
+If Not fso.FolderExists(lib) Then lib = install & "\lib"
+Set env = sh.Environment("PROCESS")
+env("PATH") = install & ";" & lib & ";" & env("PATH")
+sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
+"#;
+
+const LAUNCH_BACKGROUND_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+install = fso.GetParentFolderName(WScript.ScriptFullName)
+lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
+If Not fso.FolderExists(lib) Then lib = install & "\lib"
+Set env = sh.Environment("PROCESS")
+env("PATH") = install & ";" & lib & ";" & env("PATH")
+sh.Run """" & install & "\run-background.cmd""", 0, False
+"#;
+
+fn schtasks_available() -> bool {
     Command::new("schtasks")
-        .args(["/Query", "/TN", TASK_NAME])
+        .arg("/?")
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn create_or_update_task() -> Result<()> {
+fn startup_dir() -> Result<PathBuf> {
+    let appdata = std::env::var("APPDATA").context("APPDATA is not set")?;
+    Ok(PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup"))
+}
+
+fn autostart_configured() -> bool {
+    task_exists() || startup_agent_shortcut_exists()
+}
+
+fn task_exists() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn tray_task_exists() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", TRAY_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn startup_agent_shortcut_exists() -> bool {
+    startup_dir()
+        .map(|d| d.join(STARTUP_AGENT_VBS).is_file())
+        .unwrap_or(false)
+}
+
+fn startup_tray_shortcut_exists() -> bool {
+    startup_dir()
+        .map(|d| d.join(STARTUP_TRAY_VBS).is_file())
+        .unwrap_or(false)
+}
+
+fn register_agent_autostart() -> Result<()> {
+    if try_create_scheduled_task().is_ok() {
+        return run_scheduled_task_now();
+    }
+    install_startup_agent_shortcut()?;
+    spawn_background_detached()
+}
+
+fn register_tray_autostart() -> Result<()> {
+    if try_create_tray_task().is_ok() {
+        return run_tray_task_now();
+    }
+    install_startup_tray_shortcut()?;
+    launch_tray_if_needed()
+}
+
+fn try_create_scheduled_task() -> Result<()> {
     let runner = background_runner_path()?;
     if !runner.is_file() {
         bail!("failed to write {}", runner.display());
@@ -221,35 +343,29 @@ fn create_or_update_task() -> Result<()> {
             "LIMITED",
             "/F",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("failed to run schtasks")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "schtasks failed: {}{}",
-            stderr.trim(),
-            if stdout.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", stdout.trim())
-            }
-        );
+    if output.status.success() {
+        return Ok(());
     }
 
-    run_task_now()?;
-    ensure_tray_task()?;
-    run_tray_now()
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Access is denied") || stderr.contains("denied") {
+        bail!("schtasks access denied");
+    }
+
+    bail!("schtasks failed: {}", stderr.trim());
 }
 
-fn ensure_tray_task() -> Result<()> {
-    sync_tray_runner()?;
-    let runner = install_dir()?.join("scalattice-run.cmd");
-    if !runner.is_file() {
-        bail!("failed to write {}", runner.display());
+fn try_create_tray_task() -> Result<()> {
+    let vbs = install_dir()?.join("launch-tray.vbs");
+    if !vbs.is_file() {
+        bail!("failed to write {}", vbs.display());
     }
-    let tr = format!("\"{}\" tray", runner.display());
+
+    let tr = format!("wscript.exe //nologo \"{}\"", vbs.display());
     let output = Command::new("schtasks")
         .args([
             "/Create",
@@ -263,42 +379,51 @@ fn ensure_tray_task() -> Result<()> {
             "LIMITED",
             "/F",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("failed to create tray scheduled task")?;
 
-    if output.status.success() {
+    if output.status.success() || tray_task_exists() {
         return Ok(());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("already exists") || tray_task_exists() {
-        return Ok(());
+    if stderr.contains("Access is denied") || stderr.contains("denied") {
+        bail!("schtasks access denied");
     }
 
-    bail!("failed to register tray task: {}", stderr.trim())
+    bail!("failed to register tray task: {}", stderr.trim());
 }
 
-fn tray_task_exists() -> bool {
-    Command::new("schtasks")
-        .args(["/Query", "/TN", TRAY_TASK_NAME])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn run_tray_now() -> Result<()> {
-    if !tray_task_exists() {
-        return Ok(());
-    }
-    let _ = Command::new("schtasks")
-        .args(["/Run", "/TN", TRAY_TASK_NAME])
-        .output();
+fn install_startup_agent_shortcut() -> Result<()> {
+    let startup = startup_dir()?;
+    fs::create_dir_all(&startup)?;
+    let src = install_dir()?.join("launch-background.vbs");
+    let dest = startup.join(STARTUP_AGENT_VBS);
+    fs::copy(&src, &dest).with_context(|| format!("failed to install {}", dest.display()))?;
     Ok(())
 }
 
-fn run_task_now() -> Result<()> {
+fn install_startup_tray_shortcut() -> Result<()> {
+    let startup = startup_dir()?;
+    fs::create_dir_all(&startup)?;
+    let src = install_dir()?.join("launch-tray.vbs");
+    let dest = startup.join(STARTUP_TRAY_VBS);
+    fs::copy(&src, &dest).with_context(|| format!("failed to install {}", dest.display()))?;
+    Ok(())
+}
+
+fn remove_startup_shortcuts() {
+    if let Ok(startup) = startup_dir() {
+        let _ = fs::remove_file(startup.join(STARTUP_AGENT_VBS));
+        let _ = fs::remove_file(startup.join(STARTUP_TRAY_VBS));
+    }
+}
+
+fn run_scheduled_task_now() -> Result<()> {
     let output = Command::new("schtasks")
         .args(["/Run", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("failed to start background task")?;
 
@@ -311,5 +436,66 @@ fn run_task_now() -> Result<()> {
         return Ok(());
     }
 
-    bail!("failed to start background agent: {}", stderr.trim());
+    spawn_background_detached()
+}
+
+fn run_tray_task_now() -> Result<()> {
+    if !tray_task_exists() {
+        return launch_tray_if_needed();
+    }
+    let _ = Command::new("schtasks")
+        .args(["/Run", "/TN", TRAY_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    launch_tray_if_needed()
+}
+
+fn spawn_background_detached() -> Result<()> {
+    let vbs = install_dir()?.join("launch-background.vbs");
+    if vbs.is_file() {
+        Command::new("wscript.exe")
+            .args(["//nologo", &vbs.display().to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .context("failed to start background agent")?;
+        return Ok(());
+    }
+
+    let runner = background_runner_path()?;
+    Command::new("cmd")
+        .args(["/C", "start", "", "/MIN", &runner.display().to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .context("failed to start background agent")?;
+    Ok(())
+}
+
+fn launch_tray_if_needed() -> Result<()> {
+    if tray_instance_running() {
+        return Ok(());
+    }
+
+    let vbs = install_dir()?.join("launch-tray.vbs");
+    Command::new("wscript.exe")
+        .args(["//nologo", &vbs.display().to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .context("failed to launch tray")?;
+    Ok(())
+}
+
+fn tray_instance_running() -> bool {
+    let name: Vec<u16> = "ScalatticeAgentTray\0".encode_utf16().collect();
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
+        if handle.is_null() {
+            return false;
+        }
+        let already = GetLastError() == ERROR_ALREADY_EXISTS;
+        CloseHandle(handle);
+        already
+    }
 }
