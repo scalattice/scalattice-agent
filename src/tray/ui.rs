@@ -7,6 +7,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 

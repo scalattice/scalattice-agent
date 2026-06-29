@@ -51,7 +51,6 @@ $env:LIBCLANG_PATH = $clang
 Set-CmakeNinjaMsvcEnv
 Set-ShortCargoTargetDir
 Set-WindowsBuildParallelism -Jobs 4
-Clear-LlamaCmakeCache
 
 # win-gpu replaces default gpu (which includes vulkan); do not add to defaults
 Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"

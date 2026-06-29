@@ -34,7 +34,7 @@ url = "2"
 tray-icon = "0.19"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 image = "0.25"
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_Threading", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading"] }
 
 [features]
 default = ["gpu"]
