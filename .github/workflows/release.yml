@@ -94,7 +94,7 @@ jobs:
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-windows-ci.ps1
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-self-hosted-v1
+          shared-key: release-windows-self-hosted-v2
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1

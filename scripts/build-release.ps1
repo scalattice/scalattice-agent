@@ -48,6 +48,9 @@ if (-not $clang) {
 }
 $env:LIBCLANG_PATH = $clang
 
+Set-CmakeNinjaMsvcEnv
+Clear-LlamaCmakeCache
+
 # win-gpu replaces default gpu (which includes vulkan); do not add to defaults
 Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
 cargo build --release --target $Target --no-default-features --features $Features

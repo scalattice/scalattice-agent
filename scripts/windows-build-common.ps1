@@ -454,6 +454,51 @@ function Import-VsDevEnvironment {
     Ensure-VsCmakeOnPath
 }
 
+function Set-CmakeNinjaMsvcEnv {
+    Import-VsDevEnvironment | Out-Null
+
+    $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue).Source
+    if (-not $cl) {
+        Write-Error "cl.exe not found for CMake"
+    }
+
+    $env:CC = $cl
+    $env:CXX = $cl
+    $env:CMAKE_GENERATOR = "Ninja"
+
+    $ninja = Get-Command ninja.exe -ErrorAction SilentlyContinue
+    if ($ninja) {
+        $env:CMAKE_MAKE_PROGRAM = $ninja.Source
+    } else {
+        Write-Warning "ninja.exe not found on PATH"
+    }
+
+    $env:CMAKE_ARGS = "-DCMAKE_C_COMPILER=`"$cl`" -DCMAKE_CXX_COMPILER=`"$cl`""
+
+    Write-Host "==> CMAKE_GENERATOR=Ninja"
+    Write-Host "==> CC/CXX=$cl"
+    if ($ninja) {
+        Write-Host "==> CMAKE_MAKE_PROGRAM=$($ninja.Source)"
+    }
+}
+
+function Clear-LlamaCmakeCache {
+    foreach ($root in @(
+            "target\release\build",
+            "target\x86_64-pc-windows-msvc\release\build"
+        )) {
+        if (-not (Test-Path $root)) { continue }
+        Get-ChildItem $root -Directory -Filter "llama-cpp-sys-*" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $cmakeDir = Join-Path $_.FullName "out\build"
+                if (Test-Path $cmakeDir) {
+                    Write-Host "==> Clearing stale CMake cache: $cmakeDir"
+                    Remove-Item $cmakeDir -Recurse -Force
+                }
+            }
+    }
+}
+
 function Find-Nvcc {
     $candidates = @(
         $env:CUDA_PATH,
