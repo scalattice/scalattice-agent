@@ -96,7 +96,7 @@ pub fn follow_service_logs() -> Result<()> {
 }
 
 pub fn sync_background_env() -> Result<()> {
-    write_background_runner()
+    write_background_runner().map(|_| ())
 }
 
 pub fn remove_background_service() -> Result<()> {

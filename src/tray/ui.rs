@@ -7,8 +7,8 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use windows-sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-use windows-sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 
 const DASHBOARD_URL: &str = "https://scalattice.cloud/providers";
 
