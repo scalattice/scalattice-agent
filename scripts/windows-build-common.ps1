@@ -379,24 +379,54 @@ function Test-MsvcLinkerOnPath {
     return $link.Source -notmatch '\\Git\\usr\\bin\\'
 }
 
+function Get-VsInstallPath {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { return $null }
+    return & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath
+}
+
+function Ensure-VsCmakeOnPath {
+    $installPath = Get-VsInstallPath
+    if (-not $installPath) { return }
+
+    foreach ($sub in @(
+            "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin",
+            "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
+        )) {
+        $dir = Join-Path $installPath $sub
+        if (Test-Path $dir) {
+            $env:PATH = "$dir;$env:PATH"
+        }
+    }
+
+    $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    if ($cmake) {
+        Write-Host "==> cmake: $($cmake.Source)"
+    } else {
+        Write-Warning "cmake.exe not found - install VS C++ CMake components"
+    }
+}
+
+function Test-MsvcDevEnvironmentActive {
+    return [bool]$env:INCLUDE -and [bool]$env:LIB -and
+        (Get-Command cl.exe -ErrorAction SilentlyContinue) -and
+        (Test-MsvcLinkerOnPath)
+}
+
 function Import-VsDevEnvironment {
     Remove-GitUsrBinFromPath
 
-    if ((Get-Command cl.exe -ErrorAction SilentlyContinue) -and (Test-MsvcLinkerOnPath)) {
-        Write-Host "==> MSVC toolchain on PATH"
+    if (Test-MsvcDevEnvironmentActive) {
+        Write-Host "==> MSVC environment active"
         Write-Host "    cl:   $((Get-Command cl.exe).Source)"
         Write-Host "    link: $((Get-Command link.exe).Source)"
+        Ensure-VsCmakeOnPath
         return
     }
 
-    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path $vswhere)) {
-        Write-Error "vswhere not found - install Visual Studio 2022 Build Tools with C++ workload"
-    }
-
-    $installPath = & $vswhere -latest -products * `
-        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-        -property installationPath
+    $installPath = Get-VsInstallPath
     if (-not $installPath) {
         Write-Error "Visual Studio C++ tools not found - run scripts\setup-windows-build.cmd"
     }
@@ -416,14 +446,12 @@ function Import-VsDevEnvironment {
         [Environment]::SetEnvironmentVariable($name, $value, 'Process')
     }
 
-    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
-        Write-Error "MSVC cl.exe not found after VsDevCmd.bat"
-    }
-    if (-not (Test-MsvcLinkerOnPath)) {
-        Write-Error "MSVC link.exe not found after VsDevCmd.bat (check PATH for Git usr\bin conflicts)"
+    if (-not (Test-MsvcDevEnvironmentActive)) {
+        Write-Error "MSVC environment incomplete after VsDevCmd.bat (INCLUDE/LIB or cl.exe missing)"
     }
     Write-Host "==> MSVC cl:   $((Get-Command cl.exe).Source)"
     Write-Host "==> MSVC link: $((Get-Command link.exe).Source)"
+    Ensure-VsCmakeOnPath
 }
 
 function Find-Nvcc {

@@ -104,7 +104,10 @@ jobs:
         shell: cmd
         env:
           CARGO_INCREMENTAL: "0"
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=amd64 -host_arch=amd64
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: windows

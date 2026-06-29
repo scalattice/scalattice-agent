@@ -21,6 +21,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 
 Prioritize-SystemRustOnPath | Out-Null
 Import-VsDevEnvironment
+Prioritize-SystemRustOnPath | Out-Null
 $env:TrackFileAccess = "false"
 
 if (-not (Test-Path "Cargo.lock")) {
