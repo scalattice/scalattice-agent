@@ -13,6 +13,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
+. (Join-Path $PSScriptRoot "windows-build-common.ps1")
 
 function Import-VsDevEnvironment {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -59,7 +60,13 @@ if ($env:CUDA_PATH) {
     $env:PATH = "$($env:CUDA_PATH)\bin;$env:PATH"
 }
 
-# default = ["gpu"] includes vulkan; win-gpu must replace defaults, not add to them
+$clang = Find-LibClangDir
+if (-not $clang) {
+    Write-Error "libclang.dll not found - run scripts\setup-windows-build.cmd"
+}
+$env:LIBCLANG_PATH = $clang
+
+# win-gpu replaces default gpu (which includes vulkan); do not add to defaults
 Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
 cargo build --release --target $Target --no-default-features --features $Features
 

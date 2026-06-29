@@ -124,6 +124,57 @@ function Install-SystemWideRust {
     Write-Host "==> System-wide Rust installed: $cargoExe"
 }
 
+function Find-LibClangDir {
+    $candidates = @(
+        $env:LIBCLANG_PATH,
+        "${env:ProgramFiles}\LLVM\bin"
+    )
+
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $vsRoot = & $vswhere -latest -products * -property installationPath 2>$null
+        if ($vsRoot) {
+            $candidates += @(
+                (Join-Path $vsRoot "VC\Tools\Llvm\bin"),
+                (Join-Path $vsRoot "VC\Tools\Llvm\x64\bin")
+            )
+        }
+    }
+
+    foreach ($dir in $candidates) {
+        if ($dir -and (Test-Path (Join-Path $dir "libclang.dll"))) {
+            return $dir
+        }
+    }
+    return $null
+}
+
+function Install-LibClang {
+    $existing = Find-LibClangDir
+    if ($existing) {
+        Write-Host "==> libclang: $existing"
+        return $existing
+    }
+
+    Write-Host "==> Installing LLVM (libclang.dll for bindgen)"
+    Invoke-Choco @("install", "-y", "--no-progress", "llvm")
+
+    $dir = Find-LibClangDir
+    if (-not $dir) {
+        Write-Error "llvm package installed but libclang.dll not found"
+    }
+    return $dir
+}
+
+function Set-LibClangEnv {
+    param([string]$Dir)
+
+    if (-not $Dir) { return }
+    $env:LIBCLANG_PATH = $Dir
+    [Environment]::SetEnvironmentVariable("LIBCLANG_PATH", $Dir, "Machine")
+    Add-MachinePathEntry $Dir
+}
+
 function Get-WindowsBuildPathEntries {
     $paths = @()
 
@@ -147,6 +198,11 @@ function Get-WindowsBuildPathEntries {
         $paths += "$cuda\bin"
     }
 
+    $clang = Find-LibClangDir
+    if ($clang -and ($paths -notcontains $clang)) {
+        $paths += $clang
+    }
+
     return $paths
 }
 
@@ -165,6 +221,8 @@ function Ensure-BuildMachinePath {
             [Environment]::SetEnvironmentVariable("CUDA_PATH", $cuda, "Machine")
         }
     }
+
+    Set-LibClangEnv (Install-LibClang)
 }
 
 function Find-Nvcc {
