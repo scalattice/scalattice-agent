@@ -49,13 +49,15 @@ if (-not $clang) {
 $env:LIBCLANG_PATH = $clang
 
 Set-CmakeNinjaMsvcEnv
+Set-ShortCargoTargetDir
+Set-WindowsBuildParallelism -Jobs 4
 Clear-LlamaCmakeCache
 
 # win-gpu replaces default gpu (which includes vulkan); do not add to defaults
 Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
 cargo build --release --target $Target --no-default-features --features $Features
 
-$releaseDir = Join-Path "target" (Join-Path $Target "release")
+$releaseDir = Join-Path (Get-CargoTargetRoot) (Join-Path $Target "release")
 $bin = Join-Path $releaseDir "scalattice-agent.exe"
 if (-not (Test-Path $bin)) {
     Write-Error "Missing binary: $bin"

@@ -14,6 +14,8 @@ if (-not (Test-Admin)) {
 
 Ensure-PowerShellExecutionPolicy
 
+Ensure-ShortBuildDirs
+
 Ensure-Chocolatey
 
 Write-Host "==> Installing build dependencies (skips already-installed packages)"

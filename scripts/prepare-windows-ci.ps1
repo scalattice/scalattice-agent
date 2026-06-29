@@ -40,3 +40,6 @@ if ($env:GITHUB_ENV) {
 }
 $env:LIBCLANG_PATH = $clang
 Write-Host "==> LIBCLANG_PATH=$clang"
+
+Set-ShortCargoTargetDir -ExportForCi
+Set-WindowsBuildParallelism -Jobs 4

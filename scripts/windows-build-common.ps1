@@ -473,7 +473,7 @@ function Set-CmakeNinjaMsvcEnv {
         Write-Warning "ninja.exe not found on PATH"
     }
 
-    $env:CMAKE_ARGS = "-DCMAKE_C_COMPILER=`"$cl`" -DCMAKE_CXX_COMPILER=`"$cl`""
+    $env:CMAKE_ARGS = "-DCMAKE_C_COMPILER=`"$cl`" -DCMAKE_CXX_COMPILER=`"$cl`" -DCMAKE_OBJECT_PATH_MAX=512"
 
     Write-Host "==> CMAKE_GENERATOR=Ninja"
     Write-Host "==> CC/CXX=$cl"
@@ -482,11 +482,64 @@ function Set-CmakeNinjaMsvcEnv {
     }
 }
 
+function Get-ShortCargoTargetRoot {
+  return "C:\ar\t"
+}
+
+function Get-CargoTargetRoot {
+  if ($env:CARGO_TARGET_DIR) {
+    return $env:CARGO_TARGET_DIR
+  }
+  return "target"
+}
+
+function Ensure-ShortBuildDirs {
+  if (-not (Test-Admin)) { return }
+
+  $root = Split-Path (Get-ShortCargoTargetRoot) -Parent
+  $target = Get-ShortCargoTargetRoot
+  New-Item -ItemType Directory -Force -Path $root, $target | Out-Null
+
+  # Runner service (NETWORK SERVICE) must write CUDA/CMake artifacts here.
+  & icacls $root /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T 2>$null | Out-Null
+  & icacls $root /grant "BUILTIN\Administrators:(OI)(CI)F" /T 2>$null | Out-Null
+  Write-Host "==> Short build dir ready: $target"
+}
+
+function Set-ShortCargoTargetDir {
+  param([switch]$ExportForCi)
+
+  $targetDir = Get-ShortCargoTargetRoot
+  New-Item -ItemType Directory -Force -Path $targetDir -ErrorAction SilentlyContinue | Out-Null
+  $env:CARGO_TARGET_DIR = $targetDir
+
+  if ($ExportForCi -and $env:GITHUB_ENV) {
+    "CARGO_TARGET_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+  }
+
+  Write-Host "==> CARGO_TARGET_DIR=$targetDir"
+}
+
+function Set-WindowsBuildParallelism {
+  param(
+    [int]$Jobs = 4
+  )
+
+  $env:CARGO_BUILD_JOBS = "$Jobs"
+  $env:CMAKE_BUILD_PARALLEL_LEVEL = "$Jobs"
+
+  if ($env:GITHUB_ENV) {
+    "CARGO_BUILD_JOBS=$Jobs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    "CMAKE_BUILD_PARALLEL_LEVEL=$Jobs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+  }
+
+  Write-Host "==> Parallel build jobs: $Jobs"
+}
+
 function Clear-LlamaCmakeCache {
-    foreach ($root in @(
-            "target\release\build",
-            "target\x86_64-pc-windows-msvc\release\build"
-        )) {
+    $targetRoot = Get-CargoTargetRoot
+    foreach ($profile in @("release\build", "x86_64-pc-windows-msvc\release\build")) {
+        $root = Join-Path $targetRoot $profile
         if (-not (Test-Path $root)) { continue }
         Get-ChildItem $root -Directory -Filter "llama-cpp-sys-*" -ErrorAction SilentlyContinue |
             ForEach-Object {
