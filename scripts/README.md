@@ -2,7 +2,7 @@
 
 | Script | Purpose |
 |--------|---------|
-| **`release.sh --dev`** | **Day-to-day releases.** Bump, build x86_64 Linux, publish + Windows `.exe` in CI — skip aarch64. |
+| **`release.sh --dev`** | **Day-to-day releases.** x86_64 Linux local + Windows from `dist/` (preferred) or CI fallback. |
 | **`release.sh`** | Full release: x86_64 Linux + aarch64 + Windows → GitHub Releases. |
 | `build-release.sh` | Build one Linux target locally (used by `release.sh` for x86_64). |
 | `build-release.ps1` | Build Windows x86_64 locally (same output as CI). |
@@ -12,17 +12,25 @@
 
 ## Dev release (daily workflow)
 
+**Fast path (recommended):** build Windows on a Windows machine (faster than GitHub Actions), copy `dist/` to onsite, then release.
+
+```powershell
+# On Windows (Visual Studio + CUDA 12.6 + Inno Setup):
+.\scripts\build-release.ps1
+```
+
 ```bash
+# On Linux (onsite) — copies dist/ScalatticeAgentSetup-x86_64.exe if present:
 ./scripts/release.sh --dev
 ```
 
-Same as a full production release, but **skips aarch64 CI** only:
-
 1. Bumps patch version
 2. Builds **x86_64 Linux** locally
-3. Commits, pushes `main`, creates GitHub Release with x86 tarball
-4. Triggers **Windows** build in GitHub Actions and waits (~30–60 min on cold cache)
-5. Verifies x86 Linux tarball + `ScalatticeAgentSetup-x86_64.exe` are on the release
+3. Uploads Linux tarball + **local Windows** `dist/` artifacts (if present)
+4. Skips Windows CI when local `.exe` is in `dist/`
+5. Otherwise starts Windows CI **without waiting** (~1h on cold cache; use `--wait-ci` to block)
+
+Use `--windows-ci` to force the slow GitHub Actions Windows build even when `dist/` has artifacts.
 
 Use this while iterating on x86 + Windows. Run `./scripts/release.sh` (no flags) when ARM providers need the latest version.
 
@@ -50,7 +58,9 @@ Install scripts pick the right artifact automatically:
 
 | Flag | When |
 |------|------|
-| `--dev` | Day-to-day: x86_64 Linux + Windows CI (no aarch64) |
+| `--dev` | x86_64 Linux local + Windows from `dist/` or CI (no aarch64; CI does not wait by default) |
+| `--windows-ci` | Force Windows build on GitHub Actions even if `dist/` has a local `.exe` |
+| `--wait-ci` | Block until CI finishes (default for full `./scripts/release.sh`) |
 | `--skip-build` | Reuse existing `dist/` x86 tarball |
 | `--skip-aarch64` | Same as `--dev` |
 | `--version 1.0.2` | Pin version |

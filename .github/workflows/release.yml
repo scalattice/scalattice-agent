@@ -104,6 +104,7 @@ jobs:
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda_path }}
           CARGO_INCREMENTAL: "0"
+          CARGO_BUILD_JOBS: "4"
         run: |
           $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
           .\scripts\build-release.ps1

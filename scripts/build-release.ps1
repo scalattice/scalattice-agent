@@ -4,8 +4,8 @@
 #   ./scripts/build-release.ps1
 #
 # CI entry point for Windows releases (called from .github/workflows/release.yml).
-# For local Windows builds only: Rust stable, VS C++ tools, CUDA 12.6+.
-# On Linux, use ./scripts/release.sh --dev (Windows builds in GitHub Actions).
+# For local Windows builds: Rust stable, VS C++ tools, CUDA 12.6+, Inno Setup 6.
+# Then copy dist/ScalatticeAgentSetup-x86_64.exe (+ zip) to your Linux release host.
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$Features = "win-gpu"
@@ -39,10 +39,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 
 Import-VsDevEnvironment
-# llama.cpp's vulkan-shaders-gen ExternalProject runs nested CMake without the VS
-# generator; cl.exe must be on PATH. Serial builds avoid configure/install races.
 $env:TrackFileAccess = "false"
-$env:CMAKE_BUILD_PARALLEL_LEVEL = "1"
 
 if (-not (Test-Path "Cargo.lock")) {
     Write-Host "==> Generating Cargo.lock"

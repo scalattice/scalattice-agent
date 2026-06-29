@@ -3,9 +3,9 @@
 #
 # Usage:
 #   ./scripts/release.sh                 # bump patch, build both archs, publish
-#   ./scripts/release.sh --dev           # x86_64 Linux local + Windows in GitHub Actions (skip aarch64)
-#   ./scripts/release.sh --skip-build    # reuse dist/ x86 tarball; still builds CI targets below
-#   ./scripts/release.sh --skip-aarch64  # same as --dev (Windows still built in GitHub Actions)
+#   ./scripts/release.sh --dev           # x86_64 Linux local + Windows (local dist/ if present, else CI)
+#   ./scripts/release.sh --dev --windows-ci   # force slow GitHub Actions Windows build
+#   ./scripts/release.sh --skip-build    # reuse dist/ tarballs; still runs CI unless Windows is in dist/
 #   ./scripts/release.sh --version 1.0.2
 #   ./scripts/release.sh --minor
 #
@@ -19,8 +19,12 @@ BUMP="patch"
 EXPLICIT_VERSION=""
 SKIP_BUILD="false"
 DEV_RELEASE="false"
+FORCE_WINDOWS_CI="false"
+WAIT_CI="false"
 NO_PUSH="false"
 WORKFLOW_FILE=".github/workflows/release.yml"
+WIN_INSTALLER="dist/ScalatticeAgentSetup-x86_64.exe"
+WIN_ARCHIVE="dist/scalattice-agent-x86_64-pc-windows-msvc.zip"
 
 usage() {
   cat <<'EOF'
@@ -29,12 +33,18 @@ Usage: ./scripts/release.sh [options]
   Default: bump version, build x86_64 here, build aarch64 in GitHub Actions,
   upload both tarballs to one GitHub Release.
 
-  --dev: x86_64 Linux local; Windows installer built in GitHub Actions (aarch64 skipped).
+  --dev: x86_64 Linux local; Windows from dist/ (build on a Windows machine) or GitHub Actions.
+
+  Build Windows locally (on a Windows PC), then copy dist/ artifacts to this machine:
+    .\\scripts\\build-release.ps1
+    # copies: dist/ScalatticeAgentSetup-x86_64.exe + dist/scalattice-agent-x86_64-pc-windows-msvc.zip
 
 Options:
-  --dev             Day-to-day: x86_64 Linux local + Windows via GitHub Actions (no aarch64)
+  --dev             Day-to-day: x86_64 Linux local + Windows (local dist/ preferred; CI fallback)
+  --windows-ci      Force Windows build on GitHub Actions (slow; ~1h cold cache)
+  --wait-ci         Block until CI finishes (default for full release; dev CI is fire-and-forget)
   --skip-build      Skip local x86_64 compile (use existing dist/ tarball)
-  --skip-aarch64    Same as --dev (Windows still built in GitHub Actions)
+  --skip-aarch64    Same as --dev
   --version X.Y.Z   Explicit version
   --minor           Bump minor instead of patch
   --no-push         Dry run (no push/release)
@@ -49,6 +59,8 @@ while [[ $# -gt 0 ]]; do
     --dev) DEV_RELEASE="true"; shift ;;
     --skip-build) SKIP_BUILD="true"; shift ;;
     --skip-aarch64) DEV_RELEASE="true"; shift ;;
+    --windows-ci) FORCE_WINDOWS_CI="true"; shift ;;
+    --wait-ci) WAIT_CI="true"; shift ;;
     --no-push) NO_PUSH="true"; shift ;;
     --minor) BUMP="minor"; shift ;;
     --patch) BUMP="patch"; shift ;;
@@ -128,14 +140,25 @@ resolve_version() {
 build_ci_assets() {
   local tag="$1"
   local targets="$2"
+  local wait="${3:-true}"
   echo ""
   echo "==> Building ${targets} in GitHub Actions (tag ${tag})"
-  echo "    This is ~30–90 min on a cold cache; the script waits until it finishes."
+  if [[ "$wait" == "true" ]]; then
+    echo "    Waiting for CI (~30–90 min on cold cache)."
+  else
+    echo "    Not waiting — check progress: gh run list --workflow=${WORKFLOW_FILE}"
+  fi
 
   gh workflow run "$WORKFLOW_FILE" \
     --ref main \
     -f "tag=${tag}" \
     -f "targets=${targets}"
+
+  if [[ "$wait" != "true" ]]; then
+    echo "==> CI started (not waiting). Upload assets when the run finishes:"
+    echo "    gh run watch   # pick run id from: gh run list --workflow=${WORKFLOW_FILE}"
+    return 0
+  fi
 
   local run_id=""
   for _ in $(seq 1 30); do
@@ -154,8 +177,41 @@ build_ci_assets() {
   gh run watch "$run_id" --exit-status
 }
 
-# Windows is never built on the release host — always GitHub Actions (windows-2022).
-# Dev releases skip aarch64 only; full releases build aarch64 + Windows in CI.
+windows_dist_ready() {
+  [[ -f "$WIN_INSTALLER" || -f "$WIN_ARCHIVE" ]]
+}
+
+collect_windows_release_files() {
+  RELEASE_WINDOWS_FILES=()
+  if [[ -f "$WIN_INSTALLER" ]]; then
+    RELEASE_WINDOWS_FILES+=("$WIN_INSTALLER")
+  fi
+  if [[ -f "$WIN_ARCHIVE" ]]; then
+    RELEASE_WINDOWS_FILES+=("$WIN_ARCHIVE")
+  fi
+}
+
+should_build_windows_in_ci() {
+  if [[ "$FORCE_WINDOWS_CI" == "true" ]]; then
+    return 0
+  fi
+  if windows_dist_ready; then
+    return 1
+  fi
+  return 0
+}
+
+ci_wait_flag() {
+  if [[ "$WAIT_CI" == "true" ]]; then
+    echo "true"
+  elif [[ "$DEV_RELEASE" == "true" ]]; then
+    echo "false"
+  else
+    echo "true"
+  fi
+}
+
+# Dev releases skip aarch64. Windows: local dist/ preferred; CI only when missing (or --windows-ci).
 resolve_ci_targets() {
   if [[ "$DEV_RELEASE" == "true" ]]; then
     echo "windows-only"
@@ -215,13 +271,21 @@ if [[ "$(cargo_version)" != "$VERSION" ]]; then
 fi
 
 if [[ "$DEV_RELEASE" == "true" ]]; then
-  echo "==> Release ${TAG} (x86_64 Linux local + Windows via GitHub Actions; skipping aarch64)"
+  echo "==> Release ${TAG} (x86_64 Linux local; aarch64 skipped)"
 else
-  echo "==> Release ${TAG} (x86_64 local + aarch64 + Windows via GitHub Actions)"
+  echo "==> Release ${TAG} (x86_64 local + aarch64 + Windows)"
 fi
 
 CI_TARGETS="$(resolve_ci_targets)"
-echo "==> CI targets: ${CI_TARGETS} (Windows .exe always built on GitHub Actions, not onsite)"
+if windows_dist_ready; then
+  echo "==> Windows: using local dist/ (skip GitHub Actions unless --windows-ci)"
+  collect_windows_release_files
+  printf '    %s\n' "${RELEASE_WINDOWS_FILES[@]}"
+elif [[ "$DEV_RELEASE" == "true" ]]; then
+  echo "==> Windows: no dist/ artifacts — will use GitHub Actions (build on Windows with build-release.ps1 to avoid this)"
+else
+  echo "==> Windows: will build in GitHub Actions (targets=${CI_TARGETS})"
+fi
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
   [[ -f "$X86_ARCHIVE" ]] || {
@@ -255,25 +319,60 @@ if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&
   gh release delete "$TAG" --yes 2>/dev/null || true
 fi
 
-echo "==> Creating GitHub release with x86_64 tarball"
+echo "==> Creating GitHub release"
+RELEASE_FILES=("$X86_ARCHIVE")
+RELEASE_WINDOWS_FILES=()
+if windows_dist_ready; then
+  collect_windows_release_files
+  RELEASE_FILES+=("${RELEASE_WINDOWS_FILES[@]}")
+fi
 if [[ "$DEV_RELEASE" == "true" ]]; then
-  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local + Windows via GitHub Actions; dev release, no aarch64)."
+  if windows_dist_ready && [[ "$FORCE_WINDOWS_CI" != "true" ]]; then
+    RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux + Windows local dist/; dev release)."
+  else
+    RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; Windows via GitHub Actions; dev release)."
+  fi
 else
   RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; aarch64 + Windows via GitHub Actions)."
 fi
-gh release create "$TAG" "$X86_ARCHIVE" \
+gh release create "$TAG" "${RELEASE_FILES[@]}" \
   --target main \
   --title "$TAG" \
   --notes "$RELEASE_NOTES"
 
 git fetch --tags "$REMOTE" 2>/dev/null || true
 
-build_ci_assets "$TAG" "$CI_TARGETS"
+NEED_WINDOWS_VERIFY="true"
+CI_WAIT="$(ci_wait_flag)"
 
 if [[ "$DEV_RELEASE" == "true" ]]; then
+  if should_build_windows_in_ci; then
+    build_ci_assets "$TAG" "windows-only" "$CI_WAIT"
+  else
+    echo "==> Skipping Windows CI (local dist/ uploaded)"
+    NEED_WINDOWS_VERIFY="true"
+  fi
+else
+  if should_build_windows_in_ci; then
+    build_ci_assets "$TAG" "full" "$CI_WAIT"
+  else
+    echo "==> Skipping Windows CI (local dist/ uploaded); aarch64 still in CI"
+    build_ci_assets "$TAG" "aarch64-only" "$CI_WAIT"
+  fi
+fi
+
+if [[ "$CI_WAIT" == "true" ]]; then
+  if [[ "$DEV_RELEASE" == "true" ]]; then
+    verify_release_assets "$TAG" false "$NEED_WINDOWS_VERIFY"
+  else
+    verify_release_assets "$TAG" true "$NEED_WINDOWS_VERIFY"
+  fi
+elif windows_dist_ready && ! should_build_windows_in_ci; then
   verify_release_assets "$TAG" false true
 else
-  verify_release_assets "$TAG" true true
+  echo ""
+  echo "==> CI still running (or not started for Windows). Verify when done:"
+  echo "    gh release view ${TAG} --json assets -q '.assets[].name'"
 fi
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
