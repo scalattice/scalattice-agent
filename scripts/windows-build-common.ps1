@@ -126,6 +126,100 @@ function Set-SystemRustEnv {
     return $true
 }
 
+function Get-ChocolateyRustPathEntries {
+    return @(
+        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools"),
+        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools\bin")
+    )
+}
+
+function Remove-ChocolateyRustFromPath {
+    $block = Get-ChocolateyRustPathEntries
+    $parts = @($env:PATH -split ';' | Where-Object { $_ -and ($block -notcontains $_) })
+    $env:PATH = ($parts -join ';')
+}
+
+function Ensure-RustToolchainPermissions {
+    if (-not (Test-Admin)) { return }
+
+    $root = "C:\Rust"
+    if (-not (Test-Path $root)) { return }
+
+    New-Item -ItemType Directory -Force -Path (Get-SystemRustCargoBin), (Get-SystemRustupHome) | Out-Null
+    & icacls $root /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T 2>$null | Out-Null
+    & icacls $root /grant "BUILTIN\Administrators:(OI)(CI)F" /T 2>$null | Out-Null
+    Write-Host "==> Rust toolchain permissions set for runner service"
+}
+
+function Test-SystemRustExecutable {
+    param([string]$Exe)
+
+    if (-not (Test-Path -LiteralPath $Exe)) { return $false }
+    try {
+        $null = & $Exe --version 2>&1
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Repair-SystemRustToolchain {
+    $rustBin = Get-SystemRustCargoBin
+    $rustup = Join-Path $rustBin "rustup.exe"
+    $rustc = Join-Path $rustBin "rustc.exe"
+
+    if (-not (Test-Path -LiteralPath $rustup)) {
+        return $false
+    }
+
+    if (Test-SystemRustExecutable $rustc) {
+        return $true
+    }
+
+    Write-Host "==> Repairing system Rust toolchain (rustc missing or broken)"
+    & $rustup toolchain install stable --profile minimal -y 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { return $false }
+
+    & $rustup default stable 2>&1 | Out-Host
+    return (Test-SystemRustExecutable $rustc)
+}
+
+function Assert-SystemRustToolchain {
+    param([switch]$ExportForCi)
+
+    if (-not (Prioritize-SystemRustOnPath -ExportForCi:$ExportForCi)) {
+        throw "System Rust not configured at C:\Rust\cargo\bin"
+    }
+
+    $rustBin = Get-SystemRustCargoBin
+    $rustc = Join-Path $rustBin "rustc.exe"
+    $cargo = Join-Path $rustBin "cargo.exe"
+    $rustup = Join-Path $rustBin "rustup.exe"
+
+    if (-not (Test-SystemRustExecutable $rustc)) {
+        if (-not (Repair-SystemRustToolchain)) {
+            throw @"
+rustc is missing or cannot run at $rustc
+
+Run once as Administrator on the Windows build machine:
+  scripts\setup-windows-build.cmd
+"@
+        }
+    }
+
+    if (-not (Test-SystemRustExecutable $cargo)) {
+        throw "cargo cannot run at $cargo"
+    }
+
+    Write-Host "==> RUSTUP_HOME=$($env:RUSTUP_HOME)"
+    Write-Host "==> CARGO_HOME=$($env:CARGO_HOME)"
+    Write-Host "==> rustc: $rustc"
+    & $rustc --version
+    Write-Host "==> cargo: $cargo"
+    & $cargo --version
+    & $rustup show
+}
+
 function Prioritize-SystemRustOnPath {
     param([switch]$ExportForCi)
 
@@ -138,10 +232,13 @@ function Prioritize-SystemRustOnPath {
         return $false
     }
 
-    $block = @(
-        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools"),
-        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools\bin")
-    )
+    $rustc = Join-Path $rustBin "rustc.exe"
+    $cargo = Join-Path $rustBin "cargo.exe"
+    if (-not (Test-Path -LiteralPath $cargo)) {
+        return $false
+    }
+
+    $block = Get-ChocolateyRustPathEntries
     $parts = @($env:PATH -split ';' | Where-Object {
             $_ -and ($_ -ne $rustBin) -and ($block -notcontains $_)
         })
@@ -232,6 +329,9 @@ function Install-SystemWideRust {
     }
     if (-not (Test-Path $cargoExe)) {
         throw "rustup-init completed but cargo.exe missing at $cargoExe"
+    }
+    if (-not (Test-Path (Join-Path $cargoHome "bin\rustc.exe"))) {
+        & (Join-Path $cargoHome "bin\rustup.exe") toolchain install stable --profile minimal -y *> $null
     }
     Write-Host "==> System-wide Rust installed: $cargoExe"
 }
