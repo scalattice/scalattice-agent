@@ -179,38 +179,105 @@ function Ensure-RustToolchainPermissions {
     Write-Host "==> Rust toolchain permissions set for runner service"
 }
 
-function Test-SystemRustExecutable {
-    param([string]$Exe)
+function Set-SystemRustSessionEnv {
+    $env:RUSTUP_HOME = Get-SystemRustupHome
+    $env:CARGO_HOME = Get-SystemCargoHome
+    $env:RUSTUP_INIT_SKIP_PATH_CHECK = "yes"
 
-    if (-not (Test-Path -LiteralPath $Exe)) { return $false }
+    $rustBin = Get-SystemRustCargoBin
+    if ($env:PATH -notlike "$rustBin*") {
+        $env:PATH = "$rustBin;$env:PATH"
+    }
+    Remove-ChocolateyRustFromPath
+}
+
+function Test-SystemRustExecutable {
+    param(
+        [string]$Exe,
+        [switch]$Quiet
+    )
+
+    if (-not (Test-Path -LiteralPath $Exe)) {
+        if (-not $Quiet) {
+            Write-Host "==> Missing executable: $Exe"
+        }
+        return $false
+    }
+
+    Set-SystemRustSessionEnv
     try {
-        $null = & $Exe --version 2>&1
-        return $LASTEXITCODE -eq 0
+        $output = & $Exe --version 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            if (-not $Quiet) {
+                Write-Host "==> $Exe --version failed (exit $LASTEXITCODE): $output"
+            }
+            return $false
+        }
+        return $true
     } catch {
+        if (-not $Quiet) {
+            Write-Host "==> $Exe --version threw: $_"
+        }
         return $false
     }
 }
 
-function Repair-SystemRustToolchain {
-    $rustBin = Get-SystemRustCargoBin
-    $rustup = Join-Path $rustBin "rustup.exe"
-    $rustc = Join-Path $rustBin "rustc.exe"
+function Reinstall-SystemRustToolchain {
+    Set-SystemRustSessionEnv
 
-    if (-not (Test-Path -LiteralPath $rustup)) {
+    $cargoHome = Get-SystemCargoHome
+    $rustupHome = Get-SystemRustupHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $cargoHome "bin"), $rustupHome | Out-Null
+    [Environment]::SetEnvironmentVariable("RUSTUP_HOME", $rustupHome, "Machine")
+    [Environment]::SetEnvironmentVariable("CARGO_HOME", $cargoHome, "Machine")
+
+    Write-Host "==> Reinstalling system-wide Rust at C:\Rust"
+    $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
+    Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $rustupInit
+    & $rustupInit -y --default-toolchain stable --no-modify-path 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "==> rustup-init failed (exit $LASTEXITCODE)"
         return $false
     }
 
-    if (Test-SystemRustExecutable $rustc) {
+    $rustc = Join-Path (Get-SystemRustCargoBin) "rustc.exe"
+    return (Test-SystemRustExecutable $rustc)
+}
+
+function Repair-SystemRustToolchain {
+    Set-SystemRustSessionEnv
+
+    $rustBin = Get-SystemRustCargoBin
+    $rustup = Join-Path $rustBin "rustup.exe"
+    $rustc = Join-Path $rustBin "rustc.exe"
+    $cargo = Join-Path $rustBin "cargo.exe"
+
+    if (-not (Test-Path -LiteralPath $rustup)) {
+        Write-Host "==> rustup.exe missing at $rustup"
+        return (Reinstall-SystemRustToolchain)
+    }
+
+    if (Test-SystemRustExecutable $rustc -Quiet) {
         return $true
     }
 
-    Write-Host "==> Repairing system Rust toolchain (rustc missing or broken)"
-    & $rustup self repair 2>&1 | Out-Host
-    & $rustup toolchain install stable --profile minimal -y 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) { return $false }
+    Write-Host "==> Repairing system Rust toolchain"
+    Write-Host "    rustc exists: $(Test-Path -LiteralPath $rustc)"
+    Write-Host "    cargo works:  $(Test-SystemRustExecutable $cargo -Quiet)"
+    Write-Host "    RUSTUP_HOME:  $($env:RUSTUP_HOME)"
+    Write-Host "    CARGO_HOME:   $($env:CARGO_HOME)"
 
+    & $rustup self repair 2>&1 | Out-Host
+    & $rustup toolchain install stable --force --profile default -y 2>&1 | Out-Host
     & $rustup default stable 2>&1 | Out-Host
-    return (Test-SystemRustExecutable $rustc)
+    & $rustup component add rustc cargo rust-std 2>&1 | Out-Host
+
+    if (Test-SystemRustExecutable $rustc -Quiet) {
+        return $true
+    }
+
+    Write-Host "==> rustup repair incomplete; running rustup-init against C:\Rust"
+    return (Reinstall-SystemRustToolchain)
 }
 
 function Assert-SystemRustToolchain {

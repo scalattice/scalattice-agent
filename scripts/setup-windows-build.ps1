@@ -59,9 +59,15 @@ Install-CudaToolkit
 
 Ensure-BuildMachinePath
 
-if (-not (Repair-SystemRustToolchain)) {
-    Write-Error "Failed to install or repair system Rust at C:\Rust"
-}
+    if (-not (Repair-SystemRustToolchain)) {
+        Write-Error @"
+Failed to install or repair system Rust at C:\Rust.
+
+Try in an elevated PowerShell:
+  Remove-Item -Recurse -Force C:\Rust
+  scripts\setup-windows-build.cmd
+"@
+    }
 Ensure-RustToolchainPermissions
 Assert-SystemRustToolchain
 
