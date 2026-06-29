@@ -139,15 +139,43 @@ function Remove-ChocolateyRustFromPath {
     $env:PATH = ($parts -join ';')
 }
 
+function Invoke-IcaclsGrant {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Grant,
+        [switch]$Recurse
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $args = @(
+            $Path,
+            '/grant',
+            $Grant,
+            '/C',
+            '/Q'
+        )
+        if ($Recurse) { $args += '/T' }
+        & icacls @args 1>$null 2>$null
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 function Ensure-RustToolchainPermissions {
     if (-not (Test-Admin)) { return }
 
     $root = "C:\Rust"
-    if (-not (Test-Path $root)) { return }
+    New-Item -ItemType Directory -Force -Path $root, (Get-SystemCargoHome), (Get-SystemRustupHome), (Get-SystemRustCargoBin) | Out-Null
 
-    New-Item -ItemType Directory -Force -Path (Get-SystemRustCargoBin), (Get-SystemRustupHome) | Out-Null
-    & icacls $root /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T 2>$null | Out-Null
-    & icacls $root /grant "BUILTIN\Administrators:(OI)(CI)F" /T 2>$null | Out-Null
+    foreach ($dir in @($root, (Get-SystemCargoHome), (Get-SystemRustupHome), (Get-SystemRustCargoBin))) {
+        # (OI)(CI) inherits to new files/dirs without walking broken rustup proxy links.
+        Invoke-IcaclsGrant $dir "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"
+        Invoke-IcaclsGrant $dir "BUILTIN\Administrators:(OI)(CI)F"
+    }
     Write-Host "==> Rust toolchain permissions set for runner service"
 }
 
@@ -177,6 +205,7 @@ function Repair-SystemRustToolchain {
     }
 
     Write-Host "==> Repairing system Rust toolchain (rustc missing or broken)"
+    & $rustup self repair 2>&1 | Out-Host
     & $rustup toolchain install stable --profile minimal -y 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) { return $false }
 
@@ -601,8 +630,8 @@ function Ensure-ShortBuildDirs {
   New-Item -ItemType Directory -Force -Path $root, $target | Out-Null
 
   # Runner service (NETWORK SERVICE) must write CUDA/CMake artifacts here.
-  & icacls $root /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T 2>$null | Out-Null
-  & icacls $root /grant "BUILTIN\Administrators:(OI)(CI)F" /T 2>$null | Out-Null
+  Invoke-IcaclsGrant $root "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"
+  Invoke-IcaclsGrant $root "BUILTIN\Administrators:(OI)(CI)F"
   Write-Host "==> Short build dir ready: $target"
 }
 

@@ -15,7 +15,6 @@ if (-not (Test-Admin)) {
 Ensure-PowerShellExecutionPolicy
 
 Ensure-ShortBuildDirs
-Ensure-RustToolchainPermissions
 
 Ensure-Chocolatey
 
@@ -63,6 +62,7 @@ Ensure-BuildMachinePath
 if (-not (Repair-SystemRustToolchain)) {
     Write-Error "Failed to install or repair system Rust at C:\Rust"
 }
+Ensure-RustToolchainPermissions
 Assert-SystemRustToolchain
 
 # Rust may land on PATH only in new shells; refresh common locations.
