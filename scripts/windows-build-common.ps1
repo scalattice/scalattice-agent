@@ -124,7 +124,28 @@ function Install-SystemWideRust {
     Write-Host "==> System-wide Rust installed: $cargoExe"
 }
 
+function Test-LibClangCandidate {
+    param([string]$Dir)
+
+    if ([string]::IsNullOrWhiteSpace($Dir)) { return $false }
+    if ($Dir -notmatch '^[a-zA-Z]:\\') { return $false }
+    return Test-Path -LiteralPath (Join-Path $Dir "libclang.dll")
+}
+
+function Repair-LibClangMachineEnv {
+    $stored = [Environment]::GetEnvironmentVariable("LIBCLANG_PATH", "Machine")
+    if ($stored -and -not (Test-LibClangCandidate $stored)) {
+        Write-Warning "Removing invalid machine LIBCLANG_PATH"
+        [Environment]::SetEnvironmentVariable("LIBCLANG_PATH", $null, "Machine")
+    }
+    if ($env:LIBCLANG_PATH -and -not (Test-LibClangCandidate $env:LIBCLANG_PATH)) {
+        Remove-Item Env:\LIBCLANG_PATH -ErrorAction SilentlyContinue
+    }
+}
+
 function Find-LibClangDir {
+    Repair-LibClangMachineEnv
+
     $candidates = @(
         $env:LIBCLANG_PATH,
         "${env:ProgramFiles}\LLVM\bin"
@@ -142,7 +163,7 @@ function Find-LibClangDir {
     }
 
     foreach ($dir in $candidates) {
-        if ($dir -and (Test-Path (Join-Path $dir "libclang.dll"))) {
+        if (Test-LibClangCandidate $dir) {
             return $dir
         }
     }
@@ -157,19 +178,27 @@ function Install-LibClang {
     }
 
     Write-Host "==> Installing LLVM (libclang.dll for bindgen)"
-    Invoke-Choco @("install", "-y", "--no-progress", "llvm")
+    Ensure-Chocolatey
+    & choco install -y --no-progress llvm *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "choco install llvm failed (exit $LASTEXITCODE)"
+    }
 
     $dir = Find-LibClangDir
     if (-not $dir) {
         Write-Error "llvm package installed but libclang.dll not found"
     }
+    Write-Host "==> libclang installed: $dir"
     return $dir
 }
 
 function Set-LibClangEnv {
     param([string]$Dir)
 
-    if (-not $Dir) { return }
+    if (-not (Test-LibClangCandidate $Dir)) {
+        Write-Warning "Skipping invalid LIBCLANG_PATH: $Dir"
+        return
+    }
     $env:LIBCLANG_PATH = $Dir
     [Environment]::SetEnvironmentVariable("LIBCLANG_PATH", $Dir, "Machine")
     Add-MachinePathEntry $Dir
@@ -222,7 +251,7 @@ function Ensure-BuildMachinePath {
         }
     }
 
-    Set-LibClangEnv (Install-LibClang)
+    Set-LibClangEnv -Dir (Install-LibClang)
 }
 
 function Find-Nvcc {
