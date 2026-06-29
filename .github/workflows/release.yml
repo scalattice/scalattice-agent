@@ -172,6 +172,8 @@ jobs:
       )
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -181,16 +183,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release view "$TAG" >/dev/null || {
-            echo "Release ${TAG} not found." >&2
+          gh release view "$TAG" -R "$GH_REPO" >/dev/null || {
+            echo "Release ${TAG} not found on ${GH_REPO}." >&2
             exit 1
           }
-          shopt -s nullglob
-          files=(artifacts/**/*.tar.gz artifacts/**/*.zip artifacts/**/*.exe)
+          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' \))
           [[ ${#files[@]} -gt 0 ]] || { echo "No release archives built." >&2; exit 1; }
           for f in "${files[@]}"; do
             echo "Uploading $(basename "$f")"
-            gh release upload "$TAG" "$f" --clobber
+            gh release upload "$TAG" "$f" --clobber -R "$GH_REPO"
           done
