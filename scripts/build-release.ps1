@@ -35,7 +35,7 @@ function Import-VsDevEnvironment {
 }
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Write-Error "cargo not found — install Rust stable from https://rustup.rs"
+    Write-Error "cargo not found - install Rust stable from https://rustup.rs"
 }
 
 Import-VsDevEnvironment
@@ -98,5 +98,5 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 if ((Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -or (Test-Path "${env:ProgramFiles}\Inno Setup 6\ISCC.exe")) {
     & (Join-Path $PSScriptRoot "build-windows-installer.ps1")
 } else {
-    Write-Warning "Inno Setup not found — zip built but GUI installer skipped (install Inno Setup 6 and re-run)"
+    Write-Warning "Inno Setup not found - zip built but GUI installer skipped (install Inno Setup 6 and re-run)"
 }

@@ -30,7 +30,7 @@ function Copy-DependencyTree {
 
     $dumpbin = Find-Dumpbin
     if (-not $dumpbin) {
-        Write-Warning "dumpbin not found — skipping dependency scan for $Path"
+        Write-Warning "dumpbin not found - skipping dependency scan for $Path"
         return
     }
 

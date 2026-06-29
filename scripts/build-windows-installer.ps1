@@ -9,7 +9,7 @@ Set-Location $Root
 
 $distExe = Join-Path $Root "dist\scalattice-agent.exe"
 if (-not (Test-Path $distExe)) {
-    Write-Error "Missing $distExe — run scripts/build-release.ps1 first"
+    Write-Error "Missing $distExe - run scripts/build-release.ps1 first"
 }
 
 if (-not $Version) {
@@ -35,7 +35,7 @@ Write-Host "==> Compiling Windows setup (v$Version)"
 
 $setup = Join-Path $Root "dist\ScalatticeAgentSetup-x86_64.exe"
 if (-not (Test-Path $setup)) {
-    Write-Error "Installer build failed — expected $setup"
+    Write-Error "Installer build failed - expected $setup"
 }
 
 Write-Host "==> Built $setup ($([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB)"
