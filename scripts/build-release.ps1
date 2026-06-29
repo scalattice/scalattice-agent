@@ -64,6 +64,9 @@ Set-WindowsBuildParallelism -Jobs 4
 # win-gpu replaces default gpu (which includes vulkan); do not add to defaults
 Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
 cargo build --release --target $Target --no-default-features --features $Features
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "cargo build failed with exit code $LASTEXITCODE"
+}
 
 $releaseDir = Join-Path (Get-CargoTargetRoot) (Join-Path $Target "release")
 $bin = Join-Path $releaseDir "scalattice-agent.exe"

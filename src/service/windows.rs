@@ -497,7 +497,7 @@ fn activate_tray_window() {
             FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
         };
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd != 0 {
+        if !hwnd.is_null() {
             ShowWindow(hwnd, SW_RESTORE);
             ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);

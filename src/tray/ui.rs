@@ -81,7 +81,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
 
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
-    MenuEvent::set_event_handler(Some(move |event| {
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id == open_id {
             show_for_menu.store(true, Ordering::SeqCst);
         } else if event.id == quit_id {
@@ -532,7 +532,9 @@ fn launched_hidden() -> bool {
 }
 
 fn has_attached_console() -> bool {
-    unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() != 0 }
+    unsafe {
+        !windows_sys::Win32::System::Console::GetConsoleWindow().is_null()
+    }
 }
 
 fn maybe_detach_console() {
@@ -545,7 +547,7 @@ fn activate_tray_window() -> bool {
     let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
     unsafe {
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd == 0 {
+        if hwnd.is_null() {
             return false;
         }
         ShowWindow(hwnd, SW_RESTORE);
