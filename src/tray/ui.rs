@@ -142,6 +142,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
                 show_for_app,
                 status_rx,
                 status_req_tx,
+                !interactive,
             )))
         }),
     )
@@ -158,6 +159,7 @@ struct TrayApp {
     status_rx: mpsc::Receiver<Vec<String>>,
     status_req_tx: mpsc::Sender<()>,
     status_refresh_inflight: bool,
+    panel_hidden: bool,
     token_input: String,
     status_lines: Vec<String>,
     action_message: String,
@@ -175,6 +177,7 @@ impl TrayApp {
         show_window: Arc<AtomicBool>,
         status_rx: mpsc::Receiver<Vec<String>>,
         status_req_tx: mpsc::Sender<()>,
+        panel_hidden: bool,
     ) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let log_path = agent_log_path().ok();
@@ -185,6 +188,7 @@ impl TrayApp {
             status_rx,
             status_req_tx,
             status_refresh_inflight: false,
+            panel_hidden,
             token_input,
             status_lines: Vec::new(),
             action_message: String::new(),
@@ -220,6 +224,7 @@ impl TrayApp {
     }
 
     fn reveal_window(&mut self, ctx: &egui::Context) {
+        self.panel_hidden = false;
         self.next_data_poll = Instant::now();
         activate_tray_window();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -350,22 +355,22 @@ impl eframe::App for TrayApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.panel_hidden = true;
         }
 
         self.poll_tray(ctx);
 
         let native_visible = native_window_visible();
-        let viewport_visible = ctx.input(|i| i.viewport().visible.unwrap_or(true));
-
-        if !viewport_visible && native_visible {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            self.next_data_poll = Instant::now();
-            self.kick_status_refresh();
-        }
-
-        if !viewport_visible && !native_visible {
+        if !native_visible {
+            self.panel_hidden = true;
             ctx.request_repaint_after(Duration::from_millis(400));
             return;
+        }
+
+        if self.panel_hidden {
+            self.panel_hidden = false;
+            self.next_data_poll = Instant::now();
+            self.kick_status_refresh();
         }
 
         self.poll_status_results(ctx);
