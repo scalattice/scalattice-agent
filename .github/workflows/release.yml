@@ -1,7 +1,8 @@
 name: Release
 
-# Called automatically by scripts/release.sh (windows-only for --dev, full otherwise).
-# Can also be run manually from the Actions tab.
+# Linux x86_64: built locally by scripts/release.sh
+# Windows: self-hosted runner (label scalattice-release) — see scripts/install-windows-runner.ps1
+# aarch64: GitHub-hosted ARM runner (full release only)
 on:
   workflow_dispatch:
     inputs:
@@ -18,17 +19,19 @@ on:
           - aarch64-only
           - windows-only
           - full
+      windows_runner:
+        description: 'Windows build host'
+        required: true
+        type: choice
+        default: self-hosted
+        options:
+          - self-hosted
+          - github-hosted
 
 permissions:
   contents: write
 
 jobs:
-  build-x86_64:
-    if: false
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "x86_64 Linux is built locally by scripts/release.sh"
-
   build-aarch64:
     if: inputs.targets == 'aarch64-only' || inputs.targets == 'full'
     runs-on: ubuntu-24.04-arm
@@ -78,9 +81,38 @@ jobs:
           name: aarch64
           path: dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz
 
-  build-windows:
-    if: inputs.targets == 'windows-only' || inputs.targets == 'full'
+  build-windows-self-hosted:
+    if: |
+      (inputs.targets == 'windows-only' || inputs.targets == 'full') &&
+      inputs.windows_runner == 'self-hosted'
+    runs-on: [self-hosted, Windows, X64, scalattice-release]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows-self-hosted-v1
+          cache-targets: true
+          cache-workspace-crates: true
+      - name: Build + package
+        shell: pwsh
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: .\scripts\build-release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/scalattice-agent-x86_64-pc-windows-msvc.zip
+            dist/ScalatticeAgentSetup-x86_64.exe
+
+  build-windows-github-hosted:
+    if: |
+      (inputs.targets == 'windows-only' || inputs.targets == 'full') &&
+      inputs.windows_runner == 'github-hosted'
     runs-on: windows-2022
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -116,13 +148,19 @@ jobs:
             dist/ScalatticeAgentSetup-x86_64.exe
 
   upload:
-    needs: [build-aarch64, build-windows]
+    needs: [build-aarch64, build-windows-self-hosted, build-windows-github-hosted]
     if: |
       always() && !cancelled() &&
       (
-        (inputs.targets == 'windows-only' && needs.build-windows.result == 'success') ||
-        (inputs.targets == 'aarch64-only' && needs.build-aarch64.result == 'success') ||
-        (inputs.targets == 'full' && needs.build-aarch64.result == 'success' && needs.build-windows.result == 'success')
+        (inputs.targets == 'windows-only' &&
+          (needs.build-windows-self-hosted.result == 'success' ||
+           needs.build-windows-github-hosted.result == 'success')) ||
+        (inputs.targets == 'aarch64-only' &&
+          needs.build-aarch64.result == 'success') ||
+        (inputs.targets == 'full' &&
+          needs.build-aarch64.result == 'success' &&
+          (needs.build-windows-self-hosted.result == 'success' ||
+           needs.build-windows-github-hosted.result == 'success'))
       )
     runs-on: ubuntu-latest
     steps:

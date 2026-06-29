@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# One-command release: x86_64 locally + aarch64 via GitHub Actions → one GitHub Release.
+# One-command release: x86_64 Linux local + Windows on self-hosted runner + optional aarch64 CI.
 #
 # Usage:
-#   ./scripts/release.sh                 # bump patch, build both archs, publish
-#   ./scripts/release.sh --dev           # x86_64 Linux local + Windows (local dist/ if present, else CI)
-#   ./scripts/release.sh --dev --windows-ci   # force slow GitHub Actions Windows build
-#   ./scripts/release.sh --skip-build    # reuse dist/ tarballs; still runs CI unless Windows is in dist/
-#   ./scripts/release.sh --version 1.0.2
-#   ./scripts/release.sh --minor
+#   ./scripts/release.sh --dev      # x86_64 Linux here + Windows on self-hosted runner
+#   ./scripts/release.sh            # above + aarch64 on GitHub ARM runners
 #
-# Requires: rust, CUDA 12.6 dev; gh auth login for full release (see scripts/README.md).
+# First-time Windows setup (once, on a Windows PC — Admin PowerShell):
+#   .\scripts\setup-windows-build.ps1
+#   .\scripts\install-windows-runner.ps1
+#
+# Requires: rust, CUDA 12.6 dev, gh auth login (see scripts/README.md).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,8 +19,8 @@ BUMP="patch"
 EXPLICIT_VERSION=""
 SKIP_BUILD="false"
 DEV_RELEASE="false"
-FORCE_WINDOWS_CI="false"
-WAIT_CI="false"
+LOCAL_WINDOWS="false"
+GITHUB_HOSTED_WINDOWS="false"
 NO_PUSH="false"
 WORKFLOW_FILE=".github/workflows/release.yml"
 WIN_INSTALLER="dist/ScalatticeAgentSetup-x86_64.exe"
@@ -30,24 +30,25 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/release.sh [options]
 
-  Default: bump version, build x86_64 here, build aarch64 in GitHub Actions,
-  upload both tarballs to one GitHub Release.
+  ./scripts/release.sh --dev
+    1. Build x86_64 Linux locally
+    2. Push + create GitHub Release
+    3. Build Windows on your self-hosted runner (fast, warm cache)
+    4. Upload .exe + zip to the release
 
-  --dev: x86_64 Linux local; Windows from dist/ (build on a Windows machine) or GitHub Actions.
-
-  Build Windows locally (on a Windows PC), then copy dist/ artifacts to this machine:
-    .\\scripts\\build-release.ps1
-    # copies: dist/ScalatticeAgentSetup-x86_64.exe + dist/scalattice-agent-x86_64-pc-windows-msvc.zip
+  One-time Windows machine setup (Admin PowerShell):
+    .\scripts\setup-windows-build.ps1
+    .\scripts\install-windows-runner.ps1
 
 Options:
-  --dev             Day-to-day: x86_64 Linux local + Windows (local dist/ preferred; CI fallback)
-  --windows-ci      Force Windows build on GitHub Actions (slow; ~1h cold cache)
-  --wait-ci         Block until CI finishes (default for full release; dev CI is fire-and-forget)
-  --skip-build      Skip local x86_64 compile (use existing dist/ tarball)
-  --skip-aarch64    Same as --dev
-  --version X.Y.Z   Explicit version
-  --minor           Bump minor instead of patch
-  --no-push         Dry run (no push/release)
+  --dev                   Day-to-day: Linux + Windows (skip aarch64)
+  --skip-build            Reuse existing dist/ Linux tarball
+  --skip-aarch64          Same as --dev
+  --local-windows         Use dist/*.exe from disk; skip Windows CI
+  --github-hosted-windows Slow fallback (~1h); use GitHub windows-2022 runner
+  --version X.Y.Z         Explicit version
+  --minor                 Bump minor instead of patch
+  --no-push               Dry run (no push/release)
   -h, --help
 EOF
   exit "${1:-0}"
@@ -59,8 +60,8 @@ while [[ $# -gt 0 ]]; do
     --dev) DEV_RELEASE="true"; shift ;;
     --skip-build) SKIP_BUILD="true"; shift ;;
     --skip-aarch64) DEV_RELEASE="true"; shift ;;
-    --windows-ci) FORCE_WINDOWS_CI="true"; shift ;;
-    --wait-ci) WAIT_CI="true"; shift ;;
+    --local-windows) LOCAL_WINDOWS="true"; shift ;;
+    --github-hosted-windows) GITHUB_HOSTED_WINDOWS="true"; shift ;;
     --no-push) NO_PUSH="true"; shift ;;
     --minor) BUMP="minor"; shift ;;
     --patch) BUMP="patch"; shift ;;
@@ -137,28 +138,53 @@ resolve_version() {
   fi
 }
 
+windows_dist_ready() {
+  [[ -f "$WIN_INSTALLER" || -f "$WIN_ARCHIVE" ]]
+}
+
+collect_windows_release_files() {
+  RELEASE_WINDOWS_FILES=()
+  [[ -f "$WIN_INSTALLER" ]] && RELEASE_WINDOWS_FILES+=("$WIN_INSTALLER")
+  [[ -f "$WIN_ARCHIVE" ]] && RELEASE_WINDOWS_FILES+=("$WIN_ARCHIVE")
+}
+
+resolve_ci_targets() {
+  if [[ "$DEV_RELEASE" == "true" ]]; then
+    echo "windows-only"
+  else
+    echo "full"
+  fi
+}
+
+windows_runner_input() {
+  if [[ "$GITHUB_HOSTED_WINDOWS" == "true" ]]; then
+    echo "github-hosted"
+  else
+    echo "self-hosted"
+  fi
+}
+
+should_run_windows_ci() {
+  [[ "$LOCAL_WINDOWS" != "true" ]]
+}
+
 build_ci_assets() {
   local tag="$1"
   local targets="$2"
-  local wait="${3:-true}"
+  local win_runner="$3"
   echo ""
-  echo "==> Building ${targets} in GitHub Actions (tag ${tag})"
-  if [[ "$wait" == "true" ]]; then
-    echo "    Waiting for CI (~30–90 min on cold cache)."
+  echo "==> CI: ${targets} (Windows runner: ${win_runner})"
+  if [[ "$win_runner" == "self-hosted" ]]; then
+    echo "    Waiting for self-hosted Windows runner (usually minutes with warm cache)."
   else
-    echo "    Not waiting — check progress: gh run list --workflow=${WORKFLOW_FILE}"
+    echo "    Waiting for GitHub-hosted Windows runner (~1h cold cache)."
   fi
 
   gh workflow run "$WORKFLOW_FILE" \
     --ref main \
     -f "tag=${tag}" \
-    -f "targets=${targets}"
-
-  if [[ "$wait" != "true" ]]; then
-    echo "==> CI started (not waiting). Upload assets when the run finishes:"
-    echo "    gh run watch   # pick run id from: gh run list --workflow=${WORKFLOW_FILE}"
-    return 0
-  fi
+    -f "targets=${targets}" \
+    -f "windows_runner=${win_runner}"
 
   local run_id=""
   for _ in $(seq 1 30); do
@@ -175,49 +201,6 @@ build_ci_assets() {
 
   echo "==> Watching run ${run_id}"
   gh run watch "$run_id" --exit-status
-}
-
-windows_dist_ready() {
-  [[ -f "$WIN_INSTALLER" || -f "$WIN_ARCHIVE" ]]
-}
-
-collect_windows_release_files() {
-  RELEASE_WINDOWS_FILES=()
-  if [[ -f "$WIN_INSTALLER" ]]; then
-    RELEASE_WINDOWS_FILES+=("$WIN_INSTALLER")
-  fi
-  if [[ -f "$WIN_ARCHIVE" ]]; then
-    RELEASE_WINDOWS_FILES+=("$WIN_ARCHIVE")
-  fi
-}
-
-should_build_windows_in_ci() {
-  if [[ "$FORCE_WINDOWS_CI" == "true" ]]; then
-    return 0
-  fi
-  if windows_dist_ready; then
-    return 1
-  fi
-  return 0
-}
-
-ci_wait_flag() {
-  if [[ "$WAIT_CI" == "true" ]]; then
-    echo "true"
-  elif [[ "$DEV_RELEASE" == "true" ]]; then
-    echo "false"
-  else
-    echo "true"
-  fi
-}
-
-# Dev releases skip aarch64. Windows: local dist/ preferred; CI only when missing (or --windows-ci).
-resolve_ci_targets() {
-  if [[ "$DEV_RELEASE" == "true" ]]; then
-    echo "windows-only"
-  else
-    echo "full"
-  fi
 }
 
 verify_release_assets() {
@@ -264,27 +247,28 @@ fi
 VERSION="$(resolve_version)"
 TAG="v${VERSION}"
 X86_ARCHIVE="dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz"
-
-if [[ "$(cargo_version)" != "$VERSION" ]]; then
-  echo "==> Bumping Cargo.toml: $(cargo_version) → ${VERSION}"
-  set_cargo_version "$VERSION"
-fi
+CI_TARGETS="$(resolve_ci_targets)"
+WIN_RUNNER="$(windows_runner_input)"
 
 if [[ "$DEV_RELEASE" == "true" ]]; then
-  echo "==> Release ${TAG} (x86_64 Linux local; aarch64 skipped)"
+  echo "==> Release ${TAG} (Linux local + Windows CI; aarch64 skipped)"
 else
-  echo "==> Release ${TAG} (x86_64 local + aarch64 + Windows)"
+  echo "==> Release ${TAG} (Linux local + Windows + aarch64 CI)"
 fi
 
-CI_TARGETS="$(resolve_ci_targets)"
-if windows_dist_ready; then
-  echo "==> Windows: using local dist/ (skip GitHub Actions unless --windows-ci)"
-  collect_windows_release_files
-  printf '    %s\n' "${RELEASE_WINDOWS_FILES[@]}"
-elif [[ "$DEV_RELEASE" == "true" ]]; then
-  echo "==> Windows: no dist/ artifacts — will use GitHub Actions (build on Windows with build-release.ps1 to avoid this)"
+if [[ "$LOCAL_WINDOWS" == "true" ]]; then
+  windows_dist_ready || {
+    echo "Missing Windows dist/ artifacts. Run on Windows: .\\scripts\\build-release.ps1" >&2
+    exit 1
+  }
+  echo "==> Windows: uploading local dist/ (skipping CI)"
+elif [[ "$GITHUB_HOSTED_WINDOWS" == "true" ]]; then
+  echo "==> Windows: GitHub-hosted runner (slow)"
 else
-  echo "==> Windows: will build in GitHub Actions (targets=${CI_TARGETS})"
+  echo "==> Windows: self-hosted runner"
+  # shellcheck source=scripts/check-windows-runner.sh
+  source "$(dirname "$0")/check-windows-runner.sh"
+  require_windows_runner
 fi
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
@@ -319,22 +303,18 @@ if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&
   gh release delete "$TAG" --yes 2>/dev/null || true
 fi
 
-echo "==> Creating GitHub release"
 RELEASE_FILES=("$X86_ARCHIVE")
-RELEASE_WINDOWS_FILES=()
-if windows_dist_ready; then
+if [[ "$LOCAL_WINDOWS" == "true" ]]; then
   collect_windows_release_files
   RELEASE_FILES+=("${RELEASE_WINDOWS_FILES[@]}")
-fi
-if [[ "$DEV_RELEASE" == "true" ]]; then
-  if windows_dist_ready && [[ "$FORCE_WINDOWS_CI" != "true" ]]; then
-    RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux + Windows local dist/; dev release)."
-  else
-    RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; Windows via GitHub Actions; dev release)."
-  fi
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux + Windows local dist/)."
+elif [[ "$DEV_RELEASE" == "true" ]]; then
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; Windows via ${WIN_RUNNER} runner)."
 else
-  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; aarch64 + Windows via GitHub Actions)."
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; aarch64 + Windows via CI)."
 fi
+
+echo "==> Creating GitHub release"
 gh release create "$TAG" "${RELEASE_FILES[@]}" \
   --target main \
   --title "$TAG" \
@@ -342,37 +322,18 @@ gh release create "$TAG" "${RELEASE_FILES[@]}" \
 
 git fetch --tags "$REMOTE" 2>/dev/null || true
 
-NEED_WINDOWS_VERIFY="true"
-CI_WAIT="$(ci_wait_flag)"
-
-if [[ "$DEV_RELEASE" == "true" ]]; then
-  if should_build_windows_in_ci; then
-    build_ci_assets "$TAG" "windows-only" "$CI_WAIT"
+if should_run_windows_ci; then
+  if [[ "$DEV_RELEASE" == "true" ]]; then
+    build_ci_assets "$TAG" "windows-only" "$WIN_RUNNER"
   else
-    echo "==> Skipping Windows CI (local dist/ uploaded)"
-    NEED_WINDOWS_VERIFY="true"
-  fi
-else
-  if should_build_windows_in_ci; then
-    build_ci_assets "$TAG" "full" "$CI_WAIT"
-  else
-    echo "==> Skipping Windows CI (local dist/ uploaded); aarch64 still in CI"
-    build_ci_assets "$TAG" "aarch64-only" "$CI_WAIT"
+    build_ci_assets "$TAG" "full" "$WIN_RUNNER"
   fi
 fi
 
-if [[ "$CI_WAIT" == "true" ]]; then
-  if [[ "$DEV_RELEASE" == "true" ]]; then
-    verify_release_assets "$TAG" false "$NEED_WINDOWS_VERIFY"
-  else
-    verify_release_assets "$TAG" true "$NEED_WINDOWS_VERIFY"
-  fi
-elif windows_dist_ready && ! should_build_windows_in_ci; then
+if [[ "$DEV_RELEASE" == "true" ]]; then
   verify_release_assets "$TAG" false true
 else
-  echo ""
-  echo "==> CI still running (or not started for Windows). Verify when done:"
-  echo "    gh release view ${TAG} --json assets -q '.assets[].name'"
+  verify_release_assets "$TAG" true true
 fi
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
