@@ -220,6 +220,10 @@ if /I \"%~1\"==\"tray\" (\r\n\
     exit /b 0\r\n\
   )\r\n\
 )\r\n\
+if /I \"%~1\"==\"tray-debug\" (\r\n\
+  \"%INSTALL%scalattice-agent.exe\" tray --force\r\n\
+  exit /b %ERRORLEVEL%\r\n\
+)\r\n\
 \"%INSTALL%scalattice-agent.exe\" %*\r\n";
 
     fs::write(install.join("scalattice-run.cmd"), run_cmd)?;

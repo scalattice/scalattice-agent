@@ -89,12 +89,17 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: Sync Cargo.toml to release tag
+        shell: pwsh
+        env:
+          SCALATTICE_VERSION: ${{ inputs.tag }}
+        run: ./scripts/sync-cargo-version.ps1
       - name: Prepare build environment
         shell: cmd
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-windows-ci.ps1
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-self-hosted-v4
+          shared-key: release-windows-self-hosted-v5-${{ inputs.tag }}
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -124,6 +129,11 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Sync Cargo.toml to release tag
+        shell: pwsh
+        env:
+          SCALATTICE_VERSION: ${{ inputs.tag }}
+        run: ./scripts/sync-cargo-version.ps1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda
@@ -134,7 +144,7 @@ jobs:
         run: choco install innosetup -y --no-progress
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-gpu-v4
+          shared-key: release-windows-gpu-v5-${{ inputs.tag }}
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -146,6 +156,7 @@ jobs:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda_path }}
           CARGO_INCREMENTAL: "0"
           CARGO_BUILD_JOBS: "4"
+          SCALATTICE_VERSION: ${{ inputs.tag }}
         run: |
           $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
           .\scripts\build-release.ps1

@@ -16,6 +16,14 @@ $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 . (Join-Path $PSScriptRoot "windows-build-common.ps1")
 
+$syncVersion = $PackageVersion
+if (-not $syncVersion -and $env:SCALATTICE_VERSION) {
+    $syncVersion = $env:SCALATTICE_VERSION.TrimStart('v')
+}
+if ($syncVersion) {
+    & (Join-Path $PSScriptRoot "sync-cargo-version.ps1") -Version $syncVersion
+}
+
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo not found - install Rust stable from https://rustup.rs"
 }
@@ -65,6 +73,13 @@ if (-not (Test-Path $bin)) {
 
 New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 Copy-Item -LiteralPath $bin -Destination "dist\scalattice-agent.exe" -Force
+
+$builtVersion = (& "dist\scalattice-agent.exe" --version 2>&1 | Out-String).Trim()
+Write-Host "==> Built binary reports: $builtVersion"
+if ($syncVersion -and $builtVersion -notmatch [regex]::Escape($syncVersion)) {
+    Write-Error "Version mismatch: binary is '$builtVersion' but release tag is $syncVersion. Clear rust-cache and rebuild."
+}
+
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\scalattice-run.cmd") -Destination "dist\scalattice-run.cmd" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-tray.vbs") -Destination "dist\launch-tray.vbs" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-background.vbs") -Destination "dist\launch-background.vbs" -Force
@@ -103,12 +118,11 @@ if (Get-Command choco -ErrorAction SilentlyContinue) {
 }
 
 if ((Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -or (Test-Path "${env:ProgramFiles}\Inno Setup 6\ISCC.exe")) {
-    $installerArgs = @()
-    if ($PackageVersion) {
-        $installerArgs += "-Version"
-        $installerArgs += $PackageVersion
+    $installerVersion = $PackageVersion
+    if (-not $installerVersion -and $env:SCALATTICE_VERSION) {
+        $installerVersion = $env:SCALATTICE_VERSION.TrimStart('v')
     }
-    & (Join-Path $PSScriptRoot "build-windows-installer.ps1") @installerArgs
+    & (Join-Path $PSScriptRoot "build-windows-installer.ps1") -AppVersion $installerVersion
 } else {
     Write-Warning "Inno Setup not found - zip built but GUI installer skipped (install Inno Setup 6 and re-run)"
 }
