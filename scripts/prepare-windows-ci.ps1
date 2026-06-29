@@ -3,25 +3,23 @@
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "windows-build-common.ps1")
 
-Set-SystemRustEnv -ExportForCi | Out-Null
-
 $paths = Get-WindowsBuildPathEntries
 if ($paths.Count -gt 0) {
     $env:PATH = (($paths -join ';') + ';' + $env:PATH)
 }
 Remove-GitUsrBinFromPath
 
-if ($env:GITHUB_ENV) {
-    "PATH=$($env:PATH)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-}
-
-if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+if (-not (Prioritize-SystemRustOnPath -ExportForCi)) {
     Write-Error @"
-cargo not found on this self-hosted runner.
+System Rust not found at C:\Rust\cargo\bin.
 
 Run once as Administrator on the Windows build machine:
   scripts\setup-windows-build.cmd
 "@
+}
+
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Error "cargo not found on PATH after Rust bootstrap"
 }
 
 rustc --version

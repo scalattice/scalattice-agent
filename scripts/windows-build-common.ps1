@@ -126,31 +126,80 @@ function Set-SystemRustEnv {
     return $true
 }
 
+function Prioritize-SystemRustOnPath {
+    param([switch]$ExportForCi)
+
+    if (-not (Set-SystemRustEnv)) {
+        return $false
+    }
+
+    $rustBin = Get-SystemRustCargoBin
+    if (-not (Test-Path $rustBin)) {
+        return $false
+    }
+
+    $block = @(
+        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools"),
+        (Join-Path ${env:ProgramData} "chocolatey\lib\rust\tools\bin")
+    )
+    $parts = @($env:PATH -split ';' | Where-Object {
+            $_ -and ($_ -ne $rustBin) -and ($block -notcontains $_)
+        })
+    $env:PATH = ($rustBin + ';' + ($parts -join ';'))
+
+    $rustc = Join-Path $rustBin "rustc.exe"
+    $cargo = Join-Path $rustBin "cargo.exe"
+    $env:RUSTC = $rustc
+    $env:CARGO = $cargo
+
+    if ($ExportForCi -and $env:GITHUB_ENV) {
+        "PATH=$($env:PATH)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "RUSTC=$rustc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "CARGO=$cargo" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "CARGO_HOME=$($env:CARGO_HOME)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "RUSTUP_HOME=$($env:RUSTUP_HOME)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    }
+
+    return $true
+}
+
 function Ensure-RustTarget {
     param([string]$Target)
 
-    if (-not (Set-SystemRustEnv)) {
-        Write-Error "Rust toolchain home not found - run scripts\setup-windows-build.cmd"
+    if (-not (Prioritize-SystemRustOnPath)) {
+        Write-Error "Rust toolchain not found at C:\Rust - run scripts\setup-windows-build.cmd"
     }
+
+    $rustBin = Get-SystemRustCargoBin
+    $rustup = Join-Path $rustBin "rustup.exe"
+    $rustc = Join-Path $rustBin "rustc.exe"
 
     Write-Host "==> RUSTUP_HOME=$($env:RUSTUP_HOME)"
     Write-Host "==> CARGO_HOME=$($env:CARGO_HOME)"
+    Write-Host "==> rustc: $rustc"
     Write-Host "==> rustup target add $Target"
-    rustup target add $Target
+    & $rustup target add $Target
     if ($LASTEXITCODE -ne 0) {
         throw "rustup target add $Target failed (exit $LASTEXITCODE)"
     }
 
-    $installed = @(rustup target list --installed)
+    $installed = @(& $rustup target list --installed)
     if ($installed -notcontains $Target) {
-        rustup show
+        & $rustup show
         throw "Rust target not installed: $Target"
     }
 
-    $sysroot = rustc --target $Target --print sysroot 2>&1
+    $sysroot = (& $rustc --target $Target --print sysroot).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sysroot)) {
-        rustup show
+        & $rustup show
         throw "rustc sysroot missing for target $Target"
+    }
+    if ($sysroot -notlike "$($env:RUSTUP_HOME)*") {
+        throw @"
+Wrong rustc sysroot: $sysroot
+Expected under RUSTUP_HOME=$($env:RUSTUP_HOME)
+Chocolatey rust is shadowing C:\Rust - check PATH order.
+"@
     }
     Write-Host "==> Rust sysroot ($Target): $sysroot"
 }
@@ -271,9 +320,9 @@ function Get-WindowsBuildPathEntries {
     $paths = @()
 
     foreach ($dir in @(
+            (Get-SystemRustCargoBin),
             "${env:ProgramData}\chocolatey\bin",
             "${env:ProgramFiles}\Git\bin",
-            (Get-SystemRustCargoBin),
             "$env:USERPROFILE\.cargo\bin"
         )) {
         if ((Test-Path $dir) -and ($paths -notcontains $dir)) {

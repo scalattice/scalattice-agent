@@ -19,7 +19,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo not found - install Rust stable from https://rustup.rs"
 }
 
-Set-SystemRustEnv | Out-Null
+Prioritize-SystemRustOnPath | Out-Null
 Import-VsDevEnvironment
 $env:TrackFileAccess = "false"
 
