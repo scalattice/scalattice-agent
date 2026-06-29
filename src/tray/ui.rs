@@ -62,12 +62,14 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
     let icon = load_tray_icon()?;
     let viewport_icon = load_viewport_icon();
 
+    let (show_tx, show_rx) = mpsc::channel();
+    let show_for_menu = show_tx.clone();
+
     let (event_tx, event_rx) = mpsc::channel();
     TrayIconEvent::set_event_handler(Some(move |event| {
         let _ = event_tx.send(event);
     }));
 
-    let show_for_menu = show_window.clone();
     let tray_menu = Menu::new();
     let open_item = MenuItem::new("Open panel", true, None);
     let quit_item = MenuItem::new("Quit tray", true, None);
@@ -83,9 +85,12 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
 
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
+    let show_for_menu_flag = show_window.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id == open_id {
-            show_for_menu.store(true, Ordering::SeqCst);
+            show_for_menu_flag.store(true, Ordering::SeqCst);
+            let _ = show_for_menu.send(());
+            activate_tray_window();
         } else if event.id == quit_id {
             write_tray_log("tray quit from menu");
             std::process::exit(0);
@@ -103,8 +108,8 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 520.0])
-            .with_min_inner_size([640.0, 420.0])
+            .with_inner_size([640.0, 680.0])
+            .with_min_inner_size([520.0, 560.0])
             .with_title(WINDOW_TITLE)
             .with_visible(interactive)
             .with_icon(viewport_icon),
@@ -124,7 +129,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
                     ctx.request_repaint();
                 }
             });
-            Ok(Box::new(TrayApp::new(event_rx, show_for_app)))
+            Ok(Box::new(TrayApp::new(event_rx, show_rx, show_for_app)))
         }),
     )
     .map_err(|err| anyhow::anyhow!("tray UI exited: {err}"))?;
@@ -135,6 +140,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
 
 struct TrayApp {
     event_rx: mpsc::Receiver<TrayIconEvent>,
+    show_rx: mpsc::Receiver<()>,
     show_window: Arc<AtomicBool>,
     token_input: String,
     status_lines: Vec<String>,
@@ -146,11 +152,16 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn new(event_rx: mpsc::Receiver<TrayIconEvent>, show_window: Arc<AtomicBool>) -> Self {
+    fn new(
+        event_rx: mpsc::Receiver<TrayIconEvent>,
+        show_rx: mpsc::Receiver<()>,
+        show_window: Arc<AtomicBool>,
+    ) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let log_path = agent_log_path().ok();
         Self {
             event_rx,
+            show_rx,
             show_window,
             token_input,
             status_lines: Vec::new(),
@@ -163,6 +174,10 @@ impl TrayApp {
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
+        while self.show_rx.try_recv().is_ok() {
+            self.reveal_window(ctx);
+        }
+
         if self.show_window.swap(false, Ordering::SeqCst) {
             self.reveal_window(ctx);
         }
@@ -182,9 +197,11 @@ impl TrayApp {
     }
 
     fn reveal_window(&self, ctx: &egui::Context) {
+        activate_tray_window();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.request_repaint();
     }
 
     fn refresh_status(&mut self) {
@@ -260,13 +277,14 @@ impl TrayApp {
             return;
         };
         let slice = &raw[read_from as usize..];
-        let chunk = String::from_utf8_lossy(slice);
+        let chunk = strip_ansi_escapes(&String::from_utf8_lossy(slice));
         self.logs.push_str(&chunk);
         if self.logs.len() > 48_000 {
             let drop_by = self.logs.len().saturating_sub(40_000);
             self.logs.drain(..drop_by);
         }
         self.log_offset = len;
+        self.logs = strip_ansi_escapes(&self.logs);
     }
 
     fn save_token(&mut self) {
@@ -337,109 +355,112 @@ impl eframe::App for TrayApp {
                 ui.label(egui::RichText::new("Provider machine control panel").color(muted));
                 ui.add_space(10.0);
 
-                ui.columns(2, |columns| {
-                    columns[0].set_min_width(300.0);
-                    columns[0].set_max_width(320.0);
+                egui::Frame::group(ui.style())
+                    .fill(panel_fill)
+                    .stroke(egui::Stroke::new(1.0, border))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Status & token")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
 
-                    columns[0].group(|ui| {
-                        egui::Frame::group(ui.style())
-                            .fill(panel_fill)
-                            .stroke(egui::Stroke::new(1.0, border))
-                            .inner_margin(egui::Margin::same(12))
+                        for line in &self.status_lines {
+                            ui.label(
+                                egui::RichText::new(line)
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(220, 220, 220)),
+                            );
+                        }
+
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label(
+                            egui::RichText::new("Provider token")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.token_input)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("slt_provider_…"),
+                        );
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Save token").clicked() {
+                                self.save_token();
+                            }
+                            if ui.button("Open dashboard").clicked() {
+                                self.open_dashboard();
+                            }
+                        });
+
+                        if !self.action_message.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(&self.action_message)
+                                    .color(egui::Color32::from_rgb(99, 179, 237)),
+                            );
+                        }
+                    });
+
+                ui.add_space(12.0);
+
+                egui::Frame::group(ui.style())
+                    .fill(panel_fill)
+                    .stroke(egui::Stroke::new(1.0, border))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Live log")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .auto_shrink([false; 2])
+                            .max_height(280.0)
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("Status & token")
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
-                                ui.add_space(6.0);
-
-                                for line in &self.status_lines {
-                                    ui.label(
-                                        egui::RichText::new(line)
-                                            .size(13.0)
-                                            .color(egui::Color32::from_rgb(220, 220, 220)),
-                                    );
-                                }
-
-                                ui.add_space(10.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                ui.label(
-                                    egui::RichText::new("Provider token")
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
+                                ui.set_max_width(ui.available_width());
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut self.token_input)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text("slt_provider_…"),
+                                    egui::Label::new(
+                                        egui::RichText::new(&self.logs)
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(egui::Color32::from_rgb(200, 200, 200)),
+                                    )
+                                    .wrap(),
                                 );
-
-                                ui.horizontal(|ui| {
-                                    if ui.button("Save token").clicked() {
-                                        self.save_token();
-                                    }
-                                    if ui.button("Open dashboard").clicked() {
-                                        self.open_dashboard();
-                                    }
-                                });
-
-                                if !self.action_message.is_empty() {
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(&self.action_message)
-                                            .color(egui::Color32::from_rgb(99, 179, 237)),
-                                    );
-                                }
                             });
                     });
-
-                    columns[1].group(|ui| {
-                        egui::Frame::group(ui.style())
-                            .fill(panel_fill)
-                            .stroke(egui::Stroke::new(1.0, border))
-                            .inner_margin(egui::Margin::same(12))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("Live log")
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
-                                ui.add_space(4.0);
-                                egui::ScrollArea::vertical()
-                                    .stick_to_bottom(true)
-                                    .auto_shrink([false; 2])
-                                    .max_height(ui.available_height() - 8.0)
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(ui.available_width());
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&self.logs)
-                                                    .monospace()
-                                                    .size(12.0)
-                                                    .color(egui::Color32::from_rgb(200, 200, 200)),
-                                            )
-                                            .wrap(),
-                                        );
-                                    });
-                            });
-                    });
-                });
-
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Closing this window hides the panel — the tray icon and background agent keep running.",
-                    )
-                    .size(12.0)
-                    .color(muted),
-                );
             });
 
         ctx.request_repaint_after(Duration::from_millis(500));
     }
+}
+
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.next_if_eq(&'[').is_some() {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn scalattice_visuals() -> egui::Visuals {
