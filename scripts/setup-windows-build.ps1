@@ -1,104 +1,38 @@
 # One-time Windows build host setup (Visual Studio C++, CUDA 12.6, Inno Setup, Rust).
 # Run as Administrator.
 #
-# Usage (Admin PowerShell or cmd):
+# Usage (Admin cmd):
 #   scripts\setup-windows-build.cmd
-#
-# CUDA only (if the main script failed on cuda):
-#   scripts\install-cuda-windows.cmd
 
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
-
-function Test-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $p = New-Object Security.Principal.WindowsPrincipal($id)
-    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Invoke-Choco {
-    param([Parameter(Mandatory = $true)][string[]]$InstallArgs)
-    & choco @InstallArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "choco failed (exit $LASTEXITCODE): choco $($InstallArgs -join ' ')"
-    }
-}
-
-function Find-Nvcc {
-    $candidates = @(
-        $env:CUDA_PATH,
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6.3"
-    ) | Where-Object { $_ -and (Test-Path $_) }
-
-    foreach ($root in $candidates) {
-        $nvcc = Join-Path $root "bin\nvcc.exe"
-        if (Test-Path $nvcc) { return $nvcc }
-    }
-
-    $toolkitRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
-    if (Test-Path $toolkitRoot) {
-        $nvcc = Get-ChildItem -Path $toolkitRoot -Recurse -Filter nvcc.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($nvcc) { return $nvcc.FullName }
-    }
-    return $null
-}
-
-function Install-CudaToolkit {
-    $existing = Find-Nvcc
-    if ($existing) {
-        Write-Host "==> CUDA already installed: $existing"
-        return
-    }
-
-    Write-Host "==> Installing NVIDIA CUDA Toolkit 12.6.3 (large download, 10-20 min)"
-    # Chocolatey version must be the full package id (not 12.6.3 alone).
-    $cudaVersion = "12.6.3.561"
-    try {
-        Invoke-Choco @("install", "-y", "--no-progress", "cuda", "--version=$cudaVersion")
-    } catch {
-        Write-Warning "Chocolatey cuda $cudaVersion failed: $_"
-        Write-Host "==> Trying latest cuda package from Chocolatey..."
-        Invoke-Choco @("install", "-y", "--no-progress", "cuda")
-    }
-
-    $nvcc = Find-Nvcc
-    if (-not $nvcc) {
-        Write-Error @"
-CUDA toolkit not found after install.
-
-Install manually, then re-run this script (it will skip installed components):
-  choco install -y cuda --version=12.6.3.561
-
-Or download from:
-  https://developer.nvidia.com/cuda-12-6-3-download-archive
-"@
-    }
-    Write-Host "==> CUDA OK: $nvcc"
-}
+. (Join-Path $PSScriptRoot "windows-build-common.ps1")
 
 if (-not (Test-Admin)) {
     Write-Error "Run this script in an elevated (Administrator) PowerShell."
 }
 
-if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-    Write-Host "==> Installing Chocolatey"
-    Set-ExecutionPolicy Bypass -Scope Process -Force
-    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-}
+Ensure-Chocolatey
 
-Write-Host "==> Installing build dependencies (may take 30-60 min first time)"
+Write-Host "==> Installing build dependencies (skips already-installed packages)"
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Invoke-Choco @("install", "-y", "--no-progress", "git")
+} else {
+    Write-Host "==> git already installed"
 }
+
 if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -and
     -not (Test-Path "${env:ProgramFiles}\Inno Setup 6\ISCC.exe")) {
     Invoke-Choco @("install", "-y", "--no-progress", "innosetup")
+} else {
+    Write-Host "==> Inno Setup already installed"
 }
+
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Invoke-Choco @("install", "-y", "--no-progress", "rust")
+} else {
+    Write-Host "==> Rust/cargo already installed"
 }
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -118,6 +52,12 @@ if (-not $hasVcTools) {
 }
 
 Install-CudaToolkit
+
+# Rust may land on PATH only in new shells; refresh common locations.
+$rustBin = "$env:USERPROFILE\.cargo\bin"
+if ((Test-Path $rustBin) -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $env:PATH = "$rustBin;$env:PATH"
+}
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo not on PATH - open a new Administrator PowerShell and re-run this script"

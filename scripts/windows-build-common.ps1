@@ -1,0 +1,102 @@
+# Shared helpers for Windows setup scripts (dot-sourced).
+
+function Test-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = New-Object Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Ensure-Chocolatey {
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    $chocoRoot = "${env:ProgramData}\chocolatey"
+    $chocoBin = Join-Path $chocoRoot "bin"
+    $chocoExe = Join-Path $chocoBin "choco.exe"
+
+    if (Test-Path $chocoExe) {
+        Write-Host "==> Chocolatey found at $chocoBin (adding to PATH for this session)"
+        $env:PATH = "$chocoBin;$env:PATH"
+        if (Get-Command choco -ErrorAction SilentlyContinue) {
+            return
+        }
+    }
+
+    Write-Host "==> Installing Chocolatey"
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:PATH = "$machinePath;$userPath"
+    if ((Test-Path $chocoExe) -and -not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        $env:PATH = "$chocoBin;$env:PATH"
+    }
+
+    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        Write-Error "Chocolatey is not available. Open a new Administrator terminal or reinstall from https://chocolatey.org/install"
+    }
+}
+
+function Invoke-Choco {
+    param([Parameter(Mandatory = $true)][string[]]$InstallArgs)
+    Ensure-Chocolatey
+    & choco @InstallArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "choco failed (exit $LASTEXITCODE): choco $($InstallArgs -join ' ')"
+    }
+}
+
+function Find-Nvcc {
+    $candidates = @(
+        $env:CUDA_PATH,
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6.3"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    foreach ($root in $candidates) {
+        $nvcc = Join-Path $root "bin\nvcc.exe"
+        if (Test-Path $nvcc) { return $nvcc }
+    }
+
+    $toolkitRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+    if (Test-Path $toolkitRoot) {
+        $nvcc = Get-ChildItem -Path $toolkitRoot -Recurse -Filter nvcc.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($nvcc) { return $nvcc.FullName }
+    }
+    return $null
+}
+
+function Install-CudaToolkit {
+    $existing = Find-Nvcc
+    if ($existing) {
+        Write-Host "==> CUDA already installed: $existing"
+        return
+    }
+
+    Write-Host "==> Installing NVIDIA CUDA Toolkit 12.6.3 (large download, 10-20 min)"
+    $cudaVersion = "12.6.3.561"
+    try {
+        Invoke-Choco @("install", "-y", "--no-progress", "cuda", "--version=$cudaVersion")
+    } catch {
+        Write-Warning "Chocolatey cuda $cudaVersion failed: $_"
+        Write-Host "==> Trying latest cuda package from Chocolatey..."
+        Invoke-Choco @("install", "-y", "--no-progress", "cuda")
+    }
+
+    $nvcc = Find-Nvcc
+    if (-not $nvcc) {
+        Write-Error @"
+CUDA toolkit not found after install.
+
+Try manually:
+  choco install -y cuda --version=12.6.3.561
+
+Or download:
+  https://developer.nvidia.com/cuda-12-6-3-download-archive
+"@
+    }
+    Write-Host "==> CUDA OK: $nvcc"
+}
