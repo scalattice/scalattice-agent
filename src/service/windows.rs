@@ -136,6 +136,7 @@ fn ensure_background_task(config: &AgentConfig) -> Result<()> {
         run_task_now()?;
     }
 
+    sync_tray_runner()?;
     ensure_tray_task()?;
     run_tray_now()?;
 
@@ -174,6 +175,22 @@ cd /d \"{install}\"\r\n\
 
     fs::write(&runner, script)?;
     Ok(changed)
+}
+
+fn sync_tray_runner() -> Result<()> {
+    let install = install_dir()?;
+    fs::create_dir_all(&install)?;
+    let runner = install.join("scalattice-run.cmd");
+    let script = "@echo off\r\n\
+setlocal\r\n\
+set \"INSTALL=%~dp0\"\r\n\
+set \"LIB=%LOCALAPPDATA%\\Scalattice\\lib\"\r\n\
+if not exist \"%LIB%\" set \"LIB=%INSTALL%lib\"\r\n\
+set \"PATH=%INSTALL%;%LIB%;%PATH%\"\r\n\
+cd /d \"%INSTALL%\"\r\n\
+\"%INSTALL%scalattice-agent.exe\" %*\r\n";
+    fs::write(&runner, script)?;
+    Ok(())
 }
 
 fn task_exists() -> bool {
@@ -227,8 +244,12 @@ fn create_or_update_task() -> Result<()> {
 }
 
 fn ensure_tray_task() -> Result<()> {
-    let bin = resolve_agent_binary()?;
-    let tr = format!("\"{}\" tray", bin.display());
+    sync_tray_runner()?;
+    let runner = install_dir()?.join("scalattice-run.cmd");
+    if !runner.is_file() {
+        bail!("failed to write {}", runner.display());
+    }
+    let tr = format!("\"{}\" tray", runner.display());
     let output = Command::new("schtasks")
         .args([
             "/Create",

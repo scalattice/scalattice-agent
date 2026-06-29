@@ -69,6 +69,46 @@ if (Test-Path $BuildRoot) {
         }
 }
 
+function Copy-CudaRuntimeLibs {
+    param([string]$DestDir)
+
+    $cuda = $env:CUDA_PATH
+    if (-not $cuda) {
+        $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+    }
+    $cudaBin = Join-Path $cuda "bin"
+    if (-not (Test-Path $cudaBin)) {
+        Write-Warning "CUDA bin not found at $cudaBin - CUDA runtime DLLs not bundled"
+        return
+    }
+
+    # ggml-cuda loads these at runtime; dumpbin does not see them on the main exe.
+    $patterns = @(
+        "cudart64_12.dll",
+        "cublas64_12.dll",
+        "cublasLt64_12.dll",
+        "nvrtc-builtins64_12.dll",
+        "nvrtc64_12*.dll"
+    )
+
+    $copied = 0
+    foreach ($pattern in $patterns) {
+        Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+            $dest = Join-Path $DestDir $_.Name
+            Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+            Copy-DependencyTree -Path $dest
+            $copied++
+            Write-Host "    bundled $($_.Name)"
+        }
+    }
+
+    if ($copied -eq 0) {
+        Write-Warning "No CUDA 12 runtime DLLs found under $cudaBin"
+    }
+}
+
+Copy-CudaRuntimeLibs -DestDir $LibDir
+
 if (-not (Get-ChildItem -Path $LibDir -ErrorAction SilentlyContinue)) {
     Remove-Item -Path $LibDir -Force -ErrorAction SilentlyContinue
 }

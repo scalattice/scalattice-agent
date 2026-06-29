@@ -43,11 +43,12 @@ Name: "desktopicon"; Description: "Create a desktop shortcut to open the provide
 
 [Files]
 Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "tray"; Comment: "Open status, token, and live log panel"
-Name: "{autoprograms}\{#MyAppName} Status"; Filename: "{app}\{#MyAppExeName}"; Parameters: "status"; Comment: "Show agent status in a terminal"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\scalattice-run.cmd"; Parameters: "tray"; Comment: "Open status, token, and live log panel"
+Name: "{autoprograms}\{#MyAppName} Status"; Filename: "{app}\scalattice-run.cmd"; Parameters: "status"; Comment: "Show agent status in a terminal"
 Name: "{autoprograms}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Comment: "Manage GPUs and models"
 Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Tasks: desktopicon
 

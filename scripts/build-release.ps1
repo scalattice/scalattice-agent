@@ -64,15 +64,16 @@ if (-not (Test-Path $bin)) {
 
 New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 Copy-Item -LiteralPath $bin -Destination "dist\scalattice-agent.exe" -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\scalattice-run.cmd") -Destination "dist\scalattice-run.cmd" -Force
 & (Join-Path $PSScriptRoot "bundle-release-windows.ps1") -Binary "dist\scalattice-agent.exe" -OutDir "dist" -BuildRoot $releaseDir
 
 $archive = "dist\scalattice-agent-$Target.zip"
 if (Test-Path $archive) { Remove-Item $archive -Force }
 
 if (Test-Path "dist\lib") {
-    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\lib" -DestinationPath $archive -Force
+    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd", "dist\lib" -DestinationPath $archive -Force
 } else {
-    Compress-Archive -Path "dist\scalattice-agent.exe" -DestinationPath $archive -Force
+    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd" -DestinationPath $archive -Force
 }
 
 Write-Host ""

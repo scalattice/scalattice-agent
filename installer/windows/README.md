@@ -16,7 +16,7 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`choco install innos
 
 1. Welcome + token input (`slt_provider_…`)
 2. Copies `scalattice-agent.exe` to `%LOCALAPPDATA%\Scalattice\bin`
-3. Copies bundled DLLs to `%LOCALAPPDATA%\Scalattice\lib`
+3. Copies bundled DLLs (including CUDA 12 runtime) to `%LOCALAPPDATA%\Scalattice\lib`
 4. Adds both folders to the user `PATH`
 5. Runs `scalattice-agent set-token` to register the background scheduled task
 6. Starts the notification area control panel (`scalattice-agent tray`)
