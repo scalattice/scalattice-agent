@@ -3,6 +3,8 @@
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "windows-build-common.ps1")
 
+Set-SystemRustEnv -ExportForCi | Out-Null
+
 $paths = Get-WindowsBuildPathEntries
 if ($paths.Count -gt 0) {
     $env:PATH = (($paths -join ';') + ';' + $env:PATH)
@@ -24,6 +26,7 @@ Run once as Administrator on the Windows build machine:
 
 rustc --version
 cargo --version
+rustup show
 
 $clang = Find-LibClangDir
 if (-not $clang) {

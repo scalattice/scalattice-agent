@@ -19,6 +19,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo not found - install Rust stable from https://rustup.rs"
 }
 
+Set-SystemRustEnv | Out-Null
 Import-VsDevEnvironment
 $env:TrackFileAccess = "false"
 
@@ -27,7 +28,7 @@ if (-not (Test-Path "Cargo.lock")) {
     cargo generate-lockfile
 }
 
-rustup target add $Target | Out-Null
+Ensure-RustTarget -Target $Target
 
 $env:CARGO_INCREMENTAL = "0"
 if (-not $env:CUDA_PATH) {

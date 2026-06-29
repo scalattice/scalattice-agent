@@ -92,6 +92,69 @@ function Get-SystemRustCargoBin {
     return "C:\Rust\cargo\bin"
 }
 
+function Get-SystemRustupHome {
+    return "C:\Rust\rustup"
+}
+
+function Get-SystemCargoHome {
+    return "C:\Rust\cargo"
+}
+
+function Set-SystemRustEnv {
+    param([switch]$ExportForCi)
+
+    $cargoHome = Get-SystemCargoHome
+    $rustupHome = Get-SystemRustupHome
+    $cargoExe = Join-Path $cargoHome "bin\cargo.exe"
+
+    if (Test-Path $cargoExe) {
+        $env:CARGO_HOME = $cargoHome
+        $env:RUSTUP_HOME = $rustupHome
+    } elseif ($env:CARGO_HOME) {
+        if (-not $env:RUSTUP_HOME) {
+            $env:RUSTUP_HOME = Join-Path (Split-Path $env:CARGO_HOME -Parent) "rustup"
+        }
+    } else {
+        return $false
+    }
+
+    if ($ExportForCi -and $env:GITHUB_ENV) {
+        "CARGO_HOME=$($env:CARGO_HOME)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "RUSTUP_HOME=$($env:RUSTUP_HOME)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    }
+
+    return $true
+}
+
+function Ensure-RustTarget {
+    param([string]$Target)
+
+    if (-not (Set-SystemRustEnv)) {
+        Write-Error "Rust toolchain home not found - run scripts\setup-windows-build.cmd"
+    }
+
+    Write-Host "==> RUSTUP_HOME=$($env:RUSTUP_HOME)"
+    Write-Host "==> CARGO_HOME=$($env:CARGO_HOME)"
+    Write-Host "==> rustup target add $Target"
+    rustup target add $Target
+    if ($LASTEXITCODE -ne 0) {
+        throw "rustup target add $Target failed (exit $LASTEXITCODE)"
+    }
+
+    $installed = @(rustup target list --installed)
+    if ($installed -notcontains $Target) {
+        rustup show
+        throw "Rust target not installed: $Target"
+    }
+
+    $sysroot = rustc --target $Target --print sysroot 2>&1
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sysroot)) {
+        rustup show
+        throw "rustc sysroot missing for target $Target"
+    }
+    Write-Host "==> Rust sysroot ($Target): $sysroot"
+}
+
 function Install-SystemWideRust {
     $rustRoot = "C:\Rust"
     $cargoHome = Join-Path $rustRoot "cargo"
