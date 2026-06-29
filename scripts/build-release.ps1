@@ -15,26 +15,6 @@ $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 . (Join-Path $PSScriptRoot "windows-build-common.ps1")
 
-function Import-VsDevEnvironment {
-    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path $vswhere)) {
-        Write-Warning "vswhere not found; assuming MSVC is already on PATH"
-        return
-    }
-
-    $installPath = & $vswhere -latest -products * `
-        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-        -property installationPath
-    if (-not $installPath) {
-        Write-Warning "Visual Studio C++ workload not found; assuming MSVC is already on PATH"
-        return
-    }
-
-    Import-Module "$installPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-    Enter-VsDevShell -VsInstallPath $installPath -SkipAutomaticLocation `
-        -DevCmdArguments "-arch=amd64 -host_arch=amd64"
-}
-
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo not found - install Rust stable from https://rustup.rs"
 }

@@ -97,6 +97,9 @@ jobs:
           shared-key: release-windows-self-hosted-v1
           cache-targets: true
           cache-workspace-crates: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - name: Build + package
         shell: cmd
         env:

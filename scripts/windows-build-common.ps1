@@ -254,6 +254,45 @@ function Ensure-BuildMachinePath {
     Set-LibClangEnv -Dir (Install-LibClang)
 }
 
+function Import-VsDevEnvironment {
+    if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
+        Write-Host "==> MSVC already on PATH: $((Get-Command cl.exe).Source)"
+        return
+    }
+
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) {
+        Write-Error "vswhere not found - install Visual Studio 2022 Build Tools with C++ workload"
+    }
+
+    $installPath = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath
+    if (-not $installPath) {
+        Write-Error "Visual Studio C++ tools not found - run scripts\setup-windows-build.cmd"
+    }
+
+    $devCmd = Join-Path $installPath "Common7\Tools\VsDevCmd.bat"
+    if (-not (Test-Path $devCmd)) {
+        Write-Error "VsDevCmd.bat not found under $installPath"
+    }
+
+    Write-Host "==> Loading MSVC environment from VsDevCmd.bat"
+    $envDump = cmd.exe /c "`"$devCmd`" -no_logo -arch=amd64 -host_arch=amd64 && set"
+    foreach ($line in $envDump) {
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $name = $line.Substring(0, $eq)
+        $value = $line.Substring($eq + 1)
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+
+    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+        Write-Error "MSVC cl.exe not found after VsDevCmd.bat"
+    }
+    Write-Host "==> MSVC: $((Get-Command cl.exe).Source)"
+}
+
 function Find-Nvcc {
     $candidates = @(
         $env:CUDA_PATH,
