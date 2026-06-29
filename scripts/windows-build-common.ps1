@@ -3,10 +3,29 @@
 function Ensure-PowerShellExecutionPolicy {
     if (-not (Test-Admin)) { return }
 
-    $current = Get-ExecutionPolicy -Scope LocalMachine
-    if ($current -eq 'Restricted' -or $current -eq 'Undefined') {
-        Write-Host "==> Setting PowerShell execution policy to RemoteSigned (LocalMachine)"
-        Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+    try {
+        $machinePolicy = Get-ExecutionPolicy -Scope LocalMachine
+        if ($machinePolicy -eq 'Restricted' -or $machinePolicy -eq 'Undefined') {
+            Write-Host "==> Setting PowerShell execution policy to RemoteSigned (LocalMachine)"
+            Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop
+            Write-Host "==> LocalMachine execution policy set to RemoteSigned"
+        } else {
+            Write-Host "==> LocalMachine execution policy already: $machinePolicy"
+        }
+    } catch {
+        Write-Warning @"
+Could not change LocalMachine execution policy: $_
+
+This is usually fine. Self-hosted CI already runs scripts with -ExecutionPolicy Bypass.
+If a future GHA step fails with 'running scripts is disabled', set policy in an
+elevated PowerShell (not cmd):
+
+  powershell -Command "Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force"
+
+Or check overrides with:
+
+  powershell -Command "Get-ExecutionPolicy -List"
+"@
     }
 }
 
