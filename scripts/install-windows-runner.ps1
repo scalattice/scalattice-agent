@@ -36,7 +36,7 @@ if (-not $RegistrationToken) {
     Write-Host "==> Fetching runner registration token for $Repo"
     $RegistrationToken = gh api --method POST "repos/$Repo/actions/runners/registration-token" -q .token
     if (-not $RegistrationToken) {
-        Write-Error "Could not get registration token — check gh auth and repo access"
+        Write-Error "Could not get registration token - check gh auth and repo access"
     }
 }
 
