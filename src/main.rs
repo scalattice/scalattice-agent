@@ -298,7 +298,7 @@ fn print_status() -> Result<()> {
     #[cfg(windows)]
     {
         if user_settings.auto_update {
-            println!("Update   automatic (daily, tray panel)");
+            println!("Update   automatic (daily at a random time, tray panel)");
         } else {
             println!("Update   scalattice-agent update  (or use the panel Updates section)");
         }
@@ -307,10 +307,10 @@ fn print_status() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         if user_settings.auto_update {
-            println!("Update   automatic (daily systemd timer)");
+            println!("Update   automatic (daily at a random time, systemd timer)");
         } else {
             println!("Update   scalattice-agent update");
-            println!("         scalattice-agent update --enable-auto  (daily checks)");
+            println!("         scalattice-agent update --enable-auto  (daily at a random time)");
         }
     }
     Ok(())

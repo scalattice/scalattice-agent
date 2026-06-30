@@ -193,7 +193,7 @@ Description=Daily Scalattice Agent update check\n\
 [Timer]\n\
 OnCalendar=daily\n\
 Persistent=true\n\
-RandomizedDelaySec=4h\n\
+RandomizedDelaySec=12h\n\
 \n\
 [Install]\n\
 WantedBy=timers.target\n";

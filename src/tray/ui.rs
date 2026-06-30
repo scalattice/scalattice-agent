@@ -221,6 +221,7 @@ struct TrayApp {
     update_busy: bool,
     update_available: bool,
     latest_version: Option<String>,
+    update_notice: String,
     settings: UserSettings,
     next_update_check: Instant,
     panel_hidden: bool,
@@ -249,7 +250,14 @@ impl TrayApp {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let token_revealed = token_input.is_empty();
         let log_path = agent_log_path().ok();
-        let settings = UserSettings::load();
+        let mut settings = UserSettings::load();
+        let should_save_defaults = match crate::paths::settings_path() {
+            Ok(path) => !path.is_file(),
+            Err(_) => true,
+        };
+        if should_save_defaults {
+            let _ = settings.save();
+        }
         let should_check_now = settings.should_check_for_update();
         let mut app = Self {
             event_rx,
@@ -264,11 +272,13 @@ impl TrayApp {
             update_busy: false,
             update_available: false,
             latest_version: None,
+            update_notice: String::new(),
             settings,
             next_update_check: if should_check_now {
                 Instant::now()
             } else {
-                Instant::now() + Duration::from_secs(settings::UPDATE_CHECK_INTERVAL_SECS)
+                Instant::now()
+                    + Duration::from_secs(settings.seconds_until_update_check())
             },
             panel_hidden,
             token_input,
@@ -336,7 +346,13 @@ impl TrayApp {
         }
         if self.update_cmd_tx.send(UpdateWorkerCmd::Check).is_ok() {
             self.update_check_inflight = true;
+            self.update_notice = "Checking for updates…".to_string();
         }
+    }
+
+    fn schedule_next_update_check(&mut self) {
+        self.next_update_check =
+            Instant::now() + Duration::from_secs(self.settings.seconds_until_update_check());
     }
 
     fn start_update_install(&mut self) {
@@ -344,8 +360,9 @@ impl TrayApp {
             return;
         }
         self.update_busy = true;
-        self.action_message = "Downloading update. The panel will close while the installer runs."
-            .to_string();
+        self.update_notice =
+            "Downloading and installing update. This panel will close shortly.".to_string();
+        self.action_message.clear();
         let _ = self.update_cmd_tx.send(UpdateWorkerCmd::Install);
     }
 
@@ -358,8 +375,8 @@ impl TrayApp {
                     self.latest_version = Some(outcome.info().latest_version.clone());
                     self.settings.mark_update_checked();
                     let _ = self.settings.save();
-                    self.next_update_check =
-                        Instant::now() + Duration::from_secs(settings::UPDATE_CHECK_INTERVAL_SECS);
+                    self.update_notice = update::format_update_status(&outcome);
+                    self.schedule_next_update_check();
 
                     if self.settings.auto_update && self.update_available {
                         write_tray_log(&format!(
@@ -373,12 +390,15 @@ impl TrayApp {
                 UpdateWorkerMsg::CheckFailed(err) => {
                     self.update_check_inflight = false;
                     write_tray_log(&format!("update check failed: {err}"));
-                    self.next_update_check =
-                        Instant::now() + Duration::from_secs(settings::UPDATE_CHECK_INTERVAL_SECS);
+                    self.settings.mark_update_checked();
+                    let _ = self.settings.save();
+                    self.update_notice = format!("Update check failed: {err}");
+                    self.schedule_next_update_check();
                 }
                 UpdateWorkerMsg::InstallFailed(err) => {
                     self.update_busy = false;
-                    self.action_message = format!("Update failed: {err}");
+                    self.update_notice = format!("Update failed: {err}");
+                    self.action_message.clear();
                     ctx.request_repaint();
                 }
             }
@@ -388,6 +408,7 @@ impl TrayApp {
     fn save_settings_if_needed(&mut self, prev: &UserSettings) {
         if self.settings.auto_update != prev.auto_update {
             let _ = self.settings.save();
+            self.schedule_next_update_check();
         }
     }
 
@@ -576,14 +597,10 @@ impl eframe::App for TrayApp {
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
 
                         for line in &self.status_lines {
-                            ui.label(
-                                egui::RichText::new(line)
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(220, 220, 220)),
-                            );
+                            render_status_line(ui, line);
                         }
 
                         ui.add_space(10.0);
@@ -635,12 +652,14 @@ impl eframe::App for TrayApp {
                         let prev_settings = self.settings.clone();
                         ui.checkbox(
                             &mut self.settings.auto_update,
-                            "Automatically install updates (checked daily)",
+                            "Automatically install updates (once daily at a random time)",
                         );
                         self.save_settings_if_needed(&prev_settings);
 
                         let update_label = if self.update_busy {
                             "Updating…".to_string()
+                        } else if self.update_check_inflight {
+                            "Checking…".to_string()
                         } else if self.update_available {
                             format!(
                                 "Install v{}",
@@ -653,18 +672,16 @@ impl eframe::App for TrayApp {
                             let button =
                                 egui::Button::new(update_label).min_size(egui::vec2(140.0, 0.0));
                             if ui
-                                .add_enabled(!self.update_busy, button)
+                                .add_enabled(!self.update_busy && !self.update_check_inflight, button)
                                 .clicked()
                             {
                                 if self.update_available {
                                     self.start_update_install();
                                 } else {
                                     self.kick_update_check();
-                                    self.action_message =
-                                        "Checking GitHub for the latest release…".to_string();
                                 }
                             }
-                            if self.update_available && !self.update_busy {
+                            if self.update_available && !self.update_busy && !self.update_check_inflight {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "v{} available",
@@ -674,6 +691,22 @@ impl eframe::App for TrayApp {
                                 );
                             }
                         });
+
+                        if !self.update_notice.is_empty() {
+                            ui.add_space(6.0);
+                            let notice_color = if self.update_notice.contains("failed") {
+                                egui::Color32::from_rgb(255, 140, 140)
+                            } else if self.update_available {
+                                egui::Color32::from_rgb(120, 200, 140)
+                            } else {
+                                egui::Color32::from_rgb(99, 179, 237)
+                            };
+                            ui.label(
+                                egui::RichText::new(&self.update_notice)
+                                    .size(13.0)
+                                    .color(notice_color),
+                            );
+                        }
 
                         if !self.action_message.is_empty() {
                             ui.add_space(6.0);
@@ -767,6 +800,70 @@ fn gather_status_lines(log_path: &Option<PathBuf>) -> Vec<String> {
     }
 
     lines
+}
+
+fn render_status_line(ui: &mut egui::Ui, line: &str) {
+    let body = egui::Color32::from_rgb(220, 220, 220);
+    let emphasis = egui::Color32::WHITE;
+
+    if let Some(rest) = line.strip_prefix("Scalattice Cloud: ") {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Scalattice Cloud:")
+                    .strong()
+                    .size(13.0)
+                    .color(emphasis),
+            );
+            ui.label(
+                egui::RichText::new(rest)
+                    .strong()
+                    .size(13.0)
+                    .color(body),
+            );
+        });
+    } else if let Some(rest) = line.strip_prefix("Status: ") {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Status:")
+                    .strong()
+                    .size(13.0)
+                    .color(emphasis),
+            );
+            ui.label(
+                egui::RichText::new(rest)
+                    .strong()
+                    .size(13.0)
+                    .color(body),
+            );
+        });
+    } else if let Some(rest) = line.strip_prefix("Node: ") {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Node:")
+                    .strong()
+                    .size(13.0)
+                    .color(emphasis),
+            );
+            ui.label(
+                egui::RichText::new(rest)
+                    .strong()
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(120, 200, 140)),
+            );
+        });
+    } else if let Some((label, rest)) = line.split_once(": ") {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{label}:"))
+                    .size(13.0)
+                    .color(body),
+            );
+            ui.label(egui::RichText::new(rest).size(13.0).color(body));
+        });
+    } else {
+        ui.label(egui::RichText::new(line).size(13.0).color(body));
+    }
+    ui.add_space(5.0);
 }
 
 fn native_window_visible() -> bool {
