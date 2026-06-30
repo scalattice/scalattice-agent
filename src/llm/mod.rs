@@ -1,4 +1,5 @@
 mod embedded;
+mod prompt;
 mod split;
 
 pub use embedded::{generate, init_backend, GenerateConfig};

@@ -1,7 +1,9 @@
 use crate::config::AgentConfig;
 use crate::paths::{agent_log_path, install_dir, lib_dir};
 use crate::service;
+use crate::settings::{self, UserSettings};
 use crate::state;
+use crate::update::{self, UpdateCheckOutcome};
 use anyhow::{Context, Result};
 use eframe::egui;
 use std::io::{Read, Seek, SeekFrom};
@@ -21,6 +23,56 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const DASHBOARD_URL: &str = "https://scalattice.cloud/providers";
 const WINDOW_TITLE: &str = "Scalattice Agent";
 const TRAY_MUTEX: &str = "ScalatticeAgentTray";
+
+enum UpdateWorkerCmd {
+    Check,
+    Install,
+}
+
+enum UpdateWorkerMsg {
+    Checked(UpdateCheckOutcome),
+    CheckFailed(String),
+    InstallFailed(String),
+}
+
+fn spawn_update_worker() -> (mpsc::Sender<UpdateWorkerCmd>, mpsc::Receiver<UpdateWorkerMsg>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<UpdateWorkerCmd>();
+    let (msg_tx, msg_rx) = mpsc::channel::<UpdateWorkerMsg>();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(err) => {
+                let _ = msg_tx.send(UpdateWorkerMsg::CheckFailed(err.to_string()));
+                return;
+            }
+        };
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                UpdateWorkerCmd::Check => match rt.block_on(update::check_for_update()) {
+                    Ok(outcome) => {
+                        if msg_tx.send(UpdateWorkerMsg::Checked(outcome)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if msg_tx
+                            .send(UpdateWorkerMsg::CheckFailed(err.to_string()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                UpdateWorkerCmd::Install => {
+                    if let Err(err) = rt.block_on(update::install_latest_update()) {
+                        let _ = msg_tx.send(UpdateWorkerMsg::InstallFailed(err.to_string()));
+                    }
+                }
+            }
+        }
+    });
+    (cmd_tx, msg_rx)
+}
 
 pub fn run_tray_ui(force: bool) -> Result<()> {
     write_tray_log(&format!(
@@ -131,6 +183,8 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
         }
     });
 
+    let (update_cmd_tx, update_msg_rx) = spawn_update_worker();
+
     eframe::run_native(
         WINDOW_TITLE,
         options,
@@ -142,6 +196,8 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
                 show_for_app,
                 status_rx,
                 status_req_tx,
+                update_cmd_tx,
+                update_msg_rx,
                 !interactive,
             )))
         }),
@@ -159,6 +215,14 @@ struct TrayApp {
     status_rx: mpsc::Receiver<Vec<String>>,
     status_req_tx: mpsc::Sender<()>,
     status_refresh_inflight: bool,
+    update_cmd_tx: mpsc::Sender<UpdateWorkerCmd>,
+    update_msg_rx: mpsc::Receiver<UpdateWorkerMsg>,
+    update_check_inflight: bool,
+    update_busy: bool,
+    update_available: bool,
+    latest_version: Option<String>,
+    settings: UserSettings,
+    next_update_check: Instant,
     panel_hidden: bool,
     token_input: String,
     token_revealed: bool,
@@ -178,18 +242,34 @@ impl TrayApp {
         show_window: Arc<AtomicBool>,
         status_rx: mpsc::Receiver<Vec<String>>,
         status_req_tx: mpsc::Sender<()>,
+        update_cmd_tx: mpsc::Sender<UpdateWorkerCmd>,
+        update_msg_rx: mpsc::Receiver<UpdateWorkerMsg>,
         panel_hidden: bool,
     ) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let token_revealed = token_input.is_empty();
         let log_path = agent_log_path().ok();
-        Self {
+        let settings = UserSettings::load();
+        let should_check_now = settings.should_check_for_update();
+        let mut app = Self {
             event_rx,
             show_rx,
             show_window,
             status_rx,
             status_req_tx,
             status_refresh_inflight: false,
+            update_cmd_tx,
+            update_msg_rx,
+            update_check_inflight: false,
+            update_busy: false,
+            update_available: false,
+            latest_version: None,
+            settings,
+            next_update_check: if should_check_now {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(settings::UPDATE_CHECK_INTERVAL_SECS)
+            },
             panel_hidden,
             token_input,
             token_revealed,
@@ -200,7 +280,11 @@ impl TrayApp {
             log_offset: 0,
             next_data_poll: Instant::now(),
             last_outer_rect: None,
+        };
+        if should_check_now {
+            app.kick_update_check();
         }
+        app
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
@@ -243,6 +327,67 @@ impl TrayApp {
         }
         if self.status_req_tx.send(()).is_ok() {
             self.status_refresh_inflight = true;
+        }
+    }
+
+    fn kick_update_check(&mut self) {
+        if self.update_check_inflight || self.update_busy {
+            return;
+        }
+        if self.update_cmd_tx.send(UpdateWorkerCmd::Check).is_ok() {
+            self.update_check_inflight = true;
+        }
+    }
+
+    fn start_update_install(&mut self) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        self.action_message = "Downloading update. The panel will close while the installer runs."
+            .to_string();
+        let _ = self.update_cmd_tx.send(UpdateWorkerCmd::Install);
+    }
+
+    fn poll_update_results(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.update_msg_rx.try_recv() {
+            match msg {
+                UpdateWorkerMsg::Checked(outcome) => {
+                    self.update_check_inflight = false;
+                    self.update_available = outcome.info().update_available;
+                    self.latest_version = Some(outcome.info().latest_version.clone());
+                    self.settings.mark_update_checked();
+                    let _ = self.settings.save();
+                    self.next_update_check =
+                        Instant::now() + Duration::from_secs(settings::UPDATE_CHECK_INTERVAL_SECS);
+
+                    if self.settings.auto_update && self.update_available {
+                        write_tray_log(&format!(
+                            "auto-update: installing v{}",
+                            outcome.info().latest_version
+                        ));
+                        self.start_update_install();
+                    }
+                    ctx.request_repaint();
+                }
+                UpdateWorkerMsg::CheckFailed(err) => {
+                    self.update_check_inflight = false;
+                    write_tray_log(&format!("update check failed: {err}"));
+                    self.next_update_check =
+                        Instant::now() + Duration::from_secs(settings::UPDATE_CHECK_INTERVAL_SECS);
+                }
+                UpdateWorkerMsg::InstallFailed(err) => {
+                    self.update_busy = false;
+                    self.action_message = format!("Update failed: {err}");
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    fn save_settings_if_needed(&mut self, prev: &UserSettings) {
+        if self.settings.auto_update != prev.auto_update {
+            let _ = self.settings.save();
         }
     }
 
@@ -363,6 +508,14 @@ impl eframe::App for TrayApp {
         }
 
         self.poll_tray(ctx);
+        self.poll_update_results(ctx);
+
+        if Instant::now() >= self.next_update_check
+            && !self.update_check_inflight
+            && !self.update_busy
+        {
+            self.kick_update_check();
+        }
 
         let native_visible = native_window_visible();
         if !native_visible {
@@ -465,6 +618,60 @@ impl eframe::App for TrayApp {
                             }
                             if ui.button("Open dashboard").clicked() {
                                 self.open_dashboard();
+                            }
+                        });
+
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label(
+                            egui::RichText::new("Updates")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(4.0);
+
+                        let prev_settings = self.settings.clone();
+                        ui.checkbox(
+                            &mut self.settings.auto_update,
+                            "Automatically install updates (checked daily)",
+                        );
+                        self.save_settings_if_needed(&prev_settings);
+
+                        let update_label = if self.update_busy {
+                            "Updating…".to_string()
+                        } else if self.update_available {
+                            format!(
+                                "Install v{}",
+                                self.latest_version.as_deref().unwrap_or("latest")
+                            )
+                        } else {
+                            "Check for updates".to_string()
+                        };
+                        ui.horizontal(|ui| {
+                            let button =
+                                egui::Button::new(update_label).min_size(egui::vec2(140.0, 0.0));
+                            if ui
+                                .add_enabled(!self.update_busy, button)
+                                .clicked()
+                            {
+                                if self.update_available {
+                                    self.start_update_install();
+                                } else {
+                                    self.kick_update_check();
+                                    self.action_message =
+                                        "Checking GitHub for the latest release…".to_string();
+                                }
+                            }
+                            if self.update_available && !self.update_busy {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "v{} available",
+                                        self.latest_version.as_deref().unwrap_or("?")
+                                    ))
+                                    .color(egui::Color32::from_rgb(120, 200, 140)),
+                                );
                             }
                         });
 

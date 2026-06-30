@@ -211,6 +211,11 @@ fn stop_tray_agent_only() {
         .output();
 }
 
+pub fn stop_agents_for_update() {
+    stop_background_agent_only();
+    stop_tray_agent_only();
+}
+
 fn write_background_runner() -> Result<bool> {
     let install = install_dir()?;
     let lib = lib_dir()?;

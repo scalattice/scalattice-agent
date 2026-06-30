@@ -99,6 +99,26 @@ pub fn remove_background_service() -> Result<()> {
     uninstall_user_service()
 }
 
+pub fn stop_background_for_update() -> Result<()> {
+    if !background_service_available() || !service_active() {
+        return Ok(());
+    }
+    run_systemctl(&["--user", "stop", UNIT_NAME])?;
+    Ok(())
+}
+
+pub fn restart_background_after_update() -> Result<()> {
+    if !background_service_available() {
+        return Ok(());
+    }
+    let home = crate::paths::home_dir()?;
+    if !systemd_user_unit_path(&home).is_file() {
+        return Ok(());
+    }
+    run_systemctl(&["--user", "restart", UNIT_NAME])?;
+    Ok(())
+}
+
 pub fn systemd_unit_path() -> Result<PathBuf> {
     Ok(systemd_user_unit_path(&crate::paths::home_dir()?))
 }

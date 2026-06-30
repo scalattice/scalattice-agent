@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn qwen_fits_on_laptop_with_offload() {
         let model = CatalogModel {
-            model_id: "qwen-3.6".into(),
+            model_id: "qwen-2.5-7b".into(),
             display_name: String::new(),
             runtime_model: String::new(),
             max_context_tokens: 0,

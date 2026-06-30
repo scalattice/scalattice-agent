@@ -95,6 +95,33 @@ begin
   Result := (Length(Token) >= 16) and (Copy(Token, 1, 13) = 'slt_provider_');
 end;
 
+function ReadSavedToken(): String;
+var
+  TokenPath: String;
+  Lines: TArrayOfString;
+  I: Integer;
+  Line, Value: String;
+begin
+  Result := '';
+  TokenPath := ExpandConstant('{userprofile}\.config\scalattice\agent.env');
+  if not FileExists(TokenPath) then
+    Exit;
+  if LoadStringsFromFile(TokenPath, Lines) then
+  begin
+    for I := 0 to GetArrayLength(Lines) - 1 do
+    begin
+      Line := Trim(Lines[I]);
+      if Copy(Line, 1, 23) = 'SCALATTICE_AGENT_TOKEN=' then
+      begin
+        Value := Trim(Copy(Line, 24, MaxInt));
+        if TokenLooksValid(Value) then
+          Result := Value;
+        Exit;
+      end;
+    end;
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 begin
   PrefillToken := ExpandConstant('{param:TOKEN|}');
@@ -133,7 +160,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
   SetTokenResult: Integer;
-  Token, AppDir: String;
+  Token, SavedToken, AppDir: String;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -149,15 +176,29 @@ begin
       BroadcastEnvironmentChange;
     end;
 
-    Token := Trim(TokenPage.Values[0]);
-    Exec(AppDir + '\scalattice-run.cmd',
-      'set-token --token "' + Token + '"',
-      AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
+    SavedToken := ReadSavedToken();
+    SetTokenResult := 0;
+    if SavedToken <> '' then
+    begin
+      Exec(AppDir + '\scalattice-run.cmd',
+        'status',
+        AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
+    end
+    else
+    begin
+      Token := Trim(TokenPage.Values[0]);
+      if Token <> '' then
+      begin
+        Exec(AppDir + '\scalattice-run.cmd',
+          'set-token --token "' + Token + '"',
+          AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
+      end;
+    end;
 
     Exec('wscript.exe', '//nologo "' + AppDir + '\launch-tray.vbs"',
       AppDir, SW_HIDE, ewNoWait, ResultCode);
 
-    if SetTokenResult <> 0 then
+    if (SavedToken = '') and (SetTokenResult <> 0) then
       MsgBox('Scalattice Agent was installed, but starting the background service failed.' + #13#10 +
         'Open Command Prompt and run:' + #13#10 +
         '  scalattice-run.cmd set-token --token YOUR_TOKEN' + #13#10 + #13#10 +

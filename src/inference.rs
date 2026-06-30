@@ -114,6 +114,7 @@ impl InferenceEngine {
 
         let pool = self.pool.clone();
         let messages = req.messages.to_vec();
+        let model_id = req.model_id.to_string();
 
         let output = tokio::task::spawn_blocking(move || {
             generate(&GenerateConfig {
@@ -121,6 +122,7 @@ impl InferenceEngine {
                 pool,
                 messages,
                 max_tokens: 512,
+                model_id,
             })
         })
         .await

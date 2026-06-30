@@ -15,6 +15,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use super::prompt::{build_chat_prompt, sanitize_completion};
+
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,7 @@ pub struct GenerateConfig {
     pub pool: VirtualCard,
     pub messages: Vec<ChatMessage>,
     pub max_tokens: u32,
+    pub model_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -65,9 +68,9 @@ pub fn generate(config: &GenerateConfig) -> Result<GenerateOutput> {
         .new_context(backend, ctx_params)
         .context("create llama context")?;
 
-    let prompt = build_prompt(&model, &config.messages)?;
+    let prompt = build_chat_prompt(&model, &config.messages)?;
     let mut prompt_tokens = model
-        .str_to_token(&prompt, AddBos::Always)
+        .str_to_token(&prompt, AddBos::Never)
         .context("tokenize prompt")?;
 
     let max_tokens = config.max_tokens.max(1).min(2048) as usize;
@@ -120,28 +123,10 @@ pub fn generate(config: &GenerateConfig) -> Result<GenerateOutput> {
     }
 
     Ok(GenerateOutput {
-        content: content.trim().to_string(),
+        content: sanitize_completion(&config.model_id, &content),
         prompt_tokens: prompt_token_count,
         completion_tokens: generated.max(1),
     })
-}
-
-fn build_prompt(_model: &LlamaModel, messages: &[ChatMessage]) -> Result<String> {
-    Ok(messages_to_prompt(messages))
-}
-
-fn messages_to_prompt(messages: &[ChatMessage]) -> String {
-    let mut out = String::new();
-    for message in messages {
-        let role = match message.role.as_str() {
-            "system" => "System",
-            "assistant" => "Assistant",
-            _ => "User",
-        };
-        out.push_str(&format!("{role}: {}\n", message.content));
-    }
-    out.push_str("Assistant: ");
-    out
 }
 
 pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelParams> {

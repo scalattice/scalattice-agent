@@ -8,8 +8,10 @@ mod paths;
 mod protocol;
 mod runtime;
 mod service;
+mod settings;
 mod specs;
 mod state;
+mod update;
 #[cfg(windows)]
 mod tray;
 
@@ -57,6 +59,18 @@ enum Commands {
         /// Start even if another tray instance appears stuck (kills stale tray PID file)
         #[arg(long, hide = true)]
         force: bool,
+    },
+    /// Check for and install the latest release
+    Update {
+        /// Only check whether a newer release exists
+        #[arg(long)]
+        check: bool,
+        /// Enable automatic daily update checks (Linux: systemd user timer)
+        #[arg(long)]
+        enable_auto: bool,
+        /// Disable automatic daily update checks
+        #[arg(long)]
+        disable_auto: bool,
     },
 }
 
@@ -131,6 +145,7 @@ async fn run_async(cli: Cli) -> Result<()> {
             }
             #[cfg(windows)]
             spawn_tray_hidden()?;
+            let _ = update::maybe_sync_auto_update_timer();
         }
         Some(Commands::Uninstall { yes, purge }) => {
             service::uninstall_agent(&service::UninstallOptions {
@@ -140,6 +155,13 @@ async fn run_async(cli: Cli) -> Result<()> {
         }
         #[cfg(windows)]
         Some(Commands::Tray { .. }) => unreachable!("tray handled in main"),
+        Some(Commands::Update {
+            check,
+            enable_auto,
+            disable_auto,
+        }) => {
+            run_update(check, enable_auto, disable_auto).await?;
+        }
     }
 
     Ok(())
@@ -159,6 +181,7 @@ fn spawn_tray_hidden() -> Result<()> {
 
 async fn run_foreground(token: Option<String>) -> Result<()> {
     if service::invoked_by_systemd() || service::invoked_by_background_service() {
+        let _ = update::maybe_sync_auto_update_timer();
         let config = config::AgentConfig::from_env_and_cli(token)?;
         return agent::run_agent(config).await;
     }
@@ -269,11 +292,61 @@ fn print_status() -> Result<()> {
     }
     println!();
     println!("Dashboard https://scalattice.cloud/providers");
+    let user_settings = settings::UserSettings::load();
     #[cfg(windows)]
-    println!("Control panel: scalattice-agent tray  (or click the notification-area icon)");
+    {
+        if user_settings.auto_update {
+            println!("Update   automatic (daily, tray panel)");
+        } else {
+            println!("Update   scalattice-agent update  (or use the panel Updates section)");
+        }
+        println!("Control panel: scalattice-agent tray  (or click the notification-area icon)");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if user_settings.auto_update {
+            println!("Update   automatic (daily systemd timer)");
+        } else {
+            println!("Update   scalattice-agent update");
+            println!("         scalattice-agent update --enable-auto  (daily checks)");
+        }
+    }
     Ok(())
 }
 
 fn agent_token_configured() -> bool {
     config::read_saved_agent_token().is_some()
+}
+
+async fn run_update(check_only: bool, enable_auto: bool, disable_auto: bool) -> Result<()> {
+    if enable_auto && disable_auto {
+        anyhow::bail!("cannot use --enable-auto and --disable-auto together");
+    }
+
+    let mut user_settings = settings::UserSettings::load();
+
+    if enable_auto {
+        user_settings.auto_update = true;
+        user_settings.save()?;
+        update::sync_auto_update(true)?;
+        return Ok(());
+    }
+    if disable_auto {
+        user_settings.auto_update = false;
+        user_settings.save()?;
+        update::sync_auto_update(false)?;
+        return Ok(());
+    }
+
+    let outcome = update::check_for_update().await?;
+    println!("{}", update::format_update_status(&outcome));
+
+    user_settings.mark_update_checked();
+    let _ = user_settings.save();
+
+    if check_only || !outcome.info().update_available {
+        return Ok(());
+    }
+
+    update::install_latest_update().await
 }

@@ -1,7 +1,7 @@
 use crate::config::AgentConfig;
 use crate::paths::{
     agent_binary_name, agent_env_path, agent_state_path, config_dir, install_dir, is_dir_empty,
-    lib_dir, models_cache_dir, remove_path_quiet,
+    lib_dir, models_cache_dir, remove_path_quiet, settings_path,
 };
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -38,6 +38,16 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
 
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::restart_background_from_config(config)
+}
+
+#[cfg(target_os = "linux")]
+pub fn stop_background_for_update() -> Result<()> {
+    platform::stop_background_for_update()
+}
+
+#[cfg(target_os = "linux")]
+pub fn restart_background_after_update() -> Result<()> {
+    platform::restart_background_after_update()
 }
 
 #[cfg(windows)]
@@ -132,6 +142,7 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         lib.clone(),
         agent_env_path()?,
         agent_state_path()?,
+        settings_path()?,
     ];
 
     #[cfg(unix)]
@@ -172,6 +183,11 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
 
     if background_service_available() {
         platform::remove_background_service()?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = crate::update::sync_auto_update(false);
     }
 
     for path in &targets {

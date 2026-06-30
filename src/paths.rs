@@ -28,6 +28,10 @@ pub fn agent_state_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("agent.state.json"))
 }
 
+pub fn settings_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("settings.json"))
+}
+
 pub fn install_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("SCALATTICE_INSTALL_DIR") {
         let trimmed = dir.trim();
