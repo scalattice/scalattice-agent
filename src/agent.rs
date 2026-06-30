@@ -76,7 +76,7 @@ impl SessionState {
 
     fn evict_vram_cache(&self) {
         info!("evicting in-memory model weights from VRAM");
-        crate::llm::model_cache::evict_all();
+        crate::llm::evict_all();
     }
 
     fn apply_schedule(&mut self, schedule: AgentSchedule) -> ScheduleTransition {

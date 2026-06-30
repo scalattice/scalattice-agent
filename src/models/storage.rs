@@ -194,7 +194,7 @@ pub fn purge_incomplete_model_weights(runtime_model: &str) {
 
 pub fn purge_model_weights(runtime_model: &str) {
     if let Some(path) = resolve_model_gguf(runtime_model) {
-        crate::llm::model_cache::evict_all_for_path(&path);
+        crate::llm::evict_all_for_path(&path);
     }
     let dir = model_cache_dir(runtime_model);
     if dir.is_dir() {
