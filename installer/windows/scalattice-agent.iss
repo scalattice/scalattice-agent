@@ -160,8 +160,7 @@ begin
   if not Result then
     Exit;
   InstallDir := ExpandConstant('{localappdata}\Scalattice\bin');
-  Result := IsUpgrade
-    or DirExists(InstallDir)
+  Result := DirExists(InstallDir)
     or (ReadSavedToken() <> '')
     or FileExists(InstallDir + '\{#MyAppExeName}');
 end;
