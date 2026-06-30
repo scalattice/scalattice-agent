@@ -64,7 +64,7 @@ pub fn sync_auto_update_timer(enable: bool) -> Result<()> {
         println!("Automatic daily updates enabled (systemd timer).");
     } else {
         let _ = run_systemctl(&["--user", "disable", "--now", UPDATE_TIMER]);
-        remove_update_units();
+        let _ = remove_update_units();
         let _ = run_systemctl(&["--user", "daemon-reload"]);
         println!("Automatic daily updates disabled.");
     }

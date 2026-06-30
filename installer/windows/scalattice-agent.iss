@@ -103,7 +103,7 @@ var
   Line, Value: String;
 begin
   Result := '';
-  TokenPath := ExpandConstant('{userprofile}\.config\scalattice\agent.env');
+  TokenPath := ExpandConstant('{userpf}\.config\scalattice\agent.env');
   if not FileExists(TokenPath) then
     Exit;
   if LoadStringsFromFile(TokenPath, Lines) then
@@ -218,4 +218,4 @@ Type: files; Name: "{app}\run-background.cmd"
 Type: dirifempty; Name: "{localappdata}\Scalattice\bin"
 Type: dirifempty; Name: "{localappdata}\Scalattice\logs"
 Type: dirifempty; Name: "{localappdata}\Scalattice"
-Type: filesandordirs; Name: "{%USERPROFILE}\.config\scalattice"
+Type: filesandordirs; Name: "{userpf}\.config\scalattice"
