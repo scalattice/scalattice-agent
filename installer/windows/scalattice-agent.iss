@@ -239,7 +239,7 @@ begin
     ModelsPage := CreateCustomPage(
       TokenPage.ID,
       'Stored model weights',
-      'A previous install left downloaded models on this PC (' + SizeLabel + ').',
+      'A previous install left downloaded models on this PC (' + SizeLabel + ').' + #13#10 + #13#10 +
       'Keep them if you plan to run the agent again — reconnects stay instant.' + #13#10 + #13#10 +
       'Remove them only if you want to free disk space. Enabled models will download again later.');
     PurgeModelsCheck := TNewCheckBox.Create(ModelsPage);
