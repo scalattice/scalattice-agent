@@ -92,7 +92,7 @@ begin
         end
         else
         begin
-          FileSize := FindRec.Size;
+          FileSize := FindRec.SizeLow;
           FileSize := FileSize + (Int64(FindRec.SizeHigh) shl 32);
           Size := Size + FileSize;
         end;
