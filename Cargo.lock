@@ -3462,6 +3462,7 @@ dependencies = [
  "encoding_rs",
  "futures-util",
  "image",
+ "libc",
  "llama-cpp-2",
  "reqwest",
  "rustls",

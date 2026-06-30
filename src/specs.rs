@@ -41,6 +41,8 @@ pub struct MachineSpecs {
     pub ram_gb: Option<u32>,
     #[serde(rename = "ramUsedGb", skip_serializing_if = "Option::is_none")]
     pub ram_used_gb: Option<u32>,
+    #[serde(rename = "diskTotalGb", skip_serializing_if = "Option::is_none")]
+    pub disk_total_gb: Option<u32>,
     #[serde(rename = "computeDevices", skip_serializing_if = "Vec::is_empty")]
     pub compute_devices: Vec<ComputeDevice>,
 }
@@ -150,6 +152,7 @@ pub fn build_specs_from_devices(
         cpu_model,
         ram_gb,
         ram_used_gb: detect_ram_used_gb(),
+        disk_total_gb: detect_disk_total_gb(),
         compute_devices: devices.to_vec(),
     }
 }
@@ -796,6 +799,62 @@ pub fn detect_ram_used_gb() -> Option<u32> {
     }
     #[cfg(not(any(unix, windows)))]
     {
+        None
+    }
+}
+
+pub fn detect_disk_total_gb() -> Option<u32> {
+    let path = crate::paths::home_dir().ok()?;
+    disk_total_gb(&path)
+}
+
+fn bytes_to_gb(bytes: u64) -> u32 {
+    ((bytes as f64) / 1024.0 / 1024.0 / 1024.0).round().max(1.0) as u32
+}
+
+fn disk_total_gb(path: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        let c_path = CString::new(bytes).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        let total = stat.f_blocks as u64 * stat.f_frsize as u64;
+        return Some(bytes_to_gb(total));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut free = 0u64;
+        let mut total = 0u64;
+        let mut total_free = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free as *mut u64,
+                &mut total as *mut u64,
+                &mut total_free as *mut u64,
+            )
+        };
+        if ok == 0 || total == 0 {
+            return None;
+        }
+        return Some(bytes_to_gb(total));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
         None
     }
 }

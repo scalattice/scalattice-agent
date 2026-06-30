@@ -12,6 +12,7 @@ mod settings;
 mod specs;
 mod state;
 mod update;
+mod vram_lifecycle;
 #[cfg(windows)]
 mod tray;
 
@@ -248,15 +249,23 @@ fn print_status() -> Result<()> {
     }
 
     if service::background_service_available() {
-        let service_line = match service::background_status() {
-            service::BackgroundStatus::Running => "running",
-            service::BackgroundStatus::Stopped => "stopped",
-            service::BackgroundStatus::NotInstalled => "not configured",
-        };
-        println!("Service  {service_line}");
         #[cfg(windows)]
-        if let Some(method) = service::autostart_method_line() {
-            println!("Autostart {method}");
+        {
+            let service_line = match service::background_status() {
+                service::BackgroundStatus::Running => "running",
+                service::BackgroundStatus::Stopped => "stopped (starts when you sign in)",
+                service::BackgroundStatus::NotInstalled => "not set up",
+            };
+            println!("Agent    {service_line}");
+        }
+        #[cfg(not(windows))]
+        {
+            let service_line = match service::background_status() {
+                service::BackgroundStatus::Running => "running",
+                service::BackgroundStatus::Stopped => "stopped",
+                service::BackgroundStatus::NotInstalled => "not configured",
+            };
+            println!("Service  {service_line}");
         }
     } else {
         #[cfg(unix)]
@@ -277,18 +286,27 @@ fn print_status() -> Result<()> {
     }
 
     println!();
-    if let Ok(bin) = crate::paths::install_dir() {
-        println!("Bin      {}", bin.display());
+    #[cfg(windows)]
+    {
+        if let Ok(log) = crate::paths::agent_log_path() {
+            println!("Log file {}", log.display());
+        }
     }
-    if let Ok(lib) = crate::paths::lib_dir() {
-        println!("Lib      {}", lib.display());
-    }
-    if let Ok(log) = crate::paths::agent_log_path() {
-        println!("Log      {}", log.display());
-        if let Some(parent) = log.parent() {
-            let tray_log = parent.join("tray.log");
-            if tray_log.is_file() {
-                println!("Tray log {}", tray_log.display());
+    #[cfg(not(windows))]
+    {
+        if let Ok(bin) = crate::paths::install_dir() {
+            println!("Bin      {}", bin.display());
+        }
+        if let Ok(lib) = crate::paths::lib_dir() {
+            println!("Lib      {}", lib.display());
+        }
+        if let Ok(log) = crate::paths::agent_log_path() {
+            println!("Log      {}", log.display());
+            if let Some(parent) = log.parent() {
+                let tray_log = parent.join("tray.log");
+                if tray_log.is_file() {
+                    println!("Tray log {}", tray_log.display());
+                }
             }
         }
     }
@@ -298,7 +316,7 @@ fn print_status() -> Result<()> {
     #[cfg(windows)]
     {
         if user_settings.auto_update {
-            println!("Update   automatic (daily at a random time, tray panel)");
+            println!("Update   automatic");
         } else {
             println!("Update   scalattice-agent update  (or use the panel Updates section)");
         }
@@ -307,10 +325,10 @@ fn print_status() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         if user_settings.auto_update {
-            println!("Update   automatic (daily at a random time, systemd timer)");
+            println!("Update   automatic");
         } else {
             println!("Update   scalattice-agent update");
-            println!("         scalattice-agent update --enable-auto  (daily at a random time)");
+            println!("         scalattice-agent update --enable-auto");
         }
     }
     Ok(())

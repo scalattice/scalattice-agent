@@ -59,6 +59,30 @@ pub struct ComputeDevicePolicy {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentSchedule {
+    #[serde(rename = "acceptingJobs", default = "default_true")]
+    pub accepting_jobs: bool,
+    #[serde(rename = "scheduleMode", default)]
+    pub schedule_mode: String,
+    #[serde(rename = "minutesUntilEarning", default)]
+    pub minutes_until_earning: Option<u32>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AgentSchedule {
+    fn default() -> Self {
+        Self {
+            accepting_jobs: false,
+            schedule_mode: String::new(),
+            minutes_until_earning: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReadyMessage {
     #[serde(rename = "nodeId")]
@@ -70,6 +94,8 @@ pub struct ReadyMessage {
     pub enabled_models: Vec<ModelPolicyEntry>,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
+    #[serde(default)]
+    pub schedule: AgentSchedule,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +106,10 @@ pub struct PongMessage {
     pub enabled_models: Vec<ModelPolicyEntry>,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
+    #[serde(rename = "purgeModels", default)]
+    pub purge_models: Vec<String>,
+    #[serde(default)]
+    pub schedule: AgentSchedule,
 }
 
 #[derive(Debug, Serialize)]

@@ -7,9 +7,7 @@ pub fn models_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
-    std::env::var("HOME")
-        .map(|home| PathBuf::from(home).join(".cache/scalattice/models"))
-        .unwrap_or_else(|_| PathBuf::from(".cache/scalattice/models"))
+    crate::paths::models_cache_dir()
 }
 
 pub fn runtime_cache_key(runtime_model: &str) -> String {
@@ -191,5 +189,15 @@ pub fn purge_incomplete_model_weights(runtime_model: &str) {
         if path.is_file() && !is_manifest_weight_file(runtime_model, &path) {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+pub fn purge_model_weights(runtime_model: &str) {
+    if let Some(path) = resolve_model_gguf(runtime_model) {
+        crate::llm::model_cache::evict_all_for_path(&path);
+    }
+    let dir = model_cache_dir(runtime_model);
+    if dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,12 +1,13 @@
 use crate::config::{AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
-    CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage, ModelPolicyEntry,
-    RegisterMessage,
+    AgentSchedule, CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage,
+    ModelPolicyEntry, RegisterMessage,
 };
+use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecycleState, VramTickAction};
 use crate::compute_pool::build_virtual_card;
 use crate::inference::{InferenceEngine, InferenceRequest};
-use crate::models::{can_host_model, model_weights_ready, purge_incomplete_model_weights, spawn_catalog_sync};
+use crate::models::{can_host_model, model_weights_ready, purge_incomplete_model_weights, purge_model_weights, spawn_catalog_sync};
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::{
     apply_compute_policy, build_specs_from_devices, detect_all_compute_devices, detect_cpu_model,
@@ -45,6 +46,7 @@ struct SessionState {
     download_cancel: Arc<AtomicBool>,
     sync_in_flight: Arc<AtomicBool>,
     logged_download_blockers: bool,
+    vram_lifecycle: VramLifecycleState,
 }
 
 impl SessionState {
@@ -64,7 +66,52 @@ impl SessionState {
             download_cancel: Arc::new(AtomicBool::new(false)),
             sync_in_flight: Arc::new(AtomicBool::new(false)),
             logged_download_blockers: false,
+            vram_lifecycle: VramLifecycleState::default(),
         }
+    }
+
+    fn vram_config(&self) -> VramLifecycleConfig {
+        VramLifecycleConfig::from_env()
+    }
+
+    fn evict_vram_cache(&self) {
+        info!("evicting in-memory model weights from VRAM");
+        crate::llm::model_cache::evict_all();
+    }
+
+    fn apply_schedule(&mut self, schedule: AgentSchedule) -> ScheduleTransition {
+        let transition = self.vram_lifecycle.apply_schedule(schedule);
+        if transition.left_earning {
+            self.evict_vram_cache();
+        }
+        transition
+    }
+
+    fn tick_vram_lifecycle(&mut self) {
+        let config = self.vram_config();
+        let action = self.vram_lifecycle.tick(self.job_state, &config);
+        if action == VramTickAction::EvictVram {
+            self.evict_vram_cache();
+        }
+    }
+
+    fn warm_runtime_models(&self) -> Vec<String> {
+        self.register_model_ids()
+            .into_iter()
+            .filter_map(|model_id| {
+                self.catalog.iter().find_map(|model| {
+                    if model.model_id != model_id {
+                        return None;
+                    }
+                    let runtime = if model.runtime_model.trim().is_empty() {
+                        model.model_id.clone()
+                    } else {
+                        model.runtime_model.clone()
+                    };
+                    Some(runtime)
+                })
+            })
+            .collect()
     }
 
     fn effective_hf_token(&self, server_token: Option<String>) -> Option<String> {
@@ -221,12 +268,54 @@ impl SessionState {
             .iter()
             .map(|model| (model.model_id.clone(), model.enabled))
             .collect();
-        if self.model_policy != next {
-            self.cancel_active_downloads();
-            self.model_policy = next;
-            self.logged_download_blockers = false;
-            self.prune_disabled_model_weights();
+        if self.model_policy == next {
+            return;
         }
+
+        self.model_policy = next;
+        self.logged_download_blockers = false;
+        self.prune_disabled_model_weights();
+
+        if let Some(downloading) = crate::state::downloading_model() {
+            let still_enabled = self
+                .model_policy
+                .iter()
+                .any(|(id, enabled)| id == &downloading && *enabled);
+            if !still_enabled {
+                self.cancel_active_downloads();
+            }
+        }
+    }
+
+    fn runtime_for_model_id(&self, model_id: &str) -> String {
+        self.catalog
+            .iter()
+            .find(|model| model.model_id == model_id)
+            .map(|model| {
+                if model.runtime_model.trim().is_empty() {
+                    model.model_id.clone()
+                } else {
+                    model.runtime_model.clone()
+                }
+            })
+            .unwrap_or_else(|| model_id.to_string())
+    }
+
+    fn apply_purge_models(&mut self, model_ids: &[String]) {
+        if model_ids.is_empty() {
+            return;
+        }
+        if let Some(downloading) = crate::state::downloading_model() {
+            if model_ids.iter().any(|id| id == &downloading) {
+                self.cancel_active_downloads();
+            }
+        }
+        for model_id in model_ids {
+            let runtime_model = self.runtime_for_model_id(model_id);
+            info!("purging model weights for {model_id} ({runtime_model})");
+            purge_model_weights(&runtime_model);
+        }
+        self.evict_vram_cache();
     }
 
     fn is_model_enabled(&self, model_id: &str) -> bool {
@@ -445,6 +534,7 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
             _ = heartbeat.tick() => {
                 let registered = {
                     let mut guard = state.lock().await;
+                    guard.tick_vram_lifecycle();
                     if guard.registered {
                         let hf_token = guard.hf_token.clone();
                         guard.sync_model_weights(hf_token, &config.token);
@@ -452,6 +542,7 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
                     guard.registered
                 };
                 if registered {
+                    maybe_warm_models(state.clone()).await;
                     let reregister = state.lock().await.needs_reregister();
                     if reregister {
                         send_register_message(&state, &mut write).await?;
@@ -468,6 +559,37 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
+    let (should_preload, warm_models, pool) = {
+        let guard = state.lock().await;
+        let config = guard.vram_config();
+        if !guard.vram_lifecycle.should_preload(&config) {
+            return;
+        }
+        let warm_models = guard.warm_runtime_models();
+        if warm_models.is_empty() {
+            return;
+        }
+        let Ok(engine) = guard.refresh_inference() else {
+            return;
+        };
+        (true, warm_models, engine.pool().clone())
+    };
+    if !should_preload {
+        return;
+    }
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        if crate::inference::warm_cached_models(&pool, &warm_models)
+            .await
+            .is_ok()
+        {
+            let mut guard = state_for_task.lock().await;
+            guard.vram_lifecycle.on_vram_loaded();
+        }
+    });
 }
 
 async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -> Result<()> {
@@ -528,11 +650,13 @@ async fn handle_server_message(
                         guard.apply_model_policy(&ready.enabled_models);
                         guard.catalog = ready.catalog.clone();
                         guard.last_sync_token = None;
+                        let transition = guard.apply_schedule(ready.schedule.clone());
                         guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);
                         guard.persist_local_state();
-                    }
-                    if let Ok(engine) = state.lock().await.refresh_inference() {
-                        let _ = crate::inference::warm_pool_devices(engine.pool()).await;
+                        drop(guard);
+                        if transition.entered_earning {
+                            maybe_warm_models(state.clone()).await;
+                        }
                     }
                     send_register_message(state, write).await?;
                 }
@@ -563,11 +687,20 @@ async fn handle_server_message(
                 }
                 "pong" => {
                     if let Ok(pong) = parse_pong(data) {
-                        let mut guard = state.lock().await;
-                        guard.apply_compute_devices(&pong.compute_devices);
-                        guard.apply_model_policy(&pong.enabled_models);
-                        guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
-                        guard.persist_local_state();
+                        let transition = {
+                            let mut guard = state.lock().await;
+                            guard.apply_compute_devices(&pong.compute_devices);
+                            guard.apply_model_policy(&pong.enabled_models);
+                            guard.apply_purge_models(&pong.purge_models);
+                            let transition = guard.apply_schedule(pong.schedule.clone());
+                            guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
+                            guard.tick_vram_lifecycle();
+                            guard.persist_local_state();
+                            transition
+                        };
+                        if transition.entered_earning {
+                            maybe_warm_models(state.clone()).await;
+                        }
                     }
                 }
                 "error" => {
@@ -607,6 +740,7 @@ async fn respond_invoke(
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
+        guard.vram_lifecycle.on_job_started();
     }
     send_heartbeat(state, write).await?;
 
@@ -663,6 +797,7 @@ async fn respond_invoke(
         guard.job_state = JobState::Idle;
         guard.active_job_id = None;
         guard.active_model_id = None;
+        guard.vram_lifecycle.on_job_finished();
     }
     send_heartbeat(state, write).await?;
 
@@ -684,6 +819,7 @@ async fn respond_invoke_split(
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
+        guard.vram_lifecycle.on_job_started();
     }
     send_heartbeat(state, write).await?;
 
@@ -761,6 +897,7 @@ async fn respond_invoke_split(
         guard.job_state = JobState::Idle;
         guard.active_job_id = None;
         guard.active_model_id = None;
+        guard.vram_lifecycle.on_job_finished();
     }
     send_heartbeat(state, write).await?;
 

@@ -1,5 +1,5 @@
 use crate::config::AgentConfig;
-use crate::paths::{agent_log_path, install_dir, lib_dir};
+use crate::paths::agent_log_path;
 use crate::service;
 use crate::settings::UserSettings;
 use crate::state;
@@ -176,7 +176,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
     std::thread::spawn(move || {
         while status_req_rx.recv().is_ok() {
             let log_path = agent_log_path().ok();
-            let lines = gather_status_lines(&log_path);
+            let lines = gather_status_lines();
             if status_tx.send(lines).is_err() {
                 break;
             }
@@ -652,7 +652,7 @@ impl eframe::App for TrayApp {
                         let prev_settings = self.settings.clone();
                         ui.checkbox(
                             &mut self.settings.auto_update,
-                            "Automatically install updates (once daily at a random time)",
+                            "Automatically install updates",
                         );
                         self.save_settings_if_needed(&prev_settings);
 
@@ -760,7 +760,7 @@ impl eframe::App for TrayApp {
     }
 }
 
-fn gather_status_lines(log_path: &Option<PathBuf>) -> Vec<String> {
+fn gather_status_lines() -> Vec<String> {
     let mut lines = vec![format!("Version {}", env!("CARGO_PKG_VERSION"))];
     lines.push(state::cloud_connection_line());
 
@@ -772,25 +772,10 @@ fn gather_status_lines(log_path: &Option<PathBuf>) -> Vec<String> {
 
     let service_line = match service::background_status() {
         service::BackgroundStatus::Running => "Agent: running",
-        service::BackgroundStatus::Stopped => "Agent: stopped (will start at logon)",
-        service::BackgroundStatus::NotInstalled => "Agent: not configured",
+        service::BackgroundStatus::Stopped => "Agent: stopped · starts when you sign in",
+        service::BackgroundStatus::NotInstalled => "Agent: not set up yet",
     };
     lines.push(service_line.to_string());
-
-    #[cfg(windows)]
-    if let Some(method) = service::autostart_method_line() {
-        lines.push(format!("Autostart: {method}"));
-    }
-
-    if let Ok(bin) = install_dir() {
-        lines.push(format!("Bin: {}", bin.display()));
-    }
-    if let Ok(lib) = lib_dir() {
-        lines.push(format!("Lib: {}", lib.display()));
-    }
-    if let Some(log) = log_path {
-        lines.push(format!("Log: {}", log.display()));
-    }
 
     if let Some(summary) = state::agent_activity_summary() {
         lines.push(format!("Status: {}", summary.status));

@@ -59,35 +59,65 @@ Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/prov
 [Code]
 var
   TokenPage: TInputQueryWizardPage;
+  ModelsPage: TWizardPage;
+  PurgeModelsCheck: TNewCheckBox;
   PrefillToken: String;
   LibDir: String;
+  ModelsCacheDir: String;
+  ModelsCacheBytes: Int64;
+  ShowModelsPage: Boolean;
 
-function NeedsAddPath(Param: string): Boolean;
+function GetDirSize(const Dir: string; var Size: Int64): Boolean;
 var
-  OrigPath: string;
+  FindRec: TFindRec;
+  Path: string;
+  FileSize: Int64;
 begin
-  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', OrigPath) then
-    OrigPath := '';
-  Result := Pos(';' + UpperCase(Param) + ';', ';' + UpperCase(OrigPath) + ';') = 0;
+  Result := True;
+  if not DirExists(Dir) then
+    Exit;
+  if FindFirst(Dir + '\*', FindRec) then
+  try
+    repeat
+      if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+      begin
+        Path := Dir + '\' + FindRec.Name;
+        if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
+        begin
+          if not GetDirSize(Path, Size) then
+          begin
+            Result := False;
+            Exit;
+          end;
+        end
+        else
+        begin
+          FileSize := FindRec.Size;
+          FileSize := FileSize + (Int64(FindRec.SizeHigh) shl 32);
+          Size := Size + FileSize;
+        end;
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
 end;
 
-procedure AddToUserPath(PathToAdd: string);
+function FormatCacheSize(SizeBytes: Int64): String;
 var
-  OrigPath, NewPath: string;
+  Gb, Mb: Double;
 begin
-  if RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', OrigPath) then
-    NewPath := PathToAdd + ';' + OrigPath
+  Gb := SizeBytes / (1024.0 * 1024.0 * 1024.0);
+  if Gb >= 0.05 then
+    Result := Format('%.1f GB', [Gb])
   else
-    NewPath := PathToAdd;
-  RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath);
-end;
-
-procedure BroadcastEnvironmentChange;
-var
-  Msg: LongWord;
-begin
-  Msg := $001A;
-  SendNotifyMessage(HWND_BROADCAST, Msg, 0, 0);
+  begin
+    Mb := SizeBytes / (1024.0 * 1024.0);
+    if Mb >= 1.0 then
+      Result := Format('%.0f MB', [Mb])
+    else
+      Result := 'less than 1 MB';
+  end;
 end;
 
 function TokenLooksValid(const Token: string): Boolean;
@@ -122,14 +152,75 @@ begin
   end;
 end;
 
+function ShouldOfferModelPurge(): Boolean;
+var
+  InstallDir: String;
+begin
+  Result := ModelsCacheBytes > 0;
+  if not Result then
+    Exit;
+  InstallDir := ExpandConstant('{localappdata}\Scalattice\bin');
+  Result := IsUpgrade
+    or DirExists(InstallDir)
+    or (ReadSavedToken() <> '')
+    or FileExists(InstallDir + '\{#MyAppExeName}');
+end;
+
+procedure RemoveModelsCache;
+var
+  CacheRoot: String;
+begin
+  if not DirExists(ModelsCacheDir) then
+    Exit;
+  DelTree(ModelsCacheDir, True, True, True);
+  CacheRoot := ExpandConstant('{userpf}\.cache\scalattice');
+  if DirExists(CacheRoot) then
+    RemoveDir(CacheRoot);
+end;
+
+function NeedsAddPath(Param: string): Boolean;
+var
+  OrigPath: string;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', OrigPath) then
+    OrigPath := '';
+  Result := Pos(';' + UpperCase(Param) + ';', ';' + UpperCase(OrigPath) + ';') = 0;
+end;
+
+procedure AddToUserPath(PathToAdd: string);
+var
+  OrigPath, NewPath: string;
+begin
+  if RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', OrigPath) then
+    NewPath := PathToAdd + ';' + OrigPath
+  else
+    NewPath := PathToAdd;
+  RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath);
+end;
+
+procedure BroadcastEnvironmentChange;
+var
+  Msg: LongWord;
+begin
+  Msg := $001A;
+  SendNotifyMessage(HWND_BROADCAST, Msg, 0, 0);
+end;
+
 function InitializeSetup(): Boolean;
 begin
   PrefillToken := ExpandConstant('{param:TOKEN|}');
   LibDir := ExpandConstant('{localappdata}\Scalattice\lib');
+  ModelsCacheDir := ExpandConstant('{userpf}\.cache\scalattice\models');
+  ModelsCacheBytes := 0;
+  if DirExists(ModelsCacheDir) then
+    GetDirSize(ModelsCacheDir, ModelsCacheBytes);
+  ShowModelsPage := ShouldOfferModelPurge();
   Result := True;
 end;
 
 procedure InitializeWizard;
+var
+  SizeLabel: String;
 begin
   TokenPage := CreateInputQueryPage(
     wpWelcome,
@@ -139,7 +230,27 @@ begin
     'The installer saves the token, adds Scalattice to your PATH, and starts the background agent.');
   TokenPage.Add('Provider token (slt_provider_…):', False);
   if PrefillToken <> '' then
-    TokenPage.Values[0] := PrefillToken;
+    TokenPage.Values[0] := PrefillToken
+  else if ReadSavedToken() <> '' then
+    TokenPage.Values[0] := ReadSavedToken();
+
+  if ShowModelsPage then
+  begin
+    SizeLabel := FormatCacheSize(ModelsCacheBytes);
+    ModelsPage := CreateCustomPage(
+      TokenPage.ID,
+      'Stored model weights',
+      'A previous install left downloaded models on this PC (' + SizeLabel + ').',
+      'Keep them if you plan to run the agent again — reconnects stay instant.' + #13#10 + #13#10 +
+      'Remove them only if you want to free disk space. Enabled models will download again later.');
+    PurgeModelsCheck := TNewCheckBox.Create(ModelsPage);
+    PurgeModelsCheck.Parent := ModelsPage.Surface;
+    PurgeModelsCheck.Caption := 'Remove stored models (' + SizeLabel + ')';
+    PurgeModelsCheck.Left := ScaleX(0);
+    PurgeModelsCheck.Top := ScaleY(8);
+    PurgeModelsCheck.Width := ModelsPage.SurfaceWidth;
+    PurgeModelsCheck.Checked := False;
+  end;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -147,6 +258,8 @@ begin
   Result := True;
   if CurPageID = TokenPage.ID then
   begin
+    if ReadSavedToken() <> '' then
+      Exit;
     if not TokenLooksValid(Trim(TokenPage.Values[0])) then
     begin
       MsgBox('Enter a valid provider token starting with slt_provider_.' + #13#10 +
@@ -164,6 +277,9 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    if ShowModelsPage and (PurgeModelsCheck <> nil) and PurgeModelsCheck.Checked then
+      RemoveModelsCache;
+
     AppDir := ExpandConstant('{app}');
     if NeedsAddPath(AppDir) then
     begin

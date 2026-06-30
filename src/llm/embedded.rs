@@ -56,76 +56,74 @@ pub(crate) fn backend() -> Result<&'static LlamaBackend> {
 
 pub fn generate(config: &GenerateConfig) -> Result<GenerateOutput> {
     let backend = backend()?;
-    let model_params = model_params_for_pool(&config.pool)?;
     let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
         NonZeroU32::new(4096).context("invalid default context size")?,
     ));
 
-    let model = LlamaModel::load_from_file(backend, &config.model_path, &model_params)
-        .with_context(|| format!("load model {}", config.model_path.display()))?;
+    super::model_cache::with_loaded_model(&config.model_path, &config.pool, |model| {
+        let mut ctx = model
+            .new_context(backend, ctx_params)
+            .context("create llama context")?;
 
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .context("create llama context")?;
+        let prompt = build_chat_prompt(model, &config.messages)?;
+        let mut prompt_tokens = model
+            .str_to_token(&prompt, AddBos::Never)
+            .context("tokenize prompt")?;
 
-    let prompt = build_chat_prompt(&model, &config.messages)?;
-    let mut prompt_tokens = model
-        .str_to_token(&prompt, AddBos::Never)
-        .context("tokenize prompt")?;
-
-    let max_tokens = config.max_tokens.max(1).min(2048) as usize;
-    if prompt_tokens.len() + max_tokens > ctx.n_ctx() as usize {
-        anyhow::bail!(
-            "prompt too long for context window ({} + {} > {})",
-            prompt_tokens.len(),
-            max_tokens,
-            ctx.n_ctx()
-        );
-    }
-
-    let prompt_token_count = prompt_tokens.len() as u32;
-    let mut batch = LlamaBatch::new(prompt_tokens.len().max(1), 1);
-    let last = prompt_tokens.len().saturating_sub(1);
-    for (pos, token) in prompt_tokens.drain(..).enumerate() {
-        batch
-            .add(token, pos as i32, &[0], pos == last)
-            .context("add prompt token to batch")?;
-    }
-    ctx.decode(&mut batch).context("decode prompt")?;
-
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::dist(0x5CA1A7CE),
-        LlamaSampler::greedy(),
-    ]);
-
-    let mut content = String::new();
-    let mut position = last as i32;
-    let mut generated = 0u32;
-
-    while generated < max_tokens as u32 {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-
-        if model.is_eog_token(token) {
-            break;
+        let max_tokens = config.max_tokens.max(1).min(2048) as usize;
+        if prompt_tokens.len() + max_tokens > ctx.n_ctx() as usize {
+            anyhow::bail!(
+                "prompt too long for context window ({} + {} > {})",
+                prompt_tokens.len(),
+                max_tokens,
+                ctx.n_ctx()
+            );
         }
 
-        let piece = decode_token(&model, token)?;
-        content.push_str(&piece);
+        let prompt_token_count = prompt_tokens.len() as u32;
+        let mut batch = LlamaBatch::new(prompt_tokens.len().max(1), 1);
+        let last = prompt_tokens.len().saturating_sub(1);
+        for (pos, token) in prompt_tokens.drain(..).enumerate() {
+            batch
+                .add(token, pos as i32, &[0], pos == last)
+                .context("add prompt token to batch")?;
+        }
+        ctx.decode(&mut batch).context("decode prompt")?;
 
-        batch.clear();
-        position += 1;
-        batch
-            .add(token, position, &[0], true)
-            .context("add generated token to batch")?;
-        ctx.decode(&mut batch).context("decode generated token")?;
-        generated += 1;
-    }
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::dist(0x5CA1A7CE),
+            LlamaSampler::greedy(),
+        ]);
 
-    Ok(GenerateOutput {
-        content: sanitize_completion(&config.model_id, &content),
-        prompt_tokens: prompt_token_count,
-        completion_tokens: generated.max(1),
+        let mut content = String::new();
+        let mut position = last as i32;
+        let mut generated = 0u32;
+
+        while generated < max_tokens as u32 {
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
+
+            if model.is_eog_token(token) {
+                break;
+            }
+
+            let piece = decode_token(model, token)?;
+            content.push_str(&piece);
+
+            batch.clear();
+            position += 1;
+            batch
+                .add(token, position, &[0], true)
+                .context("add generated token to batch")?;
+            ctx.decode(&mut batch).context("decode generated token")?;
+            generated += 1;
+        }
+
+        Ok(GenerateOutput {
+            content: sanitize_completion(&config.model_id, &content),
+            prompt_tokens: prompt_token_count,
+            completion_tokens: generated.max(1),
+        })
     })
 }
 

@@ -15,7 +15,8 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`choco install innos
 ## What the installer does
 
 1. Welcome + token input (`slt_provider_…`)
-2. Copies `scalattice-agent.exe` to `%LOCALAPPDATA%\Scalattice\bin`
+2. **Reinstall only:** optional page to remove stored model weights (shows size in GB)
+3. Copies `scalattice-agent.exe` to `%LOCALAPPDATA%\Scalattice\bin`
 3. Copies bundled DLLs (including CUDA 12 runtime) to `%LOCALAPPDATA%\Scalattice\lib`
 4. Adds both folders to the user `PATH`
 5. Runs `scalattice-agent set-token` to register the background scheduled task
@@ -41,3 +42,5 @@ Uninstall via Windows Settings → Apps, or:
 ```text
 scalattice-agent uninstall --yes
 ```
+
+Add `--purge` to also delete cached model weights (`%USERPROFILE%\.cache\scalattice\models`).

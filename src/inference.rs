@@ -1,6 +1,7 @@
 use crate::compute_pool::VirtualCard;
 use crate::llm::{
-    generate, split_lower, split_upper, GenerateConfig, SplitLowerConfig, SplitUpperConfig,
+    generate, preload_model, split_lower, split_upper, GenerateConfig, SplitLowerConfig,
+    SplitUpperConfig,
 };
 use crate::models::{list_cached_runtime_models, models_dir, resolve_model_gguf};
 use crate::protocol::ChatMessage;
@@ -143,6 +144,32 @@ impl InferenceEngine {
             completion_tokens: output.completion_tokens,
         })
     }
+}
+
+/// Load enabled model weights into GPU memory so the first invoke skips disk load.
+pub async fn warm_cached_models(pool: &VirtualCard, runtime_models: &[String]) -> Result<()> {
+    if runtime_models.is_empty() {
+        return Ok(());
+    }
+    let pool = pool.clone();
+    let models = runtime_models.to_vec();
+    tokio::task::spawn_blocking(move || {
+        for runtime_model in models {
+            let Some(model_path) = resolve_model_gguf(&runtime_model) else {
+                continue;
+            };
+            if let Err(error) = preload_model(&model_path, &pool) {
+                tracing::warn!(
+                    runtime_model = %runtime_model,
+                    error = %error,
+                    "model preload failed"
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+    .context("model preload task failed")?
 }
 
 /// Optional health check: ping each CUDA device in the pool (no-op when unavailable).
