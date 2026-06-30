@@ -39,7 +39,7 @@ impl UserSettings {
         if !path.is_file() {
             return Self::default_with_jitter();
         }
-        let mut settings = fs::read_to_string(&path)
+        let mut settings: UserSettings = fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
