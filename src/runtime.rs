@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -32,6 +33,15 @@ pub struct AgentRuntime {
     pub loaded_models: Vec<String>,
     #[serde(rename = "modelsDiskGb", skip_serializing_if = "Option::is_none")]
     pub models_disk_gb: Option<u32>,
+    #[serde(rename = "modelDisk", skip_serializing_if = "HashMap::is_empty")]
+    pub model_disk: HashMap<String, SerializedModelDiskStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SerializedModelDiskStatus {
+    #[serde(rename = "diskGb")]
+    pub disk_gb: f64,
+    pub complete: bool,
 }
 
 pub fn build_runtime(
@@ -43,6 +53,7 @@ pub fn build_runtime(
     downloading_model: Option<&str>,
     blocked_enabled_models: usize,
     models_disk_gb: u32,
+    model_disk: HashMap<String, SerializedModelDiskStatus>,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
     let status_label = status_label(
@@ -75,7 +86,27 @@ pub fn build_runtime(
         } else {
             None
         },
+        model_disk,
     }
+}
+
+pub fn serialize_model_disk(
+    entries: &[(String, crate::models::ModelDiskStatus)],
+) -> HashMap<String, SerializedModelDiskStatus> {
+    entries
+        .iter()
+        .map(|(runtime_model, status)| {
+            let disk_gb = (status.bytes as f64) / 1024.0 / 1024.0 / 1024.0;
+            let disk_gb = (disk_gb * 10.0).round() / 10.0;
+            (
+                runtime_model.clone(),
+                SerializedModelDiskStatus {
+                    disk_gb,
+                    complete: status.complete,
+                },
+            )
+        })
+        .collect()
 }
 
 fn status_label(

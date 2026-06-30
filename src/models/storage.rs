@@ -100,6 +100,38 @@ fn dir_size_bytes(path: &Path) -> u64 {
     total
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelDiskStatus {
+    pub bytes: u64,
+    pub complete: bool,
+}
+
+pub fn list_model_disk_status() -> Vec<(String, ModelDiskStatus)> {
+    let Ok(entries) = std::fs::read_dir(models_dir()) else {
+        return Vec::new();
+    };
+
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let cache_key = entry.file_name().into_string().ok()?;
+            let runtime_model = cache_key.replace("__", "/");
+            let bytes = dir_size_bytes(&entry.path());
+            if bytes == 0 {
+                return None;
+            }
+            Some((
+                runtime_model.clone(),
+                ModelDiskStatus {
+                    bytes,
+                    complete: model_weights_ready(&runtime_model),
+                },
+            ))
+        })
+        .collect()
+}
+
 pub fn list_cached_runtime_models() -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(models_dir()) else {
         return Vec::new();

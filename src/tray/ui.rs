@@ -396,6 +396,7 @@ impl TrayApp {
                 }
                 UpdateWorkerMsg::InstallFailed(err) => {
                     self.update_busy = false;
+                    write_tray_log(&format!("update install failed: {err}"));
                     self.update_notice = format!("Update failed: {err}");
                     self.action_message.clear();
                     ctx.request_repaint();

@@ -457,6 +457,7 @@ impl SessionState {
             downloading.as_deref(),
             blocked_models,
             crate::models::models_cache_disk_gb(),
+            crate::runtime::serialize_model_disk(&crate::models::list_model_disk_status()),
         )
     }
 

@@ -6,9 +6,11 @@ use std::cmp::Ordering;
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const INSTALLER_NAME: &str = "ScalatticeAgentSetup-x86_64.exe";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 pub async fn check_for_update() -> Result<UpdateCheckOutcome> {
     let latest = fetch_latest_release().await?;
@@ -60,12 +62,27 @@ fn update_installer_path(tag: &str) -> Result<PathBuf> {
 pub fn spawn_installer_and_exit(installer: &Path) -> Result<()> {
     let install = install_dir().context("resolve install directory")?;
     let runner = write_update_runner(installer, &install)?;
-    Command::new("cmd.exe")
-        .args(["/C", "start", "", "/MIN", runner.to_string_lossy().as_ref()])
-        .creation_flags(0x0800_0000)
+    if !runner.is_file() {
+        anyhow::bail!("update runner script missing at {}", runner.display());
+    }
+
+    let cmd = windows_cmd();
+    Command::new(&cmd)
+        .arg("/C")
+        .arg(&runner)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .context("launch update runner")?;
+        .with_context(|| format!("launch update runner via {} {}", cmd.display(), runner.display()))?;
     std::process::exit(0);
+}
+
+fn windows_cmd() -> PathBuf {
+    std::env::var("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\cmd.exe"))
 }
 
 fn write_update_runner(installer: &Path, install_dir: &Path) -> Result<PathBuf> {
