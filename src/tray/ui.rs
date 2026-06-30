@@ -1,7 +1,7 @@
 use crate::config::AgentConfig;
 use crate::paths::{agent_log_path, install_dir, lib_dir};
 use crate::service;
-use crate::settings::{self, UserSettings};
+use crate::settings::UserSettings;
 use crate::state;
 use crate::update::{self, UpdateCheckOutcome};
 use anyhow::{Context, Result};
@@ -250,7 +250,7 @@ impl TrayApp {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
         let token_revealed = token_input.is_empty();
         let log_path = agent_log_path().ok();
-        let mut settings = UserSettings::load();
+        let settings = UserSettings::load();
         let should_save_defaults = match crate::paths::settings_path() {
             Ok(path) => !path.is_file(),
             Err(_) => true,
@@ -259,6 +259,11 @@ impl TrayApp {
             let _ = settings.save();
         }
         let should_check_now = settings.should_check_for_update();
+        let next_update_check = if should_check_now {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_secs(settings.seconds_until_update_check())
+        };
         let mut app = Self {
             event_rx,
             show_rx,
@@ -274,12 +279,7 @@ impl TrayApp {
             latest_version: None,
             update_notice: String::new(),
             settings,
-            next_update_check: if should_check_now {
-                Instant::now()
-            } else {
-                Instant::now()
-                    + Duration::from_secs(settings.seconds_until_update_check())
-            },
+            next_update_check,
             panel_hidden,
             token_input,
             token_revealed,
