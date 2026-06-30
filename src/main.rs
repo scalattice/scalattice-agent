@@ -15,7 +15,9 @@ mod update;
 #[cfg(windows)]
 mod tray;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
