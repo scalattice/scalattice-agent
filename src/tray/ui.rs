@@ -1,5 +1,5 @@
 use crate::config::AgentConfig;
-use crate::paths::agent_log_path;
+use crate::paths::{agent_log_path, install_dir};
 use crate::service;
 use crate::settings::UserSettings;
 use crate::state;
@@ -175,7 +175,6 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
     let (status_req_tx, status_req_rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
         while status_req_rx.recv().is_ok() {
-            let log_path = agent_log_path().ok();
             let lines = gather_status_lines();
             if status_tx.send(lines).is_err() {
                 break;
