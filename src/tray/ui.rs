@@ -488,10 +488,6 @@ impl TrayApp {
 
         match AgentConfig::from_env_and_cli(Some(token.clone())) {
             Ok(config) => {
-                if let Err(err) = service::persist_agent_token(&config.token) {
-                    self.action_message = format!("Could not save token: {err}");
-                    return;
-                }
                 self.token_revealed = false;
                 match service::restart_background_from_config(&config) {
                     Ok(()) => {

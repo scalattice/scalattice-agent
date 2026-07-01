@@ -29,7 +29,27 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
 }
 
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
-    ensure_background_task(config, true)
+    force_restart_background(config, true)
+}
+
+fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()> {
+    let _ = crate::service::persist_agent_token(&config.token)?;
+    let _ = write_background_runner()?;
+    sync_launch_scripts()?;
+
+    if !autostart_configured() {
+        ensure_agent_autostart_registered()?;
+    }
+
+    stop_background_for_token_restart()?;
+    spawn_background_detached()?;
+
+    if !skip_tray && !in_tray_process() {
+        ensure_tray_autostart_registered()?;
+        launch_tray_if_needed()?;
+    }
+
+    Ok(())
 }
 
 pub fn in_tray_process() -> bool {
@@ -153,11 +173,6 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     let runner_changed = write_background_runner()?;
     sync_launch_scripts()?;
 
-    if token_changed && background_agent_running() {
-        stop_background_agent_only();
-        std::thread::sleep(std::time::Duration::from_millis(600));
-    }
-
     let needs_register = !autostart_configured() || token_changed || runner_changed;
 
     if needs_register {
@@ -165,6 +180,9 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     }
 
     if token_changed || !background_agent_running() {
+        if token_changed && background_agent_running() {
+            stop_background_for_token_restart()?;
+        }
         spawn_background_detached()?;
     }
 
@@ -197,6 +215,37 @@ fn background_agent_running() -> bool {
 fn stop_background_agent_only() {
     let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
   Where-Object { $_.CommandLine -match 'foreground' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+fn stop_background_for_token_restart() -> Result<()> {
+    let _ = Command::new("schtasks")
+        .args(["/End", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    for _ in 0..10 {
+        stop_background_agent_only();
+        stop_non_tray_agent_processes();
+        if !background_agent_running() {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            if !background_agent_running() {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    bail!("could not stop the background agent; close it from Task Manager and try again")
+}
+
+fn stop_non_tray_agent_processes() {
+    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
+  Where-Object { $_.CommandLine -notmatch '\s+tray(\s|$)' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
     let _ = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])

@@ -1,4 +1,4 @@
-use crate::config::{AgentConfig, SCALATTICE_WS_URL};
+use crate::config::{read_saved_agent_token, AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
     AgentSchedule, CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage,
@@ -475,7 +475,7 @@ impl SessionState {
     }
 }
 
-pub async fn run_agent(config: AgentConfig) -> Result<()> {
+pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     if let Err(err) = crate::llm::init_backend() {
         warn!("embedded llama.cpp backend init failed: {err:#}");
     }
@@ -488,13 +488,30 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
         match run_agent_session(&config).await {
             Ok(()) => return Ok(()),
             Err(err) => {
-                state::mark_disconnected(Some(format!("{err:#}")));
-                warn!("disconnected: {err:#}; reconnecting in {:?}...", backoff);
+                let err_str = format!("{err:#}");
+                state::mark_disconnected(Some(err_str.clone()));
+                if is_token_auth_error(&err_str) {
+                    if let Some(fresh) = read_saved_agent_token() {
+                        if fresh != config.token {
+                            info!("provider token changed on disk; reconnecting immediately");
+                            config.token = fresh;
+                            backoff = Duration::from_secs(1);
+                            continue;
+                        }
+                    }
+                }
+                warn!("disconnected: {err_str}; reconnecting in {:?}...", backoff);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(120));
             }
         }
     }
+}
+
+fn is_token_auth_error(message: &str) -> bool {
+    message.contains("invalid_agent_token")
+        || message.contains("token_revoked")
+        || message.contains("invalid agent token")
 }
 
 async fn run_agent_session(config: &AgentConfig) -> Result<()> {

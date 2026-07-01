@@ -31,7 +31,25 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
 }
 
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
-    ensure_service_running(config)
+    if !background_service_available() {
+        return ensure_service_running(config);
+    }
+
+    let home = crate::paths::home_dir()?;
+    let unit_path = systemd_user_unit_path(&home);
+    let _ = crate::service::persist_agent_token(&config.token)?;
+    let _ = write_user_unit(&home)?;
+    sync_systemd_env_file(&home)?;
+    run_systemctl(&["--user", "daemon-reload"])?;
+
+    if unit_path.is_file() {
+        run_systemctl(&["--user", "restart", UNIT_NAME])?;
+    } else {
+        run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
+    }
+
+    verify_service_active()?;
+    Ok(())
 }
 
 pub fn invoked_by_systemd() -> bool {

@@ -132,8 +132,7 @@ async fn run_async(cli: Cli) -> Result<()> {
         }
         Some(Commands::SetToken { token }) => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
-            service::persist_agent_token(&config.token)?;
-            match service::start_background_from_config(&config) {
+            match service::restart_background_from_config(&config) {
                 Ok(()) => {
                     if service::service_active() {
                         println!("Token saved. Background agent running.");
