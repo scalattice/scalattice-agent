@@ -212,25 +212,16 @@ async fn run_foreground(token: Option<String>) -> Result<()> {
 }
 
 fn maybe_start_background_from_saved_token() -> Result<()> {
-    if !service::background_service_available() {
-        return Ok(());
-    }
-    if !agent_token_configured() {
-        return Ok(());
-    }
-    if service::service_active() {
-        return Ok(());
-    }
-    match service::background_status() {
-        service::BackgroundStatus::Running => Ok(()),
-        service::BackgroundStatus::Stopped | service::BackgroundStatus::NotInstalled => {
-            let config = config::AgentConfig::from_env_and_cli(None)?;
-            if let Err(err) = service::start_background_from_config(&config) {
-                if !service::service_active() {
-                    eprintln!("Note: could not auto-start background agent: {err}");
-                }
-            } else if service::service_active() {
+    match service::ensure_background_running_if_configured() {
+        Ok(()) => {
+            if service::service_active() {
                 println!("Background agent started.");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if !service::service_active() {
+                eprintln!("Note: could not auto-start background agent: {err}");
             }
             Ok(())
         }

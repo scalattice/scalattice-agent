@@ -159,6 +159,17 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
 
     write_tray_log("tray started");
 
+    std::thread::spawn(|| {
+        match service::ensure_background_running_if_configured() {
+            Ok(()) => {
+                if service::service_active() {
+                    write_tray_log("background agent auto-started");
+                }
+            }
+            Err(err) => write_tray_log(&format!("background auto-start failed: {err:#}")),
+        }
+    });
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([640.0, 680.0])

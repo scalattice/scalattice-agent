@@ -34,7 +34,13 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
 }
 
 pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
-    schedule_full_application_restart(config)
+    if in_tray_process() {
+        schedule_full_application_restart(config)
+    } else {
+        // Install / CLI set-token: register autostart and start the agent without killing
+        // a tray the installer may launch immediately afterward.
+        ensure_background_task(config, false)
+    }
 }
 
 pub fn schedule_full_application_restart(config: &AgentConfig) -> Result<()> {
@@ -63,7 +69,16 @@ ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyConti
     );
 
     std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let _ = sync_launch_scripts();
+    let _ = ensure_agent_autostart_registered();
+    let _ = ensure_tray_autostart_registered();
+
     spawn_background_detached()?;
+    if !wait_for_background_start(std::time::Duration::from_secs(8)) {
+        spawn_background_detached()?;
+        let _ = wait_for_background_start(std::time::Duration::from_secs(5));
+    }
     std::thread::sleep(std::time::Duration::from_millis(600));
     launch_tray_if_needed()?;
     Ok(())
@@ -257,6 +272,10 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
             stop_background_for_token_restart()?;
         }
         spawn_background_detached()?;
+        if !wait_for_background_start(std::time::Duration::from_secs(8)) {
+            spawn_background_detached()?;
+            let _ = wait_for_background_start(std::time::Duration::from_secs(5));
+        }
     }
 
     if !skip_tray && !in_tray_process() {
@@ -267,6 +286,17 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn wait_for_background_start(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if background_agent_running() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
 }
 
 fn background_agent_running() -> bool {

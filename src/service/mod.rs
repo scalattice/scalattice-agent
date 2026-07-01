@@ -36,6 +36,26 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::start_background_from_config(config)
 }
 
+/// Start the background agent when a token is saved but the foreground worker is not running.
+pub fn ensure_background_running_if_configured() -> Result<()> {
+    if !background_service_available() {
+        return Ok(());
+    }
+    if crate::config::read_saved_agent_token().is_none() {
+        return Ok(());
+    }
+    if service_active() {
+        return Ok(());
+    }
+    match background_status() {
+        BackgroundStatus::Running => Ok(()),
+        BackgroundStatus::Stopped | BackgroundStatus::NotInstalled => {
+            let config = crate::config::AgentConfig::from_env_and_cli(None)?;
+            start_background_from_config(&config)
+        }
+    }
+}
+
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::restart_background_from_config(config)
 }
