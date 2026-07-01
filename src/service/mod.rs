@@ -45,6 +45,11 @@ pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
     platform::restart_after_token_change(config)
 }
 
+#[cfg(windows)]
+pub fn run_restart_after_token_worker() -> Result<()> {
+    platform::run_restart_after_token_worker()
+}
+
 #[cfg(target_os = "linux")]
 pub fn stop_background_for_update() -> Result<()> {
     platform::stop_background_for_update()

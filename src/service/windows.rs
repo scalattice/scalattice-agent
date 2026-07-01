@@ -40,19 +40,65 @@ pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
 pub fn schedule_full_application_restart(config: &AgentConfig) -> Result<()> {
     let _ = crate::service::persist_agent_token(&config.token)?;
     let _ = write_background_runner_with_token(&config.token)?;
+    spawn_hidden_restart_worker()
+}
 
-    let helper = write_token_restart_helper()?;
-    let cmd = windows_cmd();
-    Command::new(&cmd)
-        .arg("/C")
-        .arg(&helper)
+pub fn run_restart_after_token_worker() -> Result<()> {
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let _ = hidden_powershell(
+        "[Environment]::SetEnvironmentVariable('SCALATTICE_AGENT_TOKEN', $null, 'User')",
+    );
+
+    for task in [TASK_NAME, TRAY_TASK_NAME] {
+        let _ = Command::new("schtasks")
+            .args(["/End", "/TN", task])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+
+    let _ = hidden_powershell(
+        r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
+ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#,
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    spawn_background_detached()?;
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    launch_tray_if_needed()?;
+    Ok(())
+}
+
+fn spawn_hidden_restart_worker() -> Result<()> {
+    let bin = resolve_agent_binary()?;
+    Command::new(&bin)
+        .arg("restart-after-token")
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("launch token restart helper via {}", cmd.display()))?;
+        .with_context(|| format!("launch restart worker via {}", bin.display()))?;
     Ok(())
+}
+
+fn hidden_powershell(script: &str) -> std::io::Result<std::process::Output> {
+    Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+}
+
+fn hidden_powershell_output(script: &str) -> std::io::Result<std::process::Output> {
+    Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
 }
 
 fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()> {
@@ -227,11 +273,7 @@ fn background_agent_running() -> bool {
     let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
   Where-Object { $_.CommandLine -match 'foreground' } |
   Select-Object -First 1 -ExpandProperty ProcessId"#;
-    match Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
+    match hidden_powershell_output(script) {
         Ok(output) if output.status.success() => {
             !String::from_utf8_lossy(&output.stdout).trim().is_empty()
         }
@@ -243,10 +285,7 @@ fn stop_background_agent_only() {
     let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
   Where-Object { $_.CommandLine -match 'foreground' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let _ = hidden_powershell(script);
 }
 
 fn stop_background_for_token_restart() -> Result<()> {
@@ -274,20 +313,14 @@ fn stop_non_tray_agent_processes() {
     let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
   Where-Object { $_.CommandLine -notmatch '\s+tray(\s|$)' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let _ = hidden_powershell(script);
 }
 
 fn stop_tray_agent_only() {
     let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
   Where-Object { $_.CommandLine -match '\s+tray(\s|$)' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let _ = hidden_powershell(script);
 }
 
 pub fn stop_agents_for_update() {
@@ -340,43 +373,6 @@ cd /d \"{install}\"\r\n\
 
     fs::write(&runner, script)?;
     Ok(changed)
-}
-
-fn write_token_restart_helper() -> Result<PathBuf> {
-    let install = install_dir()?;
-    let helper = std::env::temp_dir()
-        .join("Scalattice")
-        .join("restart-after-token.cmd");
-    if let Some(parent) = helper.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let script = format!(
-        "@echo off\r\n\
-setlocal\r\n\
-timeout /t 1 /nobreak >nul\r\n\
-powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable('SCALATTICE_AGENT_TOKEN', $null, 'User')\" >nul 2>&1\r\n\
-schtasks /End /TN {agent_task} >nul 2>&1\r\n\
-schtasks /End /TN {tray_task} >nul 2>&1\r\n\
-powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\"name='scalattice-agent.exe'\\\" | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}\"\r\n\
-timeout /t 2 /nobreak >nul\r\n\
-wscript.exe //nologo \"{install}\\launch-background.vbs\"\r\n\
-timeout /t 2 /nobreak >nul\r\n\
-wscript.exe //nologo \"{install}\\launch-tray.vbs\"\r\n\
-del /f /q \"%~f0\" >nul 2>&1\r\n",
-        agent_task = TASK_NAME,
-        tray_task = TRAY_TASK_NAME,
-        install = install.display(),
-    );
-
-    fs::write(&helper, script)?;
-    Ok(helper)
-}
-
-fn windows_cmd() -> PathBuf {
-    std::env::var("COMSPEC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\cmd.exe"))
 }
 
 fn sync_launch_scripts() -> Result<()> {

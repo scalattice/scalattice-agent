@@ -76,6 +76,10 @@ enum Commands {
         #[arg(long)]
         disable_auto: bool,
     },
+    /// Windows only: hidden worker that restarts background + tray after a token change
+    #[cfg(windows)]
+    #[command(hide = true)]
+    RestartAfterToken,
 }
 
 fn main() -> Result<()> {
@@ -135,19 +139,15 @@ async fn run_async(cli: Cli) -> Result<()> {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
             match service::restart_after_token_change(&config) {
                 Ok(()) => {
-                    if service::service_active() {
-                        println!("Token saved. Scalattice Agent is restarting.");
-                    } else {
-                        println!("Token saved. Scalattice Agent is restarting.");
-                    }
+                    println!("Token saved. Scalattice Agent is restarting.");
                 }
                 Err(err) => {
                     println!("Token saved.");
                     eprintln!("Note: {err}");
+                    #[cfg(windows)]
+                    spawn_tray_hidden()?;
                 }
             }
-            #[cfg(windows)]
-            spawn_tray_hidden()?;
             let _ = update::maybe_sync_auto_update_timer();
         }
         Some(Commands::Uninstall { yes, purge }) => {
@@ -158,6 +158,10 @@ async fn run_async(cli: Cli) -> Result<()> {
         }
         #[cfg(windows)]
         Some(Commands::Tray { .. }) => unreachable!("tray handled in main"),
+        #[cfg(windows)]
+        Some(Commands::RestartAfterToken) => {
+            service::run_restart_after_token_worker()?;
+        }
         Some(Commands::Update {
             check,
             enable_auto,

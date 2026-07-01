@@ -486,20 +486,20 @@ impl TrayApp {
             return;
         }
 
-        match AgentConfig::from_env_and_cli(Some(token.clone())) {
-            Ok(config) => {
-                self.token_revealed = false;
-                self.action_message = "Saving token and restarting…".to_string();
-                let restart = service::restart_after_token_change(&config);
-                match restart {
-                    Ok(()) => std::process::exit(0),
-                    Err(err) => {
-                        self.action_message = format!("Could not restart: {err}");
-                    }
-                }
+        let config = match AgentConfig::from_env_and_cli(Some(token)) {
+            Ok(config) => config,
+            Err(err) => {
+                self.action_message = err.to_string();
+                return;
             }
-            Err(err) => self.action_message = err.to_string(),
-        }
+        };
+
+        self.token_revealed = false;
+        self.action_message = "Saving token and restarting…".to_string();
+        std::thread::spawn(move || {
+            let _ = service::restart_after_token_change(&config);
+            std::process::exit(0);
+        });
     }
 
     fn open_dashboard(&mut self) {
