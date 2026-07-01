@@ -257,9 +257,18 @@ begin
   Result := True;
   if CurPageID = TokenPage.ID then
   begin
-    if ReadSavedToken() <> '' then
-      Exit;
-    if not TokenLooksValid(Trim(TokenPage.Values[0])) then
+    if Trim(TokenPage.Values[0]) <> '' then
+    begin
+      if not TokenLooksValid(Trim(TokenPage.Values[0])) then
+      begin
+        MsgBox('Enter a valid provider token starting with slt_provider_.' + #13#10 +
+          'Create one at scalattice.cloud/providers', mbError, MB_OK);
+        Result := False;
+      end;
+    end
+    else if ReadSavedToken() <> '' then
+      Exit
+    else
     begin
       MsgBox('Enter a valid provider token starting with slt_provider_.' + #13#10 +
         'Create one at scalattice.cloud/providers', mbError, MB_OK);
@@ -293,27 +302,24 @@ begin
 
     SavedToken := ReadSavedToken();
     SetTokenResult := 0;
-    if SavedToken <> '' then
+    Token := Trim(TokenPage.Values[0]);
+    if Token <> '' then
     begin
       Exec(AppDir + '\scalattice-run.cmd',
-        'status',
+        'set-token --token "' + Token + '"',
         AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
     end
-    else
+    else if SavedToken <> '' then
     begin
-      Token := Trim(TokenPage.Values[0]);
-      if Token <> '' then
-      begin
-        Exec(AppDir + '\scalattice-run.cmd',
-          'set-token --token "' + Token + '"',
-          AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
-      end;
+      Exec(AppDir + '\scalattice-run.cmd',
+        'set-token --token "' + SavedToken + '"',
+        AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
     end;
 
     Exec('wscript.exe', '//nologo "' + AppDir + '\launch-tray.vbs"',
       AppDir, SW_HIDE, ewNoWait, ResultCode);
 
-    if (SavedToken = '') and (SetTokenResult <> 0) then
+    if (SavedToken = '') and (Token = '') and (SetTokenResult <> 0) then
       MsgBox('Scalattice Agent was installed, but starting the background service failed.' + #13#10 +
         'Open Command Prompt and run:' + #13#10 +
         '  scalattice-run.cmd set-token --token YOUR_TOKEN' + #13#10 + #13#10 +

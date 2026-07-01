@@ -1,4 +1,4 @@
-use crate::config::{read_saved_agent_token, AgentConfig, SCALATTICE_WS_URL};
+use crate::config::{read_saved_agent_token, token_snippet, AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
     AgentSchedule, CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage,
@@ -491,16 +491,25 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
                 let err_str = format!("{err:#}");
                 state::mark_disconnected(Some(err_str.clone()));
                 if is_token_auth_error(&err_str) {
+                    warn!(
+                        "disconnected: {err_str} (token {}); reconnecting in {:?}...",
+                        token_snippet(&config.token),
+                        backoff
+                    );
                     if let Some(fresh) = read_saved_agent_token() {
                         if fresh != config.token {
-                            info!("provider token changed on disk; reconnecting immediately");
+                            info!(
+                                "retrying with saved token {}",
+                                token_snippet(&fresh)
+                            );
                             config.token = fresh;
                             backoff = Duration::from_secs(1);
                             continue;
                         }
                     }
+                } else {
+                    warn!("disconnected: {err_str}; reconnecting in {:?}...", backoff);
                 }
-                warn!("disconnected: {err_str}; reconnecting in {:?}...", backoff);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(120));
             }
@@ -515,6 +524,10 @@ fn is_token_auth_error(message: &str) -> bool {
 }
 
 async fn run_agent_session(config: &AgentConfig) -> Result<()> {
+    info!(
+        "connecting with provider token {}",
+        token_snippet(&config.token)
+    );
     let state = Arc::new(Mutex::new(SessionState::new()));
 
     let mut request = SCALATTICE_WS_URL
@@ -727,6 +740,12 @@ async fn handle_server_message(
                         .get("error")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error");
+                    if is_token_auth_error(message) {
+                        return Err(anyhow!(
+                            "server error: {message} (token {})",
+                            token_snippet(&config.token)
+                        ));
+                    }
                     return Err(anyhow!("server error: {message}"));
                 }
                 other => {

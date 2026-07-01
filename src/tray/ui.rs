@@ -489,17 +489,12 @@ impl TrayApp {
         match AgentConfig::from_env_and_cli(Some(token.clone())) {
             Ok(config) => {
                 self.token_revealed = false;
-                match service::restart_background_from_config(&config) {
-                    Ok(()) => {
-                        self.action_message =
-                            "Token saved. Background agent restarted.".to_string();
-                        self.kick_status_refresh();
-                    }
+                self.action_message = "Saving token and restarting…".to_string();
+                let restart = service::restart_after_token_change(&config);
+                match restart {
+                    Ok(()) => std::process::exit(0),
                     Err(err) => {
-                        self.action_message = format!(
-                            "Token saved. Background restart issue: {err}"
-                        );
-                        self.kick_status_refresh();
+                        self.action_message = format!("Could not restart: {err}");
                     }
                 }
             }

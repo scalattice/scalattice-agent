@@ -37,7 +37,8 @@ struct Cli {
 enum Commands {
     /// Follow live logs from the background agent (Ctrl+C stops watching only)
     Foreground {
-        #[arg(long, env = "SCALATTICE_AGENT_TOKEN", hide = true)]
+        /// Provider token (background launcher passes this; do not rely on SCALATTICE_AGENT_TOKEN env)
+        #[arg(long, hide = true)]
         token: Option<String>,
     },
     /// Show connection status and whether the background agent is running
@@ -132,12 +133,12 @@ async fn run_async(cli: Cli) -> Result<()> {
         }
         Some(Commands::SetToken { token }) => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
-            match service::restart_background_from_config(&config) {
+            match service::restart_after_token_change(&config) {
                 Ok(()) => {
                     if service::service_active() {
-                        println!("Token saved. Background agent running.");
+                        println!("Token saved. Scalattice Agent is restarting.");
                     } else {
-                        println!("Token saved. Agent will start at next logon (Startup folder).");
+                        println!("Token saved. Scalattice Agent is restarting.");
                     }
                 }
                 Err(err) => {
@@ -184,6 +185,9 @@ fn spawn_tray_hidden() -> Result<()> {
 async fn run_foreground(token: Option<String>) -> Result<()> {
     if service::invoked_by_systemd() || service::invoked_by_background_service() {
         let _ = update::maybe_sync_auto_update_timer();
+        let token = token
+            .filter(|t| !t.trim().is_empty())
+            .or_else(config::read_saved_agent_token);
         let config = config::AgentConfig::from_env_and_cli(token)?;
         return agent::run_agent(config).await;
     }

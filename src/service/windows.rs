@@ -5,9 +5,10 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 const TASK_NAME: &str = "ScalatticeAgent";
 const TRAY_TASK_NAME: &str = "ScalatticeAgentTray";
 const STARTUP_AGENT_VBS: &str = "ScalatticeAgent.vbs";
@@ -32,9 +33,31 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     force_restart_background(config, true)
 }
 
+pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
+    schedule_full_application_restart(config)
+}
+
+pub fn schedule_full_application_restart(config: &AgentConfig) -> Result<()> {
+    let _ = crate::service::persist_agent_token(&config.token)?;
+    let _ = write_background_runner_with_token(&config.token)?;
+
+    let helper = write_token_restart_helper()?;
+    let cmd = windows_cmd();
+    Command::new(&cmd)
+        .arg("/C")
+        .arg(&helper)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("launch token restart helper via {}", cmd.display()))?;
+    Ok(())
+}
+
 fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     let _ = crate::service::persist_agent_token(&config.token)?;
-    let _ = write_background_runner()?;
+    let _ = write_background_runner_with_token(&config.token)?;
     sync_launch_scripts()?;
 
     if !autostart_configured() {
@@ -114,7 +137,11 @@ pub fn follow_service_logs() -> Result<()> {
 }
 
 pub fn sync_background_env() -> Result<()> {
-    write_background_runner().map(|_| ())
+    if let Some(token) = crate::config::read_saved_agent_token() {
+        write_background_runner_with_token(&token).map(|_| ())
+    } else {
+        write_background_runner_with_token("").map(|_| ())
+    }
 }
 
 pub fn remove_background_service() -> Result<()> {
@@ -170,7 +197,7 @@ pub fn autostart_method_line() -> Option<String> {
 
 fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     let token_changed = crate::service::persist_agent_token(&config.token)?;
-    let runner_changed = write_background_runner()?;
+    let runner_changed = write_background_runner_with_token(&config.token)?;
     sync_launch_scripts()?;
 
     let needs_register = !autostart_configured() || token_changed || runner_changed;
@@ -268,32 +295,41 @@ pub fn stop_agents_for_update() {
     stop_tray_agent_only();
 }
 
-fn write_background_runner() -> Result<bool> {
+fn write_background_runner_with_token(token: &str) -> Result<bool> {
     let install = install_dir()?;
     let lib = lib_dir()?;
     let log = agent_log_path()?;
     let bin = resolve_agent_binary()?;
     let runner = install.join("run-background.cmd");
-    let token = crate::config::read_saved_agent_token().unwrap_or_default();
+    let token_arg = token.trim().replace('%', "%%").replace('"', "");
 
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::create_dir_all(&install)?;
 
+    let foreground_cmd = if token_arg.is_empty() {
+        format!("\"{}\" foreground", bin.display())
+    } else {
+        format!(
+            "\"{}\" foreground --token \"{}\"",
+            bin.display(),
+            token_arg
+        )
+    };
+
     let script = format!(
         "@echo off\r\n\
 setlocal\r\n\
 set SCALATTICE_BACKGROUND=1\r\n\
-set \"SCALATTICE_AGENT_TOKEN={token}\"\r\n\
+set SCALATTICE_AGENT_TOKEN=\r\n\
 set \"PATH={install};{lib};%PATH%\"\r\n\
 cd /d \"{install}\"\r\n\
-\"{bin}\" foreground >> \"{log}\" 2>&1\r\n",
-        token = token.replace('%', "%%"),
+{foreground_cmd} >> \"{log}\" 2>&1\r\n",
         install = install.display(),
         lib = lib.display(),
-        bin = bin.display(),
         log = log.display(),
+        foreground_cmd = foreground_cmd,
     );
 
     let changed = if runner.is_file() {
@@ -304,6 +340,43 @@ cd /d \"{install}\"\r\n\
 
     fs::write(&runner, script)?;
     Ok(changed)
+}
+
+fn write_token_restart_helper() -> Result<PathBuf> {
+    let install = install_dir()?;
+    let helper = std::env::temp_dir()
+        .join("Scalattice")
+        .join("restart-after-token.cmd");
+    if let Some(parent) = helper.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let script = format!(
+        "@echo off\r\n\
+setlocal\r\n\
+timeout /t 1 /nobreak >nul\r\n\
+powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable('SCALATTICE_AGENT_TOKEN', $null, 'User')\" >nul 2>&1\r\n\
+schtasks /End /TN {agent_task} >nul 2>&1\r\n\
+schtasks /End /TN {tray_task} >nul 2>&1\r\n\
+powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\"name='scalattice-agent.exe'\\\" | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}\"\r\n\
+timeout /t 2 /nobreak >nul\r\n\
+wscript.exe //nologo \"{install}\\launch-background.vbs\"\r\n\
+timeout /t 2 /nobreak >nul\r\n\
+wscript.exe //nologo \"{install}\\launch-tray.vbs\"\r\n\
+del /f /q \"%~f0\" >nul 2>&1\r\n",
+        agent_task = TASK_NAME,
+        tray_task = TRAY_TASK_NAME,
+        install = install.display(),
+    );
+
+    fs::write(&helper, script)?;
+    Ok(helper)
+}
+
+fn windows_cmd() -> PathBuf {
+    std::env::var("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\cmd.exe"))
 }
 
 fn sync_launch_scripts() -> Result<()> {

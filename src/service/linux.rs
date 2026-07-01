@@ -30,6 +30,10 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     ensure_service_running(config)
 }
 
+pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
+    restart_background_from_config(config)
+}
+
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     if !background_service_available() {
         return ensure_service_running(config);

@@ -31,19 +31,28 @@ fn parse_token_from_env_file(raw: &str) -> Option<String> {
     None
 }
 
+pub fn token_snippet(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() <= 20 {
+        return trimmed.to_string();
+    }
+    format!("{}…{}", &trimmed[..20], &trimmed[trimmed.len().saturating_sub(4)..])
+}
+
 pub fn read_saved_agent_token() -> Option<String> {
-    if let Some(token) = read_token_from_config_files() {
-        return Some(token);
-    }
+    read_token_from_config_files()
+}
 
-    if let Ok(token) = env::var("SCALATTICE_AGENT_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return Some(token);
-        }
-    }
-
-    None
+/// Token for interactive/CLI use: saved file, then process environment.
+pub fn resolve_agent_token(cli: Option<String>) -> Option<String> {
+    cli.filter(|t| !t.trim().is_empty())
+        .or_else(read_saved_agent_token)
+        .or_else(|| {
+            env::var("SCALATTICE_AGENT_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        })
 }
 
 fn read_token_from_config_files() -> Option<String> {
@@ -69,8 +78,7 @@ fn read_token_from_config_files() -> Option<String> {
 
 impl AgentConfig {
     pub fn from_env_and_cli(token: Option<String>) -> Result<Self> {
-        let token = token
-            .or_else(read_saved_agent_token)
+        let token = resolve_agent_token(token)
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .context(

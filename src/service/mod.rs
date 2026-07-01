@@ -40,6 +40,11 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::restart_background_from_config(config)
 }
 
+/// Persist the token and restart background + tray (Windows relaunches the whole app).
+pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
+    platform::restart_after_token_change(config)
+}
+
 #[cfg(target_os = "linux")]
 pub fn stop_background_for_update() -> Result<()> {
     platform::stop_background_for_update()
