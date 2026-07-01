@@ -66,8 +66,8 @@ pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub fn run_restart_after_token_worker() -> Result<()> {
-    platform::run_restart_after_token_worker()
+pub fn run_relaunch_tray_worker() -> Result<()> {
+    platform::run_relaunch_tray_worker()
 }
 
 #[cfg(target_os = "linux")]

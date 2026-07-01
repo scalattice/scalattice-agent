@@ -35,65 +35,64 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
 
 pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
     if in_tray_process() {
-        schedule_full_application_restart(config)
+        apply_token_and_restart_background(config)?;
+        spawn_relaunch_tray_worker()
     } else {
-        // Install / CLI set-token: register autostart and start the agent without killing
-        // a tray the installer may launch immediately afterward.
         ensure_background_task(config, false)
     }
 }
 
-pub fn schedule_full_application_restart(config: &AgentConfig) -> Result<()> {
-    let _ = crate::service::persist_agent_token(&config.token)?;
-    let _ = write_background_runner_with_token(&config.token)?;
-    spawn_hidden_restart_worker()
-}
-
-pub fn run_restart_after_token_worker() -> Result<()> {
-    std::thread::sleep(std::time::Duration::from_millis(600));
+fn apply_token_and_restart_background(config: &AgentConfig) -> Result<()> {
+    let token_changed = crate::service::persist_agent_token(&config.token)?;
+    let runner_changed = write_background_runner_with_token(&config.token)?;
+    sync_launch_scripts()?;
 
     let _ = hidden_powershell(
         "[Environment]::SetEnvironmentVariable('SCALATTICE_AGENT_TOKEN', $null, 'User')",
     );
 
-    for task in [TASK_NAME, TRAY_TASK_NAME] {
-        let _ = Command::new("schtasks")
-            .args(["/End", "/TN", task])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+    let needs_register = !autostart_configured() || token_changed || runner_changed;
+    if needs_register {
+        ensure_agent_autostart_registered()?;
+        ensure_tray_autostart_registered()?;
     }
 
-    let _ = hidden_powershell(
-        r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
-ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#,
-    );
-
-    std::thread::sleep(std::time::Duration::from_millis(600));
-
-    let _ = sync_launch_scripts();
-    let _ = ensure_agent_autostart_registered();
-    let _ = ensure_tray_autostart_registered();
-
-    spawn_background_detached()?;
-    if !wait_for_background_start(std::time::Duration::from_secs(8)) {
-        spawn_background_detached()?;
-        let _ = wait_for_background_start(std::time::Duration::from_secs(5));
+    if background_agent_running() {
+        stop_background_for_token_restart()?;
     }
-    std::thread::sleep(std::time::Duration::from_millis(600));
-    launch_tray_if_needed()?;
+
+    if token_changed || !background_agent_running() {
+        start_background_with_retry()?;
+    }
+
     Ok(())
 }
 
-fn spawn_hidden_restart_worker() -> Result<()> {
+pub fn run_relaunch_tray_worker() -> Result<()> {
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    launch_tray_if_needed()
+}
+
+fn start_background_with_retry() -> Result<()> {
+    spawn_background_detached()?;
+    wait_for_background_start_gentle();
+    if !background_agent_running() {
+        spawn_background_detached()?;
+        wait_for_background_start_gentle();
+    }
+    Ok(())
+}
+
+fn spawn_relaunch_tray_worker() -> Result<()> {
     let bin = resolve_agent_binary()?;
     Command::new(&bin)
-        .arg("restart-after-token")
+        .arg("relaunch-tray")
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("launch restart worker via {}", bin.display()))?;
+        .with_context(|| format!("launch tray relaunch worker via {}", bin.display()))?;
     Ok(())
 }
 
@@ -271,11 +270,7 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
         if token_changed && background_agent_running() {
             stop_background_for_token_restart()?;
         }
-        spawn_background_detached()?;
-        if !wait_for_background_start(std::time::Duration::from_secs(8)) {
-            spawn_background_detached()?;
-            let _ = wait_for_background_start(std::time::Duration::from_secs(5));
-        }
+        start_background_with_retry()?;
     }
 
     if !skip_tray && !in_tray_process() {
@@ -288,15 +283,13 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_background_start(timeout: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+fn wait_for_background_start_gentle() {
+    for delay_ms in [800_u64, 1200, 2000] {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         if background_agent_running() {
-            return true;
+            return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    false
 }
 
 fn background_agent_running() -> bool {
@@ -319,14 +312,8 @@ fn stop_background_agent_only() {
 }
 
 fn stop_background_for_token_restart() -> Result<()> {
-    let _ = Command::new("schtasks")
-        .args(["/End", "/TN", TASK_NAME])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-
-    for _ in 0..10 {
+    for _ in 0..6 {
         stop_background_agent_only();
-        stop_non_tray_agent_processes();
         if !background_agent_running() {
             std::thread::sleep(std::time::Duration::from_millis(150));
             if !background_agent_running() {
@@ -337,13 +324,6 @@ fn stop_background_for_token_restart() -> Result<()> {
     }
 
     bail!("could not stop the background agent; close it from Task Manager and try again")
-}
-
-fn stop_non_tray_agent_processes() {
-    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
-  Where-Object { $_.CommandLine -notmatch '\s+tray(\s|$)' } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
-    let _ = hidden_powershell(script);
 }
 
 fn stop_tray_agent_only() {

@@ -76,10 +76,10 @@ enum Commands {
         #[arg(long)]
         disable_auto: bool,
     },
-    /// Windows only: hidden worker that restarts background + tray after a token change
+    /// Windows only: hidden worker that relaunches the tray after a token change
     #[cfg(windows)]
     #[command(hide = true)]
-    RestartAfterToken,
+    RelaunchTray,
 }
 
 fn main() -> Result<()> {
@@ -159,8 +159,8 @@ async fn run_async(cli: Cli) -> Result<()> {
         #[cfg(windows)]
         Some(Commands::Tray { .. }) => unreachable!("tray handled in main"),
         #[cfg(windows)]
-        Some(Commands::RestartAfterToken) => {
-            service::run_restart_after_token_worker()?;
+        Some(Commands::RelaunchTray) => {
+            service::run_relaunch_tray_worker()?;
         }
         Some(Commands::Update {
             check,
