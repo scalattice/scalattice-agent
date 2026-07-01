@@ -153,22 +153,25 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     let runner_changed = write_background_runner()?;
     sync_launch_scripts()?;
 
+    if token_changed && background_agent_running() {
+        stop_background_agent_only();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+
     let needs_register = !autostart_configured() || token_changed || runner_changed;
 
     if needs_register {
-        register_agent_autostart()?;
+        ensure_agent_autostart_registered()?;
     }
 
     if token_changed || !background_agent_running() {
-        if background_agent_running() {
-            stop_background_agent_only();
-            std::thread::sleep(std::time::Duration::from_millis(400));
-        }
         spawn_background_detached()?;
     }
 
     if !skip_tray && !in_tray_process() {
-        register_tray_autostart()?;
+        if needs_register {
+            ensure_tray_autostart_registered()?;
+        }
         launch_tray_if_needed()?;
     }
 
@@ -222,6 +225,7 @@ fn write_background_runner() -> Result<bool> {
     let log = agent_log_path()?;
     let bin = resolve_agent_binary()?;
     let runner = install.join("run-background.cmd");
+    let token = crate::config::read_saved_agent_token().unwrap_or_default();
 
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
@@ -230,10 +234,13 @@ fn write_background_runner() -> Result<bool> {
 
     let script = format!(
         "@echo off\r\n\
+setlocal\r\n\
 set SCALATTICE_BACKGROUND=1\r\n\
+set \"SCALATTICE_AGENT_TOKEN={token}\"\r\n\
 set \"PATH={install};{lib};%PATH%\"\r\n\
 cd /d \"{install}\"\r\n\
 \"{bin}\" foreground >> \"{log}\" 2>&1\r\n",
+        token = token.replace('%', "%%"),
         install = install.display(),
         lib = lib.display(),
         bin = bin.display(),
@@ -359,20 +366,24 @@ fn startup_tray_shortcut_exists() -> bool {
         .unwrap_or(false)
 }
 
-fn register_agent_autostart() -> Result<()> {
-    if try_create_scheduled_task().is_ok() {
-        return run_scheduled_task_now();
+fn ensure_agent_autostart_registered() -> Result<()> {
+    if task_exists() {
+        return Ok(());
     }
-    install_startup_agent_shortcut()?;
-    spawn_background_detached()
+    if try_create_scheduled_task().is_ok() {
+        return Ok(());
+    }
+    install_startup_agent_shortcut()
 }
 
-fn register_tray_autostart() -> Result<()> {
-    if try_create_tray_task().is_ok() {
-        return run_tray_task_now();
+fn ensure_tray_autostart_registered() -> Result<()> {
+    if tray_task_exists() {
+        return Ok(());
     }
-    install_startup_tray_shortcut()?;
-    launch_tray_if_needed()
+    if try_create_tray_task().is_ok() {
+        return Ok(());
+    }
+    install_startup_tray_shortcut()
 }
 
 fn try_create_scheduled_task() -> Result<()> {

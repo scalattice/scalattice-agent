@@ -32,6 +32,10 @@ fn parse_token_from_env_file(raw: &str) -> Option<String> {
 }
 
 pub fn read_saved_agent_token() -> Option<String> {
+    if let Some(token) = read_token_from_config_files() {
+        return Some(token);
+    }
+
     if let Ok(token) = env::var("SCALATTICE_AGENT_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
@@ -39,6 +43,10 @@ pub fn read_saved_agent_token() -> Option<String> {
         }
     }
 
+    None
+}
+
+fn read_token_from_config_files() -> Option<String> {
     let config = config_dir().ok()?;
     for name in ["agent.env", "agent.systemd.env"] {
         let path = config.join(name);
