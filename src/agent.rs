@@ -475,6 +475,8 @@ impl SessionState {
     }
 }
 
+const TOKEN_UPDATED: &str = "token_updated";
+
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     if let Err(err) = crate::llm::init_backend() {
         warn!("embedded llama.cpp backend init failed: {err:#}");
@@ -485,10 +487,33 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
 
     let mut backoff = Duration::from_secs(3);
     loop {
+        if let Some(fresh) = read_saved_agent_token() {
+            if fresh != config.token {
+                info!(
+                    "provider token changed on disk, using {}",
+                    token_snippet(&fresh)
+                );
+                config.token = fresh;
+            }
+        }
+
         match run_agent_session(&config).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 let err_str = format!("{err:#}");
+                if err_str == TOKEN_UPDATED {
+                    if let Some(fresh) = read_saved_agent_token() {
+                        config.token = fresh;
+                    }
+                    state::mark_disconnected(Some("reconnecting with new token".to_string()));
+                    info!(
+                        "reconnecting with provider token {}",
+                        token_snippet(&config.token)
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    backoff = Duration::from_secs(1);
+                    continue;
+                }
                 state::mark_disconnected(Some(err_str.clone()));
                 if is_token_auth_error(&err_str) {
                     warn!(
@@ -550,6 +575,8 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
 
     let (mut write, mut read) = ws.split();
     let mut heartbeat = interval(Duration::from_secs(25));
+    let mut token_poll = interval(Duration::from_secs(1));
+    token_poll.tick().await;
 
     loop {
         tokio::select! {
@@ -560,6 +587,17 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
                 let msg = msg.context("websocket read error")?;
                 if !handle_server_message(config, &state, &mut write, msg).await? {
                     break;
+                }
+            }
+            _ = token_poll.tick() => {
+                if let Some(fresh) = read_saved_agent_token() {
+                    if fresh != config.token {
+                        info!(
+                            "provider token saved, reconnecting with {}",
+                            token_snippet(&fresh)
+                        );
+                        bail!(TOKEN_UPDATED);
+                    }
                 }
             }
             _ = heartbeat.tick() => {

@@ -65,9 +65,10 @@ pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
     platform::restart_after_token_change(config)
 }
 
-#[cfg(windows)]
-pub fn run_relaunch_tray_worker() -> Result<()> {
-    platform::run_relaunch_tray_worker()
+/// Save a new token for the running background agent to pick up without restarting the tray.
+pub fn save_agent_token(config: &AgentConfig) -> Result<()> {
+    persist_agent_token(&config.token)?;
+    ensure_background_running_if_configured()
 }
 
 #[cfg(target_os = "linux")]

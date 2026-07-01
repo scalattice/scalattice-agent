@@ -34,66 +34,7 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
 }
 
 pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
-    if in_tray_process() {
-        apply_token_and_restart_background(config)?;
-        spawn_relaunch_tray_worker()
-    } else {
-        ensure_background_task(config, false)
-    }
-}
-
-fn apply_token_and_restart_background(config: &AgentConfig) -> Result<()> {
-    let token_changed = crate::service::persist_agent_token(&config.token)?;
-    let runner_changed = write_background_runner_with_token(&config.token)?;
-    sync_launch_scripts()?;
-
-    let _ = hidden_powershell(
-        "[Environment]::SetEnvironmentVariable('SCALATTICE_AGENT_TOKEN', $null, 'User')",
-    );
-
-    let needs_register = !autostart_configured() || token_changed || runner_changed;
-    if needs_register {
-        ensure_agent_autostart_registered()?;
-        ensure_tray_autostart_registered()?;
-    }
-
-    if background_agent_running() {
-        stop_background_for_token_restart()?;
-    }
-
-    if token_changed || !background_agent_running() {
-        start_background_with_retry()?;
-    }
-
-    Ok(())
-}
-
-pub fn run_relaunch_tray_worker() -> Result<()> {
-    std::thread::sleep(std::time::Duration::from_millis(900));
-    launch_tray_if_needed()
-}
-
-fn start_background_with_retry() -> Result<()> {
-    spawn_background_detached()?;
-    wait_for_background_start_gentle();
-    if !background_agent_running() {
-        spawn_background_detached()?;
-        wait_for_background_start_gentle();
-    }
-    Ok(())
-}
-
-fn spawn_relaunch_tray_worker() -> Result<()> {
-    let bin = resolve_agent_binary()?;
-    Command::new(&bin)
-        .arg("relaunch-tray")
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("launch tray relaunch worker via {}", bin.display()))?;
-    Ok(())
+    ensure_background_task(config, false)
 }
 
 fn hidden_powershell(script: &str) -> std::io::Result<std::process::Output> {
@@ -280,6 +221,16 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
         launch_tray_if_needed()?;
     }
 
+    Ok(())
+}
+
+fn start_background_with_retry() -> Result<()> {
+    spawn_background_detached()?;
+    wait_for_background_start_gentle();
+    if !background_agent_running() {
+        spawn_background_detached()?;
+        wait_for_background_start_gentle();
+    }
     Ok(())
 }
 

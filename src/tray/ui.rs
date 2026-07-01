@@ -506,11 +506,14 @@ impl TrayApp {
         };
 
         self.token_revealed = false;
-        self.action_message = "Saving token and restarting…".to_string();
-        std::thread::spawn(move || {
-            let _ = service::restart_after_token_change(&config);
-            std::process::exit(0);
-        });
+        match service::save_agent_token(&config) {
+            Ok(()) => {
+                self.action_message = "Token saved. Reconnecting…".to_string();
+            }
+            Err(err) => {
+                self.action_message = format!("Could not save token: {err}");
+            }
+        }
     }
 
     fn open_dashboard(&mut self) {
