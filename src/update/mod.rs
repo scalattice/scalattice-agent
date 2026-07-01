@@ -30,7 +30,7 @@ impl UpdateCheckOutcome {
     }
 }
 
-const GITHUB_REPO: &str = "Robottik-Software/Scalattice-Client";
+const GITHUB_REPO: &str = "Robottik-Software/scalattice-agent";
 
 pub async fn check_for_update() -> anyhow::Result<UpdateCheckOutcome> {
     #[cfg(windows)]

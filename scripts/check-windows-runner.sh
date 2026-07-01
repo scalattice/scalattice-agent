@@ -21,7 +21,7 @@ No online self-hosted Windows runner with label "${RUNNER_LABEL}".
 One-time setup on your Windows build machine (Admin PowerShell):
 
   git clone https://github.com/${repo}.git
-  cd Scalattice-Client
+  cd scalattice-agent
   gh auth login
   .\\scripts\\setup-windows-build.ps1
   .\\scripts\\install-windows-runner.ps1

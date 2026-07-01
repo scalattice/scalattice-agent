@@ -1,7 +1,7 @@
 # Contributing to Scalattice Agent
 
 Thank you for your interest in **scalattice-agent**, the open-source GPU operator
-client for [Scalattice](https://scalattice.com).
+agent for [Scalattice](https://scalattice.com).
 
 This repository is published under the [MIT License](LICENSE). You may read,
 study, build, and run the software freely. **Most day-to-day development is done
@@ -16,7 +16,7 @@ and release pipeline. Unexpected changes can break live GPU fleets.
 
 | Type | Where | Notes |
 |------|--------|--------|
-| **Bug reports** | [GitHub Issues](https://github.com/Robottik-Software/Scalattice-Client/issues) | Repro steps, versions, logs |
+| **Bug reports** | [GitHub Issues](https://github.com/Robottik-Software/scalattice-agent/issues) | Repro steps, versions, logs |
 | **Security reports** | See [SECURITY.md](SECURITY.md) | Please do not open public issues |
 | **Documentation fixes** | Issue first, or small PR | Typos and factual corrections |
 | **Feature ideas** | GitHub Issues | Describe the provider/operator use case |
@@ -41,8 +41,8 @@ Requirements:
 - NVIDIA driver and/or Vulkan stack when testing GPU inference locally
 
 ```bash
-git clone https://github.com/Robottik-Software/Scalattice-Client.git
-cd Scalattice-Client
+git clone https://github.com/Robottik-Software/scalattice-agent.git
+cd scalattice-agent
 
 # x86_64 — CUDA + Vulkan
 cargo build --release --features gpu

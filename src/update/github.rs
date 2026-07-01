@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 pub(crate) const GITHUB_API_LATEST: &str =
-    "https://api.github.com/repos/Robottik-Software/Scalattice-Client/releases/latest";
+    "https://api.github.com/repos/Robottik-Software/scalattice-agent/releases/latest";
 
 const MIN_RELEASE_BYTES: u64 = 512 * 1024;
 const DOWNLOAD_ATTEMPTS: u32 = 3;
@@ -44,7 +44,7 @@ pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
 
 pub(crate) fn release_download_url(tag: &str, asset_name: &str) -> String {
     format!(
-        "https://github.com/Robottik-Software/Scalattice-Client/releases/download/{tag}/{asset_name}"
+        "https://github.com/Robottik-Software/scalattice-agent/releases/download/{tag}/{asset_name}"
     )
 }
 

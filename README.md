@@ -1,6 +1,6 @@
 # Scalattice Agent
 
-Open-source GPU operator client for the [Scalattice](https://scalattice.com) inference network.
+Open-source GPU operator agent for the [Scalattice](https://scalattice.com) inference network.
 
 Connects to Scalattice Cloud over WebSocket, registers your GPU, and accepts inference jobs routed by the hypervisor.
 
@@ -18,7 +18,7 @@ scalattice-agent status
 
 ### Windows
 
-Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/Robottik-Software/Scalattice-Client/releases/latest/download/ScalatticeAgentSetup-x86_64.exe)** from GitHub Releases (or use **Download Windows installer** on the Providers dashboard).
+Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/Robottik-Software/scalattice-agent/releases/latest/download/ScalatticeAgentSetup-x86_64.exe)** from GitHub Releases (or use **Download Windows installer** on the Providers dashboard).
 
 1. Run the setup wizard (approve SmartScreen if prompted)
 2. Paste your `slt_provider_…` token when asked
@@ -37,7 +37,7 @@ scalattice-agent uninstall --yes          # Windows (same command)
 
 Add `--purge` to also delete cached model weights.
 
-Install scripts download self-contained releases from [GitHub](https://github.com/Robottik-Software/Scalattice-Client) (binary + bundled runtime libraries), or build from source with Rust/Cargo. The Linux install script lives in **scalattice-server** (`frontend/public/install/agent`); Windows uses `ScalatticeAgentSetup-x86_64.exe` from GitHub Releases. After install, use the notification area icon for status, token changes, and live logs.
+Install scripts download self-contained releases from [GitHub](https://github.com/Robottik-Software/scalattice-agent) (binary + bundled runtime libraries), or build from source with Rust/Cargo. The Linux install script lives in **scalattice-server** (`frontend/public/install/agent`); Windows uses `ScalatticeAgentSetup-x86_64.exe` from GitHub Releases. After install, use the notification area icon for status, token changes, and live logs.
 
 ### Hardware support
 

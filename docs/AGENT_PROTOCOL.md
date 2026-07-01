@@ -1,6 +1,6 @@
 # Scalattice GPU Agent Protocol
 
-Public WebSocket protocol for `scalattice-agent` and other operator clients connecting to [Scalattice Cloud](https://scalattice.cloud).
+Public WebSocket protocol for `scalattice-agent` and other operator agents connecting to [Scalattice Cloud](https://scalattice.cloud).
 
 ## Connect
 

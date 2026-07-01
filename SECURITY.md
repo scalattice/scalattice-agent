@@ -4,7 +4,7 @@
 
 Security fixes are applied to **currently supported release tags** of
 `scalattice-agent`. Install the latest release from
-[GitHub Releases](https://github.com/Robottik-Software/Scalattice-Client/releases)
+[GitHub Releases](https://github.com/Robottik-Software/scalattice-agent/releases)
 or via:
 
 ```bash
