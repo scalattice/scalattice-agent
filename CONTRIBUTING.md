@@ -16,7 +16,7 @@ and release pipeline. Unexpected changes can break live GPU fleets.
 
 | Type | Where | Notes |
 |------|--------|--------|
-| **Bug reports** | [GitHub Issues](https://github.com/Robottik-Software/scalattice-agent/issues) | Repro steps, versions, logs |
+| **Bug reports** | [GitHub Issues](https://github.com/scalattice/scalattice-agent/issues) | Repro steps, versions, logs |
 | **Security reports** | See [SECURITY.md](SECURITY.md) | Please do not open public issues |
 | **Documentation fixes** | Issue first, or small PR | Typos and factual corrections |
 | **Feature ideas** | GitHub Issues | Describe the provider/operator use case |
@@ -41,7 +41,7 @@ Requirements:
 - NVIDIA driver and/or Vulkan stack when testing GPU inference locally
 
 ```bash
-git clone https://github.com/Robottik-Software/scalattice-agent.git
+git clone https://github.com/scalattice/scalattice-agent.git
 cd scalattice-agent
 
 # x86_64 — CUDA + Vulkan

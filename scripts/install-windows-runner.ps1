@@ -9,7 +9,7 @@
 #   .\scripts\install-windows-runner.ps1
 
 param(
-    [string]$Repo = "Robottik-Software/scalattice-agent",
+    [string]$Repo = "scalattice/scalattice-agent",
     [string]$RunnerName = $env:COMPUTERNAME,
     [string]$Labels = "self-hosted,Windows,X64,scalattice-release",
     [string]$WorkDir = "C:\actions-runner-scalattice",

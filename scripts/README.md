@@ -27,7 +27,7 @@
 On a Windows PC or VM (**Administrator** — cmd or PowerShell):
 
 ```cmd
-git clone https://github.com/Robottik-Software/scalattice-agent.git
+git clone https://github.com/scalattice/scalattice-agent.git
 cd scalattice-agent
 gh auth login
 scripts\setup-windows-build.cmd
