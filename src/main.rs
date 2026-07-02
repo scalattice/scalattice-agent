@@ -79,6 +79,8 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    paths::init_windows_native_search_path();
     init_crypto()?;
     init_logging();
 
@@ -178,9 +180,9 @@ async fn run_async(cli: Cli) -> Result<()> {
 #[cfg(windows)]
 fn spawn_tray_hidden() -> Result<()> {
     use std::os::windows::process::CommandExt;
-    let vbs = crate::paths::install_dir()?.join("launch-tray.vbs");
-    std::process::Command::new("wscript.exe")
-        .args(["//nologo", &vbs.display().to_string()])
+    let bin = crate::paths::resolve_agent_binary()?;
+    std::process::Command::new(&bin)
+        .arg("tray")
         .creation_flags(0x0800_0000)
         .spawn()
         .context("failed to launch tray")?;

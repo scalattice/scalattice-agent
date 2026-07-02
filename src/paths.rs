@@ -130,6 +130,33 @@ pub fn resolve_agent_binary() -> Result<PathBuf> {
     );
 }
 
+/// Ensure bundled CUDA/Vulkan DLLs resolve when the exe is launched from a Start Menu shortcut.
+#[cfg(windows)]
+pub fn init_windows_native_search_path() {
+    let Ok(install) = install_dir() else {
+        return;
+    };
+    if !install.is_dir() {
+        return;
+    }
+    let lib = lib_dir().ok().filter(|path| path.is_dir());
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut prefix = install.display().to_string();
+    if let Some(lib) = &lib {
+        prefix = format!("{};{}", prefix, lib.display());
+    }
+    if current
+        .to_ascii_lowercase()
+        .starts_with(&prefix.to_ascii_lowercase())
+    {
+        return;
+    }
+    let _ = std::env::set_var("PATH", format!("{prefix};{current}"));
+}
+
+#[cfg(not(windows))]
+pub fn init_windows_native_search_path() {}
+
 mod which {
     use std::path::PathBuf;
     use std::process::Command;
