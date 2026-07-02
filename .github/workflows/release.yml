@@ -104,14 +104,14 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare build environment
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-windows-ci.ps1
       - name: Sync Cargo.toml to release tag
         shell: cmd
         env:
           SCALATTICE_VERSION: ${{ inputs.tag }}
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-cargo-version.ps1
-      - name: Prepare build environment
-        shell: cmd
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-windows-ci.ps1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-windows-self-hosted-v5-${{ inputs.tag }}
@@ -144,12 +144,12 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Sync Cargo.toml to release tag
         shell: cmd
         env:
           SCALATTICE_VERSION: ${{ inputs.tag }}
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-cargo-version.ps1
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda
         with:

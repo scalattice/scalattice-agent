@@ -27,9 +27,52 @@ if ($updated -eq $text) {
     Write-Host "==> Cargo.toml set to v$Version"
 }
 
-# Keep Cargo.lock in sync when present.
-if (Get-Command cargo -ErrorAction SilentlyContinue) {
-    cargo generate-lockfile | Out-Null
+function Resolve-CargoExe {
+    $common = Join-Path $PSScriptRoot "windows-build-common.ps1"
+    if (Test-Path -LiteralPath $common) {
+        . $common
+        $paths = Get-WindowsBuildPathEntries
+        if ($paths.Count -gt 0) {
+            $env:PATH = (($paths -join ';') + ';' + $env:PATH)
+        }
+        Ensure-RunnerRustToolchain | Out-Null
+        if (Prioritize-SystemRustOnPath) {
+            try {
+                return (Get-SystemRustTool cargo)
+            } catch {
+                Write-Host "==> System Rust bootstrap incomplete: $_"
+            }
+        }
+    }
+
+    if ($env:CARGO -and (Test-Path -LiteralPath $env:CARGO)) {
+        return $env:CARGO
+    }
+
+    $cmd = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) {
+        return $cmd.Source
+    }
+
+    return $null
+}
+
+# Keep Cargo.lock in sync when a working cargo is available.
+$cargoExe = Resolve-CargoExe
+if (-not $cargoExe) {
+    Write-Host "==> Skipping Cargo.lock sync (cargo not on PATH yet)"
+} else {
+    try {
+        & $cargoExe --version | Out-Host
+        & $cargoExe generate-lockfile | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "cargo generate-lockfile exited $LASTEXITCODE (continuing)"
+        } else {
+            Write-Host "==> Cargo.lock refreshed"
+        }
+    } catch {
+        Write-Warning "cargo generate-lockfile failed: $_ (continuing)"
+    }
 }
 
 Write-Host "==> Verified: $(Select-String -Path $cargo -Pattern '^version = ' | Select-Object -First 1 -ExpandProperty Line)"
