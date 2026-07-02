@@ -40,18 +40,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
-      - name: Install build deps + CUDA
+      - name: Install build deps (Vulkan)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev cmake build-essential pkg-config wget glslc \
+          set -euo pipefail
+          apt_retry() {
+            local n=0 max=5 delay=20
+            until sudo "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then
+                echo "apt command failed after ${max} attempts: $*" >&2
+                return 1
+              fi
+              echo "==> apt failed (attempt ${n}/${max}), retrying in ${delay}s: $*"
+              sudo rm -rf /var/lib/apt/lists/*
+              sleep "$delay"
+              delay=$((delay + 15))
+            done
+          }
+          apt_retry apt-get update
+          apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget glslc \
             libvulkan-dev spirv-headers libshaderc-dev spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
-          keyring="cuda-keyring_1.1-1_all.deb"
-          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/${keyring}"
-          sudo dpkg -i "${keyring}"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cuda-nvcc-12-6 cuda-cudart-dev-12-6 cuda-nvrtc-dev-12-6 \
-            cuda-cccl-12-6 libcublas-dev-12-6 libcurand-dev-12-6
+      - name: Install CUDA
+        id: cuda
+        uses: mjun0812/setup-cuda@v1
+        with:
+          version: '12.6'
+          method: auto
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-aarch64-gpu
@@ -59,13 +73,14 @@ jobs:
           cache-workspace-crates: true
       - name: Build + package
         env:
-          CUDA_PATH: /usr/local/cuda-12.6
+          CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
           CMAKE_PREFIX_PATH: /usr
           Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
           CARGO_INCREMENTAL: "0"
         run: |
           set -euo pipefail
-          export PATH="/usr/local/cuda-12.6/bin:$PATH"
+          export PATH="${CUDA_PATH}/bin:$PATH"
+          nvcc --version
           cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --features arm-gpu
           mkdir -p dist
           cp target/aarch64-unknown-linux-gnu/release/scalattice-agent dist/
