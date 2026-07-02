@@ -26,15 +26,19 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo not found on PATH after Rust bootstrap"
 }
 
-& (Get-SystemRustTool rustc) --version
-& (Get-SystemRustTool cargo) --version
-$prev = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-try {
-    & (Get-SystemRustTool rustup) show
-} finally {
-    $ErrorActionPreference = $prev
+$rustc = Get-SystemRustTool rustc
+$cargo = Get-SystemRustTool cargo
+$rustup = Get-SystemRustTool rustup
+
+if ((Invoke-NativeTool $rustc --version) -ne 0) {
+    throw "rustc failed version check: $rustc"
 }
+if ((Invoke-NativeTool $cargo --version) -ne 0) {
+    throw "cargo failed version check: $cargo"
+}
+Invoke-NativeTool $rustup show | Out-Null
+
+Ensure-RustTarget -Target x86_64-pc-windows-msvc
 
 $clang = Find-LibClangDir
 if (-not $clang) {

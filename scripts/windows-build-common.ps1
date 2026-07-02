@@ -100,12 +100,77 @@ function Get-RunnerRustCargoBin {
     return Join-Path (Get-RunnerRustRoot) "cargo\bin"
 }
 
+function Get-RustHomesForCargoBin {
+    param([Parameter(Mandatory)][string]$CargoBin)
+
+    $cargoHome = Split-Path $CargoBin -Parent
+    $root = Split-Path $cargoHome -Parent
+    return @{
+        CargoHome  = $cargoHome
+        RustupHome = Join-Path $root "rustup"
+    }
+}
+
+function Set-RustHomesForCargoBin {
+    param([Parameter(Mandatory)][string]$CargoBin)
+
+    $homes = Get-RustHomesForCargoBin $CargoBin
+    $env:CARGO_HOME = $homes.CargoHome
+    $env:RUSTUP_HOME = $homes.RustupHome
+}
+
+function Test-RustToolRunnable {
+    param(
+        [Parameter(Mandatory)][string]$Exe
+    )
+
+    if (-not (Test-Path -LiteralPath $Exe)) {
+        return $false
+    }
+    return ((Invoke-NativeTool $Exe --version) -eq 0)
+}
+
+function Test-SystemRustRunnable {
+    param([Parameter(Mandatory)][string]$CargoBin)
+
+    if (-not (Test-Path -LiteralPath (Join-Path $CargoBin "cargo.exe"))) {
+        return $false
+    }
+
+    Set-RustHomesForCargoBin $CargoBin
+    if (-not (Test-RustToolRunnable (Join-Path $CargoBin "cargo.exe"))) {
+        return $false
+    }
+
+    $rustc = Join-Path $CargoBin "rustc.exe"
+    if (Test-Path -LiteralPath $rustc) {
+        return (Test-RustToolRunnable $rustc)
+    }
+
+    $rustup = Join-Path $CargoBin "rustup.exe"
+    if (-not (Test-Path -LiteralPath $rustup)) {
+        return $false
+    }
+
+    $resolved = (& $rustup which rustc 2>$null).Trim()
+    return ($LASTEXITCODE -eq 0) -and $resolved -and (Test-RustToolRunnable $resolved)
+}
+
 function Get-SystemRustCargoBin {
     $primary = Get-PrimaryRustCargoBin
-    if (Test-Path (Join-Path $primary "cargo.exe")) {
+    if (Test-SystemRustRunnable $primary) {
         return $primary
     }
-    return Get-RunnerRustCargoBin
+
+    $runner = Get-RunnerRustCargoBin
+    if (Test-SystemRustRunnable $runner) {
+        return $runner
+    }
+
+    if (Test-Path -LiteralPath (Join-Path $primary "cargo.exe")) {
+        return $primary
+    }
+    return $runner
 }
 
 function Get-SystemRustupHome {
@@ -152,9 +217,14 @@ function Invoke-NativeTool {
 function Ensure-RunnerRustToolchain {
     param([switch]$ExportForCi)
 
-    $primaryCargo = Join-Path (Get-PrimaryRustCargoBin) "cargo.exe"
-    if (Test-Path -LiteralPath $primaryCargo) {
+    $primaryBin = Get-PrimaryRustCargoBin
+    if (Test-SystemRustRunnable $primaryBin) {
+        Write-Host "==> Using system Rust at $primaryBin"
         return
+    }
+
+    if (Test-Path -LiteralPath (Join-Path $primaryBin "cargo.exe")) {
+        Write-Host "==> C:\Rust exists but is not runnable under the runner account; using C:\ar\rust"
     }
 
     $runnerRoot = Get-RunnerRustRoot
@@ -184,6 +254,9 @@ function Ensure-RunnerRustToolchain {
             throw "rustup target add x86_64-pc-windows-msvc failed (exit $code)"
         }
     }
+
+    Invoke-IcaclsGrant $runnerRoot "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"
+    Invoke-IcaclsGrant $runnerRoot "BUILTIN\Administrators:(OI)(CI)F"
 
     if ($ExportForCi -and $env:GITHUB_ENV) {
         "CARGO_HOME=$cargoHome" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -255,17 +328,24 @@ function Get-SystemRustTool {
     Set-SystemRustEnv | Out-Null
 
     $rustBin = Get-SystemRustCargoBin
+    Set-RustHomesForCargoBin $rustBin
+
     $exe = Join-Path $rustBin "$Name.exe"
-    if (Test-Path -LiteralPath $exe) {
+    if ((Test-Path -LiteralPath $exe) -and (Test-RustToolRunnable $exe)) {
         return $exe
     }
 
     if ($Name -eq 'rustup') {
+        if (Test-Path -LiteralPath $exe) { return $exe }
         throw "rustup.exe missing at $exe"
     }
 
     if (Repair-SystemRustProxies) {
-        return (Join-Path $rustBin "$Name.exe")
+        Set-RustHomesForCargoBin $rustBin
+        $exe = Join-Path $rustBin "$Name.exe"
+        if ((Test-Path -LiteralPath $exe) -and (Test-RustToolRunnable $exe)) {
+            return $exe
+        }
     }
 
     $rustup = Join-Path $rustBin "rustup.exe"
@@ -274,11 +354,11 @@ function Get-SystemRustTool {
     }
 
     $resolved = (& $rustup which $Name).Trim()
-    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $resolved)) {
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $resolved) -and (Test-RustToolRunnable $resolved)) {
         return $resolved
     }
 
-    throw "$Name.exe missing under $(Get-SystemRustCargoBin) and rustup which $Name failed"
+    throw "$Name.exe is not runnable under $(Get-SystemRustCargoBin)"
 }
 
 function Prioritize-SystemRustOnPath {
@@ -405,6 +485,9 @@ function Install-SystemWideRust {
     if (-not (Test-Path $cargoExe)) {
         throw "rustup-init completed but cargo.exe missing at $cargoExe"
     }
+
+    Invoke-IcaclsGrant $rustRoot "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M"
+    Invoke-IcaclsGrant $rustRoot "BUILTIN\Administrators:(OI)(CI)F"
     Write-Host "==> System-wide Rust installed: $cargoExe"
 }
 

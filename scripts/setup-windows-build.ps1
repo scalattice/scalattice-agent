@@ -33,11 +33,7 @@ if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -and
     Write-Host "==> Inno Setup already installed"
 }
 
-if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Invoke-Choco @("install", "-y", "--no-progress", "rust")
-} else {
-    Write-Host "==> Rust/cargo already installed"
-}
+Install-SystemWideRust
 
 Ensure-BuildMachinePath
 

@@ -1,30 +1,94 @@
 # Scripts
 
-| Script | Purpose |
-|--------|---------|
-| **`release.sh --dev`** | **One command:** Linux x86_64 local + Windows on self-hosted runner. |
-| **`release.sh`** | Full release: Linux + Windows (self-hosted) + aarch64 (GitHub ARM). |
-| `setup-windows-build.ps1` | One-time Windows build deps (VS, CUDA, Inno Setup, Rust). |
-| `install-windows-runner.ps1` | Register Windows machine as GitHub Actions runner. |
-| `check-windows-runner.sh` | Verify runner is online (called by `release.sh`). |
-| `build-release.sh` | Build Linux x86_64 locally. |
-| `build-release.ps1` | Build Windows (used by self-hosted runner). |
+Most day-to-day work is **one command on Linux**. Everything else is setup or troubleshooting.
 
-## One-command release (after setup)
+## What to run
 
-**On Linux (onsite):**
-```bash
+| You want to… | Command | Where |
+|--------------|---------|--------|
+| **Ship a release** (Linux + Windows) | `./scripts/release.sh --dev` | Linux onsite |
+| **Ship all platforms** (+ aarch64 CI) | `./scripts/release.sh` | Linux onsite |
+| **First-time Windows build machine** | `scripts\setup-windows-build.cmd` | Windows (Admin) |
+| **Register Windows CI runner** | `scripts\install-windows-runner.cmd` | Windows (Admin) |
+| **Check runner is online** | `./scripts/check-windows-runner.sh` | Linux |
+| **Troubleshoot Windows install** | `.\scripts\diagnose-windows.ps1` | Windows |
+| **Reset GitHub tags/releases** | `./scripts/reset-releases.sh --confirm` | Linux (rare) |
+
+---
+
+## Release flow
+
+```
+Linux (onsite)                         Windows (self-hosted runner)
+─────────────────                      ───────────────────────────
 ./scripts/release.sh --dev
+  ├─ build-release.sh        local x86_64 tarball
+  ├─ gh release create
+  └─ trigger GHA workflow ─────────────► prepare-windows-ci.ps1
+                                           build-release.ps1
+                                             ├─ sync-cargo-version.ps1
+                                             ├─ bundle-release-windows.ps1
+                                             └─ build-windows-installer.ps1
 ```
 
-1. Builds **x86_64 Linux** locally  
-2. Pushes, creates GitHub Release with Linux tarball  
-3. Triggers Windows build on your **self-hosted runner**  
-4. Waits and uploads `ScalatticeAgentSetup-x86_64.exe` + zip  
+**`release.sh --dev`** — Linux x86_64 here + Windows on your runner (skip aarch64).  
+**`release.sh`** — same + aarch64 on GitHub `ubuntu-24.04-arm`.
+
+Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-hosted-windows`, `--no-push`.
+
+---
+
+## File map
+
+### Release orchestration
+
+| Script | Purpose |
+|--------|---------|
+| `release.sh` | Main entry: build Linux, create GitHub release, trigger Windows/aarch64 CI, upload assets |
+| `reset-releases.sh` | Delete all tags/releases and reset `Cargo.toml` to 1.0.0 (destructive; needs `--confirm`) |
+| `check-windows-runner.sh` | Verify an online self-hosted runner with label `scalattice-release` (used by `release.sh`) |
+
+### Linux build
+
+| Script | Purpose |
+|--------|---------|
+| `build-release.sh` | `cargo build` x86_64/aarch64 + tarball (called by `release.sh` or manually) |
+| `bundle-release-libs.sh` | Copy `.so` dependencies next to the Linux binary |
+
+### Windows build (CI + local)
+
+| Script | Purpose |
+|--------|---------|
+| `windows-build-common.ps1` | Shared library: Rust/CUDA/MSVC paths, runner bootstrap (**do not run directly**) |
+| `prepare-windows-ci.ps1` | GHA self-hosted prep: PATH, Rust, `LIBCLANG_PATH`, short `CARGO_TARGET_DIR` |
+| `sync-cargo-version.ps1` | Set `Cargo.toml` version to match release tag |
+| `build-release.ps1` | Full Windows release build (exe + zip + installer) |
+| `bundle-release-windows.ps1` | Copy CUDA/runtime DLLs into `dist/lib` |
+| `build-windows-installer.ps1` | Run Inno Setup → `ScalatticeAgentSetup-x86_64.exe` |
+
+### Windows one-time setup
+
+| Script | Purpose |
+|--------|---------|
+| `setup-windows-build.ps1` | Install VS C++, CUDA 12.6, LLVM, Inno Setup, system Rust at `C:\Rust` |
+| `setup-windows-build.cmd` | Admin wrapper (bypasses execution policy) |
+| `install-windows-runner.ps1` | Register machine as GHA runner (`scalattice-release` label) |
+| `install-windows-runner.cmd` | Admin wrapper |
+
+### Windows diagnostics
+
+| Script | Purpose |
+|--------|---------|
+| `diagnose-windows.ps1` | Installed agent health, logs, autostart, CUDA DLLs |
+| | `-Bundle` — check `dist/` before shipping |
+| | `-InstalledOnly` — CUDA DLLs under `%LOCALAPPDATA%\Scalattice` |
+| | `-LaunchTray` — open tray UI in current console |
+
+---
 
 ## One-time Windows setup
 
-On a Windows PC or VM (**Administrator** — cmd or PowerShell):
+Administrator **cmd** or PowerShell:
 
 ```cmd
 git clone https://github.com/scalattice/scalattice-agent.git
@@ -34,57 +98,36 @@ scripts\setup-windows-build.cmd
 scripts\install-windows-runner.cmd
 ```
 
-If PowerShell blocks `.ps1` files (`running scripts is disabled`), use the `.cmd` wrappers above, or run:
-
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\setup-windows-build.ps1
-```
-
-The runner installs as a Windows service (`C:\actions-runner-scalattice`) and stays online for future releases.
-
 Verify from Linux:
+
 ```bash
 ./scripts/check-windows-runner.sh
 ```
 
-## Full release
-
-```bash
-./scripts/release.sh
-```
-
-Same as `--dev`, plus **aarch64** on GitHub-hosted ARM runners.
-
-## Options
-
-| Flag | When |
-|------|------|
-| `--dev` | Linux + Windows only (no aarch64) |
-| `--skip-build` | Reuse existing Linux `dist/` tarball |
-| `--local-windows` | Upload `dist/*.exe` from disk; skip Windows CI |
-| `--github-hosted-windows` | Slow fallback (~1h) on GitHub `windows-2022` |
-| `--version 1.0.2` | Pin version |
-| `--no-push` | Dry run |
-
-## Artifacts on GitHub Releases
-
-| Platform | Asset |
-|----------|--------|
-| Linux x86_64 | `scalattice-agent-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `scalattice-agent-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows | `ScalatticeAgentSetup-x86_64.exe` · `scalattice-agent-x86_64-pc-windows-msvc.zip` |
+---
 
 ## Linux build prerequisites
 
 - Rust: https://rustup.rs  
 - GitHub CLI: `gh auth login`  
-- CUDA 12.6 dev + Vulkan (see `build-release.sh` if missing)
+- CUDA 12.6 dev + Vulkan (`build-release.sh` prints apt hints if missing)
 
-## Emergency: re-run Windows CI only
+---
+
+## Emergency: Windows CI only
 
 ```bash
-gh workflow run .github/workflows/release.yml --ref main \
-  -f tag=v1.0.2 -f targets=windows-only -f windows_runner=self-hosted
+gh workflow run release.yml -R scalattice/scalattice-agent \
+  -f tag=v1.0.0 -f targets=windows-only -f windows_runner=self-hosted
 gh run watch
 ```
+
+---
+
+## GitHub release assets
+
+| Platform | Asset |
+|----------|--------|
+| Linux x86_64 | `scalattice-agent-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64 | `scalattice-agent-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows | `ScalatticeAgentSetup-x86_64.exe`, `scalattice-agent-x86_64-pc-windows-msvc.zip` |

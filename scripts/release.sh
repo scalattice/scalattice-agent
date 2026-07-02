@@ -9,7 +9,7 @@
 #   .\scripts\setup-windows-build.ps1
 #   .\scripts\install-windows-runner.ps1
 #
-# Requires: rust, CUDA 12.6 dev, gh auth login (see scripts/README.md).
+# Requires: rust, CUDA 12.6 dev, gh auth login. Full script map: scripts/README.md
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
