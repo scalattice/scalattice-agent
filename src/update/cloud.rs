@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-pub(crate) const GITHUB_API_LATEST: &str =
-    "https://api.github.com/repos/scalattice/scalattice-agent/releases/latest";
+/// Scalattice Cloud release channel (repo name is resolved server-side only).
+pub(crate) const CLOUD_RELEASE_BASE: &str = "https://scalattice.cloud/api/v1/health/agent-release";
 
 const MIN_RELEASE_BYTES: u64 = 512 * 1024;
 const DOWNLOAD_ATTEMPTS: u32 = 3;
@@ -24,28 +24,47 @@ pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
         .context("build HTTP client")?;
 
     let response = client
-        .get(GITHUB_API_LATEST)
-        .header("Accept", "application/vnd.github+json")
+        .get(format!("{CLOUD_RELEASE_BASE}/latest"))
+        .header("Accept", "application/json")
         .send()
         .await
-        .context("request GitHub latest release")?
+        .context("request Scalattice Cloud latest release")?
         .error_for_status()
-        .context("GitHub latest release request failed")?;
+        .context("Scalattice Cloud latest release request failed")?;
 
-    let payload: serde_json::Value = response.json().await.context("parse GitHub release JSON")?;
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .context("parse Scalattice Cloud release JSON")?;
     let tag = payload
-        .get("tag_name")
+        .get("tag")
         .and_then(|v| v.as_str())
-        .context("release missing tag_name")?
+        .context("release missing tag")?
         .to_string();
-    let version = normalize_version(&tag);
+    let version = payload
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(normalize_version)
+        .unwrap_or_else(|| normalize_version(&tag));
     Ok(LatestRelease { tag, version })
 }
 
 pub(crate) fn release_download_url(tag: &str, asset_name: &str) -> String {
     format!(
-        "https://github.com/scalattice/scalattice-agent/releases/download/{tag}/{asset_name}"
+        "{CLOUD_RELEASE_BASE}/download/{}/{}",
+        urlencoding_path(tag),
+        urlencoding_path(asset_name)
     )
+}
+
+fn urlencoding_path(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u8),
+        })
+        .collect()
 }
 
 pub(crate) async fn download_release_asset(
@@ -125,9 +144,7 @@ async fn download_release_asset_once(url: &str, asset_name: &str, dest: &Path) -
 
     if downloaded < MIN_RELEASE_BYTES {
         tokio::fs::remove_file(&tmp).await.ok();
-        anyhow::bail!(
-            "download for {asset_name} looks too small ({downloaded} bytes)"
-        );
+        anyhow::bail!("download for {asset_name} looks too small ({downloaded} bytes)");
     }
 
     tokio::fs::rename(&tmp, dest)

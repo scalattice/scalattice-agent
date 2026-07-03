@@ -1,4 +1,4 @@
-use super::github::{download_release_asset, fetch_latest_release};
+use super::cloud::{download_release_asset, fetch_latest_release};
 use super::{compare_versions, current_version, UpdateCheckOutcome, UpdateInfo};
 use crate::paths::install_dir;
 use anyhow::{Context, Result};

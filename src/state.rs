@@ -153,7 +153,8 @@ pub fn read_state() -> Option<AgentLocalState> {
 pub fn cloud_connection_line() -> String {
     let Some(state) = read_state() else {
         if service_hint() {
-            return "Scalattice Cloud: unknown (agent running, see agent.log)".to_string();
+            // Service is up but has not written state yet (common right after install).
+            return "Scalattice Cloud: agent started, connecting…".to_string();
         }
         return "Scalattice Cloud: not connected".to_string();
     };

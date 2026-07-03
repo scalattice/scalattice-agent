@@ -1,4 +1,4 @@
-mod github;
+mod cloud;
 mod version;
 
 #[cfg(target_os = "linux")]
@@ -30,8 +30,6 @@ impl UpdateCheckOutcome {
     }
 }
 
-const GITHUB_REPO: &str = "scalattice/scalattice-agent";
-
 pub async fn check_for_update() -> anyhow::Result<UpdateCheckOutcome> {
     #[cfg(windows)]
     {
@@ -43,7 +41,6 @@ pub async fn check_for_update() -> anyhow::Result<UpdateCheckOutcome> {
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = GITHUB_REPO;
         anyhow::bail!("automatic updates are not supported on this platform");
     }
 }

@@ -476,6 +476,9 @@ impl SessionState {
 }
 
 const TOKEN_UPDATED: &str = "token_updated";
+/// Fixed short delay only — no exponential backoff. Tiny pause so a dead server
+/// cannot pin a core in a tight reconnect loop.
+const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     if let Err(err) = crate::llm::init_backend() {
@@ -485,7 +488,6 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
 
-    let mut backoff = Duration::from_secs(3);
     loop {
         if let Some(fresh) = read_saved_agent_token() {
             if fresh != config.token {
@@ -510,16 +512,14 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
                         "reconnecting with provider token {}",
                         token_snippet(&config.token)
                     );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    backoff = Duration::from_secs(1);
+                    tokio::time::sleep(RECONNECT_DELAY).await;
                     continue;
                 }
                 state::mark_disconnected(Some(err_str.clone()));
                 if is_token_auth_error(&err_str) {
                     warn!(
-                        "disconnected: {err_str} (token {}); reconnecting in {:?}...",
-                        token_snippet(&config.token),
-                        backoff
+                        "disconnected: {err_str} (token {}); reconnecting...",
+                        token_snippet(&config.token)
                     );
                     if let Some(fresh) = read_saved_agent_token() {
                         if fresh != config.token {
@@ -528,15 +528,13 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
                                 token_snippet(&fresh)
                             );
                             config.token = fresh;
-                            backoff = Duration::from_secs(1);
                             continue;
                         }
                     }
                 } else {
-                    warn!("disconnected: {err_str}; reconnecting in {:?}...", backoff);
+                    warn!("disconnected: {err_str}; reconnecting...");
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(120));
+                tokio::time::sleep(RECONNECT_DELAY).await;
             }
         }
     }
