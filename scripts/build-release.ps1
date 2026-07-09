@@ -85,9 +85,15 @@ if ($syncVersion -and $builtVersion -notmatch [regex]::Escape($syncVersion)) {
 
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\scalattice-run.cmd") -Destination "dist\scalattice-run.cmd" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-tray.vbs") -Destination "dist\launch-tray.vbs" -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-tray-interactive.vbs") -Destination "dist\launch-tray-interactive.vbs" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-background.vbs") -Destination "dist\launch-background.vbs" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\open-tray-debug.cmd") -Destination "dist\open-tray-debug.cmd" -Force
 & (Join-Path $PSScriptRoot "bundle-release-windows.ps1") -Binary "dist\scalattice-agent.exe" -OutDir "dist" -BuildRoot $releaseDir
+
+. (Join-Path $PSScriptRoot "sign-artifact-windows.ps1")
+Invoke-ScalatticeArtifactSigning -Paths @(
+    (Join-Path (Get-Location) "dist\scalattice-agent.exe")
+)
 
 Write-Host ""
 Write-Host "==> Bundled runtime libraries"
@@ -126,6 +132,9 @@ if ((Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -or (Test-Path 
         $installerVersion = $env:SCALATTICE_VERSION.TrimStart('v')
     }
     & (Join-Path $PSScriptRoot "build-windows-installer.ps1") -AppVersion $installerVersion
+    Invoke-ScalatticeArtifactSigning -Paths @(
+        (Join-Path (Get-Location) "dist\ScalatticeAgentSetup-x86_64.exe")
+    )
 } else {
     Write-Warning "Inno Setup not found - zip built but GUI installer skipped (install Inno Setup 6 and re-run)"
 }

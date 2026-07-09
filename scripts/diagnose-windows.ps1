@@ -36,7 +36,7 @@ function Test-BundleLayout {
     Section $Title
     Write-Host "  path: $Root"
     Show-CudaDlls (Join-Path $Root "lib") $Root
-    foreach ($name in @("scalattice-run.cmd", "launch-tray.vbs", "launch-background.vbs", "scalattice-agent.exe")) {
+    foreach ($name in @("scalattice-run.cmd", "launch-tray.vbs", "launch-tray-interactive.vbs", "launch-background.vbs", "scalattice-agent.exe")) {
         Show-FileRow $name (Join-Path $Root $name)
     }
 

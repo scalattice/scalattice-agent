@@ -29,6 +29,8 @@ Silent install with token (IT/automation):
 ScalatticeAgentSetup-x86_64.exe /TOKEN=slt_provider_… /VERYSILENT
 ```
 
+**Reinstall / upgrade:** Setup stops any running Scalattice Agent (tray + background), clears the bundled `lib` folder, then installs fresh CUDA/runtime DLLs. If setup reports that libraries could not be replaced, quit the agent from the notification area or Task Manager and run setup again.
+
 ## Tray control panel
 
 After install, a Scalattice icon stays in the Windows notification area (system tray). Click it to open a small panel with:

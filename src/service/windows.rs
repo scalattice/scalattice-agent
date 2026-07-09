@@ -353,6 +353,12 @@ if /I \"%~1\"==\"tray\" (\r\n\
     exit /b 0\r\n\
   )\r\n\
 )\r\n\
+if /I \"%~1\"==\"tray-open\" (\r\n\
+  if exist \"%INSTALL%launch-tray-interactive.vbs\" (\r\n\
+    wscript.exe //nologo \"%INSTALL%launch-tray-interactive.vbs\"\r\n\
+    exit /b 0\r\n\
+  )\r\n\
+)\r\n\
 if /I \"%~1\"==\"tray-debug\" (\r\n\
   \"%INSTALL%scalattice-agent.exe\" tray --force\r\n\
   exit /b %ERRORLEVEL%\r\n\
@@ -363,17 +369,21 @@ if /I \"%~1\"==\"tray-debug\" (\r\n\
 
     for (name, content) in [
         ("launch-tray.vbs", LAUNCH_TRAY_VBS),
+        ("launch-tray-interactive.vbs", LAUNCH_TRAY_INTERACTIVE_VBS),
         ("launch-background.vbs", LAUNCH_BACKGROUND_VBS),
     ] {
         fs::write(install.join(name), content)?;
     }
+
+    refresh_startup_shortcuts()?;
 
     Ok(())
 }
 
 const LAUNCH_TRAY_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
-install = fso.GetParentFolderName(WScript.ScriptFullName)
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
@@ -382,14 +392,36 @@ env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
 "#;
 
+const LAUNCH_TRAY_INTERACTIVE_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
+lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
+If Not fso.FolderExists(lib) Then lib = install & "\lib"
+Set env = sh.Environment("PROCESS")
+env("PATH") = install & ";" & lib & ";" & env("PATH")
+sh.Run """" & install & "\scalattice-agent.exe"" tray", 1, False
+"#;
+
 const LAUNCH_BACKGROUND_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
-install = fso.GetParentFolderName(WScript.ScriptFullName)
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.Run """" & install & "\run-background.cmd""", 0, False
+"#;
+
+const STARTUP_AGENT_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+sh.Run "wscript.exe //nologo """ & install & "\launch-background.vbs""", 0, False
+"#;
+
+const STARTUP_TRAY_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+sh.Run "wscript.exe //nologo """ & install & "\launch-tray.vbs""", 0, False
 "#;
 
 fn schtasks_available() -> bool {
@@ -466,12 +498,12 @@ fn ensure_tray_autostart_registered() -> Result<()> {
 }
 
 fn try_create_scheduled_task() -> Result<()> {
-    let runner = background_runner_path()?;
-    if !runner.is_file() {
-        bail!("failed to write {}", runner.display());
+    let vbs = install_dir()?.join("launch-background.vbs");
+    if !vbs.is_file() {
+        bail!("failed to write {}", vbs.display());
     }
 
-    let tr = format!("\"{}\"", runner.display());
+    let tr = format!("wscript.exe //nologo \"{}\"", vbs.display());
     let output = Command::new("schtasks")
         .args([
             "/Create",
@@ -538,20 +570,28 @@ fn try_create_tray_task() -> Result<()> {
 }
 
 fn install_startup_agent_shortcut() -> Result<()> {
-    let startup = startup_dir()?;
-    fs::create_dir_all(&startup)?;
-    let src = install_dir()?.join("launch-background.vbs");
-    let dest = startup.join(STARTUP_AGENT_VBS);
-    fs::copy(&src, &dest).with_context(|| format!("failed to install {}", dest.display()))?;
-    Ok(())
+    write_startup_shortcut(STARTUP_AGENT_VBS, STARTUP_AGENT_VBS_CONTENT)
 }
 
 fn install_startup_tray_shortcut() -> Result<()> {
+    write_startup_shortcut(STARTUP_TRAY_VBS, STARTUP_TRAY_VBS_CONTENT)
+}
+
+fn write_startup_shortcut(name: &str, content: &str) -> Result<()> {
     let startup = startup_dir()?;
     fs::create_dir_all(&startup)?;
-    let src = install_dir()?.join("launch-tray.vbs");
-    let dest = startup.join(STARTUP_TRAY_VBS);
-    fs::copy(&src, &dest).with_context(|| format!("failed to install {}", dest.display()))?;
+    let dest = startup.join(name);
+    fs::write(&dest, content).with_context(|| format!("failed to install {}", dest.display()))?;
+    Ok(())
+}
+
+fn refresh_startup_shortcuts() -> Result<()> {
+    if startup_agent_shortcut_exists() {
+        install_startup_agent_shortcut()?;
+    }
+    if startup_tray_shortcut_exists() {
+        install_startup_tray_shortcut()?;
+    }
     Ok(())
 }
 

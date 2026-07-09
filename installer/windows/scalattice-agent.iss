@@ -34,7 +34,8 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
-CloseApplications=no
+CloseApplications=force
+CloseApplicationsFilter=scalattice-agent.exe,*.dll,*.exe
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -43,17 +44,19 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut to open the provider dashboard"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-; Install bundled DLLs before the exe so CloseApplications / post-install can load them.
-Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\open-tray-debug.cmd"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Install bundled DLLs before the exe so post-install can load them.
+; restartreplace: replace locked CUDA/runtime DLLs on reboot if still held briefly.
+Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "..\..\dist\launch-tray-interactive.vbs"; DestDir: "{app}"; Flags: ignoreversion restartreplace skipifsourcedoesntexist
+Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "..\..\dist\open-tray-debug.cmd"; DestDir: "{app}"; Flags: ignoreversion restartreplace skipifsourcedoesntexist
+Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "tray"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open status, token, and live log panel"; AppUserModelID: "{#MyAppUserModelId}"
-Name: "{autoprograms}\{#MyAppName} (debug)"; Filename: "{app}\{#MyAppExeName}"; Parameters: "tray --force"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open tray with console for troubleshooting"; AppUserModelID: "{#MyAppUserModelId}.Debug"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "wscript.exe"; Parameters: "//nologo ""{app}\launch-tray-interactive.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open status, token, and live log panel"; AppUserModelID: "{#MyAppUserModelId}"
+Name: "{autoprograms}\{#MyAppName} (debug)"; Filename: "{app}\open-tray-debug.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open tray with console for troubleshooting"; AppUserModelID: "{#MyAppUserModelId}.Debug"
 Name: "{autoprograms}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Comment: "Manage GPUs and models"
 Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Tasks: desktopicon
 
@@ -206,6 +209,72 @@ begin
   SendNotifyMessage(HWND_BROADCAST, Msg, 0, 0);
 end;
 
+procedure StopScalatticeRuntime;
+var
+  ResultCode: Integer;
+begin
+  Exec('schtasks.exe', '/End /TN ScalatticeAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('schtasks.exe', '/End /TN ScalatticeAgentTray', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/IM scalattice-agent.exe /F /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1500);
+end;
+
+procedure ClearReadOnlyAttributes(const Dir: string);
+var
+  FindRec: TFindRec;
+  Path: string;
+  Attrs: Integer;
+begin
+  if not DirExists(Dir) then
+    Exit;
+  if FindFirst(Dir + '\*', FindRec) then
+  try
+    repeat
+      if (FindRec.Name = '.') or (FindRec.Name = '..') then
+        Continue;
+      Path := Dir + '\' + FindRec.Name;
+      if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
+        ClearReadOnlyAttributes(Path)
+      else
+      begin
+        Attrs := GetFileAttributes(Path);
+        if Attrs <> -1 then
+          SetFileAttributes(Path, Attrs and not FILE_ATTRIBUTE_READONLY);
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
+function PrepareLibDirForUpgrade(const Dir: string): Boolean;
+begin
+  Result := True;
+  if not DirExists(Dir) then
+    Exit;
+  ClearReadOnlyAttributes(Dir);
+  if not DelTree(Dir, True, True, False) then
+    Result := False;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  NeedsRestart := False;
+  if not DirExists(ExpandConstant('{localappdata}\Scalattice\bin')) then
+    Exit;
+  StopScalatticeRuntime;
+  if not PrepareLibDirForUpgrade(LibDir) then
+  begin
+    Result :=
+      'Could not replace bundled libraries in:' + #13#10 +
+      '  ' + LibDir + #13#10#13#10 +
+      'The Scalattice Agent is probably still running.' + #13#10 +
+      'Quit the tray from the notification area (or end scalattice-agent.exe in Task Manager), then run setup again.';
+    Exit;
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 begin
   PrefillToken := ExpandConstant('{param:TOKEN|}');
@@ -284,6 +353,9 @@ var
   SetTokenResult: Integer;
   Token, SavedToken, AppDir: String;
 begin
+  if CurStep = ssInstall then
+    StopScalatticeRuntime;
+
   if CurStep = ssPostInstall then
   begin
     if ShowModelsPage and (PurgeModelsCheck <> nil) and PurgeModelsCheck.Checked then

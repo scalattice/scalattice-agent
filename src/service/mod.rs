@@ -188,6 +188,7 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         let install = install_dir()?;
         targets.push(install.join("scalattice-run.cmd"));
         targets.push(install.join("launch-tray.vbs"));
+        targets.push(install.join("launch-tray-interactive.vbs"));
         targets.push(install.join("launch-background.vbs"));
     }
 

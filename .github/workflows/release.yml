@@ -120,11 +120,21 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Install Artifact Signing Client Tools
+        shell: powershell
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Error "winget is required to install Artifact Signing Client Tools"
+          }
+          winget install -e --id Microsoft.Azure.ArtifactSigningClientTools --accept-package-agreements --accept-source-agreements
       - name: Build + package
         shell: cmd
         env:
           CARGO_INCREMENTAL: "0"
           SCALATTICE_VERSION: ${{ inputs.tag }}
+          AZURE_TENANT_ID: 5d902829-56a2-41e5-812d-a3ec3a502f3d
+          AZURE_CLIENT_ID: 0c6c6d06-09c9-4da3-a72c-516eecde1b5e
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=amd64 -host_arch=amd64
@@ -165,6 +175,10 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Install Artifact Signing Client Tools
+        shell: powershell
+        run: |
+          winget install -e --id Microsoft.Azure.ArtifactSigningClientTools --accept-package-agreements --accept-source-agreements
       - name: Build + package
         shell: cmd
         env:
@@ -172,6 +186,9 @@ jobs:
           CARGO_INCREMENTAL: "0"
           CARGO_BUILD_JOBS: "4"
           SCALATTICE_VERSION: ${{ inputs.tag }}
+          AZURE_TENANT_ID: 5d902829-56a2-41e5-812d-a3ec3a502f3d
+          AZURE_CLIENT_ID: 0c6c6d06-09c9-4da3-a72c-516eecde1b5e
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           set "PATH=%CUDA_PATH%\bin;%PATH%"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1

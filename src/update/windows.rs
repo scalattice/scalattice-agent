@@ -100,7 +100,7 @@ fn write_update_runner(installer: &Path, install_dir: &Path) -> Result<PathBuf> 
 setlocal\r\n\
 timeout /t 2 /nobreak >nul\r\n\
 powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\"name='scalattice-agent.exe'\\\" | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}\"\r\n\
-\"{installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /UPDATE=1\r\n\
+\"{installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /FORCECLOSEAPPLICATIONS /UPDATE=1\r\n\
 if exist \"{install}\\launch-background.vbs\" wscript.exe //nologo \"{install}\\launch-background.vbs\"\r\n\
 if exist \"{install}\\launch-tray.vbs\" wscript.exe //nologo \"{install}\\launch-tray.vbs\"\r\n\
 del /f /q \"%~f0\" >nul 2>&1\r\n"

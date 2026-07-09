@@ -6,4 +6,4 @@ lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
 env("PATH") = install & ";" & lib & ";" & env("PATH")
-sh.Run """" & install & "\run-background.cmd""", 0, False
+sh.Run """" & install & "\scalattice-agent.exe"" tray", 1, False

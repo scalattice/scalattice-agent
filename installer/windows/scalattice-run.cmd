@@ -12,6 +12,12 @@ if /I "%~1"=="tray" (
     exit /b 0
   )
 )
+if /I "%~1"=="tray-open" (
+  if exist "%INSTALL%launch-tray-interactive.vbs" (
+    wscript.exe //nologo "%INSTALL%launch-tray-interactive.vbs"
+    exit /b 0
+  )
+)
 if /I "%~1"=="tray-debug" (
   "%INSTALL%scalattice-agent.exe" tray --force
   exit /b %ERRORLEVEL%
