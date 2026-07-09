@@ -86,16 +86,21 @@ function Find-ArtifactSigningDlib {
 
     $fileName = 'Azure.CodeSigning.Dlib.dll'
     $searchRoots = @(
+        if ($env:SCALATTICE_SIGN_DLIB_DIR) { $env:SCALATTICE_SIGN_DLIB_DIR },
+        "${env:LOCALAPPDATA}\Microsoft\ArtifactSigningClientTools",
+        "${env:LOCALAPPDATA}\Microsoft\ArtifactSigningTools",
         "${env:ProgramFiles}\Microsoft\Azure Artifact Signing Client Tools",
         "${env:ProgramFiles}\Microsoft Artifact Signing Client Tools",
+        "${env:ProgramFiles}\Microsoft\ArtifactSigningClientTools",
         "${env:ProgramFiles(x86)}\Microsoft\Azure Artifact Signing Client Tools",
-        (Join-Path $PSScriptRoot '..\.tools\Microsoft.ArtifactSigning.Client')
-    )
+        "${env:ProgramFiles(x86)}\Microsoft\ArtifactSigningClientTools",
+        (Join-Path $PSScriptRoot '..\.tools')
+    ) | Where-Object { $_ }
 
     foreach ($root in $searchRoots) {
         if (-not (Test-Path $root)) { continue }
         $match = Get-ChildItem $root -Recurse -Filter $fileName -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object { if ($_.FullName -match '\\x64\\') { 0 } elseif ($_.FullName -match '\\bin\\') { 1 } else { 2 } } |
             Select-Object -First 1
         if ($match) {
             return $match.FullName
