@@ -223,7 +223,7 @@ procedure ClearReadOnlyAttributes(const Dir: string);
 var
   FindRec: TFindRec;
   Path: string;
-  Attrs: Integer;
+  ResultCode: Integer;
 begin
   if not DirExists(Dir) then
     Exit;
@@ -235,12 +235,8 @@ begin
       Path := Dir + '\' + FindRec.Name;
       if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
         ClearReadOnlyAttributes(Path)
-      else
-      begin
-        Attrs := GetFileAttributes(Path);
-        if Attrs <> -1 then
-          SetFileAttributes(Path, Attrs and not FILE_ATTRIBUTE_READONLY);
-      end;
+      else if (FindRec.Attributes and FILE_ATTRIBUTE_READONLY) <> 0 then
+        Exec('cmd.exe', '/c attrib -R "' + Path + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     until not FindNext(FindRec);
   finally
     FindClose(FindRec);
