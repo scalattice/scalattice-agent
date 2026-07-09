@@ -109,6 +109,21 @@ function Find-ArtifactSigningDlib {
     return $null
 }
 
+function Write-Utf8NoBomFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+
+    $dir = Split-Path $Path -Parent
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
 function New-ScalatticeSigningMetadataFile {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -133,11 +148,7 @@ function New-ScalatticeSigningMetadataFile {
     }
 
     $json = ($metadata | ConvertTo-Json -Depth 4)
-    $dir = Split-Path $OutPath -Parent
-    if ($dir -and -not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    }
-    Set-Content -LiteralPath $OutPath -Value $json -Encoding utf8
+    Write-Utf8NoBomFile -Path $OutPath -Content $json
     return $OutPath
 }
 
