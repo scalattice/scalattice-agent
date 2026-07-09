@@ -126,7 +126,13 @@ jobs:
           if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
             Write-Error "winget is required to install Artifact Signing Client Tools"
           }
+          winget list -e --id Microsoft.Azure.ArtifactSigningClientTools | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Artifact Signing Client Tools already installed"
+            exit 0
+          }
           winget install -e --id Microsoft.Azure.ArtifactSigningClientTools --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build + package
         shell: cmd
         env:
@@ -178,7 +184,13 @@ jobs:
       - name: Install Artifact Signing Client Tools
         shell: powershell
         run: |
+          winget list -e --id Microsoft.Azure.ArtifactSigningClientTools | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Artifact Signing Client Tools already installed"
+            exit 0
+          }
           winget install -e --id Microsoft.Azure.ArtifactSigningClientTools --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build + package
         shell: cmd
         env:
