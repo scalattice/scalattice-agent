@@ -1,6 +1,8 @@
 use super::{current_version, normalize_version};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -14,6 +16,7 @@ const DOWNLOAD_ATTEMPTS: u32 = 3;
 pub(crate) struct LatestRelease {
     pub tag: String,
     pub version: String,
+    pub checksums: HashMap<String, String>,
 }
 
 pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
@@ -46,7 +49,26 @@ pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
         .and_then(|v| v.as_str())
         .map(normalize_version)
         .unwrap_or_else(|| normalize_version(&tag));
-    Ok(LatestRelease { tag, version })
+    let mut checksums = HashMap::new();
+    if let Some(obj) = payload.get("checksums").and_then(|v| v.as_object()) {
+        for (name, value) in obj {
+            if let Some(digest) = value.as_str() {
+                let hex = digest
+                    .trim()
+                    .strip_prefix("sha256:")
+                    .unwrap_or(digest.trim())
+                    .to_ascii_lowercase();
+                if !hex.is_empty() {
+                    checksums.insert(name.clone(), hex);
+                }
+            }
+        }
+    }
+    Ok(LatestRelease {
+        tag,
+        version,
+        checksums,
+    })
 }
 
 pub(crate) fn release_download_url(tag: &str, asset_name: &str) -> String {
@@ -71,11 +93,17 @@ pub(crate) async fn download_release_asset(
     tag: &str,
     asset_name: &str,
     dest: &Path,
+    expected_sha256: &str,
 ) -> Result<()> {
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("refusing to install {asset_name}: missing or invalid published SHA-256 checksum");
+    }
+
     let url = release_download_url(tag, asset_name);
     let mut last_err = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match download_release_asset_once(&url, asset_name, dest).await {
+        match download_release_asset_once(&url, asset_name, dest, &expected).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if attempt < DOWNLOAD_ATTEMPTS {
@@ -91,7 +119,12 @@ pub(crate) async fn download_release_asset(
     Err(last_err.unwrap())
 }
 
-async fn download_release_asset_once(url: &str, asset_name: &str, dest: &Path) -> Result<()> {
+async fn download_release_asset_once(
+    url: &str,
+    asset_name: &str,
+    dest: &Path,
+    expected_sha256: &str,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -121,10 +154,12 @@ async fn download_release_asset_once(url: &str, asset_name: &str, dest: &Path) -
     let mut stream = response.bytes_stream();
     let mut downloaded = 0u64;
     let mut last_progress_mb = 0u64;
+    let mut hasher = Sha256::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read release asset chunk")?;
         downloaded = downloaded.saturating_add(chunk.len() as u64);
+        hasher.update(&chunk);
         file.write_all(&chunk)
             .await
             .context("write release asset chunk")?;
@@ -144,7 +179,15 @@ async fn download_release_asset_once(url: &str, asset_name: &str, dest: &Path) -
 
     if downloaded < MIN_RELEASE_BYTES {
         tokio::fs::remove_file(&tmp).await.ok();
-        anyhow::bail!("download for {asset_name} looks too small ({downloaded} bytes)");
+        bail!("download for {asset_name} looks too small ({downloaded} bytes)");
+    }
+
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_sha256 {
+        tokio::fs::remove_file(&tmp).await.ok();
+        bail!(
+            "checksum mismatch for {asset_name}: expected {expected_sha256}, got {actual}"
+        );
     }
 
     tokio::fs::rename(&tmp, dest)

@@ -1025,9 +1025,8 @@ fn has_attached_console() -> bool {
 }
 
 fn maybe_detach_console() {
-    if launched_hidden() {
-        detach_console();
-    }
+    // Always detach for tray so Start Menu / Startup never leave a console host.
+    detach_console();
 }
 
 fn activate_tray_window() -> bool {

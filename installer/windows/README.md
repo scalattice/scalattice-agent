@@ -21,7 +21,7 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`choco install innos
 4. Adds both folders to the user `PATH`
 5. Runs `scalattice-agent set-token` to register the background scheduled task
 6. Starts the notification area control panel (`scalattice-agent tray`)
-7. Adds Start Menu shortcuts (tray panel + provider dashboard). The main shortcut targets `scalattice-agent.exe` so Windows can associate it with Settings → Apps (including Uninstall in Start search where supported).
+7. Adds Start Menu shortcuts (notification-area agent + provider dashboard). Upgrades remove the old "Scalattice Agent (debug)" shortcut if present.
 
 Silent install with token (IT/automation):
 

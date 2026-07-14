@@ -48,8 +48,18 @@ pub async fn install_latest_update() -> Result<()> {
 }
 
 async fn download_installer(tag: &str) -> Result<PathBuf> {
+    let latest = fetch_latest_release().await?;
+    let expected = latest
+        .checksums
+        .get(INSTALLER_NAME)
+        .cloned()
+        .with_context(|| {
+            format!(
+                "Cloud release {tag} has no SHA-256 checksum for {INSTALLER_NAME}; refusing to update"
+            )
+        })?;
     let dest = update_installer_path(tag)?;
-    download_release_asset(tag, INSTALLER_NAME, &dest).await?;
+    download_release_asset(tag, INSTALLER_NAME, &dest, &expected).await?;
     Ok(dest)
 }
 
@@ -99,8 +109,10 @@ fn write_update_runner(installer: &Path, install_dir: &Path) -> Result<PathBuf> 
         "@echo off\r\n\
 setlocal\r\n\
 timeout /t 2 /nobreak >nul\r\n\
-powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\"name='scalattice-agent.exe'\\\" | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}\"\r\n\
+powershell -NoProfile -WindowStyle Hidden -Command \"Get-CimInstance Win32_Process -Filter \\\"name='scalattice-agent.exe'\\\" | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}\"\r\n\
+timeout /t 2 /nobreak >nul\r\n\
 \"{installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /FORCECLOSEAPPLICATIONS /UPDATE=1\r\n\
+timeout /t 2 /nobreak >nul\r\n\
 if exist \"{install}\\launch-background.vbs\" wscript.exe //nologo \"{install}\\launch-background.vbs\"\r\n\
 if exist \"{install}\\launch-tray.vbs\" wscript.exe //nologo \"{install}\\launch-tray.vbs\"\r\n\
 del /f /q \"%~f0\" >nul 2>&1\r\n"

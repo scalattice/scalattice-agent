@@ -7,10 +7,36 @@ use futures_util::StreamExt;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
+use url::Url;
+
+/// Only accept platform model-mirror URLs under Scalattice Cloud API hosts.
+fn assert_allowed_mirror_url(raw: &str) -> Result<()> {
+    let url = Url::parse(raw.trim()).with_context(|| format!("invalid mirror URL: {raw}"))?;
+    if url.scheme() != "https" {
+        bail!("mirror URL must use https");
+    }
+    let host = url
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
+        .context("mirror URL missing host")?;
+    let allowed = matches!(
+        host.as_str(),
+        "api.scalattice.cloud" | "scalattice.cloud"
+    ) || host.ends_with(".scalattice.cloud");
+    if !allowed {
+        bail!("mirror URL host not allowed: {host}");
+    }
+    let path = url.path();
+    if !path.contains("/v1/operators/agent/models/") {
+        bail!("mirror URL path is not a Scalattice model mirror");
+    }
+    Ok(())
+}
 
 async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Option<&str>) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("scalattice-agent")
+        .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("build HTTP client")?;
 
@@ -25,6 +51,9 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
         .with_context(|| format!("request {url}"))?
         .error_for_status()
         .with_context(|| format!("download failed for {url}"))?;
+
+    // After redirects, final URL must still be an allowed mirror when this was a mirror fetch.
+    // (HF downloads use huggingface.co and skip this helper's mirror check.)
 
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
@@ -111,6 +140,7 @@ async fn download_mirror_file(
     mirror_url: &str,
     agent_token: &str,
 ) -> Result<()> {
+    assert_allowed_mirror_url(mirror_url)?;
     let dest = target_gguf_path(runtime_model, repo_path);
     if is_manifest_weight_file(runtime_model, &dest) {
         return Ok(());

@@ -156,6 +156,11 @@ pub fn persist_agent_token(token: &str) -> Result<bool> {
 
     if changed {
         fs::write(&env_file, format!("{}\n", lines.join("\n")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&env_file, fs::Permissions::from_mode(0o600));
+        }
         platform::sync_background_env()?;
     }
 

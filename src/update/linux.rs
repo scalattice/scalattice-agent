@@ -84,9 +84,17 @@ fn linux_release_target() -> Result<&'static str> {
 }
 
 async fn download_and_extract(tag: &str) -> Result<PathBuf> {
+    let latest = fetch_latest_release().await?;
     let archive_name = linux_archive_name()?;
+    let expected = latest
+        .checksums
+        .get(&archive_name)
+        .cloned()
+        .with_context(|| {
+            format!("Cloud release {tag} has no SHA-256 checksum for {archive_name}; refusing to update")
+        })?;
     let archive_path = update_download_path(tag, &archive_name)?;
-    download_release_asset(tag, &archive_name, &archive_path).await?;
+    download_release_asset(tag, &archive_name, &archive_path, &expected).await?;
 
     let staging = update_staging_dir(tag)?;
     if staging.exists() {

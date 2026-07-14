@@ -198,14 +198,13 @@ pub fn autostart_method_line() -> Option<String> {
 
 fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     let token_changed = crate::service::persist_agent_token(&config.token)?;
-    let runner_changed = write_background_runner_with_token(&config.token)?;
+    let _runner_changed = write_background_runner_with_token(&config.token)?;
     sync_launch_scripts()?;
 
-    let needs_register = !autostart_configured() || token_changed || runner_changed;
-
-    if needs_register {
-        ensure_agent_autostart_registered()?;
-    }
+    // Always (re)register agent + tray autostart so upgrades / partial installs recover
+    // after reboot. Single-instance mutexes prevent double-start if both Startup and
+    // scheduled tasks fire.
+    ensure_agent_autostart_registered()?;
 
     if token_changed || !background_agent_running() {
         if token_changed && background_agent_running() {
@@ -215,9 +214,7 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     }
 
     if !skip_tray && !in_tray_process() {
-        if needs_register {
-            ensure_tray_autostart_registered()?;
-        }
+        ensure_tray_autostart_registered()?;
         launch_tray_if_needed()?;
     }
 
@@ -295,28 +292,22 @@ fn write_background_runner_with_token(token: &str) -> Result<bool> {
     let log = agent_log_path()?;
     let bin = resolve_agent_binary()?;
     let runner = install.join("run-background.cmd");
-    let token_arg = token.trim().replace('%', "%%").replace('"', "");
+
+    // Keep the token out of the process command line (visible in Task Manager / WMI).
+    // Persist to agent.env and let `foreground` load SCALATTICE_AGENT_TOKEN from disk.
+    let _ = crate::service::persist_agent_token(token.trim())?;
 
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::create_dir_all(&install)?;
 
-    let foreground_cmd = if token_arg.is_empty() {
-        format!("\"{}\" foreground", bin.display())
-    } else {
-        format!(
-            "\"{}\" foreground --token \"{}\"",
-            bin.display(),
-            token_arg
-        )
-    };
+    let foreground_cmd = format!("\"{}\" foreground", bin.display());
 
     let script = format!(
         "@echo off\r\n\
 setlocal\r\n\
 set SCALATTICE_BACKGROUND=1\r\n\
-set SCALATTICE_AGENT_TOKEN=\r\n\
 set \"PATH={install};{lib};%PATH%\"\r\n\
 cd /d \"{install}\"\r\n\
 {foreground_cmd} >> \"{log}\" 2>&1\r\n",
@@ -388,7 +379,9 @@ lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
 env("SCALATTICE_TRAY_HIDDEN") = "1"
+env("SCALATTICE_TRAY") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
+sh.CurrentDirectory = install
 sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
 "#;
 
@@ -399,10 +392,15 @@ If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
+env("SCALATTICE_TRAY_HIDDEN") = "1"
+env("SCALATTICE_TRAY") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
-sh.Run """" & install & "\scalattice-agent.exe"" tray", 1, False
+sh.CurrentDirectory = install
+sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
 "#;
 
+// Launch the agent exe directly (no cmd.exe host). A blocking .cmd console used to
+// survive reboot paths and kill the agent when closed.
 const LAUNCH_BACKGROUND_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
@@ -410,8 +408,10 @@ If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
+env("SCALATTICE_BACKGROUND") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
-sh.Run """" & install & "\run-background.cmd""", 0, False
+sh.CurrentDirectory = install
+sh.Run """" & install & "\scalattice-agent.exe"" foreground", 0, False
 "#;
 
 const STARTUP_AGENT_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")
@@ -478,23 +478,25 @@ fn startup_tray_shortcut_exists() -> bool {
 }
 
 fn ensure_agent_autostart_registered() -> Result<()> {
-    if task_exists() {
-        return Ok(());
+    // Prefer scheduled task; always also write Startup VBS as a reboot safety net.
+    // Background single-instance mutex prevents double-start.
+    let _ = try_create_scheduled_task();
+    install_startup_agent_shortcut()?;
+    if task_exists() || startup_agent_shortcut_exists() {
+        Ok(())
+    } else {
+        bail!("failed to register agent autostart (scheduled task and Startup folder)")
     }
-    if try_create_scheduled_task().is_ok() {
-        return Ok(());
-    }
-    install_startup_agent_shortcut()
 }
 
 fn ensure_tray_autostart_registered() -> Result<()> {
-    if tray_task_exists() {
-        return Ok(());
+    let _ = try_create_tray_task();
+    install_startup_tray_shortcut()?;
+    if tray_task_exists() || startup_tray_shortcut_exists() {
+        Ok(())
+    } else {
+        bail!("failed to register tray autostart (scheduled task and Startup folder)")
     }
-    if try_create_tray_task().is_ok() {
-        return Ok(());
-    }
-    install_startup_tray_shortcut()
 }
 
 fn try_create_scheduled_task() -> Result<()> {
@@ -637,16 +639,29 @@ fn spawn_background_detached() -> Result<()> {
     if vbs.is_file() {
         Command::new("wscript.exe")
             .args(["//nologo", &vbs.display().to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .context("failed to start background agent")?;
         return Ok(());
     }
 
-    let runner = background_runner_path()?;
-    Command::new("cmd")
-        .args(["/C", "start", "", "/MIN", &runner.display().to_string()])
-        .creation_flags(CREATE_NO_WINDOW)
+    // Fallback: spawn the exe directly (never host under a visible cmd window).
+    let bin = resolve_agent_binary()?;
+    let lib = lib_dir().unwrap_or_else(|_| bin.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let install = install_dir().unwrap_or_else(|_| bin.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let path = format!("{};{};{}", install.display(), lib.display(), std::env::var("PATH").unwrap_or_default());
+    Command::new(&bin)
+        .arg("foreground")
+        .env("SCALATTICE_BACKGROUND", "1")
+        .env("PATH", path)
+        .current_dir(&install)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .context("failed to start background agent")?;
     Ok(())

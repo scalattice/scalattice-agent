@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod agent;
 mod compute_pool;
 mod config;
@@ -82,9 +84,13 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     paths::init_windows_native_search_path();
     init_crypto()?;
-    init_logging();
 
     let cli = Cli::parse();
+
+    #[cfg(windows)]
+    prepare_windows_process(&cli)?;
+
+    init_logging();
 
     #[cfg(windows)]
     if should_run_tray_ui(&cli) {
@@ -96,6 +102,56 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(run_async(cli))
+}
+
+/// Windows release builds use the WINDOWS subsystem (no console). Attach one for
+/// interactive CLI, and detach for background / tray so reboot startup cannot
+/// leave a visible cmd window that kills the agent when closed.
+#[cfg(windows)]
+fn prepare_windows_process(cli: &Cli) -> Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Console::{
+        AllocConsole, AttachConsole, FreeConsole, ATTACH_PARENT_PROCESS,
+    };
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let background = matches!(cli.command, Some(Commands::Foreground { .. }))
+        && service::invoked_by_background_service();
+    let tray = should_run_tray_ui(cli);
+
+    if background {
+        // Single-instance: Startup folder + scheduled task can both fire on logon.
+        let name: Vec<u16> = "Local\\ScalatticeAgentBackground\0".encode_utf16().collect();
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
+            if handle.is_null() {
+                anyhow::bail!("failed to create background instance mutex");
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(handle);
+                std::process::exit(0);
+            }
+            // Keep mutex for process lifetime.
+            std::mem::forget(handle);
+        }
+        unsafe {
+            FreeConsole();
+        }
+        return Ok(());
+    }
+
+    if tray {
+        // Tray detaches when SCALATTICE_TRAY_HIDDEN=1 (see tray::ui).
+        return Ok(());
+    }
+
+    // Interactive CLI: prefer parent console (cmd/PowerShell), else allocate one.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            let _ = AllocConsole();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -110,9 +166,32 @@ fn init_crypto() -> Result<()> {
 }
 
 fn init_logging() {
+    let filter = EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
+
+    #[cfg(windows)]
+    if service::invoked_by_background_service() {
+        if let Ok(path) = crate::paths::agent_log_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_env_filter(filter)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .init();
+                return;
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_env_filter(filter)
         .init();
 }
 
@@ -183,6 +262,8 @@ fn spawn_tray_hidden() -> Result<()> {
     let bin = crate::paths::resolve_agent_binary()?;
     std::process::Command::new(&bin)
         .arg("tray")
+        .env("SCALATTICE_TRAY_HIDDEN", "1")
+        .env("SCALATTICE_TRAY", "1")
         .creation_flags(0x0800_0000)
         .spawn()
         .context("failed to launch tray")?;
@@ -258,6 +339,9 @@ fn print_status() -> Result<()> {
                 service::BackgroundStatus::NotInstalled => "not set up",
             };
             println!("Agent    {service_line}");
+            if let Some(line) = service::autostart_method_line() {
+                println!("Autostart {line}");
+            }
         }
         #[cfg(not(windows))]
         {

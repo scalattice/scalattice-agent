@@ -16,10 +16,16 @@
 AppId={{A4E8B2C1-9F3D-4A6E-8B1C-2D5E7F9A0B3C}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/docs/providers
 AppUpdatesURL={#MyAppURL}/docs/providers
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoCompany={#MyAppPublisher}
+UninstallDisplayName={#MyAppName} {#MyAppVersion}
 DefaultDirName={localappdata}\Scalattice\bin
 DisableDirPage=yes
 DisableProgramGroupPage=yes
@@ -47,16 +53,19 @@ Name: "desktopicon"; Description: "Create a desktop shortcut to open the provide
 ; Install bundled DLLs before the exe so post-install can load them.
 ; restartreplace: replace locked CUDA/runtime DLLs on reboot if still held briefly.
 Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion restartreplace
-Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion restartreplace
-Source: "..\..\dist\launch-tray-interactive.vbs"; DestDir: "{app}"; Flags: ignoreversion restartreplace skipifsourcedoesntexist
-Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion restartreplace
-Source: "..\..\dist\open-tray-debug.cmd"; DestDir: "{app}"; Flags: ignoreversion restartreplace skipifsourcedoesntexist
-Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\launch-tray-interactive.vbs"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion
+; Prefer immediate replace of the agent exe so ARP / Explorer File version updates. Processes are stopped in CurStep/ssInstall and by silent /UPDATE.
+Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+[InstallDelete]
+Type: files; Name: "{autoprograms}\{#MyAppName} (debug).lnk"
+Type: files; Name: "{app}\open-tray-debug.cmd"
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "wscript.exe"; Parameters: "//nologo ""{app}\launch-tray-interactive.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open status, token, and live log panel"; AppUserModelID: "{#MyAppUserModelId}"
-Name: "{autoprograms}\{#MyAppName} (debug)"; Filename: "{app}\open-tray-debug.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open tray with console for troubleshooting"; AppUserModelID: "{#MyAppUserModelId}.Debug"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "wscript.exe"; Parameters: "//nologo ""{app}\launch-tray.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open Scalattice Agent in the notification area"; AppUserModelID: "{#MyAppUserModelId}"
 Name: "{autoprograms}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Comment: "Manage GPUs and models"
 Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Tasks: desktopicon
 

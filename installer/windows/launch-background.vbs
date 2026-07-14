@@ -5,5 +5,7 @@ If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 Set env = sh.Environment("PROCESS")
+env("SCALATTICE_BACKGROUND") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
-sh.Run """" & install & "\run-background.cmd""", 0, False
+sh.CurrentDirectory = install
+sh.Run """" & install & "\scalattice-agent.exe"" foreground", 0, False
