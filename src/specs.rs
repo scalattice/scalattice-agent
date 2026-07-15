@@ -969,7 +969,7 @@ fn detect_windows_memtotal_gb() -> Option<u32> {
 
 pub fn detect_cuda_version() -> Option<String> {
     for bin in nvidia_smi_bins() {
-        let output = match configure_nvidia_smi_command(bin)
+        let output = match configure_nvidia_smi_command(&bin)
             .args(["--query-gpu=cuda_version", "--format=csv,noheader"])
             .output()
         {
@@ -997,7 +997,7 @@ pub fn detect_cuda_version() -> Option<String> {
 
 pub fn detect_driver_version() -> Option<String> {
     for bin in nvidia_smi_bins() {
-        let output = match configure_nvidia_smi_command(bin)
+        let output = match configure_nvidia_smi_command(&bin)
             .args(["--query-gpu=driver_version", "--format=csv,noheader"])
             .output()
         {
