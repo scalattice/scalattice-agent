@@ -303,7 +303,7 @@ begin
     'Create a machine in the Scalattice Providers dashboard and paste its token below.' + #13#10 +
     'The installer saves the token, adds Scalattice to your PATH, and starts the background agent.' + #13#10 + #13#10 +
     'For NVIDIA GPUs: install a current Game Ready or Studio driver first (nvidia-smi must work).' + #13#10 +
-    'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.';
+    'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.');
   TokenPage.Add('Provider token (slt_provider_…):', False);
   if PrefillToken <> '' then
     TokenPage.Values[0] := PrefillToken
