@@ -65,6 +65,22 @@ pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
     platform::restart_after_token_change(config)
 }
 
+/// Restart background (+ tray on Windows) from the saved token after an update.
+pub fn restart_runtime_from_saved_token() -> Result<()> {
+    #[cfg(windows)]
+    {
+        return platform::restart_runtime_from_saved_token();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return platform::restart_background_after_update();
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        bail!("restart is not supported on this platform")
+    }
+}
+
 /// Save a new token for the running background agent to pick up without restarting the tray.
 pub fn save_agent_token(config: &AgentConfig) -> Result<()> {
     persist_agent_token(&config.token)?;

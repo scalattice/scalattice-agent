@@ -82,7 +82,7 @@ impl AgentConfig {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .context(
-                "Set SCALATTICE_AGENT_TOKEN, pass --token, or run: scalattice-agent set-token --token slt_provider_…",
+                "Set SCALATTICE_AGENT_TOKEN, pass --token, or run: scalattice-agent set-token --token slt_provider_...",
             )?;
 
         if !token.starts_with("slt_provider_") {

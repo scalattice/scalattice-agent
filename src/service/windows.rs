@@ -37,6 +37,17 @@ pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
     ensure_background_task(config, false)
 }
 
+/// Force-stop then start background + tray using the saved provider token.
+/// Used after silent in-place updates so the new binary always comes back up.
+pub fn restart_runtime_from_saved_token() -> Result<()> {
+    let token = crate::config::read_saved_agent_token()
+        .context("no saved provider token; run scalattice-agent set-token first")?;
+    let config = AgentConfig::from_env_and_cli(Some(token))?;
+    stop_agents_for_update();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    force_restart_background(&config, false)
+}
+
 fn hidden_powershell(script: &str) -> std::io::Result<std::process::Output> {
     Command::new("powershell")
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
@@ -294,7 +305,7 @@ fn write_background_runner_with_token(token: &str) -> Result<bool> {
     // Persist to agent.env and let `foreground` load SCALATTICE_AGENT_TOKEN from disk.
     let token_changed = crate::service::persist_agent_token(token.trim())?;
 
-    // Legacy helper used to host the agent under cmd.exe — that left a killable
+    // Legacy helper used to host the agent under cmd.exe - that left a killable
     // console window. Remove it so nothing can launch it by accident.
     let legacy = install.join("run-background.cmd");
     let removed_legacy = if legacy.is_file() {

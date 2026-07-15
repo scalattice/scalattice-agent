@@ -476,7 +476,7 @@ impl SessionState {
 }
 
 const TOKEN_UPDATED: &str = "token_updated";
-/// Fixed short delay only — no exponential backoff. Tiny pause so a dead server
+/// Fixed short delay only - no exponential backoff. Tiny pause so a dead server
 /// cannot pin a core in a tight reconnect loop.
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 

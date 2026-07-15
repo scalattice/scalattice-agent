@@ -4,6 +4,8 @@
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
+; Windows VERSIONINFO / ARP expect 4-part numeric versions.
+#define MyVersionInfo MyAppVersion + ".0"
 
 #define MyAppName "Scalattice Agent"
 #define MyAppPublisher "Robottik Software"
@@ -21,7 +23,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/docs/providers
 AppUpdatesURL={#MyAppURL}/docs/providers
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyVersionInfo}
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 VersionInfoCompany={#MyAppPublisher}
@@ -29,6 +31,7 @@ UninstallDisplayName={#MyAppName} {#MyAppVersion}
 DefaultDirName={localappdata}\Scalattice\bin
 DisableDirPage=yes
 DisableProgramGroupPage=yes
+UsePreviousAppDir=yes
 OutputDir=..\..\dist
 OutputBaseFilename=ScalatticeAgentSetup-x86_64
 SetupIconFile=scalattice.ico
@@ -42,6 +45,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 CloseApplications=force
 CloseApplicationsFilter=scalattice-agent.exe,*.dll,*.exe
+AppMutex=ScalatticeAgentSetup
+SetupMutex=ScalatticeAgentSetupGlobal
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -51,13 +56,15 @@ Name: "desktopicon"; Description: "Create a desktop shortcut to open the provide
 
 [Files]
 ; Install bundled DLLs before the exe so post-install can load them.
-; restartreplace: replace locked CUDA/runtime DLLs on reboot if still held briefly.
-Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs skipifsourcedoesntexist
+; PrepareToInstall moves the prior lib dir aside so we can copy fresh files without
+; in-place overwriting of locked CUDA DLLs (which left stale versions / broken updates).
+Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray-interactive.vbs"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion
-; Prefer immediate replace of the agent exe so ARP / Explorer File version updates. Processes are stopped in CurStep/ssInstall and by silent /UPDATE.
+; Processes are stopped in PrepareToInstall / CurStep so the exe replaces immediately
+; and Apps & Features / File version match MyAppVersion.
 Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
@@ -79,6 +86,7 @@ var
   ModelsCacheDir: String;
   ModelsCacheBytes: Int64;
   ShowModelsPage: Boolean;
+  IsSilentUpdate: Boolean;
 
 function GetDirSize(const Dir: string; var Size: Int64): Boolean;
 var
@@ -221,10 +229,15 @@ end;
 procedure StopScalatticeRuntime;
 var
   ResultCode: Integer;
+  I: Integer;
 begin
   Exec('schtasks.exe', '/End /TN ScalatticeAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('schtasks.exe', '/End /TN ScalatticeAgentTray', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('taskkill.exe', '/IM scalattice-agent.exe /F /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  for I := 1 to 10 do
+  begin
+    Exec('taskkill.exe', '/IM scalattice-agent.exe /F /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(400);
+  end;
   Sleep(1500);
 end;
 
@@ -252,43 +265,80 @@ begin
   end;
 end;
 
-function PrepareLibDirForUpgrade(const Dir: string): Boolean;
+{ Move the old lib tree aside so new DLLs install into a fresh directory.
+  Never hard-fail after destroying libs - that left hosts half-updated. }
+procedure PrepareLibDirForUpgrade(const Dir: string);
+var
+  Backup: String;
+  ResultCode: Integer;
 begin
-  Result := True;
   if not DirExists(Dir) then
     Exit;
   ClearReadOnlyAttributes(Dir);
-  if not DelTree(Dir, True, True, False) then
-    Result := False;
+  Backup := Dir + '.old';
+  if DirExists(Backup) then
+    DelTree(Backup, True, True, True);
+  if not RenameFile(Dir, Backup) then
+  begin
+    if not DelTree(Dir, True, True, True) then
+      Exec('cmd.exe', '/c ren "' + Dir + '" "lib.old"',
+        ExtractFileDir(Dir), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+end;
+
+procedure CleanupOldLibBackup;
+var
+  Backup: String;
+begin
+  Backup := LibDir + '.old';
+  if DirExists(Backup) then
+    DelTree(Backup, True, True, True);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  AppDir, ExePath: String;
 begin
   Result := '';
   NeedsRestart := False;
-  if not DirExists(ExpandConstant('{localappdata}\Scalattice\bin')) then
+  AppDir := ExpandConstant('{localappdata}\Scalattice\bin');
+  if not DirExists(AppDir) and not DirExists(LibDir) then
     Exit;
+
   StopScalatticeRuntime;
-  if not PrepareLibDirForUpgrade(LibDir) then
+
+  ExePath := AppDir + '\{#MyAppExeName}';
+  if FileExists(ExePath) then
   begin
-    Result :=
-      'Could not replace bundled libraries in:' + #13#10 +
-      '  ' + LibDir + #13#10#13#10 +
-      'The Scalattice Agent is probably still running.' + #13#10 +
-      'Quit the tray from the notification area (or end scalattice-agent.exe in Task Manager), then run setup again.';
-    Exit;
+    if not DeleteFile(ExePath) then
+    begin
+      { Retry once after another kill burst so silent updates still replace the binary. }
+      StopScalatticeRuntime;
+      if not DeleteFile(ExePath) then
+      begin
+        Result :=
+          'Could not replace scalattice-agent.exe in:' + #13#10 +
+          '  ' + AppDir + #13#10#13#10 +
+          'End scalattice-agent.exe in Task Manager, then run setup again.';
+        Exit;
+      end;
+    end;
   end;
+
+  PrepareLibDirForUpgrade(LibDir);
 end;
 
 function InitializeSetup(): Boolean;
 begin
   PrefillToken := ExpandConstant('{param:TOKEN|}');
+  IsSilentUpdate := ExpandConstant('{param:UPDATE|0}') = '1';
   LibDir := ExpandConstant('{localappdata}\Scalattice\lib');
   ModelsCacheDir := ExpandConstant('{userpf}\.cache\scalattice\models');
   ModelsCacheBytes := 0;
   if DirExists(ModelsCacheDir) then
     GetDirSize(ModelsCacheDir, ModelsCacheBytes);
-  ShowModelsPage := ShouldOfferModelPurge();
+  { Silent updates skip the cache-purge page entirely. }
+  ShowModelsPage := (not WizardSilent) and (not IsSilentUpdate) and ShouldOfferModelPurge();
   Result := True;
 end;
 
@@ -303,8 +353,8 @@ begin
     'Create a machine in the Scalattice Providers dashboard and paste its token below.' + #13#10 +
     'The installer saves the token, adds Scalattice to your PATH, and starts the background agent.' + #13#10 + #13#10 +
     'For NVIDIA GPUs: install a current Game Ready or Studio driver first (nvidia-smi must work).' + #13#10 +
-    'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.');
-  TokenPage.Add('Provider token (slt_provider_…):', False);
+    'You do not need the CUDA Toolkit - this installer bundles the CUDA runtime.');
+  TokenPage.Add('Provider token (slt_provider_...):', False);
   if PrefillToken <> '' then
     TokenPage.Values[0] := PrefillToken
   else if ReadSavedToken() <> '' then
@@ -317,7 +367,7 @@ begin
       TokenPage.ID,
       'Stored model weights',
       'A previous install left downloaded models on this PC (' + SizeLabel + ').' + #13#10 + #13#10 +
-      'Keep them if you plan to run the agent again — reconnects stay instant.' + #13#10 + #13#10 +
+      'Keep them if you plan to run the agent again - reconnects stay instant.' + #13#10 + #13#10 +
       'Remove them only if you want to free disk space. Enabled models will download again later.');
     PurgeModelsCheck := TNewCheckBox.Create(ModelsPage);
     PurgeModelsCheck.Parent := ModelsPage.Surface;
@@ -332,7 +382,7 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if CurPageID = TokenPage.ID then
+  if (TokenPage <> nil) and (CurPageID = TokenPage.ID) then
   begin
     if Trim(TokenPage.Values[0]) <> '' then
     begin
@@ -354,11 +404,82 @@ begin
   end;
 end;
 
-procedure CurStepChanged(CurStep: TSetupStep);
+procedure LaunchScalatticeRuntime(const AppDir: String);
 var
   ResultCode: Integer;
-  SetTokenResult: Integer;
-  Token, SavedToken, AppDir: String;
+begin
+  Exec('wscript.exe', '//nologo "' + AppDir + '\launch-background.vbs"',
+    AppDir, SW_HIDE, ewNoWait, ResultCode);
+  Sleep(800);
+  Exec('wscript.exe', '//nologo "' + AppDir + '\launch-tray.vbs"',
+    AppDir, SW_HIDE, ewNoWait, ResultCode);
+end;
+
+procedure StartScalatticeAfterInstall(const AppDir: String);
+var
+  ResultCode: Integer;
+  Token, SavedToken: String;
+begin
+  SavedToken := ReadSavedToken();
+  Token := '';
+  if (TokenPage <> nil) and (not WizardSilent) and (not IsSilentUpdate) then
+    Token := Trim(TokenPage.Values[0]);
+
+  if IsSilentUpdate or WizardSilent then
+  begin
+    { Prefer restart so same-token set-token cannot skip relaunching tray/background. }
+    Exec(AppDir + '\{#MyAppExeName}', 'restart',
+      AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if ResultCode <> 0 then
+    begin
+      if SavedToken <> '' then
+        Exec(AppDir + '\{#MyAppExeName}',
+          'set-token --token "' + SavedToken + '"',
+          AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode)
+      else if Token <> '' then
+        Exec(AppDir + '\{#MyAppExeName}',
+          'set-token --token "' + Token + '"',
+          AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      LaunchScalatticeRuntime(AppDir);
+    end
+    else
+    begin
+      { restart usually starts both; still nudge tray/background as a safety net. }
+      Sleep(1000);
+      LaunchScalatticeRuntime(AppDir);
+    end;
+    Exit;
+  end;
+
+  if Token <> '' then
+  begin
+    Exec(AppDir + '\{#MyAppExeName}',
+      'set-token --token "' + Token + '"',
+      AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  else if SavedToken <> '' then
+  begin
+    Exec(AppDir + '\{#MyAppExeName}',
+      'set-token --token "' + SavedToken + '"',
+      AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  else
+    ResultCode := 1;
+
+  LaunchScalatticeRuntime(AppDir);
+
+  if (SavedToken = '') and (Token = '') then
+    MsgBox('Scalattice Agent was installed, but no provider token was found.' + #13#10 +
+      'Open Command Prompt and run:' + #13#10 +
+      '  scalattice-agent set-token --token YOUR_TOKEN' + #13#10 + #13#10 +
+      'If you see missing cudart64_12.dll / cublas64_12.dll, the installer build did not bundle CUDA libs.' + #13#10 +
+      'Check %LOCALAPPDATA%\Scalattice\lib on this machine.',
+      mbInformation, MB_OK);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  AppDir: String;
 begin
   if CurStep = ssInstall then
     StopScalatticeRuntime;
@@ -380,33 +501,8 @@ begin
       BroadcastEnvironmentChange;
     end;
 
-    SavedToken := ReadSavedToken();
-    SetTokenResult := 0;
-    Token := Trim(TokenPage.Values[0]);
-    if Token <> '' then
-    begin
-      { Call the exe directly — never via .cmd — so no console window flashes. }
-      Exec(AppDir + '\{#MyAppExeName}',
-        'set-token --token "' + Token + '"',
-        AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
-    end
-    else if SavedToken <> '' then
-    begin
-      Exec(AppDir + '\{#MyAppExeName}',
-        'set-token --token "' + SavedToken + '"',
-        AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
-    end;
-
-    Exec('wscript.exe', '//nologo "' + AppDir + '\launch-tray.vbs"',
-      AppDir, SW_HIDE, ewNoWait, ResultCode);
-
-    if (SavedToken = '') and (Token = '') and (SetTokenResult <> 0) then
-      MsgBox('Scalattice Agent was installed, but starting the background service failed.' + #13#10 +
-        'Open Command Prompt and run:' + #13#10 +
-        '  scalattice-agent set-token --token YOUR_TOKEN' + #13#10 + #13#10 +
-        'If you see missing cudart64_12.dll / cublas64_12.dll, the installer build did not bundle CUDA libs.' + #13#10 +
-        'Check %LOCALAPPDATA%\Scalattice\lib on this machine.',
-        mbInformation, MB_OK);
+    StartScalatticeAfterInstall(AppDir);
+    CleanupOldLibBackup;
   end;
 end;
 

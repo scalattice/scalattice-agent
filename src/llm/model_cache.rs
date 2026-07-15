@@ -1,4 +1,4 @@
-//! In-process GGUF cache — avoids reloading multi-GB weights on every invoke.
+//! In-process GGUF cache - avoids reloading multi-GB weights on every invoke.
 
 use crate::compute_pool::VirtualCard;
 use anyhow::{Context, Result};

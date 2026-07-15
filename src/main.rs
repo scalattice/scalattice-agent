@@ -78,6 +78,8 @@ enum Commands {
         #[arg(long)]
         disable_auto: bool,
     },
+    /// Restart the background agent (and Windows tray) using the saved token
+    Restart,
 }
 
 fn main() -> Result<()> {
@@ -105,7 +107,7 @@ fn main() -> Result<()> {
 }
 
 /// Windows release builds use the WINDOWS subsystem (no console). Attach to a
-/// parent console for interactive CLI only — never AllocConsole (that flashes a
+/// parent console for interactive CLI only - never AllocConsole (that flashes a
 /// visible window and can loop with installers / autostart).
 #[cfg(windows)]
 fn prepare_windows_process(cli: &Cli) -> Result<()> {
@@ -249,6 +251,10 @@ async fn run_async(cli: Cli) -> Result<()> {
         }) => {
             run_update(check, enable_auto, disable_auto).await?;
         }
+        Some(Commands::Restart) => {
+            service::restart_runtime_from_saved_token()?;
+            println!("Scalattice Agent restarted.");
+        }
     }
 
     Ok(())
@@ -286,7 +292,7 @@ async fn run_foreground(token: Option<String>) -> Result<()> {
             println!("following background agent (Ctrl+C to stop watching only)");
             return service::follow_service_logs();
         }
-        anyhow::bail!("agent not running. Run: scalattice-agent set-token --token slt_provider_…");
+        anyhow::bail!("agent not running. Run: scalattice-agent set-token --token slt_provider_...");
     }
 
     let config = config::AgentConfig::from_env_and_cli(token)?;
@@ -325,7 +331,7 @@ fn print_status() -> Result<()> {
     } else {
         println!("Token    not set");
         println!("         Create one at https://scalattice.cloud/providers");
-        println!("         scalattice-agent set-token --token slt_provider_…");
+        println!("         scalattice-agent set-token --token slt_provider_...");
     }
 
     if service::background_service_available() {

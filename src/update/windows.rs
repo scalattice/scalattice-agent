@@ -10,7 +10,6 @@ use std::process::{Command, Stdio};
 
 const INSTALLER_NAME: &str = "ScalatticeAgentSetup-x86_64.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 pub async fn check_for_update() -> Result<UpdateCheckOutcome> {
     let latest = fetch_latest_release().await?;
@@ -71,28 +70,39 @@ fn update_installer_path(tag: &str) -> Result<PathBuf> {
 
 pub fn spawn_installer_and_exit(installer: &Path) -> Result<()> {
     let install = install_dir().context("resolve install directory")?;
-    // Prefer a PowerShell runner so we never flash a visible cmd.exe window.
     let runner = write_update_runner_ps1(installer, &install)?;
     if !runner.is_file() {
         anyhow::bail!("update runner script missing at {}", runner.display());
     }
 
-    Command::new("powershell")
+    // `start` detaches the updater so it survives this process exiting.
+    // Empty title string is required by cmd's start parsing.
+    let status = Command::new("cmd.exe")
         .args([
+            "/C",
+            "start",
+            "ScalatticeUpdate",
+            "/MIN",
+            "powershell.exe",
             "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
+            "-WindowStyle",
+            "Hidden",
             "-File",
             &runner.display().to_string(),
         ])
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .status()
         .with_context(|| format!("launch update runner {}", runner.display()))?;
+
+    if !status.success() {
+        anyhow::bail!("failed to detach Windows update runner");
+    }
+
     std::process::exit(0);
 }
 
@@ -107,19 +117,64 @@ fn write_update_runner_ps1(installer: &Path, install_dir: &Path) -> Result<PathB
     let installer = installer.display().to_string().replace('\'', "''");
     let install = install_dir.display().to_string().replace('\'', "''");
     let script = format!(
-        r#"$ErrorActionPreference = 'SilentlyContinue'
-Start-Sleep -Seconds 2
-Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" | ForEach-Object {{
+        r#"$ErrorActionPreference = 'Continue'
+$logDir = Join-Path $env:LOCALAPPDATA 'Scalattice\logs'
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$log = Join-Path $logDir 'update.log'
+function Log([string]$msg) {{
+  $line = '{{0}} {{1}}' -f (Get-Date -Format o), $msg
+  Add-Content -LiteralPath $log -Value $line -ErrorAction SilentlyContinue
+}}
+Log 'update runner start'
+Start-Sleep -Seconds 3
+Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" -ErrorAction SilentlyContinue | ForEach-Object {{
+  Log ("stopping pid " + $_.ProcessId)
   Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }}
+$deadline = (Get-Date).AddSeconds(45)
+while ((Get-Date) -lt $deadline) {{
+  $left = @(Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" -ErrorAction SilentlyContinue)
+  if ($left.Count -eq 0) {{ break }}
+  $left | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}
+  Start-Sleep -Milliseconds 500
+}}
 Start-Sleep -Seconds 2
-$p = Start-Process -FilePath '{installer}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/FORCECLOSEAPPLICATIONS','/UPDATE=1' -Wait -PassThru -WindowStyle Hidden
-Start-Sleep -Seconds 2
+Log 'starting installer'
+$p = Start-Process -FilePath '{installer}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS','/FORCECLOSEAPPLICATIONS','/UPDATE=1' -Wait -PassThru -WindowStyle Hidden
+$code = 0
+if ($null -ne $p) {{ $code = $p.ExitCode }}
+Log ("installer exit code " + $code)
+# 0 = success, 3010 = success reboot required (we pass /NORESTART)
+if (($code -ne 0) -and ($code -ne 3010)) {{
+  Log 'installer failed; not launching agent'
+  exit 1
+}}
+$bin = Join-Path '{install}' 'scalattice-agent.exe'
 $bg = Join-Path '{install}' 'launch-background.vbs'
 $tray = Join-Path '{install}' 'launch-tray.vbs'
-if (Test-Path $bg) {{ Start-Process -FilePath 'wscript.exe' -ArgumentList '//nologo', $bg -WindowStyle Hidden }}
-if (Test-Path $tray) {{ Start-Process -FilePath 'wscript.exe' -ArgumentList '//nologo', $tray -WindowStyle Hidden }}
+if (Test-Path -LiteralPath $bin) {{
+  try {{
+    $ver = (Get-Item -LiteralPath $bin).VersionInfo.ProductVersion
+    Log ("installed binary ProductVersion=" + $ver)
+  }} catch {{}}
+  Log 'running scalattice-agent restart'
+  $r = Start-Process -FilePath $bin -ArgumentList 'restart' -Wait -PassThru -WindowStyle Hidden
+  if ($null -ne $r) {{ Log ("restart exit code " + $r.ExitCode) }}
+}}
+Start-Sleep -Seconds 2
+if (Test-Path -LiteralPath $bg) {{
+  Log 'launch-background.vbs'
+  Start-Process -FilePath 'wscript.exe' -ArgumentList '//nologo', $bg -WindowStyle Hidden
+}}
+Start-Sleep -Seconds 1
+if (Test-Path -LiteralPath $tray) {{
+  Log 'launch-tray.vbs'
+  Start-Process -FilePath 'wscript.exe' -ArgumentList '//nologo', $tray -WindowStyle Hidden
+}}
+$alive = @(Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" -ErrorAction SilentlyContinue)
+Log ("agent processes after update: " + $alive.Count)
 Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+Log 'update runner done'
 "#
     );
 
