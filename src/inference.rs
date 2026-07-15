@@ -177,8 +177,11 @@ pub async fn warm_pool_devices(pool: &VirtualCard) -> Result<()> {
     if pool.cuda_device_ids.is_empty() {
         return Ok(());
     }
+    let Some(smi) = crate::specs::resolve_nvidia_smi() else {
+        return Ok(());
+    };
     for index in &pool.cuda_device_ids {
-        let mut cmd = std::process::Command::new("nvidia-smi");
+        let mut cmd = std::process::Command::new(&smi);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

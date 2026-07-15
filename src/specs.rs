@@ -238,7 +238,7 @@ fn sum_option(values: impl Iterator<Item = u32>) -> Option<u32> {
 
 fn detect_nvidia_devices() -> Vec<ComputeDevice> {
     for bin in nvidia_smi_bins() {
-        let devices = detect_nvidia_devices_from(bin);
+        let devices = detect_nvidia_devices_from(&bin);
         if !devices.is_empty() {
             return devices;
         }
@@ -246,27 +246,82 @@ fn detect_nvidia_devices() -> Vec<ComputeDevice> {
     detect_nvidia_devices_from_procfs()
 }
 
-fn nvidia_smi_bins() -> Vec<&'static str> {
+/// Absolute `nvidia-smi` paths first (Windows PATH is often incomplete for tray agents).
+fn nvidia_smi_bins() -> Vec<String> {
     #[cfg(windows)]
     {
-        return vec!["nvidia-smi"];
+        let mut bins = Vec::new();
+        let system32 = std::env::var_os("SystemRoot")
+            .map(|root| {
+                std::path::PathBuf::from(root)
+                    .join("System32")
+                    .join("nvidia-smi.exe")
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe"));
+        bins.push(system32.to_string_lossy().into_owned());
+
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            bins.push(
+                std::path::PathBuf::from(pf)
+                    .join("NVIDIA Corporation")
+                    .join("NVSMI")
+                    .join("nvidia-smi.exe")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
+            bins.push(
+                std::path::PathBuf::from(pf86)
+                    .join("NVIDIA Corporation")
+                    .join("NVSMI")
+                    .join("nvidia-smi.exe")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        bins.push("nvidia-smi".into());
+        bins.push("nvidia-smi.exe".into());
+        bins
     }
     #[cfg(unix)]
     {
-        return vec![
-            "/usr/lib/wsl/lib/nvidia-smi",
-            "/usr/lib/nvidia/bin/nvidia-smi",
-            "/usr/bin/nvidia-smi",
-            "/usr/sbin/nvidia-smi",
-            "/usr/local/bin/nvidia-smi",
-            "/usr/local/cuda/bin/nvidia-smi",
-            "nvidia-smi",
-        ];
+        vec![
+            "/usr/lib/wsl/lib/nvidia-smi".into(),
+            "/usr/lib/nvidia/bin/nvidia-smi".into(),
+            "/usr/bin/nvidia-smi".into(),
+            "/usr/sbin/nvidia-smi".into(),
+            "/usr/local/bin/nvidia-smi".into(),
+            "/usr/local/cuda/bin/nvidia-smi".into(),
+            "nvidia-smi".into(),
+        ]
     }
     #[cfg(not(any(unix, windows)))]
     {
-        vec!["nvidia-smi"]
+        vec!["nvidia-smi".into()]
     }
+}
+
+/// First working `nvidia-smi` for diagnostics / warm-pool (absolute path preferred).
+pub fn resolve_nvidia_smi() -> Option<String> {
+    for bin in nvidia_smi_bins() {
+        if bin != "nvidia-smi"
+            && bin != "nvidia-smi.exe"
+            && !std::path::Path::new(&bin).is_file()
+        {
+            continue;
+        }
+        let Ok(output) = configure_nvidia_smi_command(&bin)
+            .args(["-L"])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            return Some(bin);
+        }
+    }
+    None
 }
 
 fn wsl_nvidia_lib_dir() -> Option<&'static str> {
