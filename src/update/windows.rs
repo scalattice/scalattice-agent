@@ -71,52 +71,63 @@ fn update_installer_path(tag: &str) -> Result<PathBuf> {
 
 pub fn spawn_installer_and_exit(installer: &Path) -> Result<()> {
     let install = install_dir().context("resolve install directory")?;
-    let runner = write_update_runner(installer, &install)?;
+    // Prefer a PowerShell runner so we never flash a visible cmd.exe window.
+    let runner = write_update_runner_ps1(installer, &install)?;
     if !runner.is_file() {
         anyhow::bail!("update runner script missing at {}", runner.display());
     }
 
-    let cmd = windows_cmd();
-    Command::new(&cmd)
-        .arg("/C")
-        .arg(&runner)
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &runner.display().to_string(),
+        ])
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("launch update runner via {} {}", cmd.display(), runner.display()))?;
+        .with_context(|| format!("launch update runner {}", runner.display()))?;
     std::process::exit(0);
 }
 
-fn windows_cmd() -> PathBuf {
-    std::env::var("COMSPEC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\cmd.exe"))
-}
-
-fn write_update_runner(installer: &Path, install_dir: &Path) -> Result<PathBuf> {
+fn write_update_runner_ps1(installer: &Path, install_dir: &Path) -> Result<PathBuf> {
     let runner = std::env::temp_dir()
         .join("Scalattice")
-        .join("scalattice-update.cmd");
+        .join("scalattice-update.ps1");
     if let Some(parent) = runner.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let installer = installer.display();
-    let install = install_dir.display();
+    let installer = installer.display().to_string().replace('\'', "''");
+    let install = install_dir.display().to_string().replace('\'', "''");
     let script = format!(
-        "@echo off\r\n\
-setlocal\r\n\
-timeout /t 2 /nobreak >nul\r\n\
-powershell -NoProfile -WindowStyle Hidden -Command \"Get-CimInstance Win32_Process -Filter \\\"name='scalattice-agent.exe'\\\" | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}\"\r\n\
-timeout /t 2 /nobreak >nul\r\n\
-\"{installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /FORCECLOSEAPPLICATIONS /UPDATE=1\r\n\
-timeout /t 2 /nobreak >nul\r\n\
-if exist \"{install}\\launch-background.vbs\" wscript.exe //nologo \"{install}\\launch-background.vbs\"\r\n\
-if exist \"{install}\\launch-tray.vbs\" wscript.exe //nologo \"{install}\\launch-tray.vbs\"\r\n\
-del /f /q \"%~f0\" >nul 2>&1\r\n"
+        r#"$ErrorActionPreference = 'SilentlyContinue'
+Start-Sleep -Seconds 2
+Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" | ForEach-Object {{
+  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}}
+Start-Sleep -Seconds 2
+$p = Start-Process -FilePath '{installer}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/FORCECLOSEAPPLICATIONS','/UPDATE=1' -Wait -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 2
+$bg = Join-Path '{install}' 'launch-background.vbs'
+$tray = Join-Path '{install}' 'launch-tray.vbs'
+if (Test-Path $bg) {{ Start-Process -FilePath 'wscript.exe' -ArgumentList '//nologo', $bg -WindowStyle Hidden }}
+if (Test-Path $tray) {{ Start-Process -FilePath 'wscript.exe' -ArgumentList '//nologo', $tray -WindowStyle Hidden }}
+Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+"#
     );
+
+    // Remove any legacy .cmd updater that flashed a console.
+    let legacy_cmd = std::env::temp_dir()
+        .join("Scalattice")
+        .join("scalattice-update.cmd");
+    let _ = fs::remove_file(legacy_cmd);
 
     fs::write(&runner, script).with_context(|| format!("write {}", runner.display()))?;
     Ok(runner)

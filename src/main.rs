@@ -104,15 +104,13 @@ fn main() -> Result<()> {
         .block_on(run_async(cli))
 }
 
-/// Windows release builds use the WINDOWS subsystem (no console). Attach one for
-/// interactive CLI, and detach for background / tray so reboot startup cannot
-/// leave a visible cmd window that kills the agent when closed.
+/// Windows release builds use the WINDOWS subsystem (no console). Attach to a
+/// parent console for interactive CLI only — never AllocConsole (that flashes a
+/// visible window and can loop with installers / autostart).
 #[cfg(windows)]
 fn prepare_windows_process(cli: &Cli) -> Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-    use windows_sys::Win32::System::Console::{
-        AllocConsole, AttachConsole, FreeConsole, ATTACH_PARENT_PROCESS,
-    };
+    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, ATTACH_PARENT_PROCESS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
     let background = matches!(cli.command, Some(Commands::Foreground { .. }))
@@ -141,15 +139,15 @@ fn prepare_windows_process(cli: &Cli) -> Result<()> {
     }
 
     if tray {
-        // Tray detaches when SCALATTICE_TRAY_HIDDEN=1 (see tray::ui).
+        unsafe {
+            FreeConsole();
+        }
         return Ok(());
     }
 
-    // Interactive CLI: prefer parent console (cmd/PowerShell), else allocate one.
+    // Interactive CLI only: attach to the caller's console. Do not allocate a new one.
     unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
-            let _ = AllocConsole();
-        }
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
     Ok(())
 }

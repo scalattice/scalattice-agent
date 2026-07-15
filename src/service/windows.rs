@@ -177,18 +177,18 @@ pub fn systemd_unit_path() -> Result<PathBuf> {
 }
 
 pub fn autostart_method_line() -> Option<String> {
-    let agent = if task_exists() {
-        "agent: scheduled task"
-    } else if startup_agent_shortcut_exists() {
+    let agent = if startup_agent_shortcut_exists() {
         "agent: Startup folder"
+    } else if task_exists() {
+        "agent: scheduled task (legacy)"
     } else {
         return None;
     };
 
-    let tray = if tray_task_exists() {
-        "tray: scheduled task"
-    } else if startup_tray_shortcut_exists() {
+    let tray = if startup_tray_shortcut_exists() {
         "tray: Startup folder"
+    } else if tray_task_exists() {
+        "tray: scheduled task (legacy)"
     } else {
         "tray: not configured"
     };
@@ -288,43 +288,22 @@ pub fn stop_agents_for_update() {
 
 fn write_background_runner_with_token(token: &str) -> Result<bool> {
     let install = install_dir()?;
-    let lib = lib_dir()?;
-    let log = agent_log_path()?;
-    let bin = resolve_agent_binary()?;
-    let runner = install.join("run-background.cmd");
+    fs::create_dir_all(&install)?;
 
     // Keep the token out of the process command line (visible in Task Manager / WMI).
     // Persist to agent.env and let `foreground` load SCALATTICE_AGENT_TOKEN from disk.
-    let _ = crate::service::persist_agent_token(token.trim())?;
+    let token_changed = crate::service::persist_agent_token(token.trim())?;
 
-    if let Some(parent) = log.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::create_dir_all(&install)?;
-
-    let foreground_cmd = format!("\"{}\" foreground", bin.display());
-
-    let script = format!(
-        "@echo off\r\n\
-setlocal\r\n\
-set SCALATTICE_BACKGROUND=1\r\n\
-set \"PATH={install};{lib};%PATH%\"\r\n\
-cd /d \"{install}\"\r\n\
-{foreground_cmd} >> \"{log}\" 2>&1\r\n",
-        install = install.display(),
-        lib = lib.display(),
-        log = log.display(),
-        foreground_cmd = foreground_cmd,
-    );
-
-    let changed = if runner.is_file() {
-        fs::read_to_string(&runner).unwrap_or_default() != script
+    // Legacy helper used to host the agent under cmd.exe — that left a killable
+    // console window. Remove it so nothing can launch it by accident.
+    let legacy = install.join("run-background.cmd");
+    let removed_legacy = if legacy.is_file() {
+        fs::remove_file(&legacy).is_ok()
     } else {
-        true
+        false
     };
 
-    fs::write(&runner, script)?;
-    Ok(changed)
+    Ok(token_changed || removed_legacy)
 }
 
 fn sync_launch_scripts() -> Result<()> {
@@ -444,7 +423,7 @@ fn startup_dir() -> Result<PathBuf> {
 }
 
 fn autostart_configured() -> bool {
-    task_exists() || startup_agent_shortcut_exists()
+    startup_agent_shortcut_exists() || task_exists()
 }
 
 fn task_exists() -> bool {
@@ -478,24 +457,31 @@ fn startup_tray_shortcut_exists() -> bool {
 }
 
 fn ensure_agent_autostart_registered() -> Result<()> {
-    // Prefer scheduled task; always also write Startup VBS as a reboot safety net.
-    // Background single-instance mutex prevents double-start.
-    let _ = try_create_scheduled_task();
+    // Prefer the Startup folder only. Dual schtasks + Startup previously caused
+    // double launches; the Background mutex stops duplicates but Startup alone is
+    // more reliable for interactive Windows sessions after reboot.
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", TASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
     install_startup_agent_shortcut()?;
-    if task_exists() || startup_agent_shortcut_exists() {
+    if startup_agent_shortcut_exists() {
         Ok(())
     } else {
-        bail!("failed to register agent autostart (scheduled task and Startup folder)")
+        bail!("failed to register agent Startup shortcut")
     }
 }
 
 fn ensure_tray_autostart_registered() -> Result<()> {
-    let _ = try_create_tray_task();
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", TRAY_TASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
     install_startup_tray_shortcut()?;
-    if tray_task_exists() || startup_tray_shortcut_exists() {
+    if startup_tray_shortcut_exists() {
         Ok(())
     } else {
-        bail!("failed to register tray autostart (scheduled task and Startup folder)")
+        bail!("failed to register tray Startup shortcut")
     }
 }
 

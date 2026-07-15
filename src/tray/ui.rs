@@ -389,11 +389,20 @@ impl TrayApp {
                     self.schedule_next_update_check();
 
                     if self.settings.auto_update && self.update_available {
-                        write_tray_log(&format!(
-                            "auto-update: installing v{}",
-                            outcome.info().latest_version
-                        ));
-                        self.start_update_install();
+                        let latest = outcome.info().latest_version.clone();
+                        if self.settings.should_auto_install(&latest) {
+                            write_tray_log(&format!("auto-update: installing v{latest}"));
+                            self.settings.mark_auto_update_attempt(&latest);
+                            let _ = self.settings.save();
+                            self.start_update_install();
+                        } else {
+                            write_tray_log(&format!(
+                                "auto-update: skipping repeat install for v{latest}"
+                            ));
+                            self.update_notice = format!(
+                                "Update available: v{latest}. Open Updates to install manually."
+                            );
+                        }
                     }
                     ctx.request_repaint();
                 }

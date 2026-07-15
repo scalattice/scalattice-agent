@@ -383,13 +383,14 @@ begin
     Token := Trim(TokenPage.Values[0]);
     if Token <> '' then
     begin
-      Exec(AppDir + '\scalattice-run.cmd',
+      { Call the exe directly — never via .cmd — so no console window flashes. }
+      Exec(AppDir + '\{#MyAppExeName}',
         'set-token --token "' + Token + '"',
         AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
     end
     else if SavedToken <> '' then
     begin
-      Exec(AppDir + '\scalattice-run.cmd',
+      Exec(AppDir + '\{#MyAppExeName}',
         'set-token --token "' + SavedToken + '"',
         AppDir, SW_HIDE, ewWaitUntilTerminated, SetTokenResult);
     end;
@@ -400,7 +401,7 @@ begin
     if (SavedToken = '') and (Token = '') and (SetTokenResult <> 0) then
       MsgBox('Scalattice Agent was installed, but starting the background service failed.' + #13#10 +
         'Open Command Prompt and run:' + #13#10 +
-        '  scalattice-run.cmd set-token --token YOUR_TOKEN' + #13#10 + #13#10 +
+        '  scalattice-agent set-token --token YOUR_TOKEN' + #13#10 + #13#10 +
         'If you see missing cudart64_12.dll / cublas64_12.dll, the installer build did not bundle CUDA libs.' + #13#10 +
         'Check %LOCALAPPDATA%\Scalattice\lib on this machine.',
         mbInformation, MB_OK);

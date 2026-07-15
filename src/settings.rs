@@ -15,6 +15,11 @@ pub struct UserSettings {
     /// Seconds after UTC midnight when the daily update check should run (unique per install).
     #[serde(default)]
     pub update_daily_jitter_secs: u32,
+    /// Last version we already tried to auto-install (prevents install/reboot loops).
+    #[serde(default)]
+    pub last_auto_update_attempt_version: String,
+    #[serde(default)]
+    pub last_auto_update_attempt_unix: u64,
 }
 
 fn default_auto_update() -> bool {
@@ -27,6 +32,8 @@ impl Default for UserSettings {
             auto_update: true,
             last_update_check_unix: 0,
             update_daily_jitter_secs: 0,
+            last_auto_update_attempt_version: String::new(),
+            last_auto_update_attempt_unix: 0,
         }
     }
 }
@@ -92,6 +99,28 @@ impl UserSettings {
 
     pub fn mark_update_checked(&mut self) {
         self.last_update_check_unix = unix_now();
+    }
+
+    /// Returns true when auto-install is allowed for `latest_version`.
+    /// Blocks repeats of the same target within 12 hours so a failed/partial
+    /// replace cannot flash the update runner forever.
+    pub fn should_auto_install(&self, latest_version: &str) -> bool {
+        let latest = latest_version.trim();
+        if latest.is_empty() {
+            return false;
+        }
+        if self.last_auto_update_attempt_version.trim() == latest {
+            let age = unix_now().saturating_sub(self.last_auto_update_attempt_unix);
+            if age < 12 * 60 * 60 {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn mark_auto_update_attempt(&mut self, latest_version: &str) {
+        self.last_auto_update_attempt_version = latest_version.trim().to_string();
+        self.last_auto_update_attempt_unix = unix_now();
     }
 }
 
