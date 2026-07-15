@@ -178,7 +178,14 @@ pub async fn warm_pool_devices(pool: &VirtualCard) -> Result<()> {
         return Ok(());
     }
     for index in &pool.cuda_device_ids {
-        let _ = std::process::Command::new("nvidia-smi")
+        let mut cmd = std::process::Command::new("nvidia-smi");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let _ = cmd
             .args([
                 "-i",
                 &index.to_string(),

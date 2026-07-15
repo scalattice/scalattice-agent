@@ -164,10 +164,14 @@ mod which {
     pub fn which(name: &str) -> Result<PathBuf, ()> {
         #[cfg(windows)]
         {
-            let output = Command::new("where")
-                .arg(name)
-                .output()
-                .map_err(|_| ())?;
+            let mut command = Command::new("where");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            let output = command.arg(name).output().map_err(|_| ())?;
             if !output.status.success() {
                 return Err(());
             }

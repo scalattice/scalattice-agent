@@ -2,6 +2,32 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
+/// On Windows, console tools (`nvidia-smi`, `powershell`, `where`) briefly flash a
+/// cmd window unless CREATE_NO_WINDOW is set. Specs are refreshed on every
+/// heartbeat, so that flash looks like an endless open/close loop.
+fn hide_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+#[cfg(windows)]
+fn powershell_hidden(args: &[&str]) -> Command {
+    let mut cmd = Command::new("powershell");
+    hide_console(&mut cmd);
+    cmd.arg("-NoProfile");
+    cmd.arg("-WindowStyle");
+    cmd.arg("Hidden");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeDevice {
     pub id: String,
@@ -253,6 +279,7 @@ fn wsl_nvidia_lib_dir() -> Option<&'static str> {
 
 fn configure_nvidia_smi_command(bin: &str) -> Command {
     let mut cmd = Command::new(bin);
+    hide_console(&mut cmd);
     if let Some(wsl_lib) = wsl_nvidia_lib_dir() {
         let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
         let path = if existing.is_empty() {
@@ -538,13 +565,11 @@ fn detect_integrated_linux_pci_devices(existing: &[ComputeDevice]) -> Vec<Comput
 
 #[cfg(windows)]
 fn detect_integrated_windows_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
-        ])
-        .output();
+    let output = powershell_hidden(&[
+        "-Command",
+        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+    ])
+    .output();
 
     let Ok(output) = output else {
         return Vec::new();
@@ -706,7 +731,9 @@ pub fn detect_hostname() -> Option<String> {
         }
     }
 
-    let output = Command::new("hostname").output().ok()?;
+    let mut hostname_cmd = Command::new("hostname");
+    hide_console(&mut hostname_cmd);
+    let output = hostname_cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -743,14 +770,12 @@ fn detect_cpu_model_linux() -> Option<String> {
 
 #[cfg(windows)]
 fn detect_cpu_model_windows() -> Option<String> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
-        ])
-        .output()
-        .ok()?;
+    let output = powershell_hidden(&[
+        "-Command",
+        "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
+    ])
+    .output()
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -783,14 +808,12 @@ pub fn detect_ram_used_gb() -> Option<u32> {
     }
     #[cfg(windows)]
     {
-        let output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 0)",
-            ])
-            .output()
-            .ok()?;
+        let output = powershell_hidden(&[
+            "-Command",
+            "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 0)",
+        ])
+        .output()
+        .ok()?;
         if !output.status.success() {
             return None;
         }
@@ -876,14 +899,12 @@ fn detect_linux_memtotal_gb() -> Option<u32> {
 
 #[cfg(windows)]
 fn detect_windows_memtotal_gb() -> Option<u32> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)",
-        ])
-        .output()
-        .ok()?;
+    let output = powershell_hidden(&[
+        "-Command",
+        "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)",
+    ])
+    .output()
+    .ok()?;
     if !output.status.success() {
         return None;
     }
