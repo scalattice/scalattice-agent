@@ -10,6 +10,8 @@ use std::process::{Command, Stdio};
 
 const INSTALLER_NAME: &str = "ScalatticeAgentSetup-x86_64.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 pub async fn check_for_update() -> Result<UpdateCheckOutcome> {
     let latest = fetch_latest_release().await?;
@@ -75,35 +77,53 @@ pub fn spawn_installer_and_exit(installer: &Path) -> Result<()> {
         anyhow::bail!("update runner script missing at {}", runner.display());
     }
 
-    // `start` detaches the updater so it survives this process exiting.
-    // Empty title string is required by cmd's start parsing.
-    let status = Command::new("cmd.exe")
+    let runner_arg = runner.display().to_string();
+
+    // Spawn PowerShell directly with detach flags. Do not use `cmd /C start Title ...`:
+    // with separate argv entries, `start` treats the title as the program name
+    // ("Windows cannot find 'ScalatticeUpdate'").
+    let mut child = Command::new("powershell.exe");
+    child
         .args([
-            "/C",
-            "start",
-            "ScalatticeUpdate",
-            "/MIN",
-            "powershell.exe",
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-WindowStyle",
             "Hidden",
             "-File",
-            &runner.display().to_string(),
+            &runner_arg,
         ])
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("launch update runner {}", runner.display()))?;
+        .stderr(Stdio::null());
 
-    if !status.success() {
-        anyhow::bail!("failed to detach Windows update runner");
+    match child.spawn() {
+        Ok(_) => {
+            std::process::exit(0);
+        }
+        Err(direct_err) => {
+            // Fallback: one /C string so `start` gets a quoted title + real command.
+            let cmdline = format!(
+                "start \"ScalatticeUpdate\" /MIN powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{}\"",
+                runner_arg.replace('"', "")
+            );
+            Command::new("cmd.exe")
+                .args(["/C", &cmdline])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| {
+                    format!(
+                        "launch update runner {} (powershell: {direct_err})",
+                        runner.display()
+                    )
+                })?;
+            std::process::exit(0);
+        }
     }
-
-    std::process::exit(0);
 }
 
 fn write_update_runner_ps1(installer: &Path, install_dir: &Path) -> Result<PathBuf> {
