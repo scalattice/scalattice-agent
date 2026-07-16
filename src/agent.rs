@@ -573,7 +573,7 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
     }
 
     let (mut write, mut read) = ws.split();
-    let mut heartbeat = interval(Duration::from_secs(25));
+    let mut heartbeat = interval(Duration::from_secs(12));
     let mut token_poll = interval(Duration::from_secs(1));
     token_poll.tick().await;
 
@@ -756,7 +756,7 @@ async fn handle_server_message(
                     let invoke = parse_invoke_split(data)?;
                     respond_invoke_split(state, write, invoke).await?;
                 }
-                "pong" => {
+                "pong" | "policy" => {
                     if let Ok(pong) = parse_pong(data) {
                         let transition = {
                             let mut guard = state.lock().await;
