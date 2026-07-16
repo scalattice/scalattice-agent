@@ -466,6 +466,7 @@ impl SessionState {
         let devices = self.enabled_devices().compute_devices;
         state::update_connection_state(
             Some(runtime.status_label),
+            runtime.downloading_model.clone(),
             self.node_id.clone(),
             true,
             self.registered,
@@ -692,7 +693,10 @@ async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -
         runtime: Some(runtime),
     })?;
     write.send(Message::Text(hb)).await?;
-    state::touch_connection_state();
+    {
+        let guard = state.lock().await;
+        guard.persist_local_state();
+    }
     Ok(())
 }
 

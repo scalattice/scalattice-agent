@@ -30,6 +30,7 @@ pub fn state_file_path() -> Option<PathBuf> {
 
 pub fn update_connection_state(
     status_label: Option<String>,
+    downloading_model: Option<String>,
     node_id: Option<String>,
     server_connected: bool,
     server_registered: bool,
@@ -55,10 +56,9 @@ pub fn update_connection_state(
         updated_at_ms: 0,
     });
     if let Some(label) = status_label {
-        if state.downloading_model.is_none() {
-            state.status_label = Some(label);
-        }
+        state.status_label = Some(label);
     }
+    state.downloading_model = downloading_model;
     if let Some(id) = node_id {
         state.node_id = Some(id);
     }
