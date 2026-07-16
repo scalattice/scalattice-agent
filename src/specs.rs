@@ -45,6 +45,8 @@ pub struct ComputeDevice {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MachineSpecs {
+    #[serde(rename = "agentVersion", skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
     #[serde(rename = "gpuName", skip_serializing_if = "Option::is_none")]
     pub gpu_name: Option<String>,
     #[serde(rename = "vramGb", skip_serializing_if = "Option::is_none")]
@@ -71,6 +73,10 @@ pub struct MachineSpecs {
     pub disk_total_gb: Option<u32>,
     #[serde(rename = "computeDevices", skip_serializing_if = "Vec::is_empty")]
     pub compute_devices: Vec<ComputeDevice>,
+}
+
+fn agent_version_string() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
@@ -108,6 +114,7 @@ pub fn detect_machine_specs() -> MachineSpecs {
     let devices = detect_all_compute_devices();
     if devices.is_empty() {
         return MachineSpecs {
+            agent_version: Some(agent_version_string()),
             hostname,
             cpu_model,
             ram_gb,
@@ -167,6 +174,7 @@ pub fn build_specs_from_devices(
     };
 
     MachineSpecs {
+        agent_version: Some(agent_version_string()),
         gpu_name,
         vram_gb,
         vram_used_gb,
