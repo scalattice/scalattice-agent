@@ -772,6 +772,12 @@ async fn handle_server_message(
                         if transition.entered_earning {
                             maybe_warm_models(state.clone()).await;
                         }
+                        // Re-advertise immediately so disabled models leave the pool
+                        // without waiting for the next heartbeat. Do not heartbeat here —
+                        // that would recurse (heartbeat → pong → heartbeat).
+                        if state.lock().await.needs_reregister() {
+                            send_register_message(state, write).await?;
+                        }
                     }
                 }
                 "error" => {
