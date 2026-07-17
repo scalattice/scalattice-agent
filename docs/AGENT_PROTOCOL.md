@@ -28,7 +28,7 @@ Provider tokens are created on the **Providers** dashboard (`slt_provider_…` p
 ```json
 {
   "type": "register",
-  "models": ["mistral-large"],
+  "models": ["example-model"],
   "gpuName": "NVIDIA RTX 4090",
   "vramGb": 24,
   "specs": {
@@ -60,7 +60,7 @@ Provider tokens are created on the **Providers** dashboard (`slt_provider_…` p
 {
   "type": "registered",
   "nodeId": "agent-uuid",
-  "models": ["mistral-large"]
+  "models": ["example-model"]
 }
 ```
 
@@ -91,7 +91,7 @@ Heartbeats may refresh live machine specs:
     "ready": true,
     "jobState": "idle",
     "statusLabel": "Idle · ready for inference",
-    "loadedModels": ["mistralai/Mistral-Large-Instruct-2407"]
+    "loadedModels": ["org/example-runtime"]
   }
 }
 ```
@@ -104,8 +104,8 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 {
   "type": "invoke",
   "id": "request-uuid",
-  "modelId": "mistral-large",
-  "runtimeModel": "mistralai/Mistral-Large-Instruct-2407",
+  "modelId": "example-model",
+  "runtimeModel": "org/example-runtime",
   "messages": [{ "role": "user", "content": "Hello" }]
 }
 ```
