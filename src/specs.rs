@@ -71,6 +71,8 @@ pub struct MachineSpecs {
     pub ram_used_gb: Option<u32>,
     #[serde(rename = "diskTotalGb", skip_serializing_if = "Option::is_none")]
     pub disk_total_gb: Option<u32>,
+    #[serde(rename = "diskUsedGb", skip_serializing_if = "Option::is_none")]
+    pub disk_used_gb: Option<u32>,
     #[serde(rename = "computeDevices", skip_serializing_if = "Vec::is_empty")]
     pub compute_devices: Vec<ComputeDevice>,
 }
@@ -113,11 +115,15 @@ pub fn detect_machine_specs() -> MachineSpecs {
     let ram_gb = detect_ram_gb();
     let devices = detect_all_compute_devices();
     if devices.is_empty() {
+        let disk = disk_usage_gb().unwrap_or((None, None));
         return MachineSpecs {
             agent_version: Some(agent_version_string()),
             hostname,
             cpu_model,
             ram_gb,
+            ram_used_gb: detect_ram_used_gb(),
+            disk_total_gb: disk.0,
+            disk_used_gb: disk.1,
             ..MachineSpecs::default()
         };
     }
@@ -173,6 +179,8 @@ pub fn build_specs_from_devices(
         None
     };
 
+    let disk = disk_usage_gb().unwrap_or((None, None));
+
     MachineSpecs {
         agent_version: Some(agent_version_string()),
         gpu_name,
@@ -186,7 +194,8 @@ pub fn build_specs_from_devices(
         cpu_model,
         ram_gb,
         ram_used_gb: detect_ram_used_gb(),
-        disk_total_gb: detect_disk_total_gb(),
+        disk_total_gb: disk.0,
+        disk_used_gb: disk.1,
         compute_devices: devices.to_vec(),
     }
 }
@@ -890,15 +899,23 @@ pub fn detect_ram_used_gb() -> Option<u32> {
 }
 
 pub fn detect_disk_total_gb() -> Option<u32> {
-    let path = crate::paths::home_dir().ok()?;
-    disk_total_gb(&path)
+    disk_usage_gb()?.0
+}
+
+pub fn detect_disk_used_gb() -> Option<u32> {
+    disk_usage_gb()?.1
 }
 
 fn bytes_to_gb(bytes: u64) -> u32 {
     ((bytes as f64) / 1024.0 / 1024.0 / 1024.0).round().max(1.0) as u32
 }
 
-fn disk_total_gb(path: &std::path::Path) -> Option<u32> {
+fn disk_usage_gb() -> Option<(Option<u32>, Option<u32>)> {
+    let path = crate::paths::home_dir().ok()?;
+    disk_usage_for_path(&path)
+}
+
+fn disk_usage_for_path(path: &std::path::Path) -> Option<(Option<u32>, Option<u32>)> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -910,8 +927,16 @@ fn disk_total_gb(path: &std::path::Path) -> Option<u32> {
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
             return None;
         }
-        let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-        return Some(bytes_to_gb(total));
+        let total_bytes = stat.f_blocks as u64 * stat.f_frsize as u64;
+        let avail_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
+        let total = bytes_to_gb(total_bytes);
+        let used_bytes = total_bytes.saturating_sub(avail_bytes);
+        let used = if used_bytes == 0 {
+            0
+        } else {
+            bytes_to_gb(used_bytes).min(total)
+        };
+        return Some((Some(total), Some(used)));
     }
 
     #[cfg(windows)]
@@ -935,7 +960,14 @@ fn disk_total_gb(path: &std::path::Path) -> Option<u32> {
         if ok == 0 || total == 0 {
             return None;
         }
-        return Some(bytes_to_gb(total));
+        let total_gb = bytes_to_gb(total);
+        let used_bytes = total.saturating_sub(free);
+        let used_gb = if used_bytes == 0 {
+            0
+        } else {
+            bytes_to_gb(used_bytes).min(total_gb)
+        };
+        return Some((Some(total_gb), Some(used_gb)));
     }
 
     #[cfg(not(any(unix, windows)))]

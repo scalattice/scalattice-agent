@@ -6,8 +6,8 @@ Most day-to-day work is **one command on Linux**. Everything else is setup or tr
 
 | You want to… | Command | Where |
 |--------------|---------|--------|
-| **Ship a release** (Linux + Windows) | `./scripts/release.sh --dev` | Linux onsite |
-| **Ship all platforms** (+ aarch64 CI) | `./scripts/release.sh` | Linux onsite |
+| **Ship a release** (Linux + Windows) | `./scripts/release.sh --dev` | Linux build host |
+| **Ship all platforms** (+ aarch64 CI) | `./scripts/release.sh` | Linux build host |
 | **First-time Windows build machine** | `scripts\setup-windows-build.cmd` | Windows (Admin) |
 | **Register Windows CI runner** | `scripts\install-windows-runner.cmd` | Windows (Admin) |
 | **Check runner is online** | `./scripts/check-windows-runner.sh` | Linux |
@@ -19,7 +19,7 @@ Most day-to-day work is **one command on Linux**. Everything else is setup or tr
 ## Release flow
 
 ```
-Linux (onsite)                         Windows (self-hosted runner)
+Linux build host                       Windows (self-hosted runner)
 ─────────────────                      ───────────────────────────
 ./scripts/release.sh --dev
   ├─ build-release.sh        local x86_64 tarball

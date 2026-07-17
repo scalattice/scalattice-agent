@@ -8,7 +8,7 @@
 #define MyVersionInfo MyAppVersion + ".0"
 
 #define MyAppName "Scalattice Agent"
-#define MyAppPublisher "Robottik Software"
+#define MyAppPublisher "Robottik Ltd"
 #define MyAppURL "https://scalattice.cloud"
 #define MyAppExeName "scalattice-agent.exe"
 #define MyAppId "A4E8B2C1-9F3D-4A6E-8B1C-2D5E7F9A0B3C"

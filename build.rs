@@ -5,9 +5,9 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         res.set_icon("installer/windows/scalattice.ico");
         res.set("ProductName", "Scalattice Agent");
-        res.set("FileDescription", "Scalattice GPU operator agent");
-        res.set("CompanyName", "Robottik Software");
-        res.set("LegalCopyright", "Copyright (C) Robottik Software");
+        res.set("FileDescription", "Scalattice GPU agent");
+        res.set("CompanyName", "Robottik Ltd");
+        res.set("LegalCopyright", "Copyright (C) Robottik Ltd");
         // Keep string + numeric versions aligned so Explorer/ARP update after upgrades.
         res.set("ProductVersion", version);
         res.set("FileVersion", &format!("{version}.0"));

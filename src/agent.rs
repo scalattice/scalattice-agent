@@ -1011,9 +1011,9 @@ async fn send_invoke_split_error(
 
 /// Classify an inference failure into a stable, provider-agnostic code.
 ///
-/// The hypervisor logs and, ultimately, developers may see whatever we put here,
-/// so it must never contain filesystem paths, device names, hostnames, or model
-/// file locations. Full detail is logged locally on the provider instead.
+/// Scalattice Cloud and API clients may see whatever we put here, so it must
+/// never contain filesystem paths, device names, hostnames, or model file
+/// locations. Full detail is logged locally on the provider instead.
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     let detail = format!("{err:#}").to_lowercase();
     if detail.contains("null result")

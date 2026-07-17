@@ -1,19 +1,19 @@
 # Scalattice GPU Agent Protocol
 
-Public WebSocket protocol for `scalattice-agent` and other operator agents connecting to [Scalattice Cloud](https://scalattice.cloud).
+WebSocket protocol used by `scalattice-agent` (and compatible agents) to connect to [Scalattice Cloud](https://scalattice.cloud).
 
 ## Connect
 
 ```
 wss://api.scalattice.cloud/v1/operators/agent/ws
-Authorization: Bearer <provider_setup_code>
+Authorization: Bearer <provider_token>
 ```
 
-Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefix).
+Provider tokens are created on the **Providers** dashboard (`slt_provider_…` prefix).
 
 ## Message flow
 
-1. **Server → client** `ready`: assigns `nodeId`, sends the model catalog, compute device policy, and optional Hugging Face token:
+1. **Server → client** `ready`: assigns `nodeId`, sends the model catalog and compute device policy:
 
 ```json
 {
@@ -23,7 +23,7 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 }
 ```
 
-2. **Client → server** `register`: send machine specs and runtime. **Region is not sent by the agent.** Scalattice detects each machine's region from its connection IP when it registers. Advertise catalog model ids from the `ready` message:
+2. **Client → server** `register`: send machine specs and runtime. Advertise catalog model ids from the `ready` message. Do not send a region — Scalattice Cloud assigns placement.
 
 ```json
 {
@@ -52,9 +52,9 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 }
 ```
 
-`gpuName` and `vramGb` are kept for compatibility. Prefer sending the full `specs` object. Include `runtime` so the Providers dashboard can show readiness and active jobs.
+`gpuName` and `vramGb` are kept for compatibility. Prefer the full `specs` object. Include `runtime` so the Providers dashboard can show readiness and active jobs.
 
-3. **Server → client** `registered`: the machine is in the live operator pool.
+3. **Server → client** `registered`:
 
 ```json
 {
@@ -64,7 +64,7 @@ Setup codes are created on the **Providers** dashboard (`slt_provider_…` prefi
 }
 ```
 
-4. **Client ↔ server** `heartbeat` / `pong` every ~25s. The server may include updated compute device policy and Hugging Face token on each `pong`:
+4. **Client ↔ server** `heartbeat` / `pong` every ~25s. The server may refresh compute device policy on `pong`:
 
 ```json
 { "type": "pong", "computeDevices": [ { "id": "gpu0", "enabled": true } ] }
@@ -96,7 +96,7 @@ Heartbeats may refresh live machine specs:
 }
 ```
 
-The reference agent sends an extra heartbeat when a job starts or finishes so `jobState: busy` appears on the dashboard immediately. GPU detection uses NVIDIA (`nvidia-smi`), AMD (`rocm-smi`), and PCI graphics devices (`lspci`), plus host CPU/RAM via `/proc`.
+The reference agent sends an extra heartbeat when a job starts or finishes so `jobState: busy` appears on the dashboard promptly. GPU detection uses NVIDIA (`nvidia-smi`), AMD (`rocm-smi`), and PCI graphics devices (`lspci`), plus host CPU/RAM via `/proc`.
 
 5. **Server → client** `invoke`: inference job:
 
@@ -143,9 +143,9 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 
 | Variable | Description |
 |----------|-------------|
-| `SCALATTICE_AGENT_TOKEN` | Provider setup code (`slt_provider_…`) |
+| `SCALATTICE_AGENT_TOKEN` | Provider token (`slt_provider_…`) |
 
-The WebSocket endpoint is fixed at `wss://api.scalattice.cloud/v1/operators/agent/ws` (compiled into the agent). Each GPU machine's routing region is detected from its connection IP at register time — operators cannot set or override it.
+The WebSocket endpoint is fixed in the agent binary. Placement and schedule are controlled from the Providers dashboard.
 
 ## Background agent (Linux + systemd)
 
@@ -165,6 +165,7 @@ The curl installer with `--token` writes `agent.env` and starts the background a
 ## Implementation notes
 
 - Load model weights using `runtimeModel` from the catalog. Do not hardcode model names.
-- Advertise all models from the `ready` catalog; the hypervisor filters routing by region and policy.
-- Stay connected and send heartbeats while online; the Providers dashboard shows live connection status and specs while you are connected.
+- Advertise models from the `ready` catalog; Scalattice Cloud decides which jobs you receive.
+- Stay connected and send heartbeats while online; the Providers dashboard shows live status while you are connected.
 - Use your provider schedule in Scalattice Cloud to control when your GPU accepts paid work.
+- Treat prompts and completions as sensitive: they are visible on the machine that runs the agent.

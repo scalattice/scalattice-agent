@@ -42,7 +42,7 @@ Include as much of the following as you can:
 
 1. **Acknowledgement** — We aim to confirm receipt within five business days.
 2. **Triage** — We assess severity and whether the issue affects the agent,
-   install script, release artifacts, or Scalattice Cloud services.
+   install script, release artifacts, or Scalattice Cloud.
 3. **Fix** — Confirmed issues are prioritized; patches may land in `main` and
    ship in a tagged release.
 4. **Disclosure** — We coordinate reasonable disclosure timing with you. Please
@@ -64,21 +64,20 @@ notes when they wish to be credited.
 
 - Issues requiring physical access or already-compromised provider machines
 - Social engineering of provider tokens
-- Denial of service against a single operator GPU without broader impact
+- Denial of service against a single provider GPU without broader impact
 - Findings in third-party dependencies with no fix available upstream (we still
-  want to know — we may track them internally)
-- Scalattice Cloud backend or router bugs (report those to the same security
-  address; we will route internally)
+  want to know)
+- Issues that only affect Scalattice Cloud services unrelated to this agent
+  (still report them to the same security address)
 
-## Operator security notes
+## Provider security notes
 
 - Treat `slt_provider_…` tokens like passwords. Rotate them from the Providers
   dashboard if exposed.
 - The agent connects only to Scalattice Cloud; do not run patched builds that
   change the WebSocket endpoint.
-- Inference traffic is TLS-terminated at Scalattice; operators can see job
-  content on their own hardware today. See
-  [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md) for the current trust model.
+- Job content is visible on the machine that runs the agent. See
+  [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md).
 
 ## Safe harbor
 

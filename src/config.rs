@@ -2,7 +2,7 @@ use crate::paths::{agent_env_path, config_dir};
 use anyhow::{bail, Context, Result};
 use std::env;
 
-/// Hard-coded Scalattice Cloud operator WebSocket endpoint (not configurable).
+/// Hard-coded Scalattice Cloud WebSocket endpoint (not configurable).
 pub const SCALATTICE_WS_URL: &str = "wss://api.scalattice.cloud/v1/operators/agent/ws";
 
 #[derive(Debug, Clone)]

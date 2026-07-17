@@ -102,8 +102,8 @@ impl UserSettings {
     }
 
     /// Returns true when auto-install is allowed for `latest_version`.
-    /// Blocks repeats of the same target within 12 hours so a failed/partial
-    /// replace cannot flash the update runner forever.
+    /// Blocks repeats of the same target within 12 hours so closing setup
+    /// without finishing cannot reopen the installer in a loop.
     pub fn should_auto_install(&self, latest_version: &str) -> bool {
         let latest = latest_version.trim();
         if latest.is_empty() {

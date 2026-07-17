@@ -27,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     name = "scalattice-agent",
-    about = "Scalattice GPU operator agent",
+    about = "Scalattice GPU agent",
     version
 )]
 struct Cli {
