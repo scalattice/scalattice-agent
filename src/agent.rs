@@ -298,7 +298,7 @@ impl SessionState {
                     model.runtime_model.clone()
                 }
             })
-            .unwrap_or_else(|| model_id.to_string())
+            .unwrap_or_else(|| model_id.replace("__", "/"))
     }
 
     fn apply_purge_models(&mut self, model_ids: &[String]) {
