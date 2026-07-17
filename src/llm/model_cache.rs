@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use super::embedded::{backend, model_params_for_pool};
+use super::embedded::{backend, load_model_for_pool};
 
 static CACHE: OnceLock<Mutex<HashMap<String, LlamaModel>>> = OnceLock::new();
 
@@ -41,8 +41,7 @@ pub fn with_loaded_model<R>(
         .map_err(|_| anyhow::anyhow!("model cache lock poisoned"))?;
 
     if !guard.contains_key(&key) {
-        let model_params = model_params_for_pool(pool)?;
-        let model = LlamaModel::load_from_file(backend, model_path, &model_params)
+        let model = load_model_for_pool(backend, model_path, pool)
             .with_context(|| format!("load model {}", model_path.display()))?;
         guard.insert(key.clone(), model);
     }

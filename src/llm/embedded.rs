@@ -2,7 +2,7 @@
 
 use crate::compute_pool::{PoolStrategy, VirtualCard};
 use crate::protocol::ChatMessage;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::LogOptions;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -12,8 +12,9 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use tracing::warn;
 
 use super::prompt::{build_chat_prompt, sanitize_completion};
 
@@ -169,4 +170,68 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
     }
 
     Ok(model_params)
+}
+
+/// Load the model for this pool, degrading gracefully instead of hard-failing.
+///
+/// Small / memory-constrained pools frequently OOM inside llama.cpp during load,
+/// which surfaces as a null model pointer. Rather than fail the job, retry with
+/// progressively less GPU offload and finally a CPU-only floor that loads whenever
+/// system RAM allows. Detailed failures are logged locally only; the caller must
+/// keep provider-specific detail (paths, device names) out of anything sent upstream.
+pub(crate) fn load_model_for_pool(
+    backend: &LlamaBackend,
+    model_path: &Path,
+    pool: &VirtualCard,
+) -> Result<LlamaModel> {
+    let candidates = load_param_candidates(pool)?;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for (label, params) in candidates {
+        match LlamaModel::load_from_file(backend, model_path, &params) {
+            Ok(model) => {
+                if label != "configured" {
+                    warn!("model loaded via '{label}' fallback after primary load failed");
+                }
+                return Ok(model);
+            }
+            Err(err) => {
+                warn!("model load attempt '{label}' failed: {err}");
+                last_err = Some(anyhow!(err));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("model failed to load")))
+}
+
+/// Ordered load configurations to try: the pool's configured strategy first,
+/// then reduced GPU offload, then a CPU-only floor.
+fn load_param_candidates(pool: &VirtualCard) -> Result<Vec<(&'static str, LlamaModelParams)>> {
+    let mut candidates = Vec::new();
+    candidates.push(("configured", model_params_for_pool(pool)?));
+
+    if matches!(pool.strategy, PoolStrategy::GpuWithCpuOffload) && pool.gpu_layer_budget > 1 {
+        if let Some(primary) = pool.cuda_device_ids.first() {
+            let device = *primary as usize;
+            let reduced = (pool.gpu_layer_budget / 2).max(1);
+            let params = LlamaModelParams::default()
+                .with_devices(std::slice::from_ref(&device))
+                .context("configure GPU for reduced offload fallback")?
+                .with_use_mmap(true)
+                .with_n_gpu_layers(reduced);
+            candidates.push(("gpu-offload-reduced", params));
+        }
+    }
+
+    if !matches!(pool.strategy, PoolStrategy::CpuOnly) {
+        candidates.push((
+            "cpu-only",
+            LlamaModelParams::default()
+                .with_use_mmap(true)
+                .with_n_gpu_layers(0),
+        ));
+    }
+
+    Ok(candidates)
 }

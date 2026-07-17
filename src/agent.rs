@@ -858,13 +858,14 @@ async fn respond_invoke(
                 Ok(())
             }
             Err(err) => {
+                warn!(
+                    "inference invoke failed on pool {}: {err:#}",
+                    engine.pool().display_name
+                );
                 let err = InvokeErrorMessage {
                     kind: "invoke_error",
                     id: invoke.id,
-                    error: format!(
-                        "Virtual card {}: {err:#}",
-                        engine.pool().display_name
-                    ),
+                    error: invoke_error_code(&err).to_string(),
                 };
                 write
                     .send(Message::Text(serde_json::to_string(&err)?))
@@ -993,13 +994,41 @@ async fn send_invoke_split_error(
     engine: &InferenceEngine,
     err: anyhow::Error,
 ) -> Result<()> {
+    warn!(
+        "split inference failed on pool {}: {err:#}",
+        engine.pool().display_name
+    );
     let err = InvokeErrorMessage {
         kind: "invoke_error",
         id: id.to_string(),
-        error: format!("Virtual card {}: {err:#}", engine.pool().display_name),
+        error: invoke_error_code(&err).to_string(),
     };
     write
         .send(Message::Text(serde_json::to_string(&err)?))
         .await?;
     Ok(())
+}
+
+/// Classify an inference failure into a stable, provider-agnostic code.
+///
+/// The hypervisor logs and, ultimately, developers may see whatever we put here,
+/// so it must never contain filesystem paths, device names, hostnames, or model
+/// file locations. Full detail is logged locally on the provider instead.
+fn invoke_error_code(err: &anyhow::Error) -> &'static str {
+    let detail = format!("{err:#}").to_lowercase();
+    if detail.contains("null result")
+        || detail.contains("load model")
+        || detail.contains("load_from_file")
+    {
+        "model_load_failed"
+    } else if detail.contains("out of memory")
+        || detail.contains("oom")
+        || detail.contains("alloc")
+    {
+        "model_out_of_memory"
+    } else if detail.contains("context window") || detail.contains("too long") {
+        "prompt_too_long"
+    } else {
+        "inference_failed"
+    }
 }
