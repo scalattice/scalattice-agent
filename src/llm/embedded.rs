@@ -14,6 +14,7 @@ use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Instant;
 use tracing::warn;
 
 use super::prompt::{build_chat_prompt, sanitize_completion};
@@ -29,11 +30,20 @@ pub struct GenerateConfig {
     pub model_id: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GenerateTimings {
+    pub model_load_ms: u64,
+    pub prefill_ms: u64,
+    pub decode_ms: u64,
+    pub total_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerateOutput {
     pub content: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    pub timings: GenerateTimings,
 }
 
 pub fn init_backend() -> Result<()> {
@@ -56,75 +66,117 @@ pub(crate) fn backend() -> Result<&'static LlamaBackend> {
 }
 
 pub fn generate(config: &GenerateConfig) -> Result<GenerateOutput> {
+    generate_with_callback(config, |_| {})
+}
+
+pub fn generate_with_callback(
+    config: &GenerateConfig,
+    mut on_token: impl FnMut(&str),
+) -> Result<GenerateOutput> {
+    let total_start = Instant::now();
     let backend = backend()?;
     let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
         NonZeroU32::new(4096).context("invalid default context size")?,
     ));
 
-    super::model_cache::with_loaded_model(&config.model_path, &config.pool, |model| {
-        let mut ctx = model
-            .new_context(backend, ctx_params)
-            .context("create llama context")?;
+    let (output, model_load_ms) =
+        super::model_cache::with_loaded_model_timed(&config.model_path, &config.pool, |model| {
+            let prefill_start = Instant::now();
+            let mut ctx = model
+                .new_context(backend, ctx_params)
+                .context("create llama context")?;
 
-        let prompt = build_chat_prompt(model, &config.messages)?;
-        let mut prompt_tokens = model
-            .str_to_token(&prompt, AddBos::Never)
-            .context("tokenize prompt")?;
+            let prompt = build_chat_prompt(model, &config.messages)?;
+            let mut prompt_tokens = model
+                .str_to_token(&prompt, AddBos::Never)
+                .context("tokenize prompt")?;
 
-        let max_tokens = config.max_tokens.max(1).min(2048) as usize;
-        if prompt_tokens.len() + max_tokens > ctx.n_ctx() as usize {
-            anyhow::bail!(
-                "prompt too long for context window ({} + {} > {})",
-                prompt_tokens.len(),
-                max_tokens,
-                ctx.n_ctx()
-            );
-        }
-
-        let prompt_token_count = prompt_tokens.len() as u32;
-        let mut batch = LlamaBatch::new(prompt_tokens.len().max(1), 1);
-        let last = prompt_tokens.len().saturating_sub(1);
-        for (pos, token) in prompt_tokens.drain(..).enumerate() {
-            batch
-                .add(token, pos as i32, &[0], pos == last)
-                .context("add prompt token to batch")?;
-        }
-        ctx.decode(&mut batch).context("decode prompt")?;
-
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::dist(0x5CA1A7CE),
-            LlamaSampler::greedy(),
-        ]);
-
-        let mut content = String::new();
-        let mut position = last as i32;
-        let mut generated = 0u32;
-
-        while generated < max_tokens as u32 {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
-
-            if model.is_eog_token(token) {
-                break;
+            let max_tokens = config.max_tokens.max(1).min(2048) as usize;
+            if prompt_tokens.len() + max_tokens > ctx.n_ctx() as usize {
+                anyhow::bail!(
+                    "prompt too long for context window ({} + {} > {})",
+                    prompt_tokens.len(),
+                    max_tokens,
+                    ctx.n_ctx()
+                );
             }
 
-            let piece = decode_token(model, token)?;
-            content.push_str(&piece);
+            let prompt_token_count = prompt_tokens.len() as u32;
+            let mut batch = LlamaBatch::new(prompt_tokens.len().max(1), 1);
+            let last = prompt_tokens.len().saturating_sub(1);
+            for (pos, token) in prompt_tokens.drain(..).enumerate() {
+                batch
+                    .add(token, pos as i32, &[0], pos == last)
+                    .context("add prompt token to batch")?;
+            }
+            ctx.decode(&mut batch).context("decode prompt")?;
 
-            batch.clear();
-            position += 1;
-            batch
-                .add(token, position, &[0], true)
-                .context("add generated token to batch")?;
-            ctx.decode(&mut batch).context("decode generated token")?;
-            generated += 1;
-        }
+            let mut sampler = LlamaSampler::chain_simple([
+                LlamaSampler::dist(0x5CA1A7CE),
+                LlamaSampler::greedy(),
+            ]);
 
-        Ok(GenerateOutput {
-            content: sanitize_completion(&config.model_id, &content),
-            prompt_tokens: prompt_token_count,
-            completion_tokens: generated.max(1),
-        })
+            let mut content = String::new();
+            let mut position = last as i32;
+            let mut generated = 0u32;
+            let mut prefill_ms = 0u64;
+            let mut decode_ms = 0u64;
+            let mut first_token = true;
+
+            while generated < max_tokens as u32 {
+                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                sampler.accept(token);
+
+                if model.is_eog_token(token) {
+                    break;
+                }
+
+                let piece = decode_token(model, token)?;
+                if first_token {
+                    prefill_ms = prefill_start.elapsed().as_millis() as u64;
+                    first_token = false;
+                }
+                let decode_piece_start = Instant::now();
+                content.push_str(&piece);
+                on_token(&piece);
+
+                batch.clear();
+                position += 1;
+                batch
+                    .add(token, position, &[0], true)
+                    .context("add generated token to batch")?;
+                ctx.decode(&mut batch).context("decode generated token")?;
+                decode_ms += decode_piece_start.elapsed().as_millis() as u64;
+                generated += 1;
+            }
+
+            if first_token {
+                prefill_ms = prefill_start.elapsed().as_millis() as u64;
+            }
+
+            Ok(GenerateOutput {
+                content: sanitize_completion(&config.model_id, &content),
+                prompt_tokens: prompt_token_count,
+                completion_tokens: generated.max(1),
+                timings: GenerateTimings {
+                    model_load_ms: 0, // filled by caller
+                    prefill_ms,
+                    decode_ms,
+                    total_ms: 0,
+                },
+            })
+        })?;
+
+    Ok(GenerateOutput {
+        content: output.content,
+        prompt_tokens: output.prompt_tokens,
+        completion_tokens: output.completion_tokens,
+        timings: GenerateTimings {
+            model_load_ms,
+            prefill_ms: output.timings.prefill_ms,
+            decode_ms: output.timings.decode_ms,
+            total_ms: total_start.elapsed().as_millis() as u64,
+        },
     })
 }
 

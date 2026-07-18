@@ -173,6 +173,28 @@ pub struct InvokeMessage {
     #[serde(rename = "runtimeModel")]
     pub runtime_model: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InvokeTimings {
+    #[serde(rename = "modelLoadMs", skip_serializing_if = "Option::is_none")]
+    pub model_load_ms: Option<u64>,
+    #[serde(rename = "prefillMs", skip_serializing_if = "Option::is_none")]
+    pub prefill_ms: Option<u64>,
+    #[serde(rename = "decodeMs", skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<u64>,
+    #[serde(rename = "totalMs", skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvokeDeltaMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub id: String,
+    pub delta: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -191,6 +213,8 @@ pub struct InvokeResultMessage {
     pub prompt_tokens: u32,
     #[serde(rename = "completionTokens")]
     pub completion_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<InvokeTimings>,
 }
 
 #[derive(Debug, Serialize)]

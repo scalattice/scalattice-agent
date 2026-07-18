@@ -6,6 +6,7 @@ use llama_cpp_2::model::LlamaModel;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use super::embedded::{backend, load_model_for_pool};
 
@@ -34,22 +35,36 @@ pub fn with_loaded_model<R>(
     pool: &VirtualCard,
     f: impl FnOnce(&LlamaModel) -> Result<R>,
 ) -> Result<R> {
+    let (out, _) = with_loaded_model_timed(model_path, pool, f)?;
+    Ok(out)
+}
+
+/// Like [`with_loaded_model`], but returns model-load wall time in ms (0 on cache hit).
+pub fn with_loaded_model_timed<R>(
+    model_path: &Path,
+    pool: &VirtualCard,
+    f: impl FnOnce(&LlamaModel) -> Result<R>,
+) -> Result<(R, u64)> {
     let backend = backend()?;
     let key = cache_key(model_path, pool);
     let mut guard = cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("model cache lock poisoned"))?;
 
+    let mut model_load_ms = 0u64;
     if !guard.contains_key(&key) {
+        let load_start = Instant::now();
         let model = load_model_for_pool(backend, model_path, pool)
             .with_context(|| format!("load model {}", model_path.display()))?;
+        model_load_ms = load_start.elapsed().as_millis() as u64;
         guard.insert(key.clone(), model);
     }
 
     let model = guard
         .get(&key)
         .context("model missing immediately after cache insert")?;
-    f(model)
+    let out = f(model)?;
+    Ok((out, model_load_ms))
 }
 
 pub fn evict_model(model_path: &Path, pool: &VirtualCard) {

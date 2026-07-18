@@ -1,8 +1,8 @@
 use crate::config::{read_saved_agent_token, token_snippet, AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
-    AgentSchedule, CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeErrorMessage, InvokeResultMessage,
-    ModelPolicyEntry, RegisterMessage,
+    AgentSchedule, CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeDeltaMessage, InvokeErrorMessage,
+    InvokeResultMessage, ModelPolicyEntry, RegisterMessage,
 };
 use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecycleState, VramTickAction};
 use crate::compute_pool::build_virtual_card;
@@ -814,8 +814,8 @@ async fn respond_invoke(
     invoke: crate::protocol::InvokeMessage,
 ) -> Result<()> {
     info!(
-        "invoke {} · model {} · runtime {}",
-        invoke.id, invoke.model_id, invoke.runtime_model
+        "invoke {} · model {} · runtime {} · stream={}",
+        invoke.id, invoke.model_id, invoke.runtime_model, invoke.stream
     );
 
     {
@@ -835,15 +835,63 @@ async fn respond_invoke(
     };
 
     let result = async {
-        match engine
-            .invoke(InferenceRequest {
-                job_id: &invoke.id,
-                model_id: &invoke.model_id,
-                runtime_model: &invoke.runtime_model,
-                messages: &invoke.messages,
-            })
-            .await
-        {
+        let req = InferenceRequest {
+            job_id: &invoke.id,
+            model_id: &invoke.model_id,
+            runtime_model: &invoke.runtime_model,
+            messages: &invoke.messages,
+        };
+
+        let output = if invoke.stream {
+            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let invoke_id = invoke.id.clone();
+            let gen = engine.invoke_streaming(req, delta_tx);
+            tokio::pin!(gen);
+
+            loop {
+                tokio::select! {
+                    maybe_delta = delta_rx.recv() => {
+                        match maybe_delta {
+                            Some(delta) if !delta.is_empty() => {
+                                let msg = InvokeDeltaMessage {
+                                    kind: "invoke_delta",
+                                    id: invoke_id.clone(),
+                                    delta,
+                                };
+                                write
+                                    .send(Message::Text(serde_json::to_string(&msg)?))
+                                    .await?;
+                            }
+                            Some(_) => {}
+                            None => {
+                                // Sender dropped; wait for the generate future.
+                                break gen.await;
+                            }
+                        }
+                    }
+                    out = &mut gen => {
+                        while let Ok(delta) = delta_rx.try_recv() {
+                            if delta.is_empty() {
+                                continue;
+                            }
+                            let msg = InvokeDeltaMessage {
+                                kind: "invoke_delta",
+                                id: invoke_id.clone(),
+                                delta,
+                            };
+                            write
+                                .send(Message::Text(serde_json::to_string(&msg)?))
+                                .await?;
+                        }
+                        break out;
+                    }
+                }
+            }
+        } else {
+            engine.invoke(req).await
+        };
+
+        match output {
             Ok(output) => {
                 let result = InvokeResultMessage {
                     kind: "invoke_result",
@@ -851,6 +899,7 @@ async fn respond_invoke(
                     content: output.content,
                     prompt_tokens: output.prompt_tokens,
                     completion_tokens: output.completion_tokens,
+                    timings: Some(output.timings),
                 };
                 write
                     .send(Message::Text(serde_json::to_string(&result)?))

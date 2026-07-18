@@ -371,7 +371,7 @@ impl TrayApp {
         }
         self.update_busy = true;
         self.update_notice =
-            "Downloading Scalattice setup. The installer will open next — this panel will close."
+            "Downloading Scalattice setup. The installer will open next - this panel will close."
                 .to_string();
         self.action_message.clear();
         let _ = self.update_cmd_tx.send(UpdateWorkerCmd::Install);

@@ -154,6 +154,7 @@ pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
             content: content.trim().to_string(),
             prompt_tokens: prompt_token_count,
             completion_tokens: generated.max(1),
+            timings: Default::default(),
         })
     })
 }

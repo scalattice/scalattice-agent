@@ -35,6 +35,9 @@ pub struct AgentRuntime {
     pub models_disk_gb: Option<u32>,
     #[serde(rename = "modelDisk", skip_serializing_if = "HashMap::is_empty")]
     pub model_disk: HashMap<String, SerializedModelDiskStatus>,
+    /// Agent can emit invoke_delta tokens for true SSE streaming.
+    #[serde(rename = "supportsStream")]
+    pub supports_stream: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +90,7 @@ pub fn build_runtime(
             None
         },
         model_disk,
+        supports_stream: true,
     }
 }
 

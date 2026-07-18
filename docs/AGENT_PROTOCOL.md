@@ -98,7 +98,7 @@ Heartbeats may refresh live machine specs:
 
 The reference agent sends an extra heartbeat when a job starts or finishes so `jobState: busy` appears on the dashboard promptly. GPU detection uses NVIDIA (`nvidia-smi`), AMD (`rocm-smi`), and PCI graphics devices (`lspci`), plus host CPU/RAM via `/proc`.
 
-5. **Server → client** `invoke`: inference job:
+5. **Server → client** `invoke`: inference job. Optional `"stream": true` requests token deltas:
 
 ```json
 {
@@ -106,11 +106,16 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
   "id": "request-uuid",
   "modelId": "example-model",
   "runtimeModel": "org/example-runtime",
-  "messages": [{ "role": "user", "content": "Hello" }]
+  "messages": [{ "role": "user", "content": "Hello" }],
+  "stream": true
 }
 ```
 
-6. **Client → server** `invoke_result` or `invoke_error`:
+6. **Client → server** while streaming: zero or more `invoke_delta`, then terminal `invoke_result` or `invoke_error`:
+
+```json
+{ "type": "invoke_delta", "id": "request-uuid", "delta": "Hi" }
+```
 
 ```json
 {
@@ -118,7 +123,13 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
   "id": "request-uuid",
   "content": "Hi there",
   "promptTokens": 12,
-  "completionTokens": 8
+  "completionTokens": 8,
+  "timings": {
+    "modelLoadMs": 0,
+    "prefillMs": 120,
+    "decodeMs": 800,
+    "totalMs": 950
+  }
 }
 ```
 
@@ -129,6 +140,8 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
   "error": "Model weights not loaded"
 }
 ```
+
+Advertise `runtime.supportsStream: true` on register/heartbeat so Scalattice Cloud can prefer native SSE for this agent.
 
 7. **Server → client** `error` (fatal handshake errors):
 

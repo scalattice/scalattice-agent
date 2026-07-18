@@ -1,12 +1,13 @@
 use crate::compute_pool::VirtualCard;
 use crate::llm::{
-    generate, preload_model, split_lower, split_upper, GenerateConfig, SplitLowerConfig,
-    SplitUpperConfig,
+    generate, generate_with_callback, preload_model, split_lower, split_upper, GenerateConfig,
+    GenerateTimings, SplitLowerConfig, SplitUpperConfig,
 };
 use crate::models::{list_cached_runtime_models, models_dir, resolve_model_gguf};
-use crate::protocol::ChatMessage;
+use crate::protocol::{ChatMessage, InvokeTimings};
 use crate::specs::ComputeDevice;
 use anyhow::{Context, Result};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct InferenceRequest<'a> {
@@ -21,6 +22,7 @@ pub struct InferenceResult {
     pub content: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    pub timings: InvokeTimings,
 }
 
 pub struct InferenceEngine {
@@ -100,6 +102,7 @@ impl InferenceEngine {
             content: output.content,
             prompt_tokens: output.prompt_tokens,
             completion_tokens: output.completion_tokens,
+            timings: InvokeTimings::default(),
         })
     }
 
@@ -116,6 +119,9 @@ impl InferenceEngine {
         let pool = self.pool.clone();
         let messages = req.messages.to_vec();
         let model_id = req.model_id.to_string();
+        let job_id = req.job_id.to_string();
+        let model_id_err = req.model_id.to_string();
+        let runtime_err = req.runtime_model.to_string();
 
         let output = tokio::task::spawn_blocking(move || {
             generate(&GenerateConfig {
@@ -132,9 +138,9 @@ impl InferenceEngine {
         if output.content.is_empty() {
             anyhow::bail!(
                 "embedded inference returned empty output for {} / {} (job {})",
-                req.model_id,
-                req.runtime_model,
-                req.job_id
+                model_id_err,
+                runtime_err,
+                job_id
             );
         }
 
@@ -142,7 +148,73 @@ impl InferenceEngine {
             content: output.content,
             prompt_tokens: output.prompt_tokens,
             completion_tokens: output.completion_tokens,
+            timings: timings_from_generate(&output.timings),
         })
+    }
+
+    /// Stream token pieces on `delta_tx`, then return the final sanitized result.
+    pub async fn invoke_streaming(
+        &self,
+        req: InferenceRequest<'_>,
+        delta_tx: mpsc::UnboundedSender<String>,
+    ) -> Result<InferenceResult> {
+        let model_path = resolve_model_gguf(req.runtime_model)
+            .with_context(|| {
+                format!(
+                    "model weights not found for {} in {} (wait for Scalattice to download them, or check agent logs)",
+                    req.runtime_model,
+                    models_dir().display()
+                )
+            })?;
+
+        let pool = self.pool.clone();
+        let messages = req.messages.to_vec();
+        let model_id = req.model_id.to_string();
+        let job_id = req.job_id.to_string();
+        let model_id_err = req.model_id.to_string();
+        let runtime_err = req.runtime_model.to_string();
+
+        let output = tokio::task::spawn_blocking(move || {
+            generate_with_callback(
+                &GenerateConfig {
+                    model_path,
+                    pool,
+                    messages,
+                    max_tokens: 512,
+                    model_id,
+                },
+                |piece| {
+                    let _ = delta_tx.send(piece.to_string());
+                },
+            )
+        })
+        .await
+        .context("embedded streaming inference task failed")??;
+
+        if output.content.is_empty() {
+            anyhow::bail!(
+                "embedded inference returned empty output for {} / {} (job {})",
+                model_id_err,
+                runtime_err,
+                job_id
+            );
+        }
+
+        Ok(InferenceResult {
+            content: output.content,
+            prompt_tokens: output.prompt_tokens,
+            completion_tokens: output.completion_tokens,
+            timings: timings_from_generate(&output.timings),
+        })
+    }
+}
+
+fn timings_from_generate(t: &GenerateTimings) -> InvokeTimings {
+    InvokeTimings {
+        model_load_ms: Some(t.model_load_ms),
+        prefill_ms: Some(t.prefill_ms),
+        decode_ms: Some(t.decode_ms),
+        total_ms: Some(t.total_ms),
     }
 }
 

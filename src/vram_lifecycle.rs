@@ -85,6 +85,17 @@ impl VramLifecycleState {
         }
 
         let now = Instant::now();
+        // While accepting jobs / earning soon, keep weights warm — only evict on long idle
+        // when the schedule is offline (handled above), not after every short post-job gap.
+        if self.schedule.accepting_jobs {
+            if let Some(activity) = self.last_vram_activity {
+                if now.duration_since(activity) >= Duration::from_secs(config.vram_idle_secs) {
+                    return VramTickAction::EvictVram;
+                }
+            }
+            return VramTickAction::None;
+        }
+
         if let Some(finished) = self.last_job_finished_at {
             if !self.post_job_evicted
                 && now.duration_since(finished) >= Duration::from_secs(config.post_job_idle_secs)
