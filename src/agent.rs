@@ -22,18 +22,23 @@ use crate::state;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{info, warn};
 
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+/// Full Windows specs detection (PowerShell + nvidia-smi) is expensive. Cache it so the
+/// WebSocket loop is not blocked for tens of seconds every heartbeat / invoke.
+const SPECS_CACHE_TTL: Duration = Duration::from_secs(20);
 
 struct SessionState {
     registered: bool,
@@ -51,6 +56,8 @@ struct SessionState {
     sync_in_flight: Arc<AtomicBool>,
     logged_download_blockers: bool,
     vram_lifecycle: VramLifecycleState,
+    /// Cached machine specs. RefCell: SessionState is only accessed while holding the tokio Mutex.
+    specs_cache: RefCell<Option<(Instant, MachineSpecs)>>,
 }
 
 impl SessionState {
@@ -71,6 +78,7 @@ impl SessionState {
             sync_in_flight: Arc::new(AtomicBool::new(false)),
             logged_download_blockers: false,
             vram_lifecycle: VramLifecycleState::default(),
+            specs_cache: RefCell::new(None),
         }
     }
 
@@ -100,7 +108,8 @@ impl SessionState {
     }
 
     fn warm_runtime_models(&self) -> Vec<String> {
-        self.register_model_ids()
+        let mut models = self
+            .register_model_ids()
             .into_iter()
             .filter_map(|model_id| {
                 self.catalog.iter().find_map(|model| {
@@ -118,7 +127,13 @@ impl SessionState {
                     Some(runtime)
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // ≤8GB cards can only keep one model warm; warming all of them OOMs on switch.
+        let vram = self.enabled_devices().vram_gb.unwrap_or(0);
+        if vram > 0 && vram <= 8 && models.len() > 1 {
+            models.truncate(1);
+        }
+        models
     }
 
     fn effective_hf_token(&self, server_token: Option<String>) -> Option<String> {
@@ -378,11 +393,34 @@ impl SessionState {
             .iter()
             .map(|device| (device.id.clone(), device.enabled))
             .collect();
+        self.invalidate_specs_cache();
     }
 
-    fn enabled_devices(&self) -> crate::specs::MachineSpecs {
+    fn invalidate_specs_cache(&self) {
+        *self.specs_cache.borrow_mut() = None;
+    }
+
+    fn store_specs_cache(&self, specs: MachineSpecs) {
+        *self.specs_cache.borrow_mut() = Some((Instant::now(), specs));
+    }
+
+    fn cached_specs(&self) -> Option<MachineSpecs> {
+        self.specs_cache
+            .borrow()
+            .as_ref()
+            .map(|(_, specs)| specs.clone())
+    }
+
+    fn specs_cache_fresh(&self) -> bool {
+        matches!(
+            self.specs_cache.borrow().as_ref(),
+            Some((at, _)) if at.elapsed() < SPECS_CACHE_TTL
+        )
+    }
+
+    fn detect_enabled_devices(policy: &[(String, bool)]) -> MachineSpecs {
         let mut devices = detect_all_compute_devices();
-        apply_compute_policy(&mut devices, &self.compute_policy);
+        apply_compute_policy(&mut devices, policy);
         build_specs_from_devices(
             &devices,
             detect_hostname(),
@@ -391,6 +429,17 @@ impl SessionState {
             detect_driver_version(),
             detect_cuda_version(),
         )
+    }
+
+    fn enabled_devices(&self) -> MachineSpecs {
+        // Prefer any cached snapshot (even slightly stale) over blocking the WS loop
+        // with PowerShell/nvidia-smi. Heartbeat refreshes the cache off-thread.
+        if let Some(specs) = self.cached_specs() {
+            return specs;
+        }
+        let specs = Self::detect_enabled_devices(&self.compute_policy);
+        self.store_specs_cache(specs.clone());
+        specs
     }
 
     fn live_specs(&self) -> MachineSpecs {
@@ -419,7 +468,7 @@ impl SessionState {
 
     fn count_blocked_enabled_models(&self) -> usize {
         let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
+        let ram_gb = specs.ram_gb.unwrap_or(0);
         let card = match build_virtual_card(&specs.compute_devices) {
             Ok(card) => card,
             Err(_) => return 0,
@@ -584,7 +633,10 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
     }
 
     let (mut write, mut read) = ws.split();
+    // Prime specs once before the read loop so the first heartbeat/invoke is cheap.
+    refresh_specs_cache(&state).await;
     let mut heartbeat = interval(Duration::from_secs(12));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut token_poll = interval(Duration::from_secs(1));
     token_poll.tick().await;
 
@@ -621,6 +673,12 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
                     guard.registered
                 };
                 if registered {
+                    // Never await specs detection on this task — that blocked Windows
+                    // invokes for ~28s while PowerShell/nvidia-smi ran.
+                    let state_bg = state.clone();
+                    tokio::spawn(async move {
+                        refresh_specs_cache(&state_bg).await;
+                    });
                     maybe_warm_models(state.clone()).await;
                     let reregister = state.lock().await.needs_reregister();
                     if reregister {
@@ -638,6 +696,29 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
+    let (policy, need_refresh) = {
+        let guard = state.lock().await;
+        let need = !guard.specs_cache_fresh();
+        (guard.compute_policy.clone(), need)
+    };
+    if !need_refresh {
+        return;
+    }
+    let specs = match tokio::task::spawn_blocking(move || {
+        SessionState::detect_enabled_devices(&policy)
+    })
+    .await
+    {
+        Ok(specs) => specs,
+        Err(err) => {
+            warn!("specs refresh task failed: {err:#}");
+            return;
+        }
+    };
+    state.lock().await.store_specs_cache(specs);
 }
 
 async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
@@ -694,6 +775,7 @@ async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &mut WsW
 }
 
 async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -> Result<()> {
+    // Use cached specs only — never block the WS task on PowerShell/nvidia-smi here.
     let (specs, runtime) = {
         let guard = state.lock().await;
         (guard.live_specs(), guard.runtime())

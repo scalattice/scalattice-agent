@@ -55,8 +55,16 @@ pub fn classify_weight_load_error(err: &anyhow::Error) -> WeightLoadKind {
     {
         return WeightLoadKind::ResourceLimit;
     }
+    // VRAM / context OOM is not a bad GGUF and must not quarantine or pause the fleet.
+    if detail.contains("out of memory")
+        || detail.contains("cudamalloc")
+        || detail.contains("failed to allocate")
+        || detail.contains("create llama context")
+        || detail.contains("ggml_backend_cuda")
+    {
+        return WeightLoadKind::Other;
+    }
     // Do NOT treat bare "null result from llama" / "load model" as corrupt.
-    // llama-cpp reports EMFILE that way too, and would wipe healthy weights.
     WeightLoadKind::Other
 }
 
@@ -70,6 +78,15 @@ pub fn classify_load_failure_for_path(
     if from_err != WeightLoadKind::Other {
         return from_err;
     }
+    let detail = format!("{err:#}").to_lowercase();
+    if detail.contains("out of memory")
+        || detail.contains("cudamalloc")
+        || detail.contains("create llama context")
+        || detail.contains("failed to allocate")
+    {
+        crate::llm::evict_all();
+        return WeightLoadKind::Other;
+    }
     match crate::models::gguf_check::gguf_payload_in_bounds(model_path) {
         Ok(false) => {
             warn!(
@@ -80,7 +97,7 @@ pub fn classify_load_failure_for_path(
             WeightLoadKind::Corrupt
         }
         Ok(true) => {
-            // File looks structurally fine - likely EMFILE, OOM, or transient llama failure.
+            // File looks structurally fine - likely EMFILE or transient llama failure.
             WeightLoadKind::ResourceLimit
         }
         Err(io_err) => {
