@@ -14,6 +14,18 @@
 #define MyAppId "A4E8B2C1-9F3D-4A6E-8B1C-2D5E7F9A0B3C"
 #define MyAppUserModelId "RobottikSoftware.Scalattice.Agent"
 
+; Fail the installer compile if the release bundle omitted CUDA runtime DLLs.
+; (skipifsourcedoesntexist used to ship a broken setup.exe with an empty lib folder.)
+#if !FileExists("..\..\dist\lib\cudart64_12.dll")
+  #error dist\lib\cudart64_12.dll missing — run scripts\bundle-release-windows.ps1 before building the installer
+#endif
+#if !FileExists("..\..\dist\lib\cublas64_12.dll")
+  #error dist\lib\cublas64_12.dll missing — run scripts\bundle-release-windows.ps1 before building the installer
+#endif
+#if !FileExists("..\..\dist\lib\cublasLt64_12.dll")
+  #error dist\lib\cublasLt64_12.dll missing — run scripts\bundle-release-windows.ps1 before building the installer
+#endif
+
 [Setup]
 AppId={{A4E8B2C1-9F3D-4A6E-8B1C-2D5E7F9A0B3C}}
 AppName={#MyAppName}
@@ -58,7 +70,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut to open the provide
 ; Install bundled DLLs before the exe so post-install can load them.
 ; PrepareToInstall moves the prior lib dir aside so we can copy fresh files without
 ; in-place overwriting of locked CUDA DLLs (which left stale versions / broken updates).
-Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray-interactive.vbs"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
@@ -78,6 +90,10 @@ Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/prov
 
 [Code]
 var
+  DriverPage: TWizardPage;
+  DriverStatusLabel: TNewStaticText;
+  DriverDownloadBtn: TNewButton;
+  DriverRecheckBtn: TNewButton;
   TokenPage: TInputQueryWizardPage;
   ModelsPage: TWizardPage;
   PurgeModelsCheck: TNewCheckBox;
@@ -86,6 +102,7 @@ var
   ModelsCacheDir: String;
   ModelsCacheBytes: Int64;
   ShowModelsPage: Boolean;
+  ShowDriverPage: Boolean;
   IsSilentUpdate: Boolean;
 
 function GetDirSize(const Dir: string; var Size: Int64): Boolean;
@@ -328,6 +345,75 @@ begin
   PrepareLibDirForUpgrade(LibDir);
 end;
 
+function CudaRuntimePresent(const Dir: String): Boolean;
+begin
+  Result :=
+    FileExists(Dir + '\cudart64_12.dll') and
+    FileExists(Dir + '\cublas64_12.dll') and
+    FileExists(Dir + '\cublasLt64_12.dll');
+end;
+
+{ True when nvidia-smi can list GPUs (driver installed and working). }
+function NvidiaDriverOk: Boolean;
+var
+  Candidates: array[0..3] of String;
+  I, ResultCode: Integer;
+begin
+  Result := False;
+  Candidates[0] := ExpandConstant('{win}\System32\nvidia-smi.exe');
+  Candidates[1] := ExpandConstant('{pf}\NVIDIA Corporation\NVSMI\nvidia-smi.exe');
+  Candidates[2] := ExpandConstant('{pf32}\NVIDIA Corporation\NVSMI\nvidia-smi.exe');
+  Candidates[3] := 'nvidia-smi.exe';
+  for I := 0 to 3 do
+  begin
+    if (I < 3) and (not FileExists(Candidates[I])) then
+      Continue;
+    if Exec(Candidates[I], '-L', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      if ResultCode = 0 then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+  end;
+end;
+
+procedure RefreshDriverStatus;
+begin
+  if DriverStatusLabel = nil then
+    Exit;
+  if NvidiaDriverOk then
+    DriverStatusLabel.Caption :=
+      'NVIDIA driver detected (nvidia-smi OK). You can continue.'
+  else
+    DriverStatusLabel.Caption :=
+      'NVIDIA driver not detected (nvidia-smi missing or failed).' + #13#10 +
+      'Install a current Game Ready or Studio driver, then click Recheck.' + #13#10 +
+      'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.';
+end;
+
+procedure DriverDownloadClick(Sender: TObject);
+var
+  ErrorCode: Integer;
+begin
+  ShellExec('open', 'https://www.nvidia.com/Download/index.aspx', '', '',
+    SW_SHOWNORMAL, ewNoWait, ErrorCode);
+end;
+
+procedure DriverRecheckClick(Sender: TObject);
+begin
+  RefreshDriverStatus;
+  if NvidiaDriverOk then
+    MsgBox('NVIDIA driver looks good. Click Next to continue.', mbInformation, MB_OK)
+  else
+    MsgBox(
+      'Still no working nvidia-smi.' + #13#10 + #13#10 +
+      'Install the driver, reboot if Windows asks, then click Recheck again.' + #13#10 +
+      'Laptop users: prefer the OEM or NVIDIA laptop package for your exact model.',
+      mbError, MB_OK);
+end;
+
 function InitializeSetup(): Boolean;
 begin
   PrefillToken := ExpandConstant('{param:TOKEN|}');
@@ -339,21 +425,81 @@ begin
     GetDirSize(ModelsCacheDir, ModelsCacheBytes);
   { Silent updates skip the cache-purge page entirely. }
   ShowModelsPage := (not WizardSilent) and (not IsSilentUpdate) and ShouldOfferModelPurge();
+  { Interactive installs only: warn when the NVIDIA driver is missing. }
+  ShowDriverPage := (not WizardSilent) and (not IsSilentUpdate) and (not NvidiaDriverOk);
   Result := True;
 end;
 
 procedure InitializeWizard;
 var
   SizeLabel: String;
+  TokenAfterID: Integer;
+  InfoLabel: TNewStaticText;
 begin
+  TokenAfterID := wpWelcome;
+  DriverPage := nil;
+  DriverStatusLabel := nil;
+  DriverDownloadBtn := nil;
+  DriverRecheckBtn := nil;
+
+  if ShowDriverPage then
+  begin
+    DriverPage := CreateCustomPage(
+      wpWelcome,
+      'NVIDIA GPU driver required',
+      'Scalattice needs a working NVIDIA display driver before this PC can serve GPU jobs.');
+    TokenAfterID := DriverPage.ID;
+
+    InfoLabel := TNewStaticText.Create(DriverPage);
+    InfoLabel.Parent := DriverPage.Surface;
+    InfoLabel.Left := ScaleX(0);
+    InfoLabel.Top := ScaleY(0);
+    InfoLabel.Width := DriverPage.SurfaceWidth;
+    InfoLabel.Height := ScaleY(72);
+    InfoLabel.WordWrap := True;
+    InfoLabel.AutoSize := False;
+    InfoLabel.Caption :=
+      'nvidia-smi was not found on this PC. Install NVIDIA''s Game Ready or Studio driver ' +
+      '(not the CUDA Toolkit), then return here and click Recheck.' + #13#10 + #13#10 +
+      'You can continue without a driver, but GPU inference will not work until one is installed.';
+
+    DriverStatusLabel := TNewStaticText.Create(DriverPage);
+    DriverStatusLabel.Parent := DriverPage.Surface;
+    DriverStatusLabel.Left := ScaleX(0);
+    DriverStatusLabel.Top := ScaleY(80);
+    DriverStatusLabel.Width := DriverPage.SurfaceWidth;
+    DriverStatusLabel.Height := ScaleY(56);
+    DriverStatusLabel.WordWrap := True;
+    DriverStatusLabel.AutoSize := False;
+
+    DriverDownloadBtn := TNewButton.Create(DriverPage);
+    DriverDownloadBtn.Parent := DriverPage.Surface;
+    DriverDownloadBtn.Left := ScaleX(0);
+    DriverDownloadBtn.Top := ScaleY(148);
+    DriverDownloadBtn.Width := ScaleX(200);
+    DriverDownloadBtn.Height := ScaleY(28);
+    DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
+    DriverDownloadBtn.OnClick := @DriverDownloadClick;
+
+    DriverRecheckBtn := TNewButton.Create(DriverPage);
+    DriverRecheckBtn.Parent := DriverPage.Surface;
+    DriverRecheckBtn.Left := ScaleX(212);
+    DriverRecheckBtn.Top := ScaleY(148);
+    DriverRecheckBtn.Width := ScaleX(100);
+    DriverRecheckBtn.Height := ScaleY(28);
+    DriverRecheckBtn.Caption := 'Recheck';
+    DriverRecheckBtn.OnClick := @DriverRecheckClick;
+
+    RefreshDriverStatus;
+  end;
+
   TokenPage := CreateInputQueryPage(
-    wpWelcome,
+    TokenAfterID,
     'Connect to Scalattice',
     'Paste your provider machine token',
     'Create a machine in the Scalattice Providers dashboard and paste its token below.' + #13#10 +
     'The installer saves the token, adds Scalattice to your PATH, and starts the background agent.' + #13#10 + #13#10 +
-    'For NVIDIA GPUs: install a current Game Ready or Studio driver first (nvidia-smi must work).' + #13#10 +
-    'You do not need the CUDA Toolkit - this installer bundles the CUDA runtime.');
+    'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.');
   TokenPage.Add('Provider token (slt_provider_...):', False);
   if PrefillToken <> '' then
     TokenPage.Values[0] := PrefillToken
@@ -371,17 +517,36 @@ begin
       'Remove them only if you want to free disk space. Enabled models will download again later.');
     PurgeModelsCheck := TNewCheckBox.Create(ModelsPage);
     PurgeModelsCheck.Parent := ModelsPage.Surface;
-    PurgeModelsCheck.Caption := 'Remove stored models (' + SizeLabel + ')';
     PurgeModelsCheck.Left := ScaleX(0);
     PurgeModelsCheck.Top := ScaleY(8);
     PurgeModelsCheck.Width := ModelsPage.SurfaceWidth;
+    PurgeModelsCheck.Caption := 'Remove stored models (' + SizeLabel + ')';
     PurgeModelsCheck.Checked := False;
   end;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (DriverPage <> nil) and (CurPageID = DriverPage.ID) then
+    RefreshDriverStatus;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
+  if (DriverPage <> nil) and (CurPageID = DriverPage.ID) then
+  begin
+    if not NvidiaDriverOk then
+    begin
+      if MsgBox(
+        'NVIDIA driver still not detected (nvidia-smi).' + #13#10 + #13#10 +
+        'GPU inference will not work until you install a driver and reboot if prompted.' + #13#10 +
+        'Continue installing Scalattice Agent anyway?',
+        mbConfirmation, MB_YESNO) = IDNO then
+        Result := False;
+    end;
+    Exit;
+  end;
   if (TokenPage <> nil) and (CurPageID = TokenPage.ID) then
   begin
     if Trim(TokenPage.Values[0]) <> '' then
@@ -408,6 +573,18 @@ procedure LaunchScalatticeRuntime(const AppDir: String);
 var
   ResultCode: Integer;
 begin
+  if not CudaRuntimePresent(LibDir) then
+  begin
+    if not WizardSilent then
+      MsgBox(
+        'Install finished, but the CUDA 12 runtime was not copied to:' + #13#10 +
+        '  ' + LibDir + #13#10#13#10 +
+        'Required: cudart64_12.dll, cublas64_12.dll, cublasLt64_12.dll' + #13#10 +
+        'Re-download the official Scalattice Agent installer and run setup again.' + #13#10 +
+        'The agent was not started.',
+        mbError, MB_OK);
+    Exit;
+  end;
   Exec('wscript.exe', '//nologo "' + AppDir + '\launch-background.vbs"',
     AppDir, SW_HIDE, ewNoWait, ResultCode);
   Sleep(800);
@@ -471,9 +648,7 @@ begin
   if (SavedToken = '') and (Token = '') then
     MsgBox('Scalattice Agent was installed, but no provider token was found.' + #13#10 +
       'Open Command Prompt and run:' + #13#10 +
-      '  scalattice-agent set-token --token YOUR_TOKEN' + #13#10 + #13#10 +
-      'If you see missing cudart64_12.dll / cublas64_12.dll, the installer build did not bundle CUDA libs.' + #13#10 +
-      'Check %LOCALAPPDATA%\Scalattice\lib on this machine.',
+      '  scalattice-agent set-token --token YOUR_TOKEN',
       mbInformation, MB_OK);
 end;
 

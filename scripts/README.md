@@ -79,7 +79,7 @@ Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-ho
 
 | Script | Purpose |
 |--------|---------|
-| `diagnose-windows.ps1` | Installed agent health, logs, autostart, CUDA DLLs |
+| `diagnose-windows.ps1` | Installed agent health, logs, autostart, CUDA DLLs (exits 1 if CUDA runtime missing) |
 | | `-Bundle` — check `dist/` before shipping |
 | | `-InstalledOnly` — CUDA DLLs under `%LOCALAPPDATA%\Scalattice` |
 | | `-LaunchTray` — open tray UI in current console |

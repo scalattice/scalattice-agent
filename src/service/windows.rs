@@ -321,6 +321,7 @@ fn sync_launch_scripts() -> Result<()> {
     let install = install_dir()?;
     fs::create_dir_all(&install)?;
 
+    // Keep in sync with installer/windows/scalattice-run.cmd
     let run_cmd = "@echo off\r\n\
 setlocal\r\n\
 set \"INSTALL=%~dp0\"\r\n\
@@ -328,6 +329,22 @@ set \"LIB=%LOCALAPPDATA%\\Scalattice\\lib\"\r\n\
 if not exist \"%LIB%\" set \"LIB=%INSTALL%lib\"\r\n\
 set \"PATH=%INSTALL%;%LIB%;%PATH%\"\r\n\
 cd /d \"%INSTALL%\"\r\n\
+\r\n\
+call :CheckCudaRuntime\r\n\
+if errorlevel 1 (\r\n\
+  echo.\r\n\
+  echo Scalattice Agent cannot start: CUDA 12 runtime DLLs are missing.\r\n\
+  echo Expected under: %LIB%\r\n\
+  echo   cudart64_12.dll\r\n\
+  echo   cublas64_12.dll\r\n\
+  echo   cublasLt64_12.dll\r\n\
+  echo.\r\n\
+  echo Reinstall Scalattice Agent from https://scalattice.cloud\r\n\
+  echo Do not launch scalattice-agent.exe directly without the installer bundle.\r\n\
+  call :LogCudaMissing\r\n\
+  exit /b 1\r\n\
+)\r\n\
+\r\n\
 if /I \"%~1\"==\"tray\" (\r\n\
   if exist \"%INSTALL%launch-tray.vbs\" (\r\n\
     wscript.exe //nologo \"%INSTALL%launch-tray.vbs\"\r\n\
@@ -344,7 +361,20 @@ if /I \"%~1\"==\"tray-debug\" (\r\n\
   \"%INSTALL%scalattice-agent.exe\" tray --force\r\n\
   exit /b %ERRORLEVEL%\r\n\
 )\r\n\
-\"%INSTALL%scalattice-agent.exe\" %*\r\n";
+\"%INSTALL%scalattice-agent.exe\" %*\r\n\
+exit /b %ERRORLEVEL%\r\n\
+\r\n\
+:CheckCudaRuntime\r\n\
+if not exist \"%LIB%\\cudart64_12.dll\" if not exist \"%INSTALL%cudart64_12.dll\" exit /b 1\r\n\
+if not exist \"%LIB%\\cublas64_12.dll\" if not exist \"%INSTALL%cublas64_12.dll\" exit /b 1\r\n\
+if not exist \"%LIB%\\cublasLt64_12.dll\" if not exist \"%INSTALL%cublasLt64_12.dll\" exit /b 1\r\n\
+exit /b 0\r\n\
+\r\n\
+:LogCudaMissing\r\n\
+set \"LOGDIR=%LOCALAPPDATA%\\Scalattice\\logs\"\r\n\
+if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\" >nul 2>&1\r\n\
+>>\"%LOGDIR%\\agent.log\" echo [%DATE% %TIME%] CUDA runtime missing under %LIB% — reinstall Scalattice Agent\r\n\
+exit /b 0\r\n";
 
     fs::write(install.join("scalattice-run.cmd"), run_cmd)?;
 
@@ -361,33 +391,56 @@ if /I \"%~1\"==\"tray-debug\" (\r\n\
     Ok(())
 }
 
+// Keep in sync with installer/windows/launch-*.vbs
 const LAUNCH_TRAY_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
 If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
+If Not CudaRuntimeOk(fso, lib, install) Then
+  LogCudaMissing sh, fso, lib
+  MsgBox "Scalattice Agent cannot start because the CUDA 12 runtime is missing." & vbCrLf & vbCrLf & _
+    "Expected under:" & vbCrLf & "  " & lib & vbCrLf & vbCrLf & _
+    "Reinstall Scalattice Agent from https://scalattice.cloud", _
+    vbCritical, "Scalattice Agent"
+  WScript.Quit 1
+End If
 Set env = sh.Environment("PROCESS")
 env("SCALATTICE_TRAY_HIDDEN") = "1"
 env("SCALATTICE_TRAY") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.CurrentDirectory = install
 sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
+
+Function CudaRuntimeOk(fso, lib, install)
+  Dim names, i, name
+  names = Array("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+  For i = 0 To UBound(names)
+    name = names(i)
+    If Not fso.FileExists(lib & "\" & name) And Not fso.FileExists(install & "\" & name) Then
+      CudaRuntimeOk = False
+      Exit Function
+    End If
+  Next
+  CudaRuntimeOk = True
+End Function
+
+Sub LogCudaMissing(sh, fso, lib)
+  Dim logDir, logPath, ts, stream
+  On Error Resume Next
+  logDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\logs")
+  If Not fso.FolderExists(logDir) Then fso.CreateFolder logDir
+  logPath = logDir & "\agent.log"
+  ts = Now
+  Set stream = fso.OpenTextFile(logPath, 8, True)
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — reinstall Scalattice Agent"
+  stream.Close
+  On Error Goto 0
+End Sub
 "#;
 
-const LAUNCH_TRAY_INTERACTIVE_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
-If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
-lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
-If Not fso.FolderExists(lib) Then lib = install & "\lib"
-Set env = sh.Environment("PROCESS")
-env("SCALATTICE_TRAY_HIDDEN") = "1"
-env("SCALATTICE_TRAY") = "1"
-env("PATH") = install & ";" & lib & ";" & env("PATH")
-sh.CurrentDirectory = install
-sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
-"#;
+const LAUNCH_TRAY_INTERACTIVE_VBS: &str = LAUNCH_TRAY_VBS;
 
 // Launch the agent exe directly (no cmd.exe host). A blocking .cmd console used to
 // survive reboot paths and kill the agent when closed. Crash recovery is handled by
@@ -398,11 +451,41 @@ install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
 If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
+If Not CudaRuntimeOk(fso, lib, install) Then
+  LogCudaMissing sh, fso, lib
+  WScript.Quit 1
+End If
 Set env = sh.Environment("PROCESS")
 env("SCALATTICE_BACKGROUND") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.CurrentDirectory = install
 sh.Run """" & install & "\scalattice-agent.exe"" foreground", 0, False
+
+Function CudaRuntimeOk(fso, lib, install)
+  Dim names, i, name
+  names = Array("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+  For i = 0 To UBound(names)
+    name = names(i)
+    If Not fso.FileExists(lib & "\" & name) And Not fso.FileExists(install & "\" & name) Then
+      CudaRuntimeOk = False
+      Exit Function
+    End If
+  Next
+  CudaRuntimeOk = True
+End Function
+
+Sub LogCudaMissing(sh, fso, lib)
+  Dim logDir, logPath, ts, stream
+  On Error Resume Next
+  logDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\logs")
+  If Not fso.FolderExists(logDir) Then fso.CreateFolder logDir
+  logPath = logDir & "\agent.log"
+  ts = Now
+  Set stream = fso.OpenTextFile(logPath, 8, True)
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — reinstall Scalattice Agent"
+  stream.Close
+  On Error Goto 0
+End Sub
 "#;
 
 const STARTUP_AGENT_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")

@@ -14,14 +14,16 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`choco install innos
 
 ## What the installer does
 
-1. Welcome + token input (`slt_provider_…`)
-2. **Reinstall only:** optional page to remove stored model weights (shows size in GB)
-3. Copies `scalattice-agent.exe` to `%LOCALAPPDATA%\Scalattice\bin`
-3. Copies bundled DLLs (including CUDA 12 runtime) to `%LOCALAPPDATA%\Scalattice\lib`
-4. Adds both folders to the user `PATH`
-5. Runs `scalattice-agent set-token` to register the background scheduled task
-6. Starts the notification area control panel (`scalattice-agent tray`)
-7. Adds Start Menu shortcuts (notification-area agent + provider dashboard). Upgrades remove the old "Scalattice Agent (debug)" shortcut if present.
+1. Welcome
+2. **If `nvidia-smi` is missing:** driver page with link to NVIDIA download + Recheck (can continue anyway)
+3. Token input (`slt_provider_…`)
+4. **Reinstall only:** optional page to remove stored model weights (shows size in GB)
+5. Copies `scalattice-agent.exe` to `%LOCALAPPDATA%\Scalattice\bin`
+6. Copies bundled DLLs (including CUDA 12 runtime) to `%LOCALAPPDATA%\Scalattice\lib`
+7. Adds both folders to the user `PATH`
+8. Runs `scalattice-agent set-token` to register the background scheduled task
+9. Starts the notification area control panel (`scalattice-agent tray`)
+10. Adds Start Menu shortcuts (notification-area agent + provider dashboard). Upgrades remove the old "Scalattice Agent (debug)" shortcut if present.
 
 Silent install with token (IT/automation):
 
