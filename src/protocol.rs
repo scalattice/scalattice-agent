@@ -92,6 +92,8 @@ pub struct ReadyMessage {
     pub compute_devices: Vec<ComputeDevicePolicy>,
     #[serde(rename = "enabledModels", default)]
     pub enabled_models: Vec<ModelPolicyEntry>,
+    #[serde(rename = "maxCompletionTokens", default)]
+    pub max_completion_tokens: u32,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
     #[serde(default)]
@@ -108,6 +110,8 @@ pub struct PongMessage {
     pub hugging_face_token: Option<String>,
     #[serde(rename = "purgeModels", default)]
     pub purge_models: Vec<String>,
+    #[serde(rename = "maxCompletionTokens", default)]
+    pub max_completion_tokens: u32,
     #[serde(default)]
     pub schedule: AgentSchedule,
 }
@@ -175,6 +179,8 @@ pub struct InvokeMessage {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default, rename = "maxTokens")]
+    pub max_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

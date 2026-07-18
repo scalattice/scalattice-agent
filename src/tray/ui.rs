@@ -243,6 +243,7 @@ struct TrayApp {
     log_path: Option<PathBuf>,
     log_offset: u64,
     next_data_poll: Instant,
+    next_agent_watchdog: Instant,
     last_outer_rect: Option<egui::Rect>,
 }
 
@@ -299,6 +300,7 @@ impl TrayApp {
             log_path,
             log_offset: 0,
             next_data_poll: Instant::now(),
+            next_agent_watchdog: Instant::now() + Duration::from_secs(5),
             last_outer_rect: None,
         };
         if should_check_now {
@@ -358,6 +360,38 @@ impl TrayApp {
             self.update_check_inflight = true;
             self.update_notice = "Checking for updates…".to_string();
         }
+    }
+
+    /// If the background agent crashed/stopped but a token is saved, bring it back
+    /// with that token — even while the panel is hidden in the notification area.
+    fn tick_agent_watchdog(&mut self, ctx: &egui::Context) {
+        if Instant::now() < self.next_agent_watchdog {
+            let until = self
+                .next_agent_watchdog
+                .saturating_duration_since(Instant::now());
+            if !until.is_zero() {
+                ctx.request_repaint_after(until.min(Duration::from_secs(5)));
+            }
+            return;
+        }
+        self.next_agent_watchdog = Instant::now() + Duration::from_secs(5);
+        match service::background_status() {
+            service::BackgroundStatus::Stopped => {
+                match service::ensure_background_running_if_configured() {
+                    Ok(()) => {
+                        if service::service_active() {
+                            write_tray_log("watchdog restarted stopped background agent");
+                            self.action_message =
+                                "Agent was stopped — restarted with your saved token.".to_string();
+                            self.kick_status_refresh();
+                        }
+                    }
+                    Err(err) => write_tray_log(&format!("watchdog restart failed: {err:#}")),
+                }
+            }
+            service::BackgroundStatus::Running | service::BackgroundStatus::NotInstalled => {}
+        }
+        ctx.request_repaint_after(Duration::from_secs(5));
     }
 
     fn schedule_next_update_check(&mut self) {
@@ -545,6 +579,7 @@ impl eframe::App for TrayApp {
 
         self.poll_tray(ctx);
         self.poll_update_results(ctx);
+        self.tick_agent_watchdog(ctx);
 
         if Instant::now() >= self.next_update_check
             && !self.update_check_inflight
@@ -787,7 +822,7 @@ fn gather_status_lines() -> Vec<String> {
 
     let service_line = match service::background_status() {
         service::BackgroundStatus::Running => "Agent: running",
-        service::BackgroundStatus::Stopped => "Agent: stopped · starts when you sign in",
+        service::BackgroundStatus::Stopped => "Agent: stopped · auto-restarting…",
         service::BackgroundStatus::NotInstalled => "Agent: not set up yet",
     };
     lines.push(service_line.to_string());

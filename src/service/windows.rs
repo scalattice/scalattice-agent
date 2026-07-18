@@ -390,7 +390,8 @@ sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
 "#;
 
 // Launch the agent exe directly (no cmd.exe host). A blocking .cmd console used to
-// survive reboot paths and kill the agent when closed.
+// survive reboot paths and kill the agent when closed. Crash recovery is handled by
+// the tray watchdog (and Linux systemd Restart=always).
 const LAUNCH_BACKGROUND_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")

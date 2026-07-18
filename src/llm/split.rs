@@ -112,7 +112,7 @@ pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
             anyhow::bail!("split upper segment received empty restored context");
         }
 
-        let max_tokens = config.max_tokens.max(1).min(2048);
+        let max_tokens = config.max_tokens.max(1).min(8192);
         let last = *restored.last().context("restored context missing last token")?;
         let mut position = restored.len() as i32;
 

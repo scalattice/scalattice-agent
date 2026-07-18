@@ -44,6 +44,8 @@ struct SessionState {
     registered: bool,
     compute_policy: Vec<(String, bool)>,
     model_policy: Vec<(String, bool)>,
+    /// Provider dashboard cap for completion tokens on this machine (16–8192, ≤ platform max).
+    max_completion_tokens: u32,
     job_state: JobState,
     active_job_id: Option<String>,
     active_model_id: Option<String>,
@@ -66,6 +68,7 @@ impl SessionState {
             registered: false,
             compute_policy: Vec::new(),
             model_policy: Vec::new(),
+            max_completion_tokens: 1024,
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
@@ -89,6 +92,23 @@ impl SessionState {
     fn evict_vram_cache(&self) {
         info!("evicting in-memory model weights from VRAM");
         crate::llm::evict_all();
+    }
+
+    fn apply_max_completion_tokens(&mut self, raw: u32) {
+        let next = if raw == 0 {
+            1024
+        } else {
+            raw.clamp(16, 8192)
+        };
+        if self.max_completion_tokens != next {
+            info!(max_completion_tokens = next, "updated machine completion token cap");
+            self.max_completion_tokens = next;
+        }
+    }
+
+    fn effective_max_tokens(&self, requested: u32) -> u32 {
+        let req = if requested == 0 { 1024 } else { requested };
+        req.min(self.max_completion_tokens).clamp(1, 8192)
     }
 
     fn apply_schedule(&mut self, schedule: AgentSchedule) -> ScheduleTransition {
@@ -812,6 +832,7 @@ async fn handle_server_message(
                         guard.node_id = Some(ready.node_id.clone());
                         guard.apply_compute_devices(&ready.compute_devices);
                         guard.apply_model_policy(&ready.enabled_models);
+                        guard.apply_max_completion_tokens(ready.max_completion_tokens);
                         guard.catalog = ready.catalog.clone();
                         guard.last_sync_token = None;
                         let transition = guard.apply_schedule(ready.schedule.clone());
@@ -856,6 +877,7 @@ async fn handle_server_message(
                             let mut guard = state.lock().await;
                             guard.apply_compute_devices(&pong.compute_devices);
                             guard.apply_model_policy(&pong.enabled_models);
+                            guard.apply_max_completion_tokens(pong.max_completion_tokens);
                             let trash = guard.apply_purge_models(&pong.purge_models);
                             let transition = guard.apply_schedule(pong.schedule.clone());
                             guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
@@ -932,12 +954,18 @@ async fn respond_invoke(
             .context("no enabled compute devices for inference")?
     };
 
+    let max_tokens = {
+        let guard = state.lock().await;
+        guard.effective_max_tokens(invoke.max_tokens)
+    };
+
     let result = async {
         let req = InferenceRequest {
             job_id: &invoke.id,
             model_id: &invoke.model_id,
             runtime_model: &invoke.runtime_model,
             messages: &invoke.messages,
+            max_tokens,
         };
 
         let output = if invoke.stream {
@@ -1085,11 +1113,16 @@ async fn respond_invoke_split(
                 }
                 Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
             },
-            "upper" => match engine
+            "upper" => {
+                let max_tokens = {
+                    let guard = state.lock().await;
+                    guard.effective_max_tokens(invoke.max_tokens)
+                };
+                match engine
                 .invoke_split_upper(
                     &invoke.runtime_model,
                     &invoke.state_b64,
-                    invoke.max_tokens.max(1),
+                    max_tokens,
                 )
                 .await
             {

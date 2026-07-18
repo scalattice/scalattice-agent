@@ -15,6 +15,7 @@ pub struct InferenceRequest<'a> {
     pub model_id: &'a str,
     pub runtime_model: &'a str,
     pub messages: &'a [ChatMessage],
+    pub max_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -122,13 +123,14 @@ impl InferenceEngine {
         let job_id = req.job_id.to_string();
         let model_id_err = req.model_id.to_string();
         let runtime_err = req.runtime_model.to_string();
+        let max_tokens = req.max_tokens.max(1).min(8192);
 
         let output = tokio::task::spawn_blocking(move || {
             generate(&GenerateConfig {
                 model_path,
                 pool,
                 messages,
-                max_tokens: 512,
+                max_tokens,
                 model_id,
             })
         })
@@ -173,6 +175,7 @@ impl InferenceEngine {
         let job_id = req.job_id.to_string();
         let model_id_err = req.model_id.to_string();
         let runtime_err = req.runtime_model.to_string();
+        let max_tokens = req.max_tokens.max(1).min(8192);
 
         let output = tokio::task::spawn_blocking(move || {
             generate_with_callback(
@@ -180,7 +183,7 @@ impl InferenceEngine {
                     model_path,
                     pool,
                     messages,
-                    max_tokens: 512,
+                    max_tokens,
                     model_id,
                 },
                 |piece| {

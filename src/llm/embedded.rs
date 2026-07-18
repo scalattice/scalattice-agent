@@ -91,7 +91,7 @@ pub fn generate_with_callback(
                 .str_to_token(&prompt, AddBos::Never)
                 .context("tokenize prompt")?;
 
-            let max_tokens = config.max_tokens.max(1).min(2048) as usize;
+            let max_tokens = config.max_tokens.max(1).min(8192) as usize;
             if prompt_tokens.len() + max_tokens > ctx.n_ctx() as usize {
                 anyhow::bail!(
                     "prompt too long for context window ({} + {} > {})",
