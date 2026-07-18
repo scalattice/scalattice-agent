@@ -1141,7 +1141,8 @@ async fn respond_invoke_split(
                     Ok(())
                 }
                 Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
-            },
+                }
+            }
             other => {
                 let err = InvokeErrorMessage {
                     kind: "invoke_error",
