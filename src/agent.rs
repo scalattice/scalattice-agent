@@ -44,7 +44,7 @@ struct SessionState {
     registered: bool,
     compute_policy: Vec<(String, bool)>,
     model_policy: Vec<(String, bool)>,
-    /// Provider dashboard cap for completion tokens on this machine (16–8192, ≤ platform max).
+    /// Platform-wide completion ceiling from policy (same on every machine).
     max_completion_tokens: u32,
     job_state: JobState,
     active_job_id: Option<String>,
@@ -101,7 +101,7 @@ impl SessionState {
             raw.clamp(16, 8192)
         };
         if self.max_completion_tokens != next {
-            info!(max_completion_tokens = next, "updated machine completion token cap");
+            info!(max_completion_tokens = next, "updated platform completion token ceiling");
             self.max_completion_tokens = next;
         }
     }
