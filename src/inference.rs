@@ -227,6 +227,9 @@ pub async fn warm_cached_models(pool: &VirtualCard, runtime_models: &[String]) -
     let models = runtime_models.to_vec();
     tokio::task::spawn_blocking(move || {
         for runtime_model in models {
+            if crate::models::should_skip_preload(&runtime_model) {
+                continue;
+            }
             let Some(model_path) = resolve_model_gguf(&runtime_model) else {
                 continue;
             };
@@ -236,6 +239,10 @@ pub async fn warm_cached_models(pool: &VirtualCard, runtime_models: &[String]) -
                     error = %error,
                     "model preload failed"
                 );
+                crate::models::handle_weight_load_failure(&runtime_model, &error);
+                if crate::models::process_preload_paused() {
+                    break;
+                }
             }
         }
         Ok(())

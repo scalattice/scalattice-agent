@@ -45,6 +45,10 @@ pub struct SerializedModelDiskStatus {
     #[serde(rename = "diskGb")]
     pub disk_gb: f64,
     pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub fn build_runtime(
@@ -101,12 +105,14 @@ pub fn serialize_model_disk(
         .iter()
         .map(|(runtime_model, status)| {
             let disk_gb = (status.bytes as f64) / 1024.0 / 1024.0 / 1024.0;
-            let disk_gb = (disk_gb * 10.0).round() / 10.0;
+            let disk_gb = ((disk_gb * 10.0).round() / 10.0).max(0.1);
             (
                 runtime_model.clone(),
                 SerializedModelDiskStatus {
                     disk_gb,
                     complete: status.complete,
+                    state: Some(status.state.clone()),
+                    error: status.error.clone(),
                 },
             )
         })

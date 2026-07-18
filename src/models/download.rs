@@ -52,6 +52,8 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
         .error_for_status()
         .with_context(|| format!("download failed for {url}"))?;
 
+    let expected_len = response.content_length();
+
     // After redirects, final URL must still be an allowed mirror when this was a mirror fetch.
     // (HF downloads use huggingface.co and skip this helper's mirror check.)
 
@@ -70,14 +72,30 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
         .await
         .with_context(|| format!("create {}", tmp.display()))?;
     let mut stream = response.bytes_stream();
+    let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read download chunk")?;
+        written = written.saturating_add(chunk.len() as u64);
         file.write_all(&chunk)
             .await
             .context("write download chunk")?;
     }
     file.flush().await.context("flush download")?;
     drop(file);
+
+    if let Some(expected) = expected_len {
+        if written != expected {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            bail!(
+                "truncated download for {}: got {written} of {expected} bytes",
+                dest.display()
+            );
+        }
+    }
+    if written == 0 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        bail!("empty download for {}", dest.display());
+    }
 
     std::fs::rename(tmp, dest).with_context(|| format!("finalize {}", dest.display()))?;
     Ok(())
@@ -176,6 +194,7 @@ pub async fn download_hf_gguf(
     }
 
     write_manifest(runtime_model, weights)?;
+    crate::models::clear_weight_health(runtime_model);
     info!("downloaded model weights for {runtime_model}");
     Ok(())
 }
@@ -201,6 +220,7 @@ async fn download_mirror_gguf(
     }
 
     write_manifest(runtime_model, weights)?;
+    crate::models::clear_weight_health(runtime_model);
     info!("downloaded model weights for {runtime_model}");
     Ok(())
 }

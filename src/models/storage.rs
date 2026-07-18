@@ -1,3 +1,6 @@
+use crate::models::health::{
+    is_purging_cache_key, read_weight_health, runtime_from_purging_cache_key, stage_purge_model_weights,
+};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -49,6 +52,12 @@ pub fn read_manifest_filenames(runtime_model: &str) -> Option<Vec<String>> {
 }
 
 pub fn model_weights_ready(runtime_model: &str) -> bool {
+    if matches!(
+        read_weight_health(runtime_model).as_ref().map(|(s, _)| s.as_str()),
+        Some("corrupt") | Some("removing")
+    ) {
+        return false;
+    }
     let Some(filenames) = read_manifest_filenames(runtime_model) else {
         return false;
     };
@@ -104,6 +113,9 @@ fn dir_size_bytes(path: &Path) -> u64 {
 pub struct ModelDiskStatus {
     pub bytes: u64,
     pub complete: bool,
+    /// `ok` | `incomplete` | `corrupt` | `removing`
+    pub state: String,
+    pub error: Option<String>,
 }
 
 pub fn list_model_disk_status() -> Vec<(String, ModelDiskStatus)> {
@@ -111,25 +123,64 @@ pub fn list_model_disk_status() -> Vec<(String, ModelDiskStatus)> {
         return Vec::new();
     };
 
-    entries
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| {
-            let cache_key = entry.file_name().into_string().ok()?;
-            let runtime_model = cache_key.replace("__", "/");
-            let bytes = dir_size_bytes(&entry.path());
-            if bytes == 0 {
-                return None;
-            }
-            Some((
-                runtime_model.clone(),
+    let mut out: Vec<(String, ModelDiskStatus)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(cache_key) = entry.file_name().into_string() else {
+            continue;
+        };
+
+        if is_purging_cache_key(&cache_key) {
+            let Some(runtime_model) = runtime_from_purging_cache_key(&cache_key) else {
+                continue;
+            };
+            let bytes = dir_size_bytes(&path).max(1);
+            out.push((
+                runtime_model,
                 ModelDiskStatus {
                     bytes,
-                    complete: model_weights_ready(&runtime_model),
+                    complete: false,
+                    state: "removing".to_string(),
+                    error: Some("Removing weights from disk.".to_string()),
                 },
-            ))
-        })
-        .collect()
+            ));
+            continue;
+        }
+
+        let runtime_model = cache_key.replace("__", "/");
+        let bytes = dir_size_bytes(&path);
+        let health = read_weight_health(&runtime_model);
+        let corrupt = matches!(health.as_ref().map(|(s, _)| s.as_str()), Some("corrupt"));
+        if bytes == 0 && !corrupt {
+            continue;
+        }
+        let complete = model_weights_ready(&runtime_model);
+        let (state, error) = if corrupt {
+            (
+                "corrupt".to_string(),
+                health.and_then(|(_, e)| e).or_else(|| {
+                    Some("Weights failed to load and will be re-downloaded if the model stays enabled.".to_string())
+                }),
+            )
+        } else if complete {
+            ("ok".to_string(), None)
+        } else {
+            ("incomplete".to_string(), None)
+        };
+        out.push((
+            runtime_model,
+            ModelDiskStatus {
+                bytes: bytes.max(if corrupt { 1 } else { 0 }),
+                complete,
+                state,
+                error,
+            },
+        ));
+    }
+    out
 }
 
 pub fn list_cached_runtime_models() -> Vec<String> {
@@ -225,8 +276,10 @@ pub fn purge_incomplete_model_weights(runtime_model: &str) {
 }
 
 pub fn purge_model_weights(runtime_model: &str) {
-    if let Some(path) = resolve_model_gguf(runtime_model) {
-        crate::llm::evict_all_for_path(&path);
+    // Prefer rename-then-delete so dashboard inventory clears immediately.
+    if let Some(trash) = stage_purge_model_weights(runtime_model) {
+        crate::models::health::spawn_delete_staged_dirs(vec![trash]);
+        return;
     }
     let dir = model_cache_dir(runtime_model);
     if dir.is_dir() {

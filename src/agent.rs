@@ -7,7 +7,11 @@ use crate::protocol::{
 use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecycleState, VramTickAction};
 use crate::compute_pool::build_virtual_card;
 use crate::inference::{InferenceEngine, InferenceRequest};
-use crate::models::{can_host_model, model_weights_ready, purge_incomplete_model_weights, purge_model_weights, spawn_catalog_sync};
+use crate::models::{
+    can_host_model, handle_weight_load_failure, model_weights_ready, purge_incomplete_model_weights,
+    should_skip_preload, spawn_delete_staged_dirs, stage_purge_model_weights,
+    sweep_staged_purge_dirs, spawn_catalog_sync,
+};
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::{
     apply_compute_policy, build_specs_from_devices, detect_all_compute_devices, detect_cpu_model,
@@ -108,6 +112,9 @@ impl SessionState {
                     } else {
                         model.runtime_model.clone()
                     };
+                    if should_skip_preload(&runtime) {
+                        return None;
+                    }
                     Some(runtime)
                 })
             })
@@ -301,21 +308,24 @@ impl SessionState {
             .unwrap_or_else(|| model_id.replace("__", "/"))
     }
 
-    fn apply_purge_models(&mut self, model_ids: &[String]) {
+    fn apply_purge_models(&mut self, model_ids: &[String]) -> Vec<std::path::PathBuf> {
         if model_ids.is_empty() {
-            return;
+            return Vec::new();
         }
         if let Some(downloading) = crate::state::downloading_model() {
             if model_ids.iter().any(|id| id == &downloading) {
                 self.cancel_active_downloads();
             }
         }
+        let mut trash = Vec::new();
         for model_id in model_ids {
             let runtime_model = self.runtime_for_model_id(model_id);
             info!("purging model weights for {model_id} ({runtime_model})");
-            purge_model_weights(&runtime_model);
+            if let Some(path) = stage_purge_model_weights(&runtime_model) {
+                trash.push(path);
+            }
         }
-        self.evict_vram_cache();
+        trash
     }
 
     fn is_model_enabled(&self, model_id: &str) -> bool {
@@ -485,6 +495,7 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     if let Err(err) = crate::llm::init_backend() {
         warn!("embedded llama.cpp backend init failed: {err:#}");
     }
+    sweep_staged_purge_dirs();
 
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
@@ -758,25 +769,30 @@ async fn handle_server_message(
                 }
                 "pong" | "policy" => {
                     if let Ok(pong) = parse_pong(data) {
-                        let transition = {
+                        let purge_requested = !pong.purge_models.is_empty();
+                        let (transition, trash) = {
                             let mut guard = state.lock().await;
                             guard.apply_compute_devices(&pong.compute_devices);
                             guard.apply_model_policy(&pong.enabled_models);
-                            guard.apply_purge_models(&pong.purge_models);
+                            let trash = guard.apply_purge_models(&pong.purge_models);
                             let transition = guard.apply_schedule(pong.schedule.clone());
                             guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
                             guard.tick_vram_lifecycle();
                             guard.persist_local_state();
-                            transition
+                            (transition, trash)
                         };
+                        spawn_delete_staged_dirs(trash);
                         if transition.entered_earning {
                             maybe_warm_models(state.clone()).await;
                         }
                         // Re-advertise immediately so disabled models leave the pool
-                        // without waiting for the next heartbeat. Do not heartbeat here —
-                        // that would recurse (heartbeat → pong → heartbeat).
+                        // without waiting for the next heartbeat.
                         if state.lock().await.needs_reregister() {
                             send_register_message(state, write).await?;
+                        } else if purge_requested {
+                            // Fast disk remove: rename already cleared inventory; push runtime now
+                            // so the dashboard leaves "Removing…" without waiting ~12s.
+                            send_heartbeat(state, write).await?;
                         }
                     }
                 }
@@ -911,13 +927,14 @@ async fn respond_invoke(
                     "inference invoke failed on pool {}: {err:#}",
                     engine.pool().display_name
                 );
-                let err = InvokeErrorMessage {
+                handle_weight_load_failure(&invoke.runtime_model, &err);
+                let msg = InvokeErrorMessage {
                     kind: "invoke_error",
                     id: invoke.id,
                     error: invoke_error_code(&err).to_string(),
                 };
                 write
-                    .send(Message::Text(serde_json::to_string(&err)?))
+                    .send(Message::Text(serde_json::to_string(&msg)?))
                     .await?;
                 Ok(())
             }
