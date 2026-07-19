@@ -67,6 +67,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut to open the provider dashboard"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
+; Extracted to {tmp} at runtime for the NVIDIA driver lookup wizard page.
+Source: "resolve-nvidia-driver.ps1"; Flags: dontcopy
 ; Install bundled DLLs before the exe so post-install can load them.
 ; PrepareToInstall moves the prior lib dir aside so we can copy fresh files without
 ; in-place overwriting of locked CUDA DLLs (which left stale versions / broken updates).
@@ -104,6 +106,11 @@ var
   ShowModelsPage: Boolean;
   ShowDriverPage: Boolean;
   IsSilentUpdate: Boolean;
+  ResolvedDriverUrl: String;
+  ResolvedGpuName: String;
+  ResolvedDriverVersion: String;
+  DriverLookupDone: Boolean;
+
 
 function GetDirSize(const Dir: string; var Size: Int64): Boolean;
 var
@@ -379,33 +386,131 @@ begin
   end;
 end;
 
+function DriverLookupIniPath: String;
+begin
+  Result := ExpandConstant('{tmp}\scalattice-nvidia-driver.ini');
+end;
+
+procedure EnsureDriverLookupScript;
+begin
+  if not FileExists(ExpandConstant('{tmp}\resolve-nvidia-driver.ps1')) then
+    ExtractTemporaryFile('resolve-nvidia-driver.ps1');
+end;
+
+procedure RunNvidiaDriverLookup;
+var
+  ScriptPath, IniPath, Params: String;
+  ResultCode: Integer;
+begin
+  ResolvedDriverUrl := '';
+  ResolvedGpuName := '';
+  ResolvedDriverVersion := '';
+  DriverLookupDone := False;
+
+  EnsureDriverLookupScript;
+  ScriptPath := ExpandConstant('{tmp}\resolve-nvidia-driver.ps1');
+  IniPath := DriverLookupIniPath;
+  DeleteFile(IniPath);
+
+  Params :=
+    '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '" -OutFile "' + IniPath + '"';
+  if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Exit;
+
+  if not FileExists(IniPath) then
+    Exit;
+
+  ResolvedGpuName := GetIniString('Driver', 'GpuName', '', IniPath);
+  ResolvedDriverVersion := GetIniString('Driver', 'Version', '', IniPath);
+  ResolvedDriverUrl := GetIniString('Driver', 'DownloadUrl', '', IniPath);
+  DriverLookupDone := True;
+end;
+
 procedure RefreshDriverStatus;
+var
+  Err: String;
+  Laptop: String;
 begin
   if DriverStatusLabel = nil then
     Exit;
+
   if NvidiaDriverOk then
+  begin
     DriverStatusLabel.Caption :=
-      'NVIDIA driver detected (nvidia-smi OK). You can continue.'
+      'NVIDIA driver detected (nvidia-smi OK). You can continue.';
+    if DriverDownloadBtn <> nil then
+      DriverDownloadBtn.Caption := 'Open NVIDIA driver site';
+    Exit;
+  end;
+
+  if not DriverLookupDone then
+    RunNvidiaDriverLookup;
+
+  Err := '';
+  if FileExists(DriverLookupIniPath) then
+    Err := GetIniString('Driver', 'Error', '', DriverLookupIniPath);
+  Laptop := '';
+  if FileExists(DriverLookupIniPath) then
+    if GetIniString('Driver', 'IsLaptop', '0', DriverLookupIniPath) = '1' then
+      Laptop := ' (laptop package)';
+
+  if (ResolvedDriverUrl <> '') and (ResolvedGpuName <> '') then
+  begin
+    DriverStatusLabel.Caption :=
+      'Detected: ' + ResolvedGpuName + Laptop + #13#10 +
+      'Recommended Game Ready driver: ' + ResolvedDriverVersion + #13#10 +
+      'Click Download to get the matching installer from NVIDIA, then Recheck.' + #13#10 +
+      'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.';
+    if DriverDownloadBtn <> nil then
+      DriverDownloadBtn.Caption := 'Download driver ' + ResolvedDriverVersion;
+  end
+  else if Err <> '' then
+  begin
+    DriverStatusLabel.Caption :=
+      'Could not auto-select a driver: ' + Err + #13#10 +
+      'Use NVIDIA''s site to pick Game Ready / Studio for your GPU, then Recheck.';
+    if DriverDownloadBtn <> nil then
+      DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
+  end
   else
+  begin
     DriverStatusLabel.Caption :=
       'NVIDIA driver not detected (nvidia-smi missing or failed).' + #13#10 +
       'Install a current Game Ready or Studio driver, then click Recheck.' + #13#10 +
       'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.';
+    if DriverDownloadBtn <> nil then
+      DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
+  end;
 end;
 
 procedure DriverDownloadClick(Sender: TObject);
 var
   ErrorCode: Integer;
+  Url: String;
 begin
-  ShellExec('open', 'https://www.nvidia.com/Download/index.aspx', '', '',
-    SW_SHOWNORMAL, ewNoWait, ErrorCode);
+  if not DriverLookupDone then
+    RunNvidiaDriverLookup;
+
+  Url := ResolvedDriverUrl;
+  if Url = '' then
+    Url := 'https://www.nvidia.com/Download/index.aspx';
+
+  ShellExec('open', Url, '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
 end;
 
 procedure DriverRecheckClick(Sender: TObject);
 begin
+  DriverLookupDone := False;
   RefreshDriverStatus;
   if NvidiaDriverOk then
     MsgBox('NVIDIA driver looks good. Click Next to continue.', mbInformation, MB_OK)
+  else if ResolvedDriverUrl <> '' then
+    MsgBox(
+      'Still no working nvidia-smi.' + #13#10 + #13#10 +
+      'Download and install driver ' + ResolvedDriverVersion + ' for:' + #13#10 +
+      '  ' + ResolvedGpuName + #13#10 + #13#10 +
+      'Reboot if Windows asks, then click Recheck again.',
+      mbError, MB_OK)
   else
     MsgBox(
       'Still no working nvidia-smi.' + #13#10 + #13#10 +
@@ -421,6 +526,10 @@ begin
   LibDir := ExpandConstant('{localappdata}\Scalattice\lib');
   ModelsCacheDir := ExpandConstant('{userpf}\.cache\scalattice\models');
   ModelsCacheBytes := 0;
+  ResolvedDriverUrl := '';
+  ResolvedGpuName := '';
+  ResolvedDriverVersion := '';
+  DriverLookupDone := False;
   if DirExists(ModelsCacheDir) then
     GetDirSize(ModelsCacheDir, ModelsCacheBytes);
   { Silent updates skip the cache-purge page entirely. }
@@ -455,20 +564,20 @@ begin
     InfoLabel.Left := ScaleX(0);
     InfoLabel.Top := ScaleY(0);
     InfoLabel.Width := DriverPage.SurfaceWidth;
-    InfoLabel.Height := ScaleY(72);
+    InfoLabel.Height := ScaleY(56);
     InfoLabel.WordWrap := True;
     InfoLabel.AutoSize := False;
     InfoLabel.Caption :=
-      'nvidia-smi was not found on this PC. Install NVIDIA''s Game Ready or Studio driver ' +
-      '(not the CUDA Toolkit), then return here and click Recheck.' + #13#10 + #13#10 +
+      'nvidia-smi was not found. We detect your NVIDIA GPU and offer the matching ' +
+      'Game Ready driver download (not the CUDA Toolkit).' + #13#10 +
       'You can continue without a driver, but GPU inference will not work until one is installed.';
 
     DriverStatusLabel := TNewStaticText.Create(DriverPage);
     DriverStatusLabel.Parent := DriverPage.Surface;
     DriverStatusLabel.Left := ScaleX(0);
-    DriverStatusLabel.Top := ScaleY(80);
+    DriverStatusLabel.Top := ScaleY(64);
     DriverStatusLabel.Width := DriverPage.SurfaceWidth;
-    DriverStatusLabel.Height := ScaleY(56);
+    DriverStatusLabel.Height := ScaleY(72);
     DriverStatusLabel.WordWrap := True;
     DriverStatusLabel.AutoSize := False;
 
@@ -476,20 +585,21 @@ begin
     DriverDownloadBtn.Parent := DriverPage.Surface;
     DriverDownloadBtn.Left := ScaleX(0);
     DriverDownloadBtn.Top := ScaleY(148);
-    DriverDownloadBtn.Width := ScaleX(200);
+    DriverDownloadBtn.Width := ScaleX(220);
     DriverDownloadBtn.Height := ScaleY(28);
-    DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
+    DriverDownloadBtn.Caption := 'Download recommended driver';
     DriverDownloadBtn.OnClick := @DriverDownloadClick;
 
     DriverRecheckBtn := TNewButton.Create(DriverPage);
     DriverRecheckBtn.Parent := DriverPage.Surface;
-    DriverRecheckBtn.Left := ScaleX(212);
+    DriverRecheckBtn.Left := ScaleX(232);
     DriverRecheckBtn.Top := ScaleY(148);
     DriverRecheckBtn.Width := ScaleX(100);
     DriverRecheckBtn.Height := ScaleY(28);
     DriverRecheckBtn.Caption := 'Recheck';
     DriverRecheckBtn.OnClick := @DriverRecheckClick;
 
+    RunNvidiaDriverLookup;
     RefreshDriverStatus;
   end;
 
