@@ -6,8 +6,9 @@ if not exist "%LIB%" set "LIB=%INSTALL%lib"
 set "PATH=%INSTALL%;%LIB%;%PATH%"
 cd /d "%INSTALL%"
 
-rem Uninstall must run even when CUDA DLLs were already removed or locked.
+rem Uninstall / set-token must run even when CUDA DLLs are missing or locked.
 if /I "%~1"=="uninstall" goto :RunAgent
+if /I "%~1"=="set-token" goto :RunAgent
 
 call :CheckCudaRuntime
 if errorlevel 1 (

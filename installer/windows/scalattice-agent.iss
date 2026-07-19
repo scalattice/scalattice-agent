@@ -178,7 +178,7 @@ var
   Line, Value: String;
 begin
   Result := '';
-  TokenPath := ExpandConstant('{userpf}\.config\scalattice\agent.env');
+  TokenPath := ExpandConstant('{%USERPROFILE}\.config\scalattice\agent.env');
   if not FileExists(TokenPath) then
     Exit;
   if LoadStringsFromFile(TokenPath, Lines) then
@@ -217,7 +217,7 @@ begin
   if not DirExists(ModelsCacheDir) then
     Exit;
   DelTree(ModelsCacheDir, True, True, True);
-  CacheRoot := ExpandConstant('{userpf}\.cache\scalattice');
+  CacheRoot := ExpandConstant('{%USERPROFILE}\.cache\scalattice');
   if DirExists(CacheRoot) then
     RemoveDir(CacheRoot);
 end;
@@ -279,8 +279,8 @@ end;
 procedure WipeScalatticeUserData;
 begin
   { Full wipe: models, cache, config, AppData install tree. }
-  DelTree(ExpandConstant('{userpf}\.cache\scalattice'), True, True, True);
-  DelTree(ExpandConstant('{userpf}\.config\scalattice'), True, True, True);
+  DelTree(ExpandConstant('{%USERPROFILE}\.cache\scalattice'), True, True, True);
+  DelTree(ExpandConstant('{%USERPROFILE}\.config\scalattice'), True, True, True);
   DelTree(ExpandConstant('{localappdata}\Scalattice'), True, True, True);
   RemoveScalatticeStartupShortcuts;
 end;
@@ -701,7 +701,7 @@ begin
   PrefillToken := ExpandConstant('{param:TOKEN|}');
   IsSilentUpdate := ExpandConstant('{param:UPDATE|0}') = '1';
   LibDir := ExpandConstant('{localappdata}\Scalattice\lib');
-  ModelsCacheDir := ExpandConstant('{userpf}\.cache\scalattice\models');
+  ModelsCacheDir := ExpandConstant('{%USERPROFILE}\.cache\scalattice\models');
   ModelsCacheBytes := 0;
   ResolvedDriverUrl := '';
   ResolvedGpuName := '';
@@ -881,13 +881,16 @@ begin
 end;
 
 { Always launch via scalattice-run.cmd so %LOCALAPPDATA%\Scalattice\lib is on PATH
-  before Windows resolves cudart64_12.dll (bare .exe Exec causes the System Error dialog). }
+  before Windows resolves cudart64_12.dll (bare .exe Exec causes the System Error dialog).
+  set-token / uninstall do not require CUDA DLLs. }
 procedure ExecAgent(const AppDir, Params: String; var ResultCode: Integer);
 var
   RunCmd, CmdLine: String;
+  NeedsCuda: Boolean;
 begin
   ResultCode := 1;
-  if not CudaRuntimePresent(LibDir) then
+  NeedsCuda := (Pos('set-token', LowerCase(Params)) = 0) and (Pos('uninstall', LowerCase(Params)) = 0);
+  if NeedsCuda and (not CudaRuntimePresent(LibDir)) then
     Exit;
   RunCmd := AppDir + '\scalattice-run.cmd';
   if FileExists(RunCmd) then
@@ -905,7 +908,7 @@ var
 begin
   if not TokenLooksValid(Token) then
     Exit;
-  Dir := ExpandConstant('{userpf}\.config\scalattice');
+  Dir := ExpandConstant('{%USERPROFILE}\.config\scalattice');
   if not DirExists(Dir) then
     ForceDirectories(Dir);
   Path := Dir + '\agent.env';
@@ -927,7 +930,11 @@ begin
 
   { Persist token even when we cannot launch the exe (missing CUDA libs). }
   if Token <> '' then
+  begin
     PersistProviderToken(Token);
+    { set-token also registers Startup shortcuts; does not require CUDA. }
+    ExecAgent(AppDir, 'set-token --token "' + Token + '"', ResultCode);
+  end;
 
   if not CudaRuntimePresent(LibDir) then
   begin
@@ -1014,8 +1021,8 @@ Filename: "{app}\scalattice-run.cmd"; Parameters: "uninstall --yes --purge"; Wor
 Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgent.vbs"
 Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgentTray.vbs"
 Type: filesandordirs; Name: "{localappdata}\Scalattice"
-Type: filesandordirs; Name: "{userpf}\.cache\scalattice"
-Type: filesandordirs; Name: "{userpf}\.config\scalattice"
+Type: filesandordirs; Name: "{%USERPROFILE}\.cache\scalattice"
+Type: filesandordirs; Name: "{%USERPROFILE}\.config\scalattice"
 Type: files; Name: "{app}\run-background.cmd"
 Type: files; Name: "{app}\tray.pid"
 Type: files; Name: "{app}\background.pid"
