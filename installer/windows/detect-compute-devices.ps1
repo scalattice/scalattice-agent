@@ -1,47 +1,10 @@
 # Inventory CPU + GPUs for the Scalattice Agent installer (Inno Setup).
-# Writes an INI file the wizard reads on the Compatible devices page.
+# Uses only built-in Windows APIs — no nvidia-smi / CUDA / vendor SDKs required.
 param(
     [Parameter(Mandatory = $true)][string]$OutFile
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-
-function Get-NvidiaSmiPath {
-    $candidates = @(
-        (Join-Path $env:WINDIR "System32\nvidia-smi.exe"),
-        (Join-Path ${env:ProgramFiles} "NVIDIA Corporation\NVSMI\nvidia-smi.exe"),
-        (Join-Path ${env:ProgramFiles(x86)} "NVIDIA Corporation\NVSMI\nvidia-smi.exe"),
-        "nvidia-smi.exe"
-    )
-    foreach ($c in $candidates) {
-        if ($c -eq "nvidia-smi.exe") { return $c }
-        if (Test-Path -LiteralPath $c) { return $c }
-    }
-    return $null
-}
-
-function Test-NvidiaSmiOk {
-    $smi = Get-NvidiaSmiPath
-    if (-not $smi) { return $false }
-    try {
-        $p = Start-Process -FilePath $smi -ArgumentList @("-L") -WindowStyle Hidden -Wait -PassThru
-        return ($p.ExitCode -eq 0)
-    } catch {
-        return $false
-    }
-}
-
-function Get-NvidiaDriverVersion {
-    $smi = Get-NvidiaSmiPath
-    if (-not $smi) { return "" }
-    try {
-        $out = & $smi --query-gpu=driver_version --format=csv,noheader 2>$null
-        if ($LASTEXITCODE -ne 0) { return "" }
-        $line = (@($out) | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
-        if ($line) { return $line.Trim() }
-    } catch {}
-    return ""
-}
 
 function Get-CpuName {
     try {
@@ -57,13 +20,113 @@ function Test-IsIntegratedName([string]$name) {
     return [bool]($lower -match 'intel|uhd|iris|hd graphics|radeon graphics|vega|mali|amd radeon\(tm\) graphics')
 }
 
+function Test-NvidiaDriverPresent {
+    $sys = Join-Path $env:WINDIR "System32\nvcuda.dll"
+    $wow = Join-Path $env:WINDIR "SysWOW64\nvcuda.dll"
+    return (Test-Path -LiteralPath $sys) -or (Test-Path -LiteralPath $wow)
+}
+
+function Convert-ToVramMb($bytes) {
+    if ($null -eq $bytes) { return 0 }
+    try {
+        $n = [uint64]$bytes
+        if ($n -le 0) { return 0 }
+        return [int]([math]::Round($n / 1MB))
+    } catch {
+        return 0
+    }
+}
+
+# Display-adapter class: HardwareInformation.qwMemorySize is a real QWORD
+# (Win32_VideoController.AdapterRAM is a broken 32-bit field and lies above ~2-4 GB).
+function Get-RegistryVramMap {
+    $map = @{}
+    $root = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    try {
+        Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.PSChildName -notmatch '^\d{4}$') { return }
+            try {
+                $props = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+                $desc = [string]$props.DriverDesc
+                if (-not $desc -or -not $desc.Trim()) { return }
+
+                $mb = 0
+                if ($null -ne $props.'HardwareInformation.qwMemorySize') {
+                    $mb = Convert-ToVramMb $props.'HardwareInformation.qwMemorySize'
+                }
+                # DWORD MemorySize only trusted below 2 GiB (same overflow class as AdapterRAM).
+                if ($mb -le 0 -and $null -ne $props.'HardwareInformation.MemorySize') {
+                    $dw = [uint64]([uint32]$props.'HardwareInformation.MemorySize')
+                    if ($dw -gt 0 -and $dw -lt 2GB) { $mb = Convert-ToVramMb $dw }
+                }
+                if ($mb -gt 0) {
+                    $map[$desc.Trim().ToLowerInvariant()] = $mb
+                }
+            } catch {}
+        }
+    } catch {}
+    return $map
+}
+
+# dxdiag is built into Windows; use only when registry did not cover every adapter.
+function Get-DxdiagVramMap {
+    $map = @{}
+    $xmlPath = Join-Path $env:TEMP ("scalattice-dxdiag-{0}.xml" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $dxdiag = Join-Path $env:WINDIR "System32\dxdiag.exe"
+        if (-not (Test-Path -LiteralPath $dxdiag)) { return $map }
+        $p = Start-Process -FilePath $dxdiag -ArgumentList @("/x", $xmlPath) -WindowStyle Hidden -Wait -PassThru
+        if (-not (Test-Path -LiteralPath $xmlPath)) { return $map }
+        [xml]$xml = Get-Content -LiteralPath $xmlPath -Raw -ErrorAction Stop
+        $devices = @($xml.SelectNodes("//DisplayDevice"))
+        foreach ($d in $devices) {
+            $name = [string]$d.CardName
+            if (-not $name) { $name = [string]$d.ChipType }
+            if (-not $name) { continue }
+            $memText = [string]$d.DedicatedMemory
+            if (-not $memText) { $memText = [string]$d.DisplayMemory }
+            if (-not $memText) { continue }
+            $mb = 0
+            if ($memText -match '(?i)([\d\.]+)\s*GB') {
+                $mb = [int]([math]::Round([double]$Matches[1] * 1024))
+            } elseif ($memText -match '(?i)([\d\.]+)\s*MB') {
+                $mb = [int]([math]::Round([double]$Matches[1]))
+            }
+            if ($mb -gt 0) {
+                $map[$name.Trim().ToLowerInvariant()] = $mb
+            }
+        }
+    } catch {
+    } finally {
+        Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
+    }
+    return $map
+}
+
+function Resolve-VramMb([string]$name, $maps) {
+    $key = $name.ToLowerInvariant()
+    foreach ($map in $maps) {
+        if ($map.ContainsKey($key)) { return [int]$map[$key] }
+    }
+    foreach ($map in $maps) {
+        foreach ($k in @($map.Keys)) {
+            if ($key.Contains($k) -or $k.Contains($key)) { return [int]$map[$k] }
+        }
+    }
+    return 0
+}
+
 function Get-VideoControllers {
+    $regMap = Get-RegistryVramMap
     $list = @()
+
     try {
         $controllers = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
         foreach ($c in @($controllers)) {
             $name = [string]$c.Name
             if (-not $name -or -not $name.Trim()) { continue }
+            if ($name -match '(?i)microsoft basic|remote desktop|virtualbox|vmware svga|hyper-v') { continue }
+
             $pnp = [string]$c.PNPDeviceID
             $vendor = "other"
             $kind = "discrete"
@@ -79,23 +142,30 @@ function Get-VideoControllers {
             } elseif (Test-IsIntegratedName $name) {
                 $kind = "integrated"
             }
-            $vramMb = 0
+
+            $driverOk = $true
             try {
-                if ($c.AdapterRAM -and [int64]$c.AdapterRAM -gt 0 -and [int64]$c.AdapterRAM -lt [int64]([uint32]::MaxValue)) {
-                    $vramMb = [int]([math]::Round([int64]$c.AdapterRAM / 1MB))
+                if ($null -ne $c.ConfigManagerErrorCode -and [int]$c.ConfigManagerErrorCode -ne 0) {
+                    $driverOk = $false
                 }
             } catch {}
+
+            $driverVer = ""
+            try {
+                if ($c.DriverVersion) { $driverVer = ([string]$c.DriverVersion).Trim() }
+            } catch {}
+
             $list += [pscustomobject]@{
-                Name   = $name.Trim()
-                Kind   = $kind
-                Vendor = $vendor
-                VramMb = $vramMb
-                PnpId  = $pnp
+                Name          = $name.Trim()
+                Kind          = $kind
+                Vendor        = $vendor
+                VramMb        = 0
+                DriverOk      = $driverOk
+                DriverVersion = $driverVer
             }
         }
     } catch {}
 
-    # Deduplicate by name (case-insensitive).
     $seen = @{}
     $unique = @()
     foreach ($g in $list) {
@@ -104,6 +174,27 @@ function Get-VideoControllers {
         $seen[$key] = $true
         $unique += $g
     }
+
+    $maps = @($regMap)
+    $needDxdiag = $false
+    foreach ($g in $unique) {
+        $g.VramMb = Resolve-VramMb -name $g.Name -maps $maps
+        if ($g.Vendor -ne "intel" -and $g.Kind -eq "discrete" -and $g.VramMb -le 0) {
+            $needDxdiag = $true
+        }
+    }
+    if ($needDxdiag) {
+        $dxMap = Get-DxdiagVramMap
+        if ($dxMap.Count -gt 0) {
+            $maps = @($dxMap, $regMap)
+            foreach ($g in $unique) {
+                if ($g.VramMb -le 0) {
+                    $g.VramMb = Resolve-VramMb -name $g.Name -maps $maps
+                }
+            }
+        }
+    }
+
     return $unique
 }
 
@@ -114,17 +205,22 @@ if ($dir -and -not (Test-Path -LiteralPath $dir)) {
 
 $cpu = Get-CpuName
 $gpus = @(Get-VideoControllers)
-$nvidiaPresent = @($gpus | Where-Object { $_.Vendor -eq "nvidia" }).Count -gt 0
-$smiOk = Test-NvidiaSmiOk
+$nvidiaGpus = @($gpus | Where-Object { $_.Vendor -eq "nvidia" })
+$nvidiaPresent = $nvidiaGpus.Count -gt 0
+$nvidiaDeviceOk = $nvidiaPresent -and (@($nvidiaGpus | Where-Object { $_.DriverOk }).Count -gt 0)
+# Usable NVIDIA stack without calling nvidia-smi: healthy WDDM device + nvcuda.dll on disk.
+$nvidiaReady = $nvidiaDeviceOk -and (Test-NvidiaDriverPresent)
 $driverVer = ""
-if ($smiOk) { $driverVer = Get-NvidiaDriverVersion }
+if ($nvidiaPresent) {
+    $driverVer = [string](@($nvidiaGpus | Where-Object { $_.DriverVersion } | Select-Object -First 1).DriverVersion)
+}
 
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("[Inventory]")
 [void]$sb.AppendLine("CpuName=$cpu")
 [void]$sb.AppendLine("GpuCount=$($gpus.Count)")
 [void]$sb.AppendLine("NvidiaPresent=$(if ($nvidiaPresent) { '1' } else { '0' })")
-[void]$sb.AppendLine("NvidiaSmiOk=$(if ($smiOk) { '1' } else { '0' })")
+[void]$sb.AppendLine("NvidiaSmiOk=$(if ($nvidiaReady) { '1' } else { '0' })")
 [void]$sb.AppendLine("NvidiaDriverVersion=$driverVer")
 
 for ($i = 0; $i -lt $gpus.Count; $i++) {

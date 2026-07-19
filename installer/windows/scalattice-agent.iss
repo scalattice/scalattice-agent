@@ -474,8 +474,11 @@ begin
       VramMb := GetIniString('Gpu' + IntToStr(I), 'VramMb', '0', IniPath);
       Line := '  - ' + Name + '  (' + FormatGpuKind(Kind, Vendor) + ')';
       Vram := StrToIntDef(VramMb, 0);
-      if (Vram >= 1024) and (Vendor <> 'intel') then
-        Line := Line + '  ~' + IntToStr(Vram div 1024) + ' GB reported';
+      { VRAM comes from registry qwMemorySize / dxdiag — never WMI AdapterRAM. }
+      if Vram >= 1024 then
+        Line := Line + '  · ' + IntToStr((Vram + 512) div 1024) + ' GB VRAM'
+      else if Vram > 0 then
+        Line := Line + '  · ' + IntToStr(Vram) + ' MB VRAM';
       Result := Result + #13#10 + Line;
     end;
   end;
@@ -515,6 +518,7 @@ var
   Err: String;
   Laptop: String;
   InstalledVer: String;
+  DriverReady: Boolean;
 begin
   RunComputeInventory;
 
@@ -524,8 +528,8 @@ begin
   if DriverStatusLabel = nil then
     Exit;
 
-  if DriverDownloadBtn <> nil then
-    DriverDownloadBtn.Visible := InventoryNvidiaPresent;
+  DriverReady := InventoryNvidiaPresent and (InventoryNvidiaSmiOk or NvidiaDriverOk);
+
   if DriverRecheckBtn <> nil then
     DriverRecheckBtn.Visible := True;
 
@@ -533,31 +537,35 @@ begin
   begin
     DriverStatusLabel.Caption :=
       'No NVIDIA GPU detected.' + #13#10 +
-      'Scalattice can still use the CPU for compatible models. Discrete NVIDIA GPUs are needed for GPU jobs.';
+      'You can continue. The agent can use the CPU for compatible models. ' +
+      'A discrete NVIDIA GPU is required for GPU inference.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Visible := False;
     Exit;
   end;
 
-  if InventoryNvidiaSmiOk or NvidiaDriverOk then
+  if DriverReady then
   begin
     InstalledVer := '';
     if FileExists(InventoryIniPath) then
       InstalledVer := GetIniString('Inventory', 'NvidiaDriverVersion', '', InventoryIniPath);
     if InstalledVer <> '' then
       DriverStatusLabel.Caption :=
-        'NVIDIA driver looks good (nvidia-smi OK, driver ' + InstalledVer + ').' + #13#10 +
-        'This machine can run GPU jobs after you connect a provider token.'
+        'NVIDIA driver verified (version ' + InstalledVer + ').' + #13#10 +
+        'This machine is ready for GPU inference after you connect a provider token.'
     else
       DriverStatusLabel.Caption :=
-        'NVIDIA driver looks good (nvidia-smi OK).' + #13#10 +
-        'This machine can run GPU jobs after you connect a provider token.';
+        'NVIDIA driver verified.' + #13#10 +
+        'This machine is ready for GPU inference after you connect a provider token.';
     if DriverDownloadBtn <> nil then
-      DriverDownloadBtn.Caption := 'Open NVIDIA driver site';
+      DriverDownloadBtn.Visible := False;
     Exit;
   end;
 
-  { NVIDIA present but driver missing / broken }
+  { NVIDIA present but driver missing / broken — show download guidance }
+  if DriverDownloadBtn <> nil then
+    DriverDownloadBtn.Visible := True;
+
   if not DriverLookupDone then
     RunNvidiaDriverLookup;
 
@@ -572,28 +580,30 @@ begin
   if (ResolvedDriverUrl <> '') and (ResolvedGpuName <> '') then
   begin
     DriverStatusLabel.Caption :=
-      'NVIDIA GPU found, but no working driver (nvidia-smi failed).' + #13#10 +
+      'NVIDIA GPU detected, but the driver is missing or not working.' + #13#10 +
       'Detected: ' + ResolvedGpuName + Laptop + #13#10 +
-      'Install Game Ready / Studio driver ' + ResolvedDriverVersion + ', reboot if Windows asks, then Recheck.' + #13#10 +
-      'You can continue without it — the agent will run CPU-only until a driver is installed.';
+      'Install Game Ready or Studio driver ' + ResolvedDriverVersion +
+      ', reboot if Windows asks, then click Recheck.' + #13#10 +
+      'You may continue without it; the agent will use CPU-compatible models until a driver is installed.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Download driver ' + ResolvedDriverVersion;
   end
   else if Err <> '' then
   begin
     DriverStatusLabel.Caption :=
-      'NVIDIA GPU found, but no working driver (nvidia-smi failed).' + #13#10 +
-      'Could not auto-select a package: ' + Err + #13#10 +
-      'Open NVIDIA''s site, pick Game Ready or Studio for your exact GPU, install, reboot if asked, then Recheck.';
+      'NVIDIA GPU detected, but the driver is missing or not working.' + #13#10 +
+      'Could not select a package automatically: ' + Err + #13#10 +
+      'Download Game Ready or Studio drivers for your GPU from NVIDIA, install, ' +
+      'reboot if asked, then click Recheck.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
   end
   else
   begin
     DriverStatusLabel.Caption :=
-      'NVIDIA GPU found, but no working driver (nvidia-smi missing or failed).' + #13#10 +
-      'Install a current Game Ready or Studio driver from NVIDIA, reboot if Windows asks, then Recheck.' + #13#10 +
-      'Laptop users: prefer the OEM or NVIDIA laptop package for your model.';
+      'NVIDIA GPU detected, but the driver is missing or not working.' + #13#10 +
+      'Install a current Game Ready or Studio driver from NVIDIA, reboot if Windows asks, then click Recheck.' + #13#10 +
+      'On laptops, use the OEM or NVIDIA laptop package for your exact model.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
   end;
@@ -619,21 +629,23 @@ begin
   DriverLookupDone := False;
   RefreshDevicesStatus;
   if InventoryNvidiaSmiOk or NvidiaDriverOk then
-    MsgBox('NVIDIA driver looks good. Click Next to continue.', mbInformation, MB_OK)
+    MsgBox('NVIDIA driver verified. Click Next to continue.', mbInformation, MB_OK)
   else if not InventoryNvidiaPresent then
-    MsgBox('Still no NVIDIA GPU detected. You can continue with CPU-compatible models.', mbInformation, MB_OK)
+    MsgBox(
+      'No NVIDIA GPU detected. You can continue; the agent can use the CPU for compatible models.',
+      mbInformation, MB_OK)
   else if ResolvedDriverUrl <> '' then
     MsgBox(
-      'Still no working nvidia-smi.' + #13#10 + #13#10 +
+      'The NVIDIA driver is still not available.' + #13#10 + #13#10 +
       'Download and install driver ' + ResolvedDriverVersion + ' for:' + #13#10 +
       '  ' + ResolvedGpuName + #13#10 + #13#10 +
       'Reboot if Windows asks, then click Recheck again.',
       mbError, MB_OK)
   else
     MsgBox(
-      'Still no working nvidia-smi.' + #13#10 + #13#10 +
+      'The NVIDIA driver is still not available.' + #13#10 + #13#10 +
       'Install the driver, reboot if Windows asks, then click Recheck again.' + #13#10 +
-      'Laptop users: prefer the OEM or NVIDIA laptop package for your exact model.',
+      'On laptops, use the OEM or NVIDIA laptop package for your exact model.',
       mbError, MB_OK);
 end;
 
@@ -676,7 +688,7 @@ begin
     DevicesPage := CreateCustomPage(
       wpWelcome,
       'Compatible devices',
-      'Hardware Scalattice detected on this PC, plus NVIDIA driver status.');
+      'Hardware & drivers Scalattice has detected on this PC.');
     TokenAfterID := DevicesPage.ID;
 
     DevicesMemo := TNewMemo.Create(DevicesPage);
@@ -767,9 +779,10 @@ begin
     if InventoryNvidiaPresent and (not InventoryNvidiaSmiOk) and (not NvidiaDriverOk) then
     begin
       if MsgBox(
-        'NVIDIA driver not detected (nvidia-smi).' + #13#10 + #13#10 +
-        'GPU jobs will not run until you install a driver. CPU-only jobs will run instead.' + #13#10 +
-        'Continue installing Scalattice Agent anyway?',
+        'An NVIDIA GPU was detected, but no working driver is available.' + #13#10 + #13#10 +
+        'GPU inference will be unavailable until a driver is installed. ' +
+        'The agent can still use the CPU for compatible models.' + #13#10 + #13#10 +
+        'Continue installing Scalattice Agent?',
         mbConfirmation, MB_YESNO) = IDNO then
         Result := False;
     end;
