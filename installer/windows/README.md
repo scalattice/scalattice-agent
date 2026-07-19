@@ -15,7 +15,7 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`choco install innos
 ## What the installer does
 
 1. Welcome
-2. **If an NVIDIA GPU is present but `nvidia-smi` fails:** recommend the matching Game Ready driver (one-click when lookup works) + Recheck. CPU-only / non-NVIDIA PCs skip this page.
+2. **Compatible devices (always shown):** lists the detected CPU and GPUs, then NVIDIA driver status. If an NVIDIA GPU is present but `nvidia-smi` fails, offers the matching Game Ready driver download + Recheck. You can continue without a driver (CPU-only until fixed).
 3. Token input (`slt_provider_…`)
 4. **Reinstall only:** optional page to remove stored model weights (shows size in GB)
 5. Copies `scalattice-agent.exe` to `%LOCALAPPDATA%\Scalattice\bin`
@@ -23,7 +23,7 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`choco install innos
 7. Adds both folders to the user `PATH`
 8. Runs `scalattice-agent set-token` to register the background scheduled task
 9. Starts the notification area control panel (`scalattice-agent tray`)
-10. Adds Start Menu shortcuts (notification-area agent + provider dashboard). Upgrades remove the old "Scalattice Agent (debug)" shortcut if present.
+10. Adds Start Menu shortcuts (notification-area agent + provider dashboard). No desktop shortcut is offered. Upgrades remove the old "Scalattice Agent (debug)" shortcut if present.
 
 Silent install with token (IT/automation):
 

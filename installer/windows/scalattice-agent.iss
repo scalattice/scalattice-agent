@@ -63,11 +63,9 @@ SetupMutex=ScalatticeAgentSetupGlobal
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
-[Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut to open the provider dashboard"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-
 [Files]
-; Extracted to {tmp} at runtime for the NVIDIA driver lookup wizard page.
+; Extracted to {tmp} at runtime for the Compatible devices wizard page.
+Source: "detect-compute-devices.ps1"; Flags: dontcopy
 Source: "resolve-nvidia-driver.ps1"; Flags: dontcopy
 ; Install bundled DLLs before the exe so post-install can load them.
 ; PrepareToInstall moves the prior lib dir aside so we can copy fresh files without
@@ -88,11 +86,11 @@ Type: files; Name: "{app}\open-tray-debug.cmd"
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "wscript.exe"; Parameters: "//nologo ""{app}\launch-tray.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open Scalattice Agent in the notification area"; AppUserModelID: "{#MyAppUserModelId}"
 Name: "{autoprograms}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Comment: "Manage GPUs and models"
-Name: "{autodesktop}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Tasks: desktopicon
 
 [Code]
 var
-  DriverPage: TWizardPage;
+  DevicesPage: TWizardPage;
+  DevicesMemo: TNewMemo;
   DriverStatusLabel: TNewStaticText;
   DriverDownloadBtn: TNewButton;
   DriverRecheckBtn: TNewButton;
@@ -104,12 +102,14 @@ var
   ModelsCacheDir: String;
   ModelsCacheBytes: Int64;
   ShowModelsPage: Boolean;
-  ShowDriverPage: Boolean;
+  ShowDevicesPage: Boolean;
   IsSilentUpdate: Boolean;
   ResolvedDriverUrl: String;
   ResolvedGpuName: String;
   ResolvedDriverVersion: String;
   DriverLookupDone: Boolean;
+  InventoryNvidiaPresent: Boolean;
+  InventoryNvidiaSmiOk: Boolean;
 
 
 function GetDirSize(const Dir: string; var Size: Int64): Boolean;
@@ -386,32 +386,99 @@ begin
   end;
 end;
 
-{ True when Windows enumerates an NVIDIA PCI device (VEN_10DE), even without a driver. }
-function NvidiaGpuPresent: Boolean;
-var
-  ResultCode: Integer;
-  Cmd: String;
-begin
-  Cmd :=
-    '-NoProfile -ExecutionPolicy Bypass -Command "' +
-    'if (@(Get-CimInstance Win32_PnPEntity -EA SilentlyContinue | ' +
-    'Where-Object { $_.PNPDeviceID -match ''VEN_10DE'' }).Count -gt 0) { exit 0 }; ' +
-    'if (@(Get-CimInstance Win32_VideoController -EA SilentlyContinue | ' +
-    'Where-Object { $_.PNPDeviceID -match ''VEN_10DE'' }).Count -gt 0) { exit 0 }; ' +
-    'exit 1"';
-  Result := Exec('powershell.exe', Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
-    and (ResultCode = 0);
-end;
-
 function DriverLookupIniPath: String;
 begin
   Result := ExpandConstant('{tmp}\scalattice-nvidia-driver.ini');
+end;
+
+function InventoryIniPath: String;
+begin
+  Result := ExpandConstant('{tmp}\scalattice-compute-inventory.ini');
 end;
 
 procedure EnsureDriverLookupScript;
 begin
   if not FileExists(ExpandConstant('{tmp}\resolve-nvidia-driver.ps1')) then
     ExtractTemporaryFile('resolve-nvidia-driver.ps1');
+end;
+
+procedure EnsureInventoryScript;
+begin
+  if not FileExists(ExpandConstant('{tmp}\detect-compute-devices.ps1')) then
+    ExtractTemporaryFile('detect-compute-devices.ps1');
+end;
+
+procedure RunComputeInventory;
+var
+  ScriptPath, IniPath, Params: String;
+  ResultCode: Integer;
+begin
+  InventoryNvidiaPresent := False;
+  InventoryNvidiaSmiOk := False;
+  EnsureInventoryScript;
+  ScriptPath := ExpandConstant('{tmp}\detect-compute-devices.ps1');
+  IniPath := InventoryIniPath;
+  DeleteFile(IniPath);
+  Params :=
+    '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '" -OutFile "' + IniPath + '"';
+  if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Exit;
+  if not FileExists(IniPath) then
+    Exit;
+  InventoryNvidiaPresent := GetIniString('Inventory', 'NvidiaPresent', '0', IniPath) = '1';
+  InventoryNvidiaSmiOk := GetIniString('Inventory', 'NvidiaSmiOk', '0', IniPath) = '1';
+end;
+
+function FormatGpuKind(const Kind, Vendor: String): String;
+begin
+  if Kind = 'integrated' then
+    Result := 'integrated GPU'
+  else if Vendor = 'nvidia' then
+    Result := 'NVIDIA GPU'
+  else if Vendor = 'amd' then
+    Result := 'AMD GPU'
+  else if Vendor = 'intel' then
+    Result := 'Intel GPU'
+  else
+    Result := 'GPU';
+end;
+
+function BuildInventoryCaption: String;
+var
+  IniPath, CpuName, Name, Kind, Vendor, VramMb, Line: String;
+  GpuCount, I, Vram: Integer;
+begin
+  IniPath := InventoryIniPath;
+  if not FileExists(IniPath) then
+  begin
+    Result :=
+      'Could not scan this PC for compute devices.' + #13#10 +
+      'You can continue; the agent will detect hardware after install.';
+    Exit;
+  end;
+
+  CpuName := GetIniString('Inventory', 'CpuName', 'CPU', IniPath);
+  GpuCount := GetIniInt('Inventory', 'GpuCount', 0, IniPath);
+  Result := 'CPU' + #13#10 + '  ' + CpuName + #13#10;
+
+  if GpuCount <= 0 then
+    Result := Result + #13#10 + 'GPUs' + #13#10 + '  None detected'
+  else
+  begin
+    Result := Result + #13#10 + 'GPUs';
+    for I := 0 to GpuCount - 1 do
+    begin
+      Name := GetIniString('Gpu' + IntToStr(I), 'Name', 'Unknown GPU', IniPath);
+      Kind := GetIniString('Gpu' + IntToStr(I), 'Kind', 'discrete', IniPath);
+      Vendor := GetIniString('Gpu' + IntToStr(I), 'Vendor', 'other', IniPath);
+      VramMb := GetIniString('Gpu' + IntToStr(I), 'VramMb', '0', IniPath);
+      Line := '  - ' + Name + '  (' + FormatGpuKind(Kind, Vendor) + ')';
+      Vram := StrToIntDef(VramMb, 0);
+      if (Vram >= 1024) and (Vendor <> 'intel') then
+        Line := Line + '  ~' + IntToStr(Vram div 1024) + ' GB reported';
+      Result := Result + #13#10 + Line;
+    end;
+  end;
 end;
 
 procedure RunNvidiaDriverLookup;
@@ -443,23 +510,54 @@ begin
   DriverLookupDone := True;
 end;
 
-procedure RefreshDriverStatus;
+procedure RefreshDevicesStatus;
 var
   Err: String;
   Laptop: String;
+  InstalledVer: String;
 begin
+  RunComputeInventory;
+
+  if DevicesMemo <> nil then
+    DevicesMemo.Text := BuildInventoryCaption;
+
   if DriverStatusLabel = nil then
     Exit;
 
-  if NvidiaDriverOk then
+  if DriverDownloadBtn <> nil then
+    DriverDownloadBtn.Visible := InventoryNvidiaPresent;
+  if DriverRecheckBtn <> nil then
+    DriverRecheckBtn.Visible := True;
+
+  if not InventoryNvidiaPresent then
   begin
     DriverStatusLabel.Caption :=
-      'NVIDIA driver detected (nvidia-smi OK). You can continue.';
+      'No NVIDIA GPU detected.' + #13#10 +
+      'Scalattice can still use the CPU for compatible models. Discrete NVIDIA GPUs are needed for GPU jobs.';
+    if DriverDownloadBtn <> nil then
+      DriverDownloadBtn.Visible := False;
+    Exit;
+  end;
+
+  if InventoryNvidiaSmiOk or NvidiaDriverOk then
+  begin
+    InstalledVer := '';
+    if FileExists(InventoryIniPath) then
+      InstalledVer := GetIniString('Inventory', 'NvidiaDriverVersion', '', InventoryIniPath);
+    if InstalledVer <> '' then
+      DriverStatusLabel.Caption :=
+        'NVIDIA driver looks good (nvidia-smi OK, driver ' + InstalledVer + ').' + #13#10 +
+        'This machine can run GPU jobs after you connect a provider token.'
+    else
+      DriverStatusLabel.Caption :=
+        'NVIDIA driver looks good (nvidia-smi OK).' + #13#10 +
+        'This machine can run GPU jobs after you connect a provider token.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Open NVIDIA driver site';
     Exit;
   end;
 
+  { NVIDIA present but driver missing / broken }
   if not DriverLookupDone then
     RunNvidiaDriverLookup;
 
@@ -474,25 +572,28 @@ begin
   if (ResolvedDriverUrl <> '') and (ResolvedGpuName <> '') then
   begin
     DriverStatusLabel.Caption :=
+      'NVIDIA GPU found, but no working driver (nvidia-smi failed).' + #13#10 +
       'Detected: ' + ResolvedGpuName + Laptop + #13#10 +
-      'Recommended Game Ready driver: ' + ResolvedDriverVersion + #13#10 +
-      'Click Download to get the matching installer from NVIDIA, then Recheck.';
+      'Install Game Ready / Studio driver ' + ResolvedDriverVersion + ', reboot if Windows asks, then Recheck.' + #13#10 +
+      'You can continue without it — the agent will run CPU-only until a driver is installed.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Download driver ' + ResolvedDriverVersion;
   end
   else if Err <> '' then
   begin
     DriverStatusLabel.Caption :=
-      'Could not auto-select a driver: ' + Err + #13#10 +
-      'Use NVIDIA''s site to pick Game Ready / Studio for your GPU, then Recheck.';
+      'NVIDIA GPU found, but no working driver (nvidia-smi failed).' + #13#10 +
+      'Could not auto-select a package: ' + Err + #13#10 +
+      'Open NVIDIA''s site, pick Game Ready or Studio for your exact GPU, install, reboot if asked, then Recheck.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
   end
   else
   begin
     DriverStatusLabel.Caption :=
-      'NVIDIA driver not detected (nvidia-smi missing or failed).' + #13#10 +
-      'Install a current Game Ready or Studio driver, then click Recheck.';
+      'NVIDIA GPU found, but no working driver (nvidia-smi missing or failed).' + #13#10 +
+      'Install a current Game Ready or Studio driver from NVIDIA, reboot if Windows asks, then Recheck.' + #13#10 +
+      'Laptop users: prefer the OEM or NVIDIA laptop package for your model.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
   end;
@@ -516,9 +617,11 @@ end;
 procedure DriverRecheckClick(Sender: TObject);
 begin
   DriverLookupDone := False;
-  RefreshDriverStatus;
-  if NvidiaDriverOk then
+  RefreshDevicesStatus;
+  if InventoryNvidiaSmiOk or NvidiaDriverOk then
     MsgBox('NVIDIA driver looks good. Click Next to continue.', mbInformation, MB_OK)
+  else if not InventoryNvidiaPresent then
+    MsgBox('Still no NVIDIA GPU detected. You can continue with CPU-compatible models.', mbInformation, MB_OK)
   else if ResolvedDriverUrl <> '' then
     MsgBox(
       'Still no working nvidia-smi.' + #13#10 + #13#10 +
@@ -545,15 +648,14 @@ begin
   ResolvedGpuName := '';
   ResolvedDriverVersion := '';
   DriverLookupDone := False;
+  InventoryNvidiaPresent := False;
+  InventoryNvidiaSmiOk := False;
   if DirExists(ModelsCacheDir) then
     GetDirSize(ModelsCacheDir, ModelsCacheBytes);
-  { Silent updates skip the cache-purge page entirely. }
+  { Silent updates skip interactive pages. }
   ShowModelsPage := (not WizardSilent) and (not IsSilentUpdate) and ShouldOfferModelPurge();
-  { Only prompt when an NVIDIA GPU is present but the driver is missing.
-    CPU-only / non-NVIDIA machines skip this page and install normally. }
-  ShowDriverPage :=
-    (not WizardSilent) and (not IsSilentUpdate) and
-    (not NvidiaDriverOk) and NvidiaGpuPresent;
+  { Always show Compatible devices (CPU + GPUs + driver status) on interactive installs. }
+  ShowDevicesPage := (not WizardSilent) and (not IsSilentUpdate);
   Result := True;
 end;
 
@@ -561,63 +663,63 @@ procedure InitializeWizard;
 var
   SizeLabel: String;
   TokenAfterID: Integer;
-  InfoLabel: TNewStaticText;
 begin
   TokenAfterID := wpWelcome;
-  DriverPage := nil;
+  DevicesPage := nil;
+  DevicesMemo := nil;
   DriverStatusLabel := nil;
   DriverDownloadBtn := nil;
   DriverRecheckBtn := nil;
 
-  if ShowDriverPage then
+  if ShowDevicesPage then
   begin
-    DriverPage := CreateCustomPage(
+    DevicesPage := CreateCustomPage(
       wpWelcome,
-      'NVIDIA GPU driver recommended',
-      'This PC has an NVIDIA GPU, but no working driver was found (nvidia-smi).');
-    TokenAfterID := DriverPage.ID;
+      'Compatible devices',
+      'Hardware Scalattice detected on this PC, plus NVIDIA driver status.');
+    TokenAfterID := DevicesPage.ID;
 
-    InfoLabel := TNewStaticText.Create(DriverPage);
-    InfoLabel.Parent := DriverPage.Surface;
-    InfoLabel.Left := ScaleX(0);
-    InfoLabel.Top := ScaleY(0);
-    InfoLabel.Width := DriverPage.SurfaceWidth;
-    InfoLabel.Height := ScaleY(56);
-    InfoLabel.WordWrap := True;
-    InfoLabel.AutoSize := False;
-    InfoLabel.Caption :=
-      'Install the matching Game Ready or Studio driver for GPU jobs.' + #13#10 +
-      'You can continue without it — the agent will run CPU-only until a driver is installed.';
+    DevicesMemo := TNewMemo.Create(DevicesPage);
+    DevicesMemo.Parent := DevicesPage.Surface;
+    DevicesMemo.Left := ScaleX(0);
+    DevicesMemo.Top := ScaleY(0);
+    DevicesMemo.Width := DevicesPage.SurfaceWidth;
+    DevicesMemo.Height := ScaleY(118);
+    DevicesMemo.ReadOnly := True;
+    DevicesMemo.ScrollBars := ssVertical;
+    DevicesMemo.WantReturns := True;
+    DevicesMemo.Text := 'Scanning compute devices...';
 
-    DriverStatusLabel := TNewStaticText.Create(DriverPage);
-    DriverStatusLabel.Parent := DriverPage.Surface;
+    DriverStatusLabel := TNewStaticText.Create(DevicesPage);
+    DriverStatusLabel.Parent := DevicesPage.Surface;
     DriverStatusLabel.Left := ScaleX(0);
-    DriverStatusLabel.Top := ScaleY(64);
-    DriverStatusLabel.Width := DriverPage.SurfaceWidth;
-    DriverStatusLabel.Height := ScaleY(72);
+    DriverStatusLabel.Top := ScaleY(126);
+    DriverStatusLabel.Width := DevicesPage.SurfaceWidth;
+    DriverStatusLabel.Height := ScaleY(78);
     DriverStatusLabel.WordWrap := True;
     DriverStatusLabel.AutoSize := False;
+    DriverStatusLabel.Caption := 'Checking NVIDIA driver...';
 
-    DriverDownloadBtn := TNewButton.Create(DriverPage);
-    DriverDownloadBtn.Parent := DriverPage.Surface;
+    DriverDownloadBtn := TNewButton.Create(DevicesPage);
+    DriverDownloadBtn.Parent := DevicesPage.Surface;
     DriverDownloadBtn.Left := ScaleX(0);
-    DriverDownloadBtn.Top := ScaleY(148);
+    DriverDownloadBtn.Top := ScaleY(212);
     DriverDownloadBtn.Width := ScaleX(220);
     DriverDownloadBtn.Height := ScaleY(28);
     DriverDownloadBtn.Caption := 'Download recommended driver';
     DriverDownloadBtn.OnClick := @DriverDownloadClick;
+    DriverDownloadBtn.Visible := False;
 
-    DriverRecheckBtn := TNewButton.Create(DriverPage);
-    DriverRecheckBtn.Parent := DriverPage.Surface;
+    DriverRecheckBtn := TNewButton.Create(DevicesPage);
+    DriverRecheckBtn.Parent := DevicesPage.Surface;
     DriverRecheckBtn.Left := ScaleX(232);
-    DriverRecheckBtn.Top := ScaleY(148);
+    DriverRecheckBtn.Top := ScaleY(212);
     DriverRecheckBtn.Width := ScaleX(100);
     DriverRecheckBtn.Height := ScaleY(28);
     DriverRecheckBtn.Caption := 'Recheck';
     DriverRecheckBtn.OnClick := @DriverRecheckClick;
 
-    RunNvidiaDriverLookup;
-    RefreshDriverStatus;
+    RefreshDevicesStatus;
   end;
 
   TokenPage := CreateInputQueryPage(
@@ -653,16 +755,16 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if (DriverPage <> nil) and (CurPageID = DriverPage.ID) then
-    RefreshDriverStatus;
+  if (DevicesPage <> nil) and (CurPageID = DevicesPage.ID) then
+    RefreshDevicesStatus;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if (DriverPage <> nil) and (CurPageID = DriverPage.ID) then
+  if (DevicesPage <> nil) and (CurPageID = DevicesPage.ID) then
   begin
-    if not NvidiaDriverOk then
+    if InventoryNvidiaPresent and (not InventoryNvidiaSmiOk) and (not NvidiaDriverOk) then
     begin
       if MsgBox(
         'NVIDIA driver not detected (nvidia-smi).' + #13#10 + #13#10 +
