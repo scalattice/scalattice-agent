@@ -458,7 +458,7 @@ begin
   end;
 
   CpuName := GetIniString('Inventory', 'CpuName', 'CPU', IniPath);
-  GpuCount := GetIniInt('Inventory', 'GpuCount', 0, IniPath);
+  GpuCount := GetIniInt('Inventory', 'GpuCount', 0, 0, 64, IniPath);
   Result := 'CPU' + #13#10 + '  ' + CpuName + #13#10;
 
   if GpuCount <= 0 then

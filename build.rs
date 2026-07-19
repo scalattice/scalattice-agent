@@ -24,5 +24,13 @@ fn main() {
         if let Err(err) = res.compile() {
             eprintln!("winres: {err}");
         }
+
+        // CUDA-linked builds import nvcuda.dll from the NVIDIA driver (never bundled).
+        // Delay-load so the process can start on CPU-only PCs / missing drivers;
+        // llama.cpp init then fails soft and the agent stays on CPU-compatible models.
+        if std::env::var("CARGO_FEATURE_CUDA").is_ok() {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:nvcuda.dll");
+            println!("cargo:rustc-link-lib=delayimp");
+        }
     }
 }

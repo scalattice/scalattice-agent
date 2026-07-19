@@ -62,7 +62,15 @@ Set-ShortCargoTargetDir
 Set-WindowsBuildParallelism -Jobs 4
 
 # win-gpu replaces default gpu (which includes vulkan); do not add to defaults
+# Delay-load nvcuda.dll so the agent can start without an NVIDIA driver (CPU-only).
+# build.rs also sets this when CARGO_FEATURE_CUDA is on; keep RUSTFLAGS as a belt-and-suspenders.
+$delayLoad = "/DELAYLOAD:nvcuda.dll"
+$existingRustflags = [string]$env:RUSTFLAGS
+if ($existingRustflags -notmatch 'DELAYLOAD:nvcuda') {
+    $env:RUSTFLAGS = ("{0} -C link-arg={1} -C link-arg=delayimp.lib" -f $existingRustflags.Trim(), $delayLoad).Trim()
+}
 Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
+Write-Host "    RUSTFLAGS=$($env:RUSTFLAGS)"
 cargo build --release --target $Target --no-default-features --features $Features
 if ($LASTEXITCODE -ne 0) {
     Write-Error "cargo build failed with exit code $LASTEXITCODE"

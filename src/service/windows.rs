@@ -345,6 +345,17 @@ if errorlevel 1 (\r\n\
   exit /b 1\r\n\
 )\r\n\
 \r\n\
+call :CheckNvidiaDriver\r\n\
+if errorlevel 1 (\r\n\
+  echo.\r\n\
+  echo WARNING: NVIDIA driver not found (nvcuda.dll).\r\n\
+  echo GPU jobs will not run until you install a Game Ready or Studio driver from:\r\n\
+  echo   https://www.nvidia.com/Download/index.aspx\r\n\
+  echo The agent will still start for CPU-compatible models when this build supports it.\r\n\
+  echo.\r\n\
+  call :LogNvidiaDriverMissing\r\n\
+)\r\n\
+\r\n\
 if /I \"%~1\"==\"tray\" (\r\n\
   if exist \"%INSTALL%launch-tray.vbs\" (\r\n\
     wscript.exe //nologo \"%INSTALL%launch-tray.vbs\"\r\n\
@@ -370,10 +381,21 @@ if not exist \"%LIB%\\cublas64_12.dll\" if not exist \"%INSTALL%cublas64_12.dll\
 if not exist \"%LIB%\\cublasLt64_12.dll\" if not exist \"%INSTALL%cublasLt64_12.dll\" exit /b 1\r\n\
 exit /b 0\r\n\
 \r\n\
+:CheckNvidiaDriver\r\n\
+if exist \"%SystemRoot%\\System32\\nvcuda.dll\" exit /b 0\r\n\
+if exist \"%SystemRoot%\\SysWOW64\\nvcuda.dll\" exit /b 0\r\n\
+exit /b 1\r\n\
+\r\n\
 :LogCudaMissing\r\n\
 set \"LOGDIR=%LOCALAPPDATA%\\Scalattice\\logs\"\r\n\
 if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\" >nul 2>&1\r\n\
 >>\"%LOGDIR%\\agent.log\" echo [%DATE% %TIME%] CUDA runtime missing under %LIB% — reinstall Scalattice Agent\r\n\
+exit /b 0\r\n\
+\r\n\
+:LogNvidiaDriverMissing\r\n\
+set \"LOGDIR=%LOCALAPPDATA%\\Scalattice\\logs\"\r\n\
+if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\" >nul 2>&1\r\n\
+>>\"%LOGDIR%\\agent.log\" echo [%DATE% %TIME%] NVIDIA driver missing (nvcuda.dll) — install Game Ready/Studio driver for GPU jobs\r\n\
 exit /b 0\r\n";
 
     fs::write(install.join("scalattice-run.cmd"), run_cmd)?;
