@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 /// Scalattice Cloud release channel (repo name is resolved server-side only).
-pub(crate) const CLOUD_RELEASE_BASE: &str = "https://scalattice.cloud/api/v1/health/agent-release";
+pub(crate) const CLOUD_RELEASE_BASE: &str = "https://scalattice.cloud/api/v1/agent/release";
 
 const MIN_RELEASE_BYTES: u64 = 512 * 1024;
 const DOWNLOAD_ATTEMPTS: u32 = 3;
