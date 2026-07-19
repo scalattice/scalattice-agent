@@ -35,11 +35,11 @@ pub struct SplitUpperConfig {
 
 pub fn split_lower(config: &SplitLowerConfig) -> Result<SplitLowerOutput> {
     let backend = backend()?;
-    let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
-        NonZeroU32::new(4096).context("invalid default context size")?,
-    ));
 
     super::model_cache::with_loaded_model(&config.model_path, &config.pool, |model| {
+        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
+            NonZeroU32::new(4096).context("invalid default context size")?,
+        ));
         let mut ctx = model
             .new_context(backend, ctx_params)
             .context("create llama context")?;
@@ -82,11 +82,11 @@ pub fn split_lower(config: &SplitLowerConfig) -> Result<SplitLowerOutput> {
 
 pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
     let backend = backend()?;
-    let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
-        NonZeroU32::new(4096).context("invalid default context size")?,
-    ));
 
     super::model_cache::with_loaded_model(&config.model_path, &config.pool, |model| {
+        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
+            NonZeroU32::new(4096).context("invalid default context size")?,
+        ));
         let mut ctx = model
             .new_context(backend, ctx_params)
             .context("create llama context")?;

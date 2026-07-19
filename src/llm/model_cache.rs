@@ -2,6 +2,9 @@
 //!
 //! Small GPUs (≤8 GB) only keep one model resident. Warming or switching without
 //! eviction was causing cudaMalloc OOM on context create when a prior 7B stayed in VRAM.
+//!
+//! Weight load can succeed with aggressive GPU offload while context/KV alloc still
+//! OOMs; in that case we evict and walk the same reduced-offload → CPU cascade.
 
 use crate::compute_pool::VirtualCard;
 use anyhow::{Context, Result};
@@ -10,11 +13,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::embedded::{backend, load_model_for_pool};
+use super::embedded::{
+    backend, load_candidate_count, load_candidate_label, load_model_for_pool,
+    load_model_for_pool_starting_at,
+};
 
-static CACHE: OnceLock<Mutex<HashMap<String, LlamaModel>>> = OnceLock::new();
+struct CachedModel {
+    model: LlamaModel,
+    /// Index into [`load_param_candidates`] that produced this resident.
+    load_tier: usize,
+}
+
+static CACHE: OnceLock<Mutex<HashMap<String, CachedModel>>> = OnceLock::new();
 
 fn cache_key(model_path: &Path, pool: &VirtualCard) -> String {
     format!(
@@ -26,7 +38,7 @@ fn cache_key(model_path: &Path, pool: &VirtualCard) -> String {
     )
 }
 
-fn cache() -> &'static Mutex<HashMap<String, LlamaModel>> {
+fn cache() -> &'static Mutex<HashMap<String, CachedModel>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -41,7 +53,7 @@ fn max_resident_models(pool: &VirtualCard) -> usize {
     }
 }
 
-fn make_room(guard: &mut HashMap<String, LlamaModel>, keep_key: &str, pool: &VirtualCard) {
+fn make_room(guard: &mut HashMap<String, CachedModel>, keep_key: &str, pool: &VirtualCard) {
     let max = max_resident_models(pool);
     if max <= 1 {
         let before = guard.len();
@@ -82,6 +94,51 @@ fn is_vram_pressure(err: &anyhow::Error) -> bool {
         || detail.contains("ggml_backend_cuda")
 }
 
+fn insert_loaded(
+    guard: &mut HashMap<String, CachedModel>,
+    key: String,
+    model: LlamaModel,
+    load_tier: usize,
+) {
+    guard.insert(key, CachedModel { model, load_tier });
+}
+
+fn ensure_loaded(
+    guard: &mut HashMap<String, CachedModel>,
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    model_path: &Path,
+    pool: &VirtualCard,
+    key: &str,
+    start_at: usize,
+) -> Result<(u64, usize)> {
+    let load_start = Instant::now();
+    let (model, load_tier) = if start_at == 0 {
+        match load_model_for_pool(backend, model_path, pool) {
+            Ok(loaded) => loaded,
+            Err(err) if is_vram_pressure(&err) => {
+                info!("model load hit VRAM pressure; clearing cache and retrying");
+                guard.clear();
+                load_model_for_pool(backend, model_path, pool).with_context(|| {
+                    format!("load model {} after VRAM eviction", model_path.display())
+                })?
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("load model {}", model_path.display()));
+            }
+        }
+    } else {
+        load_model_for_pool_starting_at(backend, model_path, pool, start_at).with_context(|| {
+            format!(
+                "load model {} starting at cascade tier {start_at}",
+                model_path.display()
+            )
+        })?
+    };
+    let model_load_ms = load_start.elapsed().as_millis() as u64;
+    insert_loaded(guard, key.to_string(), model, load_tier);
+    Ok((model_load_ms, load_tier))
+}
+
 pub fn preload_model(model_path: &Path, pool: &VirtualCard) -> Result<()> {
     with_loaded_model(model_path, pool, |_| Ok(()))
 }
@@ -89,17 +146,21 @@ pub fn preload_model(model_path: &Path, pool: &VirtualCard) -> Result<()> {
 pub fn with_loaded_model<R>(
     model_path: &Path,
     pool: &VirtualCard,
-    f: impl FnOnce(&LlamaModel) -> Result<R>,
+    f: impl FnMut(&LlamaModel) -> Result<R>,
 ) -> Result<R> {
     let (out, _) = with_loaded_model_timed(model_path, pool, f)?;
     Ok(out)
 }
 
 /// Like [`with_loaded_model`], but returns model-load wall time in ms (0 on cache hit).
+///
+/// If the callback fails with VRAM pressure (typical: KV/context alloc after a greedy
+/// weight load), evicts the resident and reloads from the next cascade tier, retrying
+/// the callback until a tier succeeds or the cascade is exhausted.
 pub fn with_loaded_model_timed<R>(
     model_path: &Path,
     pool: &VirtualCard,
-    f: impl FnOnce(&LlamaModel) -> Result<R>,
+    mut f: impl FnMut(&LlamaModel) -> Result<R>,
 ) -> Result<(R, u64)> {
     let backend = backend()?;
     let key = cache_key(model_path, pool);
@@ -111,29 +172,43 @@ pub fn with_loaded_model_timed<R>(
 
     let mut model_load_ms = 0u64;
     if !guard.contains_key(&key) {
-        let load_start = Instant::now();
-        let model = match load_model_for_pool(backend, model_path, pool) {
-            Ok(model) => model,
-            Err(err) if is_vram_pressure(&err) => {
-                info!("model load hit VRAM pressure; clearing cache and retrying");
-                guard.clear();
-                load_model_for_pool(backend, model_path, pool).with_context(|| {
-                    format!("load model {} after VRAM eviction", model_path.display())
-                })?
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("load model {}", model_path.display()));
-            }
-        };
-        model_load_ms = load_start.elapsed().as_millis() as u64;
-        guard.insert(key.clone(), model);
+        let (ms, _) = ensure_loaded(&mut guard, backend, model_path, pool, &key, 0)?;
+        model_load_ms = ms;
     }
 
-    let model = guard
+    let mut load_tier = guard
         .get(&key)
-        .context("model missing immediately after cache insert")?;
-    let out = f(model)?;
-    Ok((out, model_load_ms))
+        .context("model missing immediately after cache insert")?
+        .load_tier;
+
+    loop {
+        let out = {
+            let model = &guard
+                .get(&key)
+                .context("model missing immediately after cache insert")?
+                .model;
+            f(model)
+        };
+
+        match out {
+            Ok(result) => return Ok((result, model_load_ms)),
+            Err(err) if is_vram_pressure(&err) => {
+                let next_tier = load_tier + 1;
+                let tier_count = load_candidate_count(pool)?;
+                if next_tier >= tier_count {
+                    return Err(err);
+                }
+                let label = load_candidate_label(pool, next_tier)?.unwrap_or("next");
+                warn!("context OOM; reloading via '{label}'");
+                guard.clear();
+                let (ms, new_tier) =
+                    ensure_loaded(&mut guard, backend, model_path, pool, &key, next_tier)?;
+                model_load_ms = model_load_ms.saturating_add(ms);
+                load_tier = new_tier;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 pub fn evict_model(model_path: &Path, pool: &VirtualCard) {

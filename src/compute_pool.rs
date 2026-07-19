@@ -104,8 +104,11 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     let gpu_layer_budget = match strategy {
         PoolStrategy::CpuOnly => 0,
         PoolStrategy::GpuWithCpuOffload => {
-            // ~1 transformer block per 300 MiB VRAM (conservative for large quant models).
-            ((gpu_vram as f32 * 1024.0) / 300.0).round().clamp(1.0, 80.0) as u32
+            // Leave headroom for KV cache + compute buffers at n_ctx=4096 (~768 MiB),
+            // then ~1 transformer block per 300 MiB of the remainder.
+            const KV_HEADROOM_MIB: f32 = 768.0;
+            let usable_mib = (gpu_vram as f32 * 1024.0 - KV_HEADROOM_MIB).max(300.0);
+            (usable_mib / 300.0).round().clamp(1.0, 80.0) as u32
         }
         _ => 999,
     };
@@ -170,5 +173,35 @@ mod tests {
         assert_eq!(card.tensor_split.len(), 2);
         assert!((card.tensor_split[0] - 0.333).abs() < 0.02);
         assert!((card.tensor_split[1] - 0.667).abs() < 0.02);
+    }
+
+    #[test]
+    fn gpu_offload_budget_reserves_kv_headroom() {
+        let card = build_virtual_card(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1650 SUPER".into(),
+                vram_gb: Some(8),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(card.strategy, PoolStrategy::GpuWithCpuOffload);
+        // (8*1024 - 768) / 300 ≈ 24.7 → 25; must be below the old ~27 budget.
+        assert_eq!(card.gpu_layer_budget, 25);
+        assert!(card.gpu_layer_budget < 27);
     }
 }

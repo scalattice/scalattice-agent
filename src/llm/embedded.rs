@@ -104,12 +104,12 @@ pub fn generate_with_callback(
 ) -> Result<GenerateOutput> {
     let total_start = Instant::now();
     let backend = backend()?;
-    let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
-        NonZeroU32::new(4096).context("invalid default context size")?,
-    ));
 
     let (output, model_load_ms) =
         super::model_cache::with_loaded_model_timed(&config.model_path, &config.pool, |model| {
+            let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
+                NonZeroU32::new(4096).context("invalid default context size")?,
+            ));
             let prefill_start = Instant::now();
             let mut ctx = model
                 .new_context(backend, ctx_params)
@@ -260,21 +260,37 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
 /// progressively less GPU offload and finally a CPU-only floor that loads whenever
 /// system RAM allows. Detailed failures are logged locally only; the caller must
 /// keep provider-specific detail (paths, device names) out of anything sent upstream.
+///
+/// Returns `(model, candidate_index)` so the cache can skip already-failed tiers
+/// when context/KV allocation OOMs after a successful weight load.
 pub(crate) fn load_model_for_pool(
     backend: &LlamaBackend,
     model_path: &Path,
     pool: &VirtualCard,
-) -> Result<LlamaModel> {
+) -> Result<(LlamaModel, usize)> {
+    load_model_for_pool_starting_at(backend, model_path, pool, 0)
+}
+
+/// Like [`load_model_for_pool`], but skips candidates before `start_at`.
+///
+/// Used after context create OOM: weights already loaded at a greedy tier, so the
+/// next attempt must start at the following cascade step (not `configured` again).
+pub(crate) fn load_model_for_pool_starting_at(
+    backend: &LlamaBackend,
+    model_path: &Path,
+    pool: &VirtualCard,
+    start_at: usize,
+) -> Result<(LlamaModel, usize)> {
     let candidates = load_param_candidates(pool)?;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for (label, params) in candidates {
+    for (idx, (label, params)) in candidates.into_iter().enumerate().skip(start_at) {
         match LlamaModel::load_from_file(backend, model_path, &params) {
             Ok(model) => {
-                if label != "configured" {
+                if start_at == 0 && label != "configured" {
                     warn!("model loaded via '{label}' fallback after primary load failed");
                 }
-                return Ok(model);
+                return Ok((model, idx));
             }
             Err(err) => {
                 warn!("model load attempt '{label}' failed: {err}");
@@ -284,6 +300,18 @@ pub(crate) fn load_model_for_pool(
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("model failed to load")))
+}
+
+/// Number of ordered load configurations for this pool (configured → reduced → cpu).
+pub(crate) fn load_candidate_count(pool: &VirtualCard) -> Result<usize> {
+    Ok(load_param_candidates(pool)?.len())
+}
+
+/// Label for the load candidate at `index`, if any.
+pub(crate) fn load_candidate_label(pool: &VirtualCard, index: usize) -> Result<Option<&'static str>> {
+    Ok(load_param_candidates(pool)?
+        .get(index)
+        .map(|(label, _)| *label))
 }
 
 /// Ordered load configurations to try: the pool's configured strategy first,

@@ -162,6 +162,8 @@ function Get-VideoControllers {
                 VramMb        = 0
                 DriverOk      = $driverOk
                 DriverVersion = $driverVer
+                # Stable unique id — identical card names (e.g. 2x T400) must not collapse.
+                InstanceId    = if ($pnp) { $pnp.Trim() } else { "$($name.Trim())|$($list.Count)" }
             }
         }
     } catch {}
@@ -169,7 +171,11 @@ function Get-VideoControllers {
     $seen = @{}
     $unique = @()
     foreach ($g in $list) {
-        $key = $g.Name.ToLowerInvariant()
+        $key = if ($g.InstanceId) {
+            $g.InstanceId.ToLowerInvariant()
+        } else {
+            $g.Name.ToLowerInvariant()
+        }
         if ($seen.ContainsKey($key)) { continue }
         $seen[$key] = $true
         $unique += $g
