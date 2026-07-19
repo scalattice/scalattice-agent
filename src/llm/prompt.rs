@@ -42,12 +42,10 @@ pub fn build_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result
     }
 }
 
-pub fn sanitize_completion(model_id: &str, content: &str) -> String {
-    let mut out = content.trim().to_string();
-    if is_reasoning_model(model_id) {
-        out = strip_thinking_blocks(&out);
-    }
-    out.trim().to_string()
+/// Trim only — do not strip model-specific reasoning markers.
+/// Open R1-class hosts leave `<think>…</think>` in `content` for the client.
+pub fn sanitize_completion(_model_id: &str, content: &str) -> String {
+    content.trim().to_string()
 }
 
 fn normalize_role(role: &str) -> String {
@@ -72,28 +70,6 @@ fn messages_to_prompt_fallback(messages: &[ChatMessage]) -> String {
     out
 }
 
-fn is_reasoning_model(model_id: &str) -> bool {
-    let id = model_id.to_ascii_lowercase();
-    id.contains("deepseek-r1") || id.contains("r1-7b")
-}
-
-fn strip_thinking_blocks(content: &str) -> String {
-    const OPEN: &str = concat!("<", "think", ">");
-    const CLOSE: &str = concat!("</", "think", ">");
-    let mut out = content.trim().to_string();
-    loop {
-        if let Some(close_idx) = out.find(CLOSE) {
-            out = out[close_idx + CLOSE.len()..].trim().to_string();
-            continue;
-        }
-        if let Some(open_idx) = out.find(OPEN) {
-            out = out[..open_idx].trim().to_string();
-        }
-        break;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,9 +85,13 @@ mod tests {
     }
 
     #[test]
-    fn strips_reasoning_suffix() {
+    fn passes_through_reasoning_markers() {
+        const OPEN: &str = concat!("<", "think", ">");
         const CLOSE: &str = concat!("</", "think", ">");
-        let raw = format!("Let me think about this.{CLOSE}Hello there.");
-        assert_eq!(sanitize_completion("deepseek-r1-7b", &raw), "Hello there.");
+        let raw = format!("{OPEN}reason{CLOSE}\nHello there.");
+        assert_eq!(
+            sanitize_completion("deepseek-r1-7b", &raw),
+            format!("{OPEN}reason{CLOSE}\nHello there.")
+        );
     }
 }
