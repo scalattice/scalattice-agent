@@ -39,6 +39,25 @@ fn preload_backoff() -> &'static Mutex<HashMap<String, Instant>> {
     BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn is_capacity_or_device_error(detail: &str) -> bool {
+    detail.contains("no compute devices enabled")
+        || detail.contains("out of memory")
+        || detail.contains("cudamalloc")
+        || detail.contains("failed to allocate")
+        || detail.contains("create llama context")
+        || detail.contains("ggml_backend_cuda")
+        || detail.contains("cuda error")
+        || detail.contains("cuda_error")
+        || detail.contains("invalid device")
+        || detail.contains("no cuda")
+        || detail.contains("cuda driver")
+        || detail.contains("device unavailable")
+        || detail.contains("failed to initialize")
+        || detail.contains("insufficient")
+        || detail.contains("won't fit")
+        || detail.contains("cannot host")
+}
+
 pub fn classify_weight_load_error(err: &anyhow::Error) -> WeightLoadKind {
     let detail = format!("{err:#}").to_lowercase();
     if detail.contains("not within the file bounds")
@@ -55,13 +74,8 @@ pub fn classify_weight_load_error(err: &anyhow::Error) -> WeightLoadKind {
     {
         return WeightLoadKind::ResourceLimit;
     }
-    // VRAM / context OOM is not a bad GGUF and must not quarantine or pause the fleet.
-    if detail.contains("out of memory")
-        || detail.contains("cudamalloc")
-        || detail.contains("failed to allocate")
-        || detail.contains("create llama context")
-        || detail.contains("ggml_backend_cuda")
-    {
+    // Disabled / undersized compute is not a bad GGUF — never quarantine for capacity.
+    if is_capacity_or_device_error(&detail) {
         return WeightLoadKind::Other;
     }
     // Do NOT treat bare "null result from llama" / "load model" as corrupt.
@@ -79,11 +93,9 @@ pub fn classify_load_failure_for_path(
         return from_err;
     }
     let detail = format!("{err:#}").to_lowercase();
-    if detail.contains("out of memory")
-        || detail.contains("cudamalloc")
-        || detail.contains("create llama context")
-        || detail.contains("failed to allocate")
-    {
+    // Capacity / device failures must never fall through to the GGUF structural check —
+    // that path can false-positive and delete healthy weights after a GPU is disabled.
+    if is_capacity_or_device_error(&detail) {
         crate::llm::evict_all();
         return WeightLoadKind::Other;
     }
@@ -168,6 +180,9 @@ pub fn sanitize_weight_error(err: &anyhow::Error) -> String {
     }
     if detail.contains("out of memory") || detail.contains("oom") {
         return "Not enough memory to load this model.".to_string();
+    }
+    if is_capacity_or_device_error(&detail) {
+        return "Not enough enabled compute (VRAM/device) to load this model.".to_string();
     }
     "Model weights failed to load.".to_string()
 }
@@ -415,6 +430,14 @@ mod tests {
     #[test]
     fn null_result_is_not_auto_corrupt() {
         let err = anyhow::anyhow!("load model C:\\weights\\model.gguf: null result from llama cpp");
+        assert_eq!(classify_weight_load_error(&err), WeightLoadKind::Other);
+    }
+
+    #[test]
+    fn disabled_compute_is_not_corrupt() {
+        let err = anyhow::anyhow!("no compute devices enabled");
+        assert_eq!(classify_weight_load_error(&err), WeightLoadKind::Other);
+        let err = anyhow::anyhow!("CUDA error: invalid device ordinal");
         assert_eq!(classify_weight_load_error(&err), WeightLoadKind::Other);
     }
 }

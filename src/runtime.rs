@@ -140,6 +140,9 @@ fn status_label(
     if ready {
         return "Ready for inference".to_string();
     }
+    if enabled_compute_devices == 0 {
+        return "No compute enabled".to_string();
+    }
     if blocked_enabled_models > 0 {
         if blocked_enabled_models == 1 {
             return "Enabled model won't fit this machine".to_string();

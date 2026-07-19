@@ -489,26 +489,26 @@ impl SessionState {
     fn count_blocked_enabled_models(&self) -> usize {
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.unwrap_or(0);
-        let card = match build_virtual_card(&specs.compute_devices) {
-            Ok(card) => card,
-            Err(_) => return 0,
-        };
-
-        self.catalog
+        let enabled_models: Vec<&CatalogModel> = self
+            .catalog
             .iter()
             .filter(|model| self.is_model_enabled(&model.model_id))
             .filter(|model| model.weights.is_some())
-            .filter(|model| {
-                let runtime_model = if model.runtime_model.trim().is_empty() {
-                    model.model_id.as_str()
-                } else {
-                    model.runtime_model.as_str()
-                };
-                if model_weights_ready(runtime_model) {
-                    return false;
-                }
-                !can_host_model(model, &card, ram_gb)
-            })
+            .collect();
+        if enabled_models.is_empty() {
+            return 0;
+        }
+        // No enabled devices: every enabled model is blocked (do not pretend weights are pending).
+        let card = match build_virtual_card(&specs.compute_devices) {
+            Ok(card) => card,
+            Err(_) => return enabled_models.len(),
+        };
+
+        enabled_models
+            .into_iter()
+            // Count models that need more VRAM than the enabled pool, even when weights
+            // are already on disk (e.g. provider disabled the GPU they require).
+            .filter(|model| !can_host_model(model, &card, ram_gb))
             .count()
     }
 
@@ -1037,11 +1037,16 @@ async fn respond_invoke(
                     "inference invoke failed on pool {}: {err:#}",
                     engine.pool().display_name
                 );
-                handle_weight_load_failure(&invoke.runtime_model, &err);
+                let code = invoke_error_code(&err);
+                // Only classify weight health on actual load failures — inference-time
+                // errors (and capacity/device misses) must not quarantine healthy GGUFs.
+                if code == "model_load_failed" {
+                    handle_weight_load_failure(&invoke.runtime_model, &err);
+                }
                 let msg = InvokeErrorMessage {
                     kind: "invoke_error",
                     id: invoke.id,
-                    error: invoke_error_code(&err).to_string(),
+                    error: code.to_string(),
                 };
                 write
                     .send(Message::Text(serde_json::to_string(&msg)?))
@@ -1198,16 +1203,21 @@ async fn send_invoke_split_error(
 /// locations. Full detail is logged locally on the provider instead.
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     let detail = format!("{err:#}").to_lowercase();
-    if detail.contains("null result")
+    if detail.contains("out of memory")
+        || detail.contains("oom")
+        || detail.contains("cudamalloc")
+        || detail.contains("failed to allocate")
+        || detail.contains("no compute devices")
+        || detail.contains("cuda error")
+        || detail.contains("invalid device")
+        || detail.contains("ggml_backend_cuda")
+    {
+        "model_out_of_memory"
+    } else if detail.contains("null result")
         || detail.contains("load model")
         || detail.contains("load_from_file")
     {
         "model_load_failed"
-    } else if detail.contains("out of memory")
-        || detail.contains("oom")
-        || detail.contains("alloc")
-    {
-        "model_out_of_memory"
     } else if detail.contains("context window") || detail.contains("too long") {
         "prompt_too_long"
     } else {
