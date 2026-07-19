@@ -160,7 +160,24 @@ pub fn remove_background_service() -> Result<()> {
     remove_startup_shortcuts();
     stop_background_agent_only();
     stop_tray_agent_only();
+    // Uninstall / wipe: force-kill any remaining agent processes so DLLs and
+    // GGUFs unlock (pid-file stops alone can miss a wedged tray).
+    force_kill_all_agent_processes();
     Ok(())
+}
+
+fn force_kill_all_agent_processes() {
+    for _ in 0..8 {
+        let _ = Command::new("taskkill")
+            .args(["/IM", "scalattice-agent.exe", "/F", "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        if !background_agent_running() && !tray_instance_running() {
+            break;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(800));
 }
 
 pub fn background_runner_path() -> Result<PathBuf> {
@@ -424,6 +441,8 @@ if not exist \"%LIB%\" set \"LIB=%INSTALL%lib\"\r\n\
 set \"PATH=%INSTALL%;%LIB%;%PATH%\"\r\n\
 cd /d \"%INSTALL%\"\r\n\
 \r\n\
+if /I \"%~1\"==\"uninstall\" goto :RunAgent\r\n\
+\r\n\
 call :CheckCudaRuntime\r\n\
 if errorlevel 1 (\r\n\
   echo.\r\n\
@@ -450,6 +469,7 @@ if errorlevel 1 (\r\n\
   call :LogNvidiaDriverMissing\r\n\
 )\r\n\
 \r\n\
+:RunAgent\r\n\
 if /I \"%~1\"==\"tray\" (\r\n\
   if exist \"%INSTALL%launch-tray.vbs\" (\r\n\
     wscript.exe //nologo \"%INSTALL%launch-tray.vbs\"\r\n\
@@ -605,13 +625,19 @@ End Sub
 "#;
 
 const STARTUP_AGENT_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
-sh.Run "wscript.exe //nologo """ & install & "\launch-background.vbs""", 0, False
+target = install & "\launch-background.vbs"
+If Not fso.FileExists(target) Then WScript.Quit 0
+sh.Run "wscript.exe //nologo """ & target & """", 0, False
 "#;
 
 const STARTUP_TRAY_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
-sh.Run "wscript.exe //nologo """ & install & "\launch-tray.vbs""", 0, False
+target = install & "\launch-tray.vbs"
+If Not fso.FileExists(target) Then WScript.Quit 0
+sh.Run "wscript.exe //nologo """ & target & """", 0, False
 "#;
 
 fn schtasks_available() -> bool {

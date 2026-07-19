@@ -14,6 +14,31 @@ function Get-CpuName {
     return "CPU (unknown)"
 }
 
+function Get-SystemRamMb {
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop | Select-Object -First 1
+        if ($cs -and $null -ne $cs.TotalPhysicalMemory) {
+            $n = [uint64]$cs.TotalPhysicalMemory
+            if ($n -gt 0) {
+                return [int]([math]::Round($n / 1MB))
+            }
+        }
+    } catch {}
+    # Fallback: sum DIMM capacities when TotalPhysicalMemory is unavailable.
+    try {
+        $total = [uint64]0
+        foreach ($stick in @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction SilentlyContinue)) {
+            if ($null -ne $stick.Capacity) {
+                $total += [uint64]$stick.Capacity
+            }
+        }
+        if ($total -gt 0) {
+            return [int]([math]::Round($total / 1MB))
+        }
+    } catch {}
+    return 0
+}
+
 function Test-IsIntegratedName([string]$name) {
     $lower = $name.ToLowerInvariant()
     if ($lower -match 'nvidia|geforce|quadro|rtx |gtx ') { return $false }
@@ -210,6 +235,7 @@ if ($dir -and -not (Test-Path -LiteralPath $dir)) {
 }
 
 $cpu = Get-CpuName
+$ramMb = Get-SystemRamMb
 $gpus = @(Get-VideoControllers)
 $nvidiaGpus = @($gpus | Where-Object { $_.Vendor -eq "nvidia" })
 $nvidiaPresent = $nvidiaGpus.Count -gt 0
@@ -224,6 +250,7 @@ if ($nvidiaPresent) {
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("[Inventory]")
 [void]$sb.AppendLine("CpuName=$cpu")
+[void]$sb.AppendLine("RamMb=$ramMb")
 [void]$sb.AppendLine("GpuCount=$($gpus.Count)")
 [void]$sb.AppendLine("NvidiaPresent=$(if ($nvidiaPresent) { '1' } else { '0' })")
 [void]$sb.AppendLine("NvidiaSmiOk=$(if ($nvidiaReady) { '1' } else { '0' })")

@@ -6,6 +6,9 @@ if not exist "%LIB%" set "LIB=%INSTALL%lib"
 set "PATH=%INSTALL%;%LIB%;%PATH%"
 cd /d "%INSTALL%"
 
+rem Uninstall must run even when CUDA DLLs were already removed or locked.
+if /I "%~1"=="uninstall" goto :RunAgent
+
 call :CheckCudaRuntime
 if errorlevel 1 (
   echo.
@@ -32,6 +35,7 @@ if errorlevel 1 (
   call :LogNvidiaDriverMissing
 )
 
+:RunAgent
 if /I "%~1"=="tray" (
   rem Hidden tray (Startup / installer). Use open-tray-debug.cmd to see errors.
   if exist "%INSTALL%launch-tray.vbs" (

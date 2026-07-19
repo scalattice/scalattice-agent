@@ -257,12 +257,50 @@ var
 begin
   Exec('schtasks.exe', '/End /TN ScalatticeAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('schtasks.exe', '/End /TN ScalatticeAgentTray', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('schtasks.exe', '/Delete /TN ScalatticeAgent /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('schtasks.exe', '/Delete /TN ScalatticeAgentTray /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   for I := 1 to 10 do
   begin
     Exec('taskkill.exe', '/IM scalattice-agent.exe /F /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(400);
   end;
   Sleep(1500);
+end;
+
+procedure RemoveScalatticeStartupShortcuts;
+var
+  Startup: String;
+begin
+  Startup := ExpandConstant('{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup');
+  DeleteFile(Startup + '\ScalatticeAgent.vbs');
+  DeleteFile(Startup + '\ScalatticeAgentTray.vbs');
+end;
+
+procedure WipeScalatticeUserData;
+begin
+  { Full wipe: models, cache, config, AppData install tree. }
+  DelTree(ExpandConstant('{userpf}\.cache\scalattice'), True, True, True);
+  DelTree(ExpandConstant('{userpf}\.config\scalattice'), True, True, True);
+  DelTree(ExpandConstant('{localappdata}\Scalattice'), True, True, True);
+  RemoveScalatticeStartupShortcuts;
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  { Kill agent/tray and clear Startup stubs BEFORE files are deleted, otherwise
+    reboot shows "Can not find script file ... launch-*.vbs". }
+  StopScalatticeRuntime;
+  RemoveScalatticeStartupShortcuts;
+  Result := True;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    StopScalatticeRuntime;
+    WipeScalatticeUserData;
+  end;
 end;
 
 procedure ClearReadOnlyAttributes(const Dir: string);
@@ -445,8 +483,8 @@ end;
 
 function BuildInventoryCaption: String;
 var
-  IniPath, CpuName, Name, Kind, Vendor, VramMb, Line: String;
-  GpuCount, I, Vram: Integer;
+  IniPath, CpuName, Name, Kind, Vendor, VramMb, Line, RamLabel: String;
+  GpuCount, I, Vram, RamMb: Integer;
 begin
   IniPath := InventoryIniPath;
   if not FileExists(IniPath) then
@@ -458,8 +496,17 @@ begin
   end;
 
   CpuName := GetIniString('Inventory', 'CpuName', 'CPU', IniPath);
+  RamMb := GetIniInt('Inventory', 'RamMb', 0, 0, MaxInt, IniPath);
   GpuCount := GetIniInt('Inventory', 'GpuCount', 0, 0, 64, IniPath);
   Result := 'CPU' + #13#10 + '  ' + CpuName + #13#10;
+
+  if RamMb >= 1024 then
+    RamLabel := IntToStr((RamMb + 512) div 1024) + ' GB'
+  else if RamMb > 0 then
+    RamLabel := IntToStr(RamMb) + ' MB'
+  else
+    RamLabel := 'Unknown';
+  Result := Result + #13#10 + 'RAM' + #13#10 + '  ' + RamLabel + #13#10;
 
   if GpuCount <= 0 then
     Result := Result + #13#10 + 'GPUs' + #13#10 + '  None detected'
@@ -696,7 +743,7 @@ begin
     DevicesMemo.Left := ScaleX(0);
     DevicesMemo.Top := ScaleY(0);
     DevicesMemo.Width := DevicesPage.SurfaceWidth;
-    DevicesMemo.Height := ScaleY(118);
+    DevicesMemo.Height := ScaleY(138);
     DevicesMemo.ReadOnly := True;
     DevicesMemo.ScrollBars := ssVertical;
     DevicesMemo.WantReturns := True;
@@ -705,7 +752,7 @@ begin
     DriverStatusLabel := TNewStaticText.Create(DevicesPage);
     DriverStatusLabel.Parent := DevicesPage.Surface;
     DriverStatusLabel.Left := ScaleX(0);
-    DriverStatusLabel.Top := ScaleY(126);
+    DriverStatusLabel.Top := ScaleY(146);
     DriverStatusLabel.Width := DevicesPage.SurfaceWidth;
     DriverStatusLabel.Height := ScaleY(78);
     DriverStatusLabel.WordWrap := True;
@@ -715,7 +762,7 @@ begin
     DriverDownloadBtn := TNewButton.Create(DevicesPage);
     DriverDownloadBtn.Parent := DevicesPage.Surface;
     DriverDownloadBtn.Left := ScaleX(0);
-    DriverDownloadBtn.Top := ScaleY(212);
+    DriverDownloadBtn.Top := ScaleY(232);
     DriverDownloadBtn.Width := ScaleX(220);
     DriverDownloadBtn.Height := ScaleY(28);
     DriverDownloadBtn.Caption := 'Download recommended driver';
@@ -725,7 +772,7 @@ begin
     DriverRecheckBtn := TNewButton.Create(DevicesPage);
     DriverRecheckBtn.Parent := DevicesPage.Surface;
     DriverRecheckBtn.Left := ScaleX(232);
-    DriverRecheckBtn.Top := ScaleY(212);
+    DriverRecheckBtn.Top := ScaleY(232);
     DriverRecheckBtn.Width := ScaleX(100);
     DriverRecheckBtn.Height := ScaleY(28);
     DriverRecheckBtn.Caption := 'Recheck';
@@ -958,13 +1005,17 @@ begin
 end;
 
 [UninstallRun]
-Filename: "{app}\scalattice-run.cmd"; Parameters: "uninstall --yes"; Flags: runhidden waituntilterminated skipifdoesntexist
+; Prefer the exe directly so CUDA checks in scalattice-run.cmd cannot block cleanup.
+; --purge removes models/cache; Startup/tasks are cleared in InitializeUninstall + agent uninstall.
+Filename: "{app}\scalattice-agent.exe"; Parameters: "uninstall --yes --purge"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "AgentUninstallPurge"
+Filename: "{app}\scalattice-run.cmd"; Parameters: "uninstall --yes --purge"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "AgentUninstallPurgeCmd"
 
 [UninstallDelete]
-Type: files; Name: "{localappdata}\Scalattice\lib\*"
-Type: dirifempty; Name: "{localappdata}\Scalattice\lib"
-Type: files; Name: "{app}\run-background.cmd"
-Type: dirifempty; Name: "{localappdata}\Scalattice\bin"
-Type: dirifempty; Name: "{localappdata}\Scalattice\logs"
-Type: dirifempty; Name: "{localappdata}\Scalattice"
+Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgent.vbs"
+Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgentTray.vbs"
+Type: filesandordirs; Name: "{localappdata}\Scalattice"
+Type: filesandordirs; Name: "{userpf}\.cache\scalattice"
 Type: filesandordirs; Name: "{userpf}\.config\scalattice"
+Type: files; Name: "{app}\run-background.cmd"
+Type: files; Name: "{app}\tray.pid"
+Type: files; Name: "{app}\background.pid"

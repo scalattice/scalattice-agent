@@ -1,7 +1,7 @@
 use crate::config::AgentConfig;
 use crate::paths::{
-    agent_binary_name, agent_env_path, agent_state_path, config_dir, install_dir, is_dir_empty,
-    lib_dir, models_cache_dir, remove_path_quiet, settings_path,
+    agent_binary_name, agent_env_path, agent_state_path, config_dir, install_dir, lib_dir,
+    models_cache_dir, remove_path_quiet, settings_path,
 };
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -195,6 +195,10 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
     let lib = lib_dir()?;
     let config = config_dir()?;
     let models = models_cache_dir();
+    let cache_root = models
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| models.clone());
 
     let mut targets: Vec<PathBuf> = vec![
         install.join(agent_binary_name()),
@@ -218,10 +222,20 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         targets.push(install.join("launch-tray.vbs"));
         targets.push(install.join("launch-tray-interactive.vbs"));
         targets.push(install.join("launch-background.vbs"));
+        targets.push(install.join("open-tray-debug.cmd"));
+        targets.push(install.join("tray.pid"));
+        targets.push(install.join("background.pid"));
+        // Logs live under %LOCALAPPDATA%\Scalattice\logs
+        if let Ok(log) = crate::paths::agent_log_path() {
+            if let Some(logs_dir) = log.parent() {
+                targets.push(logs_dir.to_path_buf());
+            }
+        }
     }
 
     if opts.purge_models {
         targets.push(models.clone());
+        targets.push(cache_root.clone());
     }
 
     if !opts.yes {
@@ -241,9 +255,9 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         bail!("Re-run with --yes to confirm: scalattice-agent uninstall --yes");
     }
 
-    if background_service_available() {
-        platform::remove_background_service()?;
-    }
+    // Always clear autostart (Startup folder + scheduled tasks) and stop processes,
+    // even when nothing looks "installed" — leftovers cause reboot Script Host errors.
+    let _ = platform::remove_background_service();
 
     #[cfg(target_os = "linux")]
     {
@@ -254,17 +268,35 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         remove_path_quiet(path);
     }
 
-    if config.is_dir() && is_dir_empty(&config) {
-        let _ = fs::remove_dir(&config);
-    }
+    // Wipe remaining config tree (token, state, settings).
+    remove_path_quiet(&config);
 
-    let cache_dir = models.parent().map(|p| p.to_path_buf());
-    if opts.purge_models {
-        if let Some(cache_dir) = cache_dir {
-            if cache_dir.is_dir() && is_dir_empty(&cache_dir) {
-                let _ = fs::remove_dir(&cache_dir);
+    #[cfg(windows)]
+    {
+        // Best-effort wipe of the whole per-user Scalattice appdata tree (bin/lib/logs).
+        // The running uninstall binary may remain until Inno deletes {app}.
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let root = PathBuf::from(local).join("Scalattice");
+            // Prefer deleting lib/logs first; leave bin for the uninstaller process.
+            remove_path_quiet(&root.join("lib"));
+            remove_path_quiet(&root.join("logs"));
+            if root.is_dir() {
+                // Remove any other leftovers under Scalattice except the live bin.
+                if let Ok(entries) = fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.file_name().and_then(|n| n.to_str()) == Some("bin") {
+                            continue;
+                        }
+                        remove_path_quiet(&path);
+                    }
+                }
             }
         }
+    }
+
+    if opts.purge_models {
+        remove_path_quiet(&cache_root);
     }
 
     println!("Scalattice agent uninstalled.");
