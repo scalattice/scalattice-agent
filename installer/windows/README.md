@@ -15,7 +15,7 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`choco install innos
 ## What the installer does
 
 1. Welcome
-2. **If `nvidia-smi` is missing:** detect the NVIDIA GPU (PCI ID), look up the matching Game Ready driver, and offer a one-click download (+ Recheck). Falls back to NVIDIA’s site if lookup fails.
+2. **If an NVIDIA GPU is present but `nvidia-smi` fails:** recommend the matching Game Ready driver (one-click when lookup works) + Recheck. CPU-only / non-NVIDIA PCs skip this page.
 3. Token input (`slt_provider_…`)
 4. **Reinstall only:** optional page to remove stored model weights (shows size in GB)
 5. Copies `scalattice-agent.exe` to `%LOCALAPPDATA%\Scalattice\bin`

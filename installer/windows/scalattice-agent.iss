@@ -386,6 +386,23 @@ begin
   end;
 end;
 
+{ True when Windows enumerates an NVIDIA PCI device (VEN_10DE), even without a driver. }
+function NvidiaGpuPresent: Boolean;
+var
+  ResultCode: Integer;
+  Cmd: String;
+begin
+  Cmd :=
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    'if (@(Get-CimInstance Win32_PnPEntity -EA SilentlyContinue | ' +
+    'Where-Object { $_.PNPDeviceID -match ''VEN_10DE'' }).Count -gt 0) { exit 0 }; ' +
+    'if (@(Get-CimInstance Win32_VideoController -EA SilentlyContinue | ' +
+    'Where-Object { $_.PNPDeviceID -match ''VEN_10DE'' }).Count -gt 0) { exit 0 }; ' +
+    'exit 1"';
+  Result := Exec('powershell.exe', Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+    and (ResultCode = 0);
+end;
+
 function DriverLookupIniPath: String;
 begin
   Result := ExpandConstant('{tmp}\scalattice-nvidia-driver.ini');
@@ -459,8 +476,7 @@ begin
     DriverStatusLabel.Caption :=
       'Detected: ' + ResolvedGpuName + Laptop + #13#10 +
       'Recommended Game Ready driver: ' + ResolvedDriverVersion + #13#10 +
-      'Click Download to get the matching installer from NVIDIA, then Recheck.' + #13#10 +
-      'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.';
+      'Click Download to get the matching installer from NVIDIA, then Recheck.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Download driver ' + ResolvedDriverVersion;
   end
@@ -476,8 +492,7 @@ begin
   begin
     DriverStatusLabel.Caption :=
       'NVIDIA driver not detected (nvidia-smi missing or failed).' + #13#10 +
-      'Install a current Game Ready or Studio driver, then click Recheck.' + #13#10 +
-      'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.';
+      'Install a current Game Ready or Studio driver, then click Recheck.';
     if DriverDownloadBtn <> nil then
       DriverDownloadBtn.Caption := 'Open NVIDIA driver download';
   end;
@@ -534,8 +549,11 @@ begin
     GetDirSize(ModelsCacheDir, ModelsCacheBytes);
   { Silent updates skip the cache-purge page entirely. }
   ShowModelsPage := (not WizardSilent) and (not IsSilentUpdate) and ShouldOfferModelPurge();
-  { Interactive installs only: warn when the NVIDIA driver is missing. }
-  ShowDriverPage := (not WizardSilent) and (not IsSilentUpdate) and (not NvidiaDriverOk);
+  { Only prompt when an NVIDIA GPU is present but the driver is missing.
+    CPU-only / non-NVIDIA machines skip this page and install normally. }
+  ShowDriverPage :=
+    (not WizardSilent) and (not IsSilentUpdate) and
+    (not NvidiaDriverOk) and NvidiaGpuPresent;
   Result := True;
 end;
 
@@ -555,8 +573,8 @@ begin
   begin
     DriverPage := CreateCustomPage(
       wpWelcome,
-      'NVIDIA GPU driver required',
-      'Scalattice needs a working NVIDIA display driver before this PC can serve GPU jobs.');
+      'NVIDIA GPU driver recommended',
+      'This PC has an NVIDIA GPU, but no working driver was found (nvidia-smi).');
     TokenAfterID := DriverPage.ID;
 
     InfoLabel := TNewStaticText.Create(DriverPage);
@@ -568,9 +586,8 @@ begin
     InfoLabel.WordWrap := True;
     InfoLabel.AutoSize := False;
     InfoLabel.Caption :=
-      'nvidia-smi was not found. We detect your NVIDIA GPU and offer the matching ' +
-      'Game Ready driver download (not the CUDA Toolkit).' + #13#10 +
-      'You can continue without a driver, but GPU inference will not work until one is installed.';
+      'Install the matching Game Ready or Studio driver for GPU jobs.' + #13#10 +
+      'You can continue without it — the agent will run CPU-only until a driver is installed.';
 
     DriverStatusLabel := TNewStaticText.Create(DriverPage);
     DriverStatusLabel.Parent := DriverPage.Surface;
@@ -608,8 +625,7 @@ begin
     'Connect to Scalattice',
     'Paste your provider machine token',
     'Create a machine in the Scalattice Providers dashboard and paste its token below.' + #13#10 +
-    'The installer saves the token, adds Scalattice to your PATH, and starts the background agent.' + #13#10 + #13#10 +
-    'You do not need the CUDA Toolkit — this installer bundles the CUDA runtime.');
+    'The installer saves the token, adds Scalattice to your PATH, and starts the background agent.');
   TokenPage.Add('Provider token (slt_provider_...):', False);
   if PrefillToken <> '' then
     TokenPage.Values[0] := PrefillToken
@@ -649,8 +665,8 @@ begin
     if not NvidiaDriverOk then
     begin
       if MsgBox(
-        'NVIDIA driver still not detected (nvidia-smi).' + #13#10 + #13#10 +
-        'GPU inference will not work until you install a driver and reboot if prompted.' + #13#10 +
+        'NVIDIA driver not detected (nvidia-smi).' + #13#10 + #13#10 +
+        'GPU jobs will not run until you install a driver. CPU-only jobs will run instead.' + #13#10 +
         'Continue installing Scalattice Agent anyway?',
         mbConfirmation, MB_YESNO) = IDNO then
         Result := False;
@@ -702,6 +718,38 @@ begin
     AppDir, SW_HIDE, ewNoWait, ResultCode);
 end;
 
+{ Always launch via scalattice-run.cmd so %LOCALAPPDATA%\Scalattice\lib is on PATH
+  before Windows resolves cudart64_12.dll (bare .exe Exec causes the System Error dialog). }
+procedure ExecAgent(const AppDir, Params: String; var ResultCode: Integer);
+var
+  RunCmd, CmdLine: String;
+begin
+  ResultCode := 1;
+  if not CudaRuntimePresent(LibDir) then
+    Exit;
+  RunCmd := AppDir + '\scalattice-run.cmd';
+  if FileExists(RunCmd) then
+  begin
+    CmdLine := '/c ""' + RunCmd + '" ' + Params + '"';
+    Exec('cmd.exe', CmdLine, AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  else
+    Exec(AppDir + '\{#MyAppExeName}', Params, AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure PersistProviderToken(const Token: String);
+var
+  Dir, Path: String;
+begin
+  if not TokenLooksValid(Token) then
+    Exit;
+  Dir := ExpandConstant('{userpf}\.config\scalattice');
+  if not DirExists(Dir) then
+    ForceDirectories(Dir);
+  Path := Dir + '\agent.env';
+  SaveStringToFile(Path, 'SCALATTICE_AGENT_TOKEN=' + Token + #13#10, False);
+end;
+
 procedure StartScalatticeAfterInstall(const AppDir: String);
 var
   ResultCode: Integer;
@@ -712,21 +760,34 @@ begin
   if (TokenPage <> nil) and (not WizardSilent) and (not IsSilentUpdate) then
     Token := Trim(TokenPage.Values[0]);
 
+  if (Token = '') and (SavedToken <> '') then
+    Token := SavedToken;
+
+  { Persist token even when we cannot launch the exe (missing CUDA libs). }
+  if Token <> '' then
+    PersistProviderToken(Token);
+
+  if not CudaRuntimePresent(LibDir) then
+  begin
+    if not WizardSilent then
+      MsgBox(
+        'Files were installed, but the CUDA 12 runtime DLLs are missing from:' + #13#10 +
+        '  ' + LibDir + #13#10#13#10 +
+        'That causes the Windows "cudart64_12.dll was not found" error.' + #13#10 +
+        'Re-download ScalatticeAgentSetup from the official Scalattice / GitHub release ' +
+        'and run setup again.',
+        mbError, MB_OK);
+    Exit;
+  end;
+
   if IsSilentUpdate or WizardSilent then
   begin
     { Prefer restart so same-token set-token cannot skip relaunching tray/background. }
-    Exec(AppDir + '\{#MyAppExeName}', 'restart',
-      AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    ExecAgent(AppDir, 'restart', ResultCode);
     if ResultCode <> 0 then
     begin
-      if SavedToken <> '' then
-        Exec(AppDir + '\{#MyAppExeName}',
-          'set-token --token "' + SavedToken + '"',
-          AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode)
-      else if Token <> '' then
-        Exec(AppDir + '\{#MyAppExeName}',
-          'set-token --token "' + Token + '"',
-          AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      if Token <> '' then
+        ExecAgent(AppDir, 'set-token --token "' + Token + '"', ResultCode);
       LaunchScalatticeRuntime(AppDir);
     end
     else
@@ -739,23 +800,13 @@ begin
   end;
 
   if Token <> '' then
-  begin
-    Exec(AppDir + '\{#MyAppExeName}',
-      'set-token --token "' + Token + '"',
-      AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  end
-  else if SavedToken <> '' then
-  begin
-    Exec(AppDir + '\{#MyAppExeName}',
-      'set-token --token "' + SavedToken + '"',
-      AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  end
+    ExecAgent(AppDir, 'set-token --token "' + Token + '"', ResultCode)
   else
     ResultCode := 1;
 
   LaunchScalatticeRuntime(AppDir);
 
-  if (SavedToken = '') and (Token = '') then
+  if Token = '' then
     MsgBox('Scalattice Agent was installed, but no provider token was found.' + #13#10 +
       'Open Command Prompt and run:' + #13#10 +
       '  scalattice-agent set-token --token YOUR_TOKEN',
