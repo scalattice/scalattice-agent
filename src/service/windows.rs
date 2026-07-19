@@ -18,7 +18,10 @@ pub fn background_status() -> BackgroundStatus {
     if service_active() {
         return BackgroundStatus::Running;
     }
-    if autostart_configured() {
+    // A saved token means setup was requested — treat as Stopped so the tray watchdog
+    // restarts the worker even if Startup shortcuts were never registered (common after
+    // installer launch-without-set-token, or an early-return save path).
+    if autostart_configured() || crate::config::read_saved_agent_token().is_some() {
         BackgroundStatus::Stopped
     } else {
         BackgroundStatus::NotInstalled
@@ -46,25 +49,6 @@ pub fn restart_runtime_from_saved_token() -> Result<()> {
     stop_agents_for_update();
     std::thread::sleep(std::time::Duration::from_millis(500));
     force_restart_background(&config, false)
-}
-
-fn hidden_powershell(script: &str) -> std::io::Result<std::process::Output> {
-    Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-}
-
-fn hidden_powershell_output(script: &str) -> std::io::Result<std::process::Output> {
-    Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
 }
 
 fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()> {
@@ -243,7 +227,9 @@ fn start_background_with_retry() -> Result<()> {
 }
 
 fn wait_for_background_start_gentle() {
-    for delay_ms in [800_u64, 1200, 2000] {
+    // Keep this short — callers (tray Save token) must not look hung. The watchdog
+    // retries if the mutex is not held yet.
+    for delay_ms in [200_u64, 400, 800] {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         if background_agent_running() {
             return;
@@ -251,23 +237,125 @@ fn wait_for_background_start_gentle() {
     }
 }
 
+/// True when the background single-instance mutex is held.
+/// Prefer this over WMI/`Get-CimInstance` — that path can hang while CUDA/driver init is wedged.
 fn background_agent_running() -> bool {
-    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
-  Where-Object { $_.CommandLine -match 'foreground' } |
-  Select-Object -First 1 -ExpandProperty ProcessId"#;
-    match hidden_powershell_output(script) {
-        Ok(output) if output.status.success() => {
-            !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+    background_mutex_held() || background_pid_alive()
+}
+
+fn background_mutex_held() -> bool {
+    let name: Vec<u16> = "Local\\ScalatticeAgentBackground\0".encode_utf16().collect();
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+        let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        if handle.is_null() {
+            false
+        } else {
+            CloseHandle(handle);
+            true
         }
-        _ => false,
+    }
+}
+
+fn background_pid_path() -> Option<PathBuf> {
+    install_dir().ok().map(|d| d.join("background.pid"))
+}
+
+fn background_pid_alive() -> bool {
+    let Some(path) = background_pid_path() else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<u32>() else {
+        return false;
+    };
+    process_id_alive(pid)
+}
+
+fn process_id_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        ok && code == STILL_ACTIVE as u32
     }
 }
 
 fn stop_background_agent_only() {
-    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
-  Where-Object { $_.CommandLine -match 'foreground' } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
-    let _ = hidden_powershell(script);
+    let mut killed = false;
+    if let Some(path) = background_pid_path() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(pid) = raw.trim().parse::<u32>() {
+                killed = taskkill_pid(pid);
+            }
+        }
+        let _ = fs::remove_file(&path);
+    }
+    // Never taskkill /IM — that would also kill the tray. Prefer the pid file;
+    // if it's missing, skip anything that looks like the tray instance.
+    if !killed && background_mutex_held() {
+        let tray_pid = install_dir()
+            .ok()
+            .and_then(|d| fs::read_to_string(d.join("tray.pid")).ok())
+            .and_then(|raw| raw.trim().parse::<u32>().ok());
+        let self_pid = std::process::id();
+        for pid in agent_exe_pids() {
+            if pid == self_pid || Some(pid) == tray_pid {
+                continue;
+            }
+            let _ = taskkill_pid(pid);
+        }
+    }
+}
+
+fn taskkill_pid(pid: u32) -> bool {
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn agent_exe_pids() -> Vec<u32> {
+    // Lightweight: tasklist CSV, no WMI command-line lookup (that can hang on bad drivers).
+    let output = Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq scalattice-agent.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            // "scalattice-agent.exe","1234","Session","..."
+            let mut parts = line.split(',');
+            let _name = parts.next()?;
+            let pid = parts.next()?.trim().trim_matches('"').parse().ok()?;
+            Some(pid)
+        })
+        .collect()
 }
 
 fn stop_background_for_token_restart() -> Result<()> {
@@ -286,10 +374,16 @@ fn stop_background_for_token_restart() -> Result<()> {
 }
 
 fn stop_tray_agent_only() {
-    let script = r#"Get-CimInstance Win32_Process -Filter "name='scalattice-agent.exe'" |
-  Where-Object { $_.CommandLine -match '\s+tray(\s|$)' } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"#;
-    let _ = hidden_powershell(script);
+    if let Ok(path) = install_dir().map(|d| d.join("tray.pid")) {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(pid) = raw.trim().parse::<u32>() {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+            }
+        }
+    }
 }
 
 pub fn stop_agents_for_update() {

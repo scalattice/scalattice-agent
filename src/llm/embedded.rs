@@ -48,6 +48,35 @@ pub struct GenerateOutput {
 
 pub fn init_backend() -> Result<()> {
     llama_cpp_2::send_logs_to_tracing(LogOptions::default());
+    if BACKEND.get().is_some() {
+        return backend().map(|_| ());
+    }
+
+    // CUDA driver mismatches can stall inside ggml_cuda_init. Bound the wait so the
+    // agent can still connect and run CPU-compatible work (or report no compute).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("llama-backend-init".into())
+        .spawn(move || {
+            let result = LlamaBackend::init().map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        })
+        .context("spawn llama.cpp backend init thread")?;
+
+    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+        Ok(result) => {
+            let _ = BACKEND.set(result);
+        }
+        Err(_) => {
+            warn!(
+                "llama.cpp backend init timed out after 12s (often an outdated NVIDIA driver); continuing without GPU backend"
+            );
+            let _ = BACKEND.set(Err(
+                "timed out initializing llama.cpp — update the NVIDIA driver or use CPU-only models"
+                    .into(),
+            ));
+        }
+    }
     backend().map(|_| ())
 }
 

@@ -81,10 +81,17 @@ pub fn restart_runtime_from_saved_token() -> Result<()> {
     }
 }
 
-/// Save a new token for the running background agent to pick up without restarting the tray.
+/// Persist the provider token and ensure the background agent is registered + running.
+///
+/// Always goes through the full start path (not a "already running" short-circuit) so
+/// Windows Startup shortcuts are created even when the installer already launched a
+/// foreground worker. Skipping that left the tray stuck on "Agent: not set up yet".
 pub fn save_agent_token(config: &AgentConfig) -> Result<()> {
     persist_agent_token(&config.token)?;
-    ensure_background_running_if_configured()
+    if !background_service_available() {
+        return Ok(());
+    }
+    start_background_from_config(config)
 }
 
 #[cfg(target_os = "linux")]

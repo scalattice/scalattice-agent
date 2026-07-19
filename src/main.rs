@@ -134,6 +134,7 @@ fn prepare_windows_process(cli: &Cli) -> Result<()> {
             // Keep mutex for process lifetime.
             std::mem::forget(handle);
         }
+        write_background_pid();
         unsafe {
             FreeConsole();
         }
@@ -214,11 +215,9 @@ async fn run_async(cli: Cli) -> Result<()> {
         }
         Some(Commands::SetToken { token }) => {
             let config = config::AgentConfig::from_env_and_cli(Some(token))?;
-            let result = if service::service_active() {
-                service::save_agent_token(&config)
-            } else {
-                service::restart_after_token_change(&config)
-            };
+            // Always use the full save path so Windows Startup registration is not
+            // skipped when a background worker is already running.
+            let result = service::save_agent_token(&config);
             match result {
                 Ok(()) => {
                     if service::service_active() {
@@ -274,6 +273,26 @@ fn spawn_tray_hidden() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn write_background_pid() {
+    if let Ok(dir) = crate::paths::install_dir() {
+        let path = dir.join("background.pid");
+        let _ = std::fs::write(&path, format!("{}", std::process::id()));
+    }
+}
+
+#[cfg(windows)]
+fn clear_background_pid() {
+    if let Ok(dir) = crate::paths::install_dir() {
+        let path = dir.join("background.pid");
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if raw.trim() == std::process::id().to_string() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 async fn run_foreground(token: Option<String>) -> Result<()> {
     if service::invoked_by_systemd() || service::invoked_by_background_service() {
         let _ = update::maybe_sync_auto_update_timer();
@@ -281,7 +300,10 @@ async fn run_foreground(token: Option<String>) -> Result<()> {
             .filter(|t| !t.trim().is_empty())
             .or_else(config::read_saved_agent_token);
         let config = config::AgentConfig::from_env_and_cli(token)?;
-        return agent::run_agent(config).await;
+        let result = agent::run_agent(config).await;
+        #[cfg(windows)]
+        clear_background_pid();
+        return result;
     }
 
     if service::background_service_available() {

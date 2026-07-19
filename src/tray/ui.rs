@@ -35,6 +35,11 @@ enum UpdateWorkerMsg {
     InstallFailed(String),
 }
 
+enum TokenWorkerMsg {
+    Saved,
+    Failed(String),
+}
+
 fn spawn_update_worker() -> (mpsc::Sender<UpdateWorkerCmd>, mpsc::Receiver<UpdateWorkerMsg>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<UpdateWorkerCmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<UpdateWorkerMsg>();
@@ -194,6 +199,7 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
     });
 
     let (update_cmd_tx, update_msg_rx) = spawn_update_worker();
+    let (token_msg_tx, token_msg_rx) = mpsc::channel::<TokenWorkerMsg>();
 
     eframe::run_native(
         WINDOW_TITLE,
@@ -208,6 +214,8 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
                 status_req_tx,
                 update_cmd_tx,
                 update_msg_rx,
+                token_msg_tx,
+                token_msg_rx,
                 !interactive,
             )))
         }),
@@ -227,6 +235,10 @@ struct TrayApp {
     status_refresh_inflight: bool,
     update_cmd_tx: mpsc::Sender<UpdateWorkerCmd>,
     update_msg_rx: mpsc::Receiver<UpdateWorkerMsg>,
+    token_msg_rx: mpsc::Receiver<TokenWorkerMsg>,
+    token_msg_tx: mpsc::Sender<TokenWorkerMsg>,
+    token_save_inflight: bool,
+    watchdog_inflight: Arc<AtomicBool>,
     update_check_inflight: bool,
     update_busy: bool,
     update_available: bool,
@@ -256,6 +268,8 @@ impl TrayApp {
         status_req_tx: mpsc::Sender<()>,
         update_cmd_tx: mpsc::Sender<UpdateWorkerCmd>,
         update_msg_rx: mpsc::Receiver<UpdateWorkerMsg>,
+        token_msg_tx: mpsc::Sender<TokenWorkerMsg>,
+        token_msg_rx: mpsc::Receiver<TokenWorkerMsg>,
         panel_hidden: bool,
     ) -> Self {
         let token_input = crate::config::read_saved_agent_token().unwrap_or_default();
@@ -284,6 +298,10 @@ impl TrayApp {
             status_refresh_inflight: false,
             update_cmd_tx,
             update_msg_rx,
+            token_msg_tx,
+            token_msg_rx,
+            token_save_inflight: false,
+            watchdog_inflight: Arc::new(AtomicBool::new(false)),
             update_check_inflight: false,
             update_busy: false,
             update_available: false,
@@ -375,19 +393,27 @@ impl TrayApp {
             return;
         }
         self.next_agent_watchdog = Instant::now() + Duration::from_secs(5);
+        if self.watchdog_inflight.load(Ordering::SeqCst) || self.token_save_inflight {
+            ctx.request_repaint_after(Duration::from_secs(5));
+            return;
+        }
+        // Only peek status with the fast mutex/pid check — never block the UI thread
+        // on ensure/start (that previously froze the panel as Not Responding).
         match service::background_status() {
             service::BackgroundStatus::Stopped => {
-                match service::ensure_background_running_if_configured() {
-                    Ok(()) => {
-                        if service::service_active() {
-                            write_tray_log("watchdog restarted stopped background agent");
-                            self.action_message =
-                                "Agent was stopped — restarted with your saved token.".to_string();
-                            self.kick_status_refresh();
+                let inflight = Arc::clone(&self.watchdog_inflight);
+                inflight.store(true, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    match service::ensure_background_running_if_configured() {
+                        Ok(()) => {
+                            if service::service_active() {
+                                write_tray_log("watchdog restarted stopped background agent");
+                            }
                         }
+                        Err(err) => write_tray_log(&format!("watchdog restart failed: {err:#}")),
                     }
-                    Err(err) => write_tray_log(&format!("watchdog restart failed: {err:#}")),
-                }
+                    inflight.store(false, Ordering::SeqCst);
+                });
             }
             service::BackgroundStatus::Running | service::BackgroundStatus::NotInstalled => {}
         }
@@ -535,6 +561,10 @@ impl TrayApp {
     }
 
     fn save_token(&mut self) {
+        if self.token_save_inflight {
+            self.action_message = "Saving token…".to_string();
+            return;
+        }
         let token = self.token_input.trim().to_string();
         if !token.starts_with("slt_provider_") {
             self.action_message = "Token must start with slt_provider_".to_string();
@@ -550,12 +580,32 @@ impl TrayApp {
         };
 
         self.token_revealed = false;
-        match service::save_agent_token(&config) {
-            Ok(()) => {
-                self.action_message = "Token saved. Reconnecting…".to_string();
-            }
-            Err(err) => {
-                self.action_message = format!("Could not save token: {err}");
+        self.token_save_inflight = true;
+        self.action_message = "Saving token…".to_string();
+        let tx = self.token_msg_tx.clone();
+        std::thread::spawn(move || {
+            let msg = match service::save_agent_token(&config) {
+                Ok(()) => TokenWorkerMsg::Saved,
+                Err(err) => TokenWorkerMsg::Failed(err.to_string()),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn poll_token_results(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.token_msg_rx.try_recv() {
+            self.token_save_inflight = false;
+            match msg {
+                TokenWorkerMsg::Saved => {
+                    self.action_message = "Token saved. Reconnecting…".to_string();
+                    self.kick_status_refresh();
+                    ctx.request_repaint();
+                }
+                TokenWorkerMsg::Failed(err) => {
+                    self.action_message = format!("Could not save token: {err}");
+                    self.kick_status_refresh();
+                    ctx.request_repaint();
+                }
             }
         }
     }
@@ -579,6 +629,7 @@ impl eframe::App for TrayApp {
 
         self.poll_tray(ctx);
         self.poll_update_results(ctx);
+        self.poll_token_results(ctx);
         self.tick_agent_watchdog(ctx);
 
         if Instant::now() >= self.next_update_check
@@ -680,7 +731,10 @@ impl eframe::App for TrayApp {
                         });
 
                         ui.horizontal(|ui| {
-                            if ui.button("Save token").clicked() {
+                            if ui
+                                .add_enabled(!self.token_save_inflight, egui::Button::new("Save token"))
+                                .clicked()
+                            {
                                 self.save_token();
                             }
                             if ui.button("Open dashboard").clicked() {
