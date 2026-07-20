@@ -125,8 +125,8 @@ pub fn service_active() -> bool {
     platform::service_active()
 }
 
-pub fn follow_service_logs() -> Result<()> {
-    platform::follow_service_logs()
+pub fn follow_service_logs(verbose: bool) -> Result<()> {
+    platform::follow_service_logs(verbose)
 }
 
 #[cfg(windows)]

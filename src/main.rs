@@ -5,6 +5,7 @@ mod compute_pool;
 mod config;
 mod inference;
 mod llm;
+mod logging;
 mod models;
 mod paths;
 mod protocol;
@@ -22,7 +23,6 @@ use anyhow::Result;
 #[cfg(windows)]
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
@@ -31,6 +31,9 @@ use tracing_subscriber::EnvFilter;
     version
 )]
 struct Cli {
+    /// Emit full llama.cpp / GGML detail (default is provider-friendly Simplified logs)
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -88,11 +91,12 @@ fn main() -> Result<()> {
     init_crypto()?;
 
     let cli = Cli::parse();
+    let verbose = logging::verbose_requested(cli.verbose);
 
     #[cfg(windows)]
     prepare_windows_process(&cli)?;
 
-    init_logging();
+    logging::init_logging(verbose);
 
     #[cfg(windows)]
     if should_run_tray_ui(&cli) {
@@ -103,7 +107,7 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_async(cli))
+        .block_on(run_async(cli, verbose))
 }
 
 /// Windows release builds use the WINDOWS subsystem (no console). Attach to a
@@ -166,37 +170,7 @@ fn init_crypto() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))
 }
 
-fn init_logging() {
-    let filter = EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
-
-    #[cfg(windows)]
-    if service::invoked_by_background_service() {
-        if let Ok(path) = crate::paths::agent_log_path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                tracing_subscriber::fmt()
-                    .with_ansi(false)
-                    .with_env_filter(filter)
-                    .with_writer(std::sync::Mutex::new(file))
-                    .init();
-                return;
-            }
-        }
-    }
-
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(filter)
-        .init();
-}
-
-async fn run_async(cli: Cli) -> Result<()> {
+async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
     match cli.command {
         None => {
             #[cfg(not(windows))]
@@ -207,7 +181,7 @@ async fn run_async(cli: Cli) -> Result<()> {
             unreachable!("tray handled in main")
         }
         Some(Commands::Foreground { token }) => {
-            run_foreground(token).await?;
+            run_foreground(token, verbose).await?;
         }
         Some(Commands::Status) => {
             print_status()?;
@@ -293,7 +267,7 @@ fn clear_background_pid() {
     }
 }
 
-async fn run_foreground(token: Option<String>) -> Result<()> {
+async fn run_foreground(token: Option<String>, verbose: bool) -> Result<()> {
     if service::invoked_by_systemd() || service::invoked_by_background_service() {
         let _ = update::maybe_sync_auto_update_timer();
         let token = token
@@ -311,8 +285,12 @@ async fn run_foreground(token: Option<String>) -> Result<()> {
             maybe_start_background_from_saved_token()?;
         }
         if service::service_active() {
-            println!("following background agent (Ctrl+C to stop watching only)");
-            return service::follow_service_logs();
+            if verbose {
+                println!("following background agent · verbose (Ctrl+C to stop watching only)");
+            } else {
+                println!("following background agent · simplified (Ctrl+C to stop watching only; use --verbose for full detail)");
+            }
+            return service::follow_service_logs(verbose);
         }
         anyhow::bail!("agent not running. Run: scalattice-agent set-token --token slt_provider_...");
     }

@@ -95,7 +95,7 @@ pub fn service_active() -> bool {
     background_agent_running()
 }
 
-pub fn follow_service_logs() -> Result<()> {
+pub fn follow_service_logs(verbose: bool) -> Result<()> {
     if !service_active() {
         bail!(
             "scalattice-agent is not running; save your token with `scalattice-agent set-token` first"
@@ -110,7 +110,7 @@ pub fn follow_service_logs() -> Result<()> {
         );
     }
 
-    let status = Command::new("powershell")
+    let mut child = Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
@@ -119,13 +119,19 @@ pub fn follow_service_logs() -> Result<()> {
                 log_path.display().to_string().replace('\'', "''")
             ),
         ])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .status()
+        .spawn()
         .context("failed to run powershell log tail")?;
 
-    match status.code() {
+    let stdout = child
+        .stdout
+        .take()
+        .context("powershell stdout missing")?;
+    crate::logging::pipe_log_lines(stdout, verbose)?;
+
+    match child.wait().context("wait for log tail")?.code() {
         Some(0) | Some(130) => Ok(()),
         Some(code) => bail!("log tail exited with status {code}"),
         None => bail!("log tail terminated by signal"),

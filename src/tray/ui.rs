@@ -251,9 +251,13 @@ struct TrayApp {
     token_revealed: bool,
     status_lines: Vec<String>,
     action_message: String,
+    /// Raw agent.log text (always full file tail).
+    log_buffer: String,
+    /// Displayed Live log (Simplified or Verbose).
     logs: String,
     log_path: Option<PathBuf>,
     log_offset: u64,
+    log_verbose: bool,
     next_data_poll: Instant,
     next_agent_watchdog: Instant,
     last_outer_rect: Option<egui::Rect>,
@@ -289,6 +293,7 @@ impl TrayApp {
         } else {
             Instant::now() + Duration::from_secs(settings.seconds_until_update_check())
         };
+        let log_verbose = settings.log_verbose;
         let mut app = Self {
             event_rx,
             show_rx,
@@ -314,9 +319,11 @@ impl TrayApp {
             token_revealed,
             status_lines: Vec::new(),
             action_message: String::new(),
+            log_buffer: String::new(),
             logs: String::new(),
             log_path,
             log_offset: 0,
+            log_verbose,
             next_data_poll: Instant::now(),
             next_agent_watchdog: Instant::now() + Duration::from_secs(5),
             last_outer_rect: None,
@@ -522,12 +529,14 @@ impl TrayApp {
             if self.logs == message {
                 return false;
             }
+            self.log_buffer = message.clone();
             self.logs = message;
             return true;
         };
         let len = meta.len();
         if len < self.log_offset {
             self.log_offset = 0;
+            self.log_buffer.clear();
         }
         if len == self.log_offset {
             return false;
@@ -551,13 +560,29 @@ impl TrayApp {
             return false;
         }
         let chunk = strip_ansi_escapes(&String::from_utf8_lossy(&buf));
-        self.logs.push_str(&chunk);
-        if self.logs.len() > 48_000 {
-            let drop_by = self.logs.len().saturating_sub(40_000);
-            self.logs.drain(..drop_by);
+        self.log_buffer.push_str(&chunk);
+        if self.log_buffer.len() > 48_000 {
+            let drop_by = self.log_buffer.len().saturating_sub(40_000);
+            self.log_buffer.drain(..drop_by);
         }
         self.log_offset = len;
+        self.rebuild_displayed_logs();
         true
+    }
+
+    fn rebuild_displayed_logs(&mut self) {
+        if self.log_verbose {
+            self.logs = self.log_buffer.clone();
+        } else {
+            self.logs = crate::logging::simplify_log_text(&self.log_buffer);
+        }
+    }
+
+    fn toggle_log_verbose(&mut self) {
+        self.log_verbose = !self.log_verbose;
+        self.settings.log_verbose = self.log_verbose;
+        let _ = self.settings.save();
+        self.rebuild_displayed_logs();
     }
 
     fn save_token(&mut self) {
@@ -828,11 +853,40 @@ impl eframe::App for TrayApp {
                     .stroke(egui::Stroke::new(1.0, border))
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Live log")
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Live log")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.add_space(8.0);
+                            let toggle_label = if self.log_verbose {
+                                "Verbose"
+                            } else {
+                                "Simplified"
+                            };
+                            let toggle = egui::Button::new(
+                                egui::RichText::new(toggle_label)
+                                    .size(12.0)
+                                    .color(if self.log_verbose {
+                                        egui::Color32::from_rgb(255, 200, 120)
+                                    } else {
+                                        egui::Color32::from_rgb(160, 200, 160)
+                                    }),
+                            )
+                            .fill(egui::Color32::from_rgb(40, 44, 52))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                if self.log_verbose {
+                                    egui::Color32::from_rgb(180, 140, 80)
+                                } else {
+                                    egui::Color32::from_rgb(80, 120, 90)
+                                },
+                            ));
+                            if ui.add(toggle).clicked() {
+                                self.toggle_log_verbose();
+                            }
+                        });
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical()
                             .stick_to_bottom(true)

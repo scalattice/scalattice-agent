@@ -20,6 +20,9 @@ pub struct UserSettings {
     pub last_auto_update_attempt_version: String,
     #[serde(default)]
     pub last_auto_update_attempt_unix: u64,
+    /// Windows tray Live log: show full llama.cpp detail when true.
+    #[serde(default)]
+    pub log_verbose: bool,
 }
 
 fn default_auto_update() -> bool {
@@ -34,6 +37,7 @@ impl Default for UserSettings {
             update_daily_jitter_secs: 0,
             last_auto_update_attempt_version: String::new(),
             last_auto_update_attempt_unix: 0,
+            log_verbose: false,
         }
     }
 }

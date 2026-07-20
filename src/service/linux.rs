@@ -79,7 +79,7 @@ pub fn service_active() -> bool {
     systemctl_success(&["--user", "is-active", UNIT_NAME])
 }
 
-pub fn follow_service_logs() -> Result<()> {
+pub fn follow_service_logs(verbose: bool) -> Result<()> {
     if !background_service_available() {
         anyhow::bail!("systemd is not available on this system");
     }
@@ -89,7 +89,7 @@ pub fn follow_service_logs() -> Result<()> {
         );
     }
 
-    let status = Command::new("journalctl")
+    let mut child = Command::new("journalctl")
         .args([
             "--user",
             "-f",
@@ -99,13 +99,19 @@ pub fn follow_service_logs() -> Result<()> {
             "30",
             "--no-pager",
         ])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .status()
+        .spawn()
         .context("failed to run journalctl")?;
 
-    match status.code() {
+    let stdout = child
+        .stdout
+        .take()
+        .context("journalctl stdout missing")?;
+    crate::logging::pipe_log_lines(stdout, verbose)?;
+
+    match child.wait().context("wait for journalctl")?.code() {
         Some(130) | Some(0) => Ok(()),
         Some(code) => anyhow::bail!("journalctl exited with status {code}"),
         None => anyhow::bail!("journalctl terminated by signal"),
