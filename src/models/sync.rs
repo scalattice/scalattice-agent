@@ -1,7 +1,7 @@
 use crate::compute_pool::VirtualCard;
 use crate::models::capacity::can_host_model;
 use crate::models::download::download_catalog_model;
-use crate::models::storage::{model_weights_ready, purge_incomplete_model_weights};
+use crate::models::storage::{catalog_model_weights_ready, purge_incomplete_model_weights};
 use crate::protocol::CatalogModel;
 use crate::state;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +36,7 @@ pub fn spawn_catalog_sync(
                 continue;
             }
             let runtime_model = runtime_model_id(&model);
-            if model_weights_ready(runtime_model) {
+            if catalog_model_weights_ready(&model) {
                 continue;
             }
             if !enabled_model_ids.contains(&model.model_id) {

@@ -8,7 +8,8 @@ use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecyc
 use crate::compute_pool::build_virtual_card;
 use crate::inference::{InferenceEngine, InferenceRequest};
 use crate::models::{
-    can_host_model, handle_weight_load_failure, model_weights_ready, purge_incomplete_model_weights,
+    can_host_model, catalog_model_weights_ready, handle_weight_load_failure,
+    purge_incomplete_model_weights,
     should_skip_preload, spawn_delete_staged_dirs, stage_purge_model_weights,
     sweep_staged_purge_dirs, spawn_catalog_sync,
 };
@@ -172,12 +173,7 @@ impl SessionState {
             .into_iter()
             .filter(|model| model.weights.is_some())
             .filter(|model| {
-                let runtime_model = if model.runtime_model.trim().is_empty() {
-                    model.model_id.as_str()
-                } else {
-                    model.runtime_model.as_str()
-                };
-                !model_weights_ready(runtime_model)
+                !catalog_model_weights_ready(model)
             })
             .collect()
     }
@@ -264,12 +260,7 @@ impl SessionState {
             }
         };
         for model in enabled {
-            let runtime_model = if model.runtime_model.trim().is_empty() {
-                model.model_id.as_str()
-            } else {
-                model.runtime_model.as_str()
-            };
-            if model_weights_ready(runtime_model) {
+            if catalog_model_weights_ready(model) {
                 continue;
             }
             if !can_host_model(model, &card, ram_gb, self.cpu_ram_headroom_gb) {
@@ -397,14 +388,7 @@ impl SessionState {
     fn register_model_ids(&self) -> Vec<String> {
         self.eligible_catalog_models()
             .iter()
-            .filter(|model| {
-                let runtime_model = if model.runtime_model.trim().is_empty() {
-                    model.model_id.as_str()
-                } else {
-                    model.runtime_model.as_str()
-                };
-                model_weights_ready(runtime_model)
-            })
+            .filter(|model| catalog_model_weights_ready(model))
             .map(|m| m.model_id.clone())
             .collect()
     }

@@ -1,5 +1,6 @@
 use crate::models::storage::{
-    ensure_model_dir, is_manifest_weight_file, target_gguf_path, weight_filenames,
+    catalog_model_weights_ready, ensure_model_dir, is_manifest_weight_file, target_gguf_path,
+    weight_filenames,
 };
 use crate::protocol::{CatalogModel, ModelWeights};
 use anyhow::{bail, Context, Result};
@@ -248,6 +249,17 @@ pub async fn download_catalog_model(
     let Some(weights) = model.weights.as_ref() else {
         return Ok(());
     };
+    if catalog_model_weights_ready(model) {
+        info!(
+            "model already cached for {}",
+            if model.runtime_model.trim().is_empty() {
+                model.model_id.as_str()
+            } else {
+                model.runtime_model.as_str()
+            }
+        );
+        return Ok(());
+    }
     let runtime_model = if model.runtime_model.trim().is_empty() {
         model.model_id.as_str()
     } else {

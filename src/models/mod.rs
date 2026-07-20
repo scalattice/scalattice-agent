@@ -11,7 +11,8 @@ pub use health::{
     spawn_delete_staged_dirs, stage_purge_model_weights, sweep_staged_purge_dirs,
 };
 pub use storage::{
-    list_cached_runtime_models, list_model_disk_status, model_weights_ready, models_cache_disk_gb,
-    models_dir, purge_incomplete_model_weights, resolve_model_gguf, ModelDiskStatus,
+    catalog_model_weights_ready, list_cached_runtime_models, list_model_disk_status,
+    models_cache_disk_gb, models_dir, purge_incomplete_model_weights, resolve_model_gguf,
+    ModelDiskStatus,
 };
 pub use sync::spawn_catalog_sync;

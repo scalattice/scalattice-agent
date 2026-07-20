@@ -17,8 +17,84 @@ pub fn runtime_cache_key(runtime_model: &str) -> String {
     runtime_model.replace('/', "__")
 }
 
+fn find_cache_dirs_case_insensitive(runtime_model: &str) -> Vec<PathBuf> {
+    let want = runtime_cache_key(runtime_model).to_ascii_lowercase();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(models_dir()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.to_ascii_lowercase() == want {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn dir_has_complete_manifest_weights(dir: &Path) -> bool {
+    let raw = match std::fs::read_to_string(dir.join("manifest.json")) {
+        Ok(raw) => raw,
+        Err(_) => return false,
+    };
+    let Some(filenames) = manifest_filenames(&raw) else {
+        return false;
+    };
+    filenames.iter().all(|filename| {
+        let basename = Path::new(filename)
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(filename));
+        is_download_complete(&dir.join(basename))
+    })
+}
+
+fn pick_best_cache_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return candidates.first().cloned();
+    }
+    let mut best: Option<(PathBuf, bool, u64)> = None;
+    for candidate in candidates {
+        let ready = dir_has_complete_manifest_weights(candidate);
+        let bytes = dir_size_bytes(candidate);
+        let replace = match &best {
+            None => true,
+            Some((_, best_ready, best_bytes)) => {
+                ready && !*best_ready || (ready == *best_ready && bytes > *best_bytes)
+            }
+        };
+        if replace {
+            best = Some((candidate.clone(), ready, bytes));
+        }
+    }
+    best.map(|(path, _, _)| path)
+}
+
+/// Cache directory for a runtime model. Reuses an existing on-disk folder even when
+/// casing differs (common after reconnect / older agent builds). When both a
+/// canonical and a case-variant folder exist, prefer the one with complete weights.
 pub fn model_cache_dir(runtime_model: &str) -> PathBuf {
-    models_dir().join(runtime_cache_key(runtime_model))
+    let canonical = models_dir().join(runtime_cache_key(runtime_model));
+    let mut candidates = find_cache_dirs_case_insensitive(runtime_model);
+    if canonical.is_dir() && !candidates.iter().any(|path| path == &canonical) {
+        candidates.push(canonical.clone());
+    }
+    if let Some(best) = pick_best_cache_dir(&candidates) {
+        return best;
+    }
+    canonical
 }
 
 pub fn model_manifest_path(runtime_model: &str) -> PathBuf {
@@ -51,6 +127,111 @@ pub fn read_manifest_filenames(runtime_model: &str) -> Option<Vec<String>> {
     manifest_filenames(&raw)
 }
 
+fn runtime_id_for_catalog(model: &crate::protocol::CatalogModel) -> &str {
+    if model.runtime_model.trim().is_empty() {
+        model.model_id.as_str()
+    } else {
+        model.runtime_model.as_str()
+    }
+}
+
+fn migrate_cache_dir_alias(from_runtime: &str, to_runtime: &str) {
+    let from = model_cache_dir(from_runtime);
+    let to_key = runtime_cache_key(to_runtime);
+    let to = models_dir().join(&to_key);
+    if !from.is_dir() || from == to {
+        return;
+    }
+    if to.is_dir() {
+        // Prefer keeping the complete install; drop an empty/partial duplicate alias.
+        if dir_has_complete_manifest_weights(&to) {
+            return;
+        }
+        if dir_has_complete_manifest_weights(&from) {
+            let _ = std::fs::remove_dir_all(&to);
+        } else {
+            return;
+        }
+    }
+    match std::fs::rename(&from, &to) {
+        Ok(()) => tracing::info!(
+            from = %from_runtime,
+            to = %to_runtime,
+            "migrated model cache folder to canonical runtime path"
+        ),
+        Err(err) => tracing::warn!(
+            from = %from_runtime,
+            to = %to_runtime,
+            error = %err,
+            "could not migrate model cache folder; will keep using alias path"
+        ),
+    }
+}
+
+/// Rewrite manifest to the on-disk GGUF when catalog filename drifted but weights are intact.
+fn adopt_existing_gguf(runtime_model: &str, weights: &crate::protocol::ModelWeights) -> bool {
+    let dir = model_cache_dir(runtime_model);
+    if !dir.is_dir() {
+        return false;
+    }
+    let wanted = Path::new(weights.filename.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(weights.filename.trim());
+    if wanted.is_empty() {
+        return false;
+    }
+    let wanted_path = dir.join(wanted);
+    if is_download_complete(&wanted_path) {
+        return write_adopted_manifest(runtime_model, weights, wanted).is_ok()
+            && model_weights_ready(runtime_model);
+    }
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let mut ggufs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("gguf") && is_download_complete(path)
+        })
+        .collect();
+    if ggufs.len() != 1 {
+        return false;
+    }
+    let existing = ggufs.remove(0);
+    let Some(existing_name) = existing.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    tracing::info!(
+        runtime_model = %runtime_model,
+        existing = %existing_name,
+        catalog = %wanted,
+        "adopting existing GGUF after catalog filename change"
+    );
+    write_adopted_manifest(runtime_model, weights, existing_name).is_ok()
+        && model_weights_ready(runtime_model)
+}
+
+fn write_adopted_manifest(
+    runtime_model: &str,
+    weights: &crate::protocol::ModelWeights,
+    filename: &str,
+) -> std::io::Result<()> {
+    let dir = ensure_model_dir(runtime_model)?;
+    let body = serde_json::json!({
+        "source": weights.source,
+        "repo": weights.repo,
+        "filename": filename,
+        // Adopted installs are single-file; companions from a newer catalog may not exist yet.
+        "companionFilenames": Vec::<String>::new(),
+        "revision": weights.revision,
+        "mirrorUrl": weights.mirror_url,
+    });
+    std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&body)?)
+}
+
 pub fn model_weights_ready(runtime_model: &str) -> bool {
     if matches!(
         read_weight_health(runtime_model).as_ref().map(|(s, _)| s.as_str()),
@@ -64,6 +245,36 @@ pub fn model_weights_ready(runtime_model: &str) -> bool {
     filenames
         .iter()
         .all(|filename| is_manifest_weight_file(runtime_model, &target_gguf_path(runtime_model, filename)))
+}
+
+/// True when weights are ready under the HF runtime id, a legacy modelId cache folder,
+/// or an existing GGUF whose catalog filename merely drifted.
+pub fn catalog_model_weights_ready(model: &crate::protocol::CatalogModel) -> bool {
+    let runtime = runtime_id_for_catalog(model);
+    if model_weights_ready(runtime) {
+        return true;
+    }
+    let model_id = model.model_id.trim();
+    if !model_id.is_empty() && !model_id.eq_ignore_ascii_case(runtime) {
+        if model_weights_ready(model_id) {
+            migrate_cache_dir_alias(model_id, runtime);
+            if model_weights_ready(runtime) || model_weights_ready(model_id) {
+                return true;
+            }
+        }
+    }
+    if let Some(weights) = model.weights.as_ref() {
+        if adopt_existing_gguf(runtime, weights) {
+            return true;
+        }
+        if !model_id.is_empty() && !model_id.eq_ignore_ascii_case(runtime) {
+            if adopt_existing_gguf(model_id, weights) {
+                migrate_cache_dir_alias(model_id, runtime);
+                return model_weights_ready(runtime) || model_weights_ready(model_id);
+            }
+        }
+    }
+    false
 }
 
 pub fn resolve_model_gguf(runtime_model: &str) -> Option<PathBuf> {
@@ -180,7 +391,26 @@ pub fn list_model_disk_status() -> Vec<(String, ModelDiskStatus)> {
             },
         ));
     }
-    out
+
+    // Collapse case-variant folders (qwen__… vs Qwen__…) into one inventory row.
+    let mut deduped: Vec<(String, ModelDiskStatus)> = Vec::new();
+    for (runtime, status) in out {
+        let key = runtime.to_ascii_lowercase();
+        if let Some(slot) = deduped
+            .iter_mut()
+            .find(|(runtime, _)| runtime.to_ascii_lowercase() == key)
+        {
+            let replace = status.complete && !slot.1.complete
+                || (status.complete == slot.1.complete && status.bytes > slot.1.bytes)
+                || (status.state == "corrupt" && slot.1.state != "corrupt" && !slot.1.complete);
+            if replace {
+                *slot = (runtime, status);
+            }
+            continue;
+        }
+        deduped.push((runtime, status));
+    }
+    deduped
 }
 
 pub fn list_cached_runtime_models() -> Vec<String> {
@@ -188,19 +418,25 @@ pub fn list_cached_runtime_models() -> Vec<String> {
         return Vec::new();
     };
 
-    entries
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| {
-            let cache_key = entry.file_name().into_string().ok()?;
-            let runtime_model = cache_key.replace("__", "/");
-            if model_weights_ready(&runtime_model) {
-                Some(runtime_model)
-            } else {
-                None
-            }
-        })
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(cache_key) = entry.file_name().into_string() else {
+            continue;
+        };
+        let runtime_model = cache_key.replace("__", "/");
+        if !model_weights_ready(&runtime_model) {
+            continue;
+        }
+        let key = runtime_model.to_ascii_lowercase();
+        if out.iter().any(|existing| existing.to_ascii_lowercase() == key) {
+            continue;
+        }
+        out.push(runtime_model);
+    }
+    out
 }
 
 pub fn ensure_model_dir(runtime_model: &str) -> std::io::Result<PathBuf> {
