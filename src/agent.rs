@@ -272,8 +272,8 @@ impl SessionState {
                 warn!(
                     "model {} cannot run on this machine (needs {} GB VRAM / {} GB RAM; virtual card has {} GB VRAM, {} GB RAM)",
                     model.model_id,
-                    model.min_vram_gb.unwrap_or(0),
-                    model.min_ram_gb.unwrap_or(0),
+                    model.min_vram_gb.unwrap_or(0.0),
+                    model.min_ram_gb.unwrap_or(0.0),
                     card.total_vram_gb,
                     ram_gb
                 );

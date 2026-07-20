@@ -35,11 +35,11 @@ pub struct CatalogModel {
     #[serde(default)]
     pub regions: Vec<String>,
     #[serde(rename = "weightSizeGb", default)]
-    pub weight_size_gb: Option<u32>,
+    pub weight_size_gb: Option<f64>,
     #[serde(rename = "minVramGb", default)]
-    pub min_vram_gb: Option<u32>,
+    pub min_vram_gb: Option<f64>,
     #[serde(rename = "minRamGb", default)]
-    pub min_ram_gb: Option<u32>,
+    pub min_ram_gb: Option<f64>,
     #[serde(default)]
     pub weights: Option<ModelWeights>,
 }
