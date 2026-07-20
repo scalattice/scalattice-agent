@@ -5,7 +5,7 @@ mod health;
 mod storage;
 mod sync;
 
-pub use capacity::can_host_model;
+pub use capacity::{can_host_model, DEFAULT_CPU_RAM_HEADROOM_GB};
 pub use health::{
     clear_weight_health, handle_weight_load_failure, process_preload_paused, should_skip_preload,
     spawn_delete_staged_dirs, stage_purge_model_weights, sweep_staged_purge_dirs,

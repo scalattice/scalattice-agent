@@ -71,7 +71,7 @@ impl SessionState {
             compute_policy: Vec::new(),
             model_policy: Vec::new(),
             max_completion_tokens: 1024,
-            cpu_ram_headroom_gb: crate::models::capacity::DEFAULT_CPU_RAM_HEADROOM_GB,
+            cpu_ram_headroom_gb: crate::models::DEFAULT_CPU_RAM_HEADROOM_GB,
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
