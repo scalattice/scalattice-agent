@@ -96,10 +96,17 @@ pub struct ReadyMessage {
     pub enabled_models: Vec<ModelPolicyEntry>,
     #[serde(rename = "maxCompletionTokens", default)]
     pub max_completion_tokens: u32,
+    /// Extra system RAM (GB) beyond weight size for CPU / offload fit checks.
+    #[serde(rename = "cpuRamHeadroomGb", default = "default_cpu_ram_headroom_gb")]
+    pub cpu_ram_headroom_gb: u32,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
     #[serde(default)]
     pub schedule: AgentSchedule,
+}
+
+fn default_cpu_ram_headroom_gb() -> u32 {
+    2
 }
 
 #[derive(Debug, Deserialize)]

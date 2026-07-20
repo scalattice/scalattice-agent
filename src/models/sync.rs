@@ -12,6 +12,7 @@ pub fn spawn_catalog_sync(
     catalog: Vec<CatalogModel>,
     card: VirtualCard,
     ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
     agent_token: String,
     hf_token: Option<String>,
     cancel: Arc<AtomicBool>,
@@ -43,14 +44,15 @@ pub fn spawn_catalog_sync(
                 purge_incomplete_model_weights(runtime_model);
                 continue;
             }
-            if !can_host_model(&model, &card, ram_gb) {
+            if !can_host_model(&model, &card, ram_gb, cpu_ram_headroom_gb) {
                 info!(
-                    "skipping {}: needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM)",
+                    "skipping {}: needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM, headroom {} GB)",
                     model.model_id,
                     model.min_vram_gb.unwrap_or(0.0),
                     model.min_ram_gb.unwrap_or(0.0),
                     card.total_vram_gb,
-                    ram_gb
+                    ram_gb,
+                    cpu_ram_headroom_gb
                 );
                 continue;
             }

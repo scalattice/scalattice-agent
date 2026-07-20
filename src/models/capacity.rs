@@ -9,11 +9,21 @@ fn gb_ceil(v: Option<f64>) -> u32 {
     n.ceil().min(u32::MAX as f64) as u32
 }
 
+/// Default when an older server omits `cpuRamHeadroomGb` on ready.
+pub const DEFAULT_CPU_RAM_HEADROOM_GB: u32 = 2;
+
 /// Whether this machine can download and serve a catalog model on its virtual compute card.
-pub fn can_host_model(model: &CatalogModel, card: &VirtualCard, ram_gb: u32) -> bool {
+/// `cpu_ram_headroom_gb` comes from the server (`ready.cpuRamHeadroomGb`).
+pub fn can_host_model(
+    model: &CatalogModel,
+    card: &VirtualCard,
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+) -> bool {
     let min_vram = gb_ceil(model.min_vram_gb);
     let min_ram = gb_ceil(model.min_ram_gb);
     let weight_gb = gb_ceil(model.weight_size_gb);
+    let ram_needed = weight_gb.saturating_add(cpu_ram_headroom_gb).max(min_ram);
 
     // Fits entirely on GPU VRAM.
     if min_vram > 0 && card.total_vram_gb >= min_vram {
@@ -28,13 +38,12 @@ pub fn can_host_model(model: &CatalogModel, card: &VirtualCard, ram_gb: u32) -> 
             PoolStrategy::GpuWithCpuOffload | PoolStrategy::Single
         )
     {
-        let ram_needed = weight_gb.saturating_add(8).max(min_ram);
         return ram_gb >= ram_needed;
     }
 
     // CPU-only inference.
     if card.strategy == PoolStrategy::CpuOnly {
-        return ram_gb >= weight_gb.saturating_add(8).max(min_ram);
+        return ram_gb >= ram_needed;
     }
 
     false

@@ -46,6 +46,8 @@ struct SessionState {
     model_policy: Vec<(String, bool)>,
     /// Platform-wide completion ceiling from policy (same on every machine).
     max_completion_tokens: u32,
+    /// Server-controlled RAM headroom for CPU / offload fit (from ready).
+    cpu_ram_headroom_gb: u32,
     job_state: JobState,
     active_job_id: Option<String>,
     active_model_id: Option<String>,
@@ -69,6 +71,7 @@ impl SessionState {
             compute_policy: Vec::new(),
             model_policy: Vec::new(),
             max_completion_tokens: 1024,
+            cpu_ram_headroom_gb: crate::models::capacity::DEFAULT_CPU_RAM_HEADROOM_GB,
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
@@ -232,6 +235,7 @@ impl SessionState {
             pending,
             card,
             ram_gb,
+            self.cpu_ram_headroom_gb,
             agent_token.to_string(),
             token,
             self.download_cancel.clone(),
@@ -268,7 +272,7 @@ impl SessionState {
             if model_weights_ready(runtime_model) {
                 continue;
             }
-            if !can_host_model(model, &card, ram_gb) {
+            if !can_host_model(model, &card, ram_gb, self.cpu_ram_headroom_gb) {
                 warn!(
                     "model {} cannot run on this machine (needs {} GB VRAM / {} GB RAM; virtual card has {} GB VRAM, {} GB RAM)",
                     model.model_id,
@@ -385,7 +389,7 @@ impl SessionState {
         self.catalog
             .iter()
             .filter(|model| self.is_model_enabled(&model.model_id))
-            .filter(|model| can_host_model(model, &card, ram_gb))
+            .filter(|model| can_host_model(model, &card, ram_gb, self.cpu_ram_headroom_gb))
             .cloned()
             .collect()
     }
@@ -508,7 +512,7 @@ impl SessionState {
             .into_iter()
             // Count models that need more VRAM than the enabled pool, even when weights
             // are already on disk (e.g. provider disabled the GPU they require).
-            .filter(|model| !can_host_model(model, &card, ram_gb))
+            .filter(|model| !can_host_model(model, &card, ram_gb, self.cpu_ram_headroom_gb))
             .count()
     }
 
@@ -833,6 +837,7 @@ async fn handle_server_message(
                         guard.apply_compute_devices(&ready.compute_devices);
                         guard.apply_model_policy(&ready.enabled_models);
                         guard.apply_max_completion_tokens(ready.max_completion_tokens);
+                        guard.cpu_ram_headroom_gb = ready.cpu_ram_headroom_gb;
                         guard.catalog = ready.catalog.clone();
                         guard.last_sync_token = None;
                         let transition = guard.apply_schedule(ready.schedule.clone());
