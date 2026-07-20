@@ -63,7 +63,9 @@ pub struct ComputeDevicePolicy {
 pub struct AgentSchedule {
     #[serde(rename = "acceptingJobs", default = "default_true")]
     pub accepting_jobs: bool,
+    /// Server schedule mode label (kept for wire compat; agent uses acceptingJobs / minutes).
     #[serde(rename = "scheduleMode", default)]
+    #[allow(dead_code)]
     pub schedule_mode: String,
     #[serde(rename = "minutesUntilEarning", default)]
     pub minutes_until_earning: Option<u32>,

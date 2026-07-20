@@ -81,7 +81,8 @@ pub fn pipe_log_lines(reader: impl std::io::Read, verbose: bool) -> anyhow::Resu
     Ok(())
 }
 
-/// Filter a multi-line log chunk for the Simplified view.
+/// Filter a multi-line log chunk for the Simplified view (Windows tray Live log).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn simplify_log_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() / 2);
     for line in raw.lines() {

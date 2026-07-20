@@ -77,14 +77,6 @@ pub fn update_connection_state(
     write_state(&state);
 }
 
-pub fn touch_connection_state() {
-    let Some(mut state) = read_state() else {
-        return;
-    };
-    state.updated_at_ms = now_ms();
-    write_state(&state);
-}
-
 pub fn mark_disconnected(error: Option<String>) {
     if state_file_path().is_none() {
         return;

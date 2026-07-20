@@ -253,33 +253,3 @@ pub async fn warm_cached_models(pool: &VirtualCard, runtime_models: &[String]) -
     .await
     .context("model preload task failed")?
 }
-
-/// Optional health check: ping each CUDA device in the pool (no-op when unavailable).
-pub async fn warm_pool_devices(pool: &VirtualCard) -> Result<()> {
-    if pool.cuda_device_ids.is_empty() {
-        return Ok(());
-    }
-    let Some(smi) = crate::specs::resolve_nvidia_smi() else {
-        return Ok(());
-    };
-    for index in &pool.cuda_device_ids {
-        let mut cmd = std::process::Command::new(&smi);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let _ = cmd
-            .args([
-                "-i",
-                &index.to_string(),
-                "--query-gpu=utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    Ok(())
-}

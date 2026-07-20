@@ -319,7 +319,8 @@ fn nvidia_smi_bins() -> Vec<String> {
     }
 }
 
-/// First working `nvidia-smi` for diagnostics / warm-pool (absolute path preferred).
+/// First working `nvidia-smi` for diagnostics (absolute path preferred).
+#[allow(dead_code)]
 pub fn resolve_nvidia_smi() -> Option<String> {
     for bin in nvidia_smi_bins() {
         if bin != "nvidia-smi"
@@ -896,14 +897,6 @@ pub fn detect_ram_used_gb() -> Option<u32> {
     {
         None
     }
-}
-
-pub fn detect_disk_total_gb() -> Option<u32> {
-    disk_usage_gb()?.0
-}
-
-pub fn detect_disk_used_gb() -> Option<u32> {
-    disk_usage_gb()?.1
 }
 
 fn bytes_to_gb(bytes: u64) -> u32 {

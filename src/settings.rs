@@ -80,10 +80,12 @@ impl UserSettings {
         }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn should_check_for_update(&self) -> bool {
         self.seconds_until_update_check() == 0
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn seconds_until_update_check(&self) -> u64 {
         let jitter = self.update_daily_jitter_secs.max(1) as u64;
         let now = unix_now();
@@ -108,6 +110,7 @@ impl UserSettings {
     /// Returns true when auto-install is allowed for `latest_version`.
     /// Blocks repeats of the same target within 12 hours so closing setup
     /// without finishing cannot reopen the installer in a loop.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn should_auto_install(&self, latest_version: &str) -> bool {
         let latest = latest_version.trim();
         if latest.is_empty() {
@@ -122,6 +125,7 @@ impl UserSettings {
         true
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn mark_auto_update_attempt(&mut self, latest_version: &str) {
         self.last_auto_update_attempt_version = latest_version.trim().to_string();
         self.last_auto_update_attempt_unix = unix_now();

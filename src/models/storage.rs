@@ -1,5 +1,5 @@
 use crate::models::health::{
-    is_purging_cache_key, read_weight_health, runtime_from_purging_cache_key, stage_purge_model_weights,
+    is_purging_cache_key, read_weight_health, runtime_from_purging_cache_key,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -272,17 +272,5 @@ pub fn purge_incomplete_model_weights(runtime_model: &str) {
         if path.is_file() && !is_manifest_weight_file(runtime_model, &path) {
             let _ = std::fs::remove_file(&path);
         }
-    }
-}
-
-pub fn purge_model_weights(runtime_model: &str) {
-    // Prefer rename-then-delete so dashboard inventory clears immediately.
-    if let Some(trash) = stage_purge_model_weights(runtime_model) {
-        crate::models::health::spawn_delete_staged_dirs(vec![trash]);
-        return;
-    }
-    let dir = model_cache_dir(runtime_model);
-    if dir.is_dir() {
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

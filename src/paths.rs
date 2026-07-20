@@ -154,9 +154,6 @@ pub fn init_windows_native_search_path() {
     let _ = std::env::set_var("PATH", format!("{prefix};{current}"));
 }
 
-#[cfg(not(windows))]
-pub fn init_windows_native_search_path() {}
-
 mod which {
     use std::path::PathBuf;
     use std::process::Command;
@@ -204,12 +201,6 @@ mod which {
             Ok(PathBuf::from(path))
         }
     }
-}
-
-pub fn is_dir_empty(path: &Path) -> bool {
-    std::fs::read_dir(path)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(false)
 }
 
 pub fn remove_path_quiet(path: &Path) {

@@ -211,13 +211,6 @@ pub fn with_loaded_model_timed<R>(
     }
 }
 
-pub fn evict_model(model_path: &Path, pool: &VirtualCard) {
-    let key = cache_key(model_path, pool);
-    if let Ok(mut guard) = cache().lock() {
-        guard.remove(&key);
-    }
-}
-
 pub fn evict_all() {
     if let Ok(mut guard) = cache().lock() {
         guard.clear();

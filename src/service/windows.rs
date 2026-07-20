@@ -32,10 +32,12 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     ensure_background_task(config, false)
 }
 
+#[allow(dead_code)]
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     force_restart_background(config, true)
 }
 
+#[allow(dead_code)]
 pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
     ensure_background_task(config, false)
 }
