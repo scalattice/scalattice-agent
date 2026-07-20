@@ -438,7 +438,7 @@ impl TrayApp {
         }
         self.update_busy = true;
         self.update_notice =
-            "Downloading Scalattice setup. The installer will open next - this panel will close."
+            "Downloading update… Scalattice will restart in the background when ready."
                 .to_string();
         self.action_message.clear();
         let _ = self.update_cmd_tx.send(UpdateWorkerCmd::Install);
@@ -781,7 +781,7 @@ impl eframe::App for TrayApp {
                         let prev_settings = self.settings.clone();
                         ui.checkbox(
                             &mut self.settings.auto_update,
-                            "Automatically install updates",
+                            "Automatically install updates in the background",
                         );
                         self.save_settings_if_needed(&prev_settings);
 

@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 const INSTALLER_NAME: &str = "ScalatticeAgentSetup-x86_64.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// Detach so the setup UI stays up after this process exits.
+/// Detach so setup keeps running after this process exits.
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
@@ -42,8 +42,8 @@ pub async fn install_latest_update() -> Result<()> {
         info.latest_version
     );
     let installer = download_setup(&info.latest_tag).await?;
-    println!("Opening Scalattice setup. Finish the installer to complete the update.");
-    spawn_setup_and_exit(&installer)?;
+    println!("Installing update silently in the background…");
+    spawn_silent_setup_and_exit(&installer)?;
     Ok(())
 }
 
@@ -69,18 +69,19 @@ fn update_setup_path(tag: &str) -> Result<PathBuf> {
     Ok(base.join(safe_tag).join(INSTALLER_NAME))
 }
 
-/// Launch the official setup wizard, then exit so it can replace running files.
-pub fn spawn_setup_and_exit(installer: &Path) -> Result<()> {
+/// Launch Inno Setup with no UI. The ISS already handles `/UPDATE=1` and `WizardSilent`:
+/// skip device/token pages, replace files, then `scalattice-agent restart`.
+pub fn spawn_silent_setup_and_exit(installer: &Path) -> Result<()> {
     if !installer.is_file() {
         anyhow::bail!("setup missing at {}", installer.display());
     }
 
-    let installer_arg = installer.display().to_string();
     let mut args = vec![
-        "/C".to_string(),
-        "start".to_string(),
-        String::new(), // empty title so `start` does not treat the path as a title
-        installer_arg,
+        "/VERYSILENT".to_string(),
+        "/SUPPRESSMSGBOXES".to_string(),
+        "/NORESTART".to_string(),
+        "/CLOSEAPPLICATIONS".to_string(),
+        "/UPDATE=1".to_string(),
     ];
     if let Some(token) = crate::config::read_saved_agent_token() {
         let token = token.trim();
@@ -89,16 +90,15 @@ pub fn spawn_setup_and_exit(installer: &Path) -> Result<()> {
         }
     }
 
-    // `cmd /C start "" setup.exe …` detaches a visible setup window reliably.
-    Command::new("cmd.exe")
+    Command::new(installer)
         .args(&args)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("launch setup {}", installer.display()))?;
+        .with_context(|| format!("launch silent setup {}", installer.display()))?;
 
-    // Exit this process (CLI or tray). Setup closes any remaining agent processes itself.
+    // Exit this process (CLI or tray) so setup can replace locked files.
     std::process::exit(0);
 }
