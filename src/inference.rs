@@ -107,6 +107,23 @@ impl InferenceEngine {
         })
     }
 
+    /// Best-effort load of model weights so a following split upper can skip cold start.
+    pub async fn invoke_split_warm(&self, runtime_model: &str) -> Result<()> {
+        let model_path = resolve_model_gguf(runtime_model).with_context(|| {
+            format!(
+                "model weights not found for {} in {}",
+                runtime_model,
+                models_dir().display()
+            )
+        })?;
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || preload_model(&model_path, &pool))
+            .await
+            .context("split warm task failed")?
+            .context("split warm preload failed")?;
+        Ok(())
+    }
+
     pub async fn invoke(&self, req: InferenceRequest<'_>) -> Result<InferenceResult> {
         let model_path = resolve_model_gguf(req.runtime_model)
             .with_context(|| {

@@ -1137,6 +1137,23 @@ async fn respond_invoke_split(
                 Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
                 }
             }
+            "warm" => match engine.invoke_split_warm(&invoke.runtime_model).await {
+                Ok(()) => {
+                    let result = crate::protocol::InvokeSplitResultMessage {
+                        kind: "invoke_split_result",
+                        id: invoke.id,
+                        state_b64: String::new(),
+                        content: String::new(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                    };
+                    write
+                        .send(Message::Text(serde_json::to_string(&result)?))
+                        .await?;
+                    Ok(())
+                }
+                Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
+            },
             other => {
                 let err = InvokeErrorMessage {
                     kind: "invoke_error",

@@ -81,6 +81,14 @@ impl VramLifecycleState {
         }
 
         if !self.schedule.earning_soon(config) {
+            // Off-schedule: free VRAM, but keep a post-job grace so debug / probes
+            // aren't immediately cold-started again on the next request.
+            if let Some(finished) = self.last_job_finished_at {
+                let now = Instant::now();
+                if now.duration_since(finished) < Duration::from_secs(config.post_job_idle_secs) {
+                    return VramTickAction::None;
+                }
+            }
             return VramTickAction::EvictVram;
         }
 
