@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://scalattice.com/resources/images/marketing/earth.png" alt="Scalattice" width="1500" height="500">
+</p>
+
 # Scalattice Agent
 
 Open-source GPU agent for the [Scalattice](https://scalattice.com) inference network,
