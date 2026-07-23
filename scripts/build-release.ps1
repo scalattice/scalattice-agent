@@ -51,6 +51,9 @@ if ($env:CUDA_PATH) {
     $env:PATH = "$($env:CUDA_PATH)\bin;$env:PATH"
 }
 
+# win-gpu includes Vulkan; llama.cpp needs glslc from the LunarG SDK on this machine only.
+Import-VulkanSdkEnv
+
 $clang = Find-LibClangDir
 if (-not $clang) {
     Write-Error "libclang.dll not found - run scripts\setup-windows-build.cmd"
@@ -61,7 +64,7 @@ Set-CmakeNinjaMsvcEnv
 Set-ShortCargoTargetDir
 Set-WindowsBuildParallelism -Jobs 4
 
-# win-gpu replaces default gpu (which includes vulkan); do not add to defaults
+# win-gpu = CUDA + Vulkan (replaces default Linux `gpu` feature set on Windows CI)
 # Delay-load nvcuda.dll so the agent can start without an NVIDIA driver (CPU-only).
 # build.rs also sets this when CARGO_FEATURE_CUDA is on; keep RUSTFLAGS as a belt-and-suspenders.
 $delayLoad = "/DELAYLOAD:nvcuda.dll"

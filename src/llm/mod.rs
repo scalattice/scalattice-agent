@@ -1,4 +1,5 @@
 mod embedded;
+mod ggml_devices;
 mod model_cache;
 mod prompt;
 mod split;

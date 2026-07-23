@@ -43,15 +43,19 @@ Releases are self-contained binaries (plus bundled runtime libraries where allow
 
 ### Hardware support
 
-Release builds include **CUDA** (NVIDIA) and **Vulkan** (AMD/Intel/ARM) backends on Linux. Windows releases use **CUDA only** (NVIDIA).
+Release builds include **CUDA** (NVIDIA) and **Vulkan** (AMD/Intel/ARM) on Linux and Windows.
 
 | Hardware | What the host needs |
 |----------|---------------------|
 | NVIDIA GTX/RTX | NVIDIA driver installed (`nvidia-smi` works) |
-| AMD / Intel GPU | Vendor Vulkan ICD (Linux releases only) |
+| AMD / Intel GPU | Vendor Vulkan ICD (AMD Adrenalin / Intel graphics driver). **ROCm is not required.** Discrete AMD/Intel are detected on Linux (`lspci`) and Windows (Win32 video controllers) and run through Vulkan when enabled in the Providers dashboard. |
 | CPU only | Nothing extra — the agent connects; inference uses the CPU backend |
 
-NVIDIA’s `libcuda.so` cannot be redistributed. Machines without a GPU driver still run the agent; GPU inference activates when the driver is present.
+When both NVIDIA and AMD/Intel are enabled, the agent prefers **CUDA**. AMD/Intel-only pools use the same load cascade as NVIDIA (`gpu-full` → offload → CPU). Check agent logs for `Vulkan pool: pinning ggml backend device(s)`.
+
+Do **not** redistribute `vulkan-1.dll` — providers get it from their GPU driver. Build machines need the [Vulkan SDK](https://vulkan.lunarg.com/) (for `glslc` only).
+
+NVIDIA’s `libcuda.so` / `nvcuda.dll` cannot be redistributed. Machines without a GPU driver still run the agent; GPU inference activates when the driver is present.
 
 ## Quick start
 
@@ -94,11 +98,12 @@ cargo build --release --no-default-features --features arm-gpu
 ```
 
 ```powershell
-# x86_64 Windows (NVIDIA CUDA) — run in PowerShell
+# x86_64 Windows (NVIDIA CUDA + AMD/Intel Vulkan) — run in PowerShell
+# Requires Vulkan SDK on the build machine (glslc). Providers do not need the SDK.
 .\scripts\build-release.ps1
 ```
 
-CI release binaries: **CUDA + Vulkan** on x86_64 and aarch64 Linux; **CUDA only** on x86_64 Windows.
+CI release binaries: **CUDA + Vulkan** on x86_64/aarch64 Linux and x86_64 Windows.
 
 ## Community
 

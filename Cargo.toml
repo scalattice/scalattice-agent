@@ -47,8 +47,8 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 default = ["gpu"]
 # x86_64 Linux: NVIDIA CUDA + AMD/Intel Vulkan; release bundles non-driver .so deps
 gpu = ["cuda", "vulkan"]
-# Windows release: CUDA only (vulkan-shaders-gen is unreliable in MSVC/CI)
-win-gpu = ["cuda"]
+# Windows release: CUDA + Vulkan (AMD/Intel). Needs Vulkan SDK on the build host (glslc).
+win-gpu = ["cuda", "vulkan"]
 # aarch64 native: NVIDIA CUDA + Vulkan (Jetson, Graviton, Mali, Adreno)
 arm-gpu = ["cuda", "vulkan"]
 cuda = ["llama-cpp-2/cuda"]

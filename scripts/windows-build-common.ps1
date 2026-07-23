@@ -834,6 +834,41 @@ function Find-Nvcc {
     return $null
 }
 
+# LunarG Vulkan SDK root (contains Bin\glslc.exe). Used only on the build host.
+function Find-VulkanSdkRoot {
+    if ($env:VULKAN_SDK -and (Test-Path (Join-Path $env:VULKAN_SDK "Bin\glslc.exe"))) {
+        return $env:VULKAN_SDK
+    }
+    $root = "C:\VulkanSDK"
+    if (-not (Test-Path $root)) { return $null }
+    $latest = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        Where-Object { Test-Path (Join-Path $_.FullName "Bin\glslc.exe") } |
+        Select-Object -First 1
+    if ($latest) { return $latest.FullName }
+    return $null
+}
+
+function Import-VulkanSdkEnv {
+    $sdk = Find-VulkanSdkRoot
+    if (-not $sdk) {
+        Write-Error @"
+Vulkan SDK not found (need Bin\glslc.exe for win-gpu Vulkan builds).
+
+Install from https://vulkan.lunarg.com/ — Core components only is enough.
+Default folder: C:\VulkanSDK\<version>
+Then open a new PowerShell and re-run the build.
+"@
+    }
+    $env:VULKAN_SDK = $sdk
+    $bin = Join-Path $sdk "Bin"
+    $env:PATH = "$bin;$env:PATH"
+    $glslc = Join-Path $bin "glslc.exe"
+    $env:Vulkan_GLSLC_EXECUTABLE = $glslc
+    Write-Host "==> Vulkan SDK: $sdk"
+    Write-Host "    glslc: $glslc"
+}
+
 function Install-CudaToolkit {
     $existing = Find-Nvcc
     if ($existing) {

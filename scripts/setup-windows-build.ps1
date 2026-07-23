@@ -78,4 +78,6 @@ if (-not $nvcc) {
 Write-Host ""
 Write-Host "==> Windows build host ready."
 Write-Host "    CUDA:  $nvcc"
+Write-Host "    Also install Vulkan SDK (build host only): https://vulkan.lunarg.com/"
+Write-Host "    Core components only — providers do not need the SDK."
 Write-Host "    Next:  scripts\install-windows-runner.cmd"

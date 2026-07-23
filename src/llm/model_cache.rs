@@ -3,10 +3,12 @@
 //! Small GPUs (≤8 GB) only keep one model resident. Warming or switching without
 //! eviction was causing cudaMalloc OOM on context create when a prior 7B stayed in VRAM.
 //!
-//! Every CUDA pool tries full use of all enabled GPUs first. If weight load or
-//! context/KV alloc OOMs, we walk:
-//!   gpu-full → gpu-offload → gpu-offload-reduced → cpu-only
-//! Size cutoffs are not used for placement — cascade failure is the safety net.
+//! Every CUDA / Vulkan pool tries the safest placement first. If weight load or
+//! context/KV alloc OOMs *and returns an error*, we walk:
+//!   [gpu-full if it fits] → gpu-offload → gpu-offload-reduced → cpu-only
+//!
+//! `gpu-full` is skipped when on-disk weights + headroom exceed available VRAM —
+//! llama.cpp CUDA often abort()s on OOM (kills the agent) instead of returning Err.
 
 use crate::compute_pool::VirtualCard;
 use anyhow::{Context, Result};
@@ -196,11 +198,11 @@ pub fn with_loaded_model_timed<R>(
             Ok(result) => return Ok((result, model_load_ms)),
             Err(err) if is_vram_pressure(&err) => {
                 let next_tier = load_tier + 1;
-                let tier_count = load_candidate_count(pool)?;
+                let tier_count = load_candidate_count(pool, model_path)?;
                 if next_tier >= tier_count {
                     return Err(err);
                 }
-                let label = load_candidate_label(pool, next_tier)?.unwrap_or("next");
+                let label = load_candidate_label(pool, model_path, next_tier)?.unwrap_or("next");
                 warn!("context OOM; reloading via '{label}'");
                 guard.clear();
                 let (ms, new_tier) =

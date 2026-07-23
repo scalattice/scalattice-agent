@@ -85,6 +85,7 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
     let mut devices = Vec::new();
     devices.extend(detect_nvidia_devices());
     devices.extend(detect_amd_devices());
+    devices.extend(detect_pci_vulkan_discrete_devices(&devices));
     devices.extend(detect_integrated_pci_devices(&devices));
     devices.extend(detect_cpu_device());
 
@@ -577,6 +578,165 @@ fn detect_integrated_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevic
     }
 }
 
+/// Discrete AMD / Intel Arc when vendor tools are absent (Linux lspci / Windows CIM).
+fn detect_pci_vulkan_discrete_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
+    #[cfg(unix)]
+    {
+        return detect_pci_vulkan_discrete_linux(existing);
+    }
+    #[cfg(windows)]
+    {
+        return detect_pci_vulkan_discrete_windows(existing);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = existing;
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+fn detect_pci_vulkan_discrete_windows(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
+    let output = powershell_hidden(&[
+        "-Command",
+        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+    ])
+    .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let known_names: HashSet<String> = existing
+        .iter()
+        .map(|d| d.name.to_ascii_lowercase())
+        .collect();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut amd_i = 0usize;
+    let mut intel_i = 0usize;
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|raw| {
+            if known_names.contains(&raw.to_ascii_lowercase()) {
+                return None;
+            }
+            if is_integrated_pci_name(raw) || !is_discrete_vulkan_pci_name(raw) {
+                return None;
+            }
+            let lower = raw.to_ascii_lowercase();
+            let (id, name) = if lower.contains("intel") || lower.contains("arc") {
+                let id = format!("pci-intel:{intel_i}");
+                intel_i += 1;
+                (id, raw.to_string())
+            } else {
+                let id = format!("pci-amd:{amd_i}");
+                amd_i += 1;
+                (id, raw.to_string())
+            };
+            Some(ComputeDevice {
+                id,
+                kind: "discrete".to_string(),
+                name,
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn detect_pci_vulkan_discrete_linux(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
+    let output = match Command::new("lspci").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let known_names: HashSet<String> = existing
+        .iter()
+        .map(|d| d.name.to_ascii_lowercase())
+        .collect();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw_names: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if !(lower.contains("vga compatible controller")
+                || lower.contains("3d controller")
+                || lower.contains("display controller"))
+            {
+                return None;
+            }
+            let name = line
+                .split_once(':')
+                .map(|(_, rest)| rest.trim())
+                .filter(|value| !value.is_empty())?;
+            if name.eq_ignore_ascii_case("device") {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect();
+
+    let names = dedupe_pci_gpu_names(raw_names);
+    let mut amd_i = 0usize;
+    let mut intel_i = 0usize;
+    names
+        .into_iter()
+        .filter_map(|raw| {
+            if is_integrated_pci_name(&raw) || !is_discrete_vulkan_pci_name(&raw) {
+                return None;
+            }
+            let name = clean_pci_gpu_name(&raw);
+            if known_names.contains(&name.to_ascii_lowercase()) {
+                return None;
+            }
+            let lower = raw.to_ascii_lowercase();
+            let (id, kind_name) = if lower.contains("intel") || lower.contains("arc") {
+                let id = format!("pci-intel:{intel_i}");
+                intel_i += 1;
+                (id, name)
+            } else {
+                let id = format!("pci-amd:{amd_i}");
+                amd_i += 1;
+                (id, name)
+            };
+            Some(ComputeDevice {
+                id,
+                kind: "discrete".to_string(),
+                name: kind_name,
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            })
+        })
+        .collect()
+}
+
+fn is_discrete_vulkan_pci_name(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("nvidia")
+        || lower.contains("geforce")
+        || lower.contains("quadro")
+        || lower.contains("tesla")
+    {
+        return false;
+    }
+    lower.contains("amd")
+        || lower.contains("radeon")
+        || lower.contains("advanced micro devices")
+        || lower.contains("arc")
+}
+
 #[cfg(unix)]
 fn detect_integrated_linux_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
     let output = match Command::new("lspci").output() {
@@ -684,7 +844,23 @@ fn detect_integrated_windows_devices(existing: &[ComputeDevice]) -> Vec<ComputeD
 
 fn is_integrated_pci_name(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro") {
+    if lower.contains("nvidia")
+        || lower.contains("geforce")
+        || lower.contains("quadro")
+        || lower.contains("arc") // discrete Intel Arc — not iGPU
+    {
+        return false;
+    }
+    // AMD discrete (RX / Pro / XT) is not integrated; APU lines use "Radeon Graphics".
+    if (lower.contains("radeon") || lower.contains("amd"))
+        && (lower.contains(" rx")
+            || lower.contains("rx ")
+            || lower.contains("pro ")
+            || lower.contains(" xt")
+            || lower.contains("xt ")
+            || lower.contains("w ")
+            || lower.contains("instinct"))
+    {
         return false;
     }
     lower.contains("intel")
@@ -1072,9 +1248,34 @@ mod tests {
         assert!(is_integrated_pci_name(
             "Intel Corporation UHD Graphics 620 [8086:5917]"
         ));
+        assert!(is_integrated_pci_name(
+            "Advanced Micro Devices, Inc. [AMD/ATI] Picasso [Radeon Vega Series / Radeon Vega Mobile Series]"
+        ));
         assert!(!is_integrated_pci_name(
             "NVIDIA Corporation GP107 [GeForce GTX 1650 SUPER]"
         ));
+        assert!(!is_integrated_pci_name(
+            "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800]"
+        ));
+        assert!(!is_integrated_pci_name(
+            "Intel Corporation DG2 [Arc A770]"
+        ));
+    }
+
+    #[test]
+    fn discrete_vulkan_pci_names() {
+        assert!(is_discrete_vulkan_pci_name(
+            "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800]"
+        ));
+        assert!(is_discrete_vulkan_pci_name("Intel Corporation DG2 [Arc A770]"));
+        assert!(!is_discrete_vulkan_pci_name(
+            "Intel Corporation UHD Graphics 620"
+        ));
+        assert!(!is_discrete_vulkan_pci_name(
+            "NVIDIA Corporation GP107 [GeForce GTX 1650 SUPER]"
+        ));
+        assert!(is_discrete_vulkan_pci_name("AMD Radeon RX 6800 XT"));
+        assert!(is_discrete_vulkan_pci_name("Intel(R) Arc(TM) A770 Graphics"));
     }
 
     #[test]

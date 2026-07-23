@@ -25,19 +25,17 @@ pub fn can_host_model(
     let weight_gb = gb_ceil(model.weight_size_gb);
     let ram_needed = weight_gb.saturating_add(cpu_ram_headroom_gb).max(min_ram);
 
-    // Fits entirely on pooled GPU VRAM (single card or multi-GPU sum).
+    // Fits entirely on pooled accelerator VRAM (CUDA and/or Vulkan estimate).
     if min_vram > 0 && card.total_vram_gb >= min_vram {
         return ram_gb >= min_ram;
     }
 
-    // Partial VRAM: full-GPU may OOM, but offload cascade can still serve via CPU RAM.
-    if !card.cuda_device_ids.is_empty()
-        && card.total_vram_gb >= 4
-        && matches!(
-            card.strategy,
-            PoolStrategy::Single | PoolStrategy::TensorParallel
-        )
-    {
+    // Partial accelerator VRAM: full-GPU may OOM, but offload cascade can still serve.
+    let has_accelerator = matches!(
+        card.strategy,
+        PoolStrategy::Single | PoolStrategy::TensorParallel | PoolStrategy::Vulkan
+    );
+    if has_accelerator && (card.total_vram_gb >= 4 || card.uses_vulkan) {
         return ram_gb >= ram_needed;
     }
 
@@ -47,4 +45,59 @@ pub fn can_host_model(
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compute_pool::{build_virtual_card, vulkan_runtime_supported};
+    use crate::specs::ComputeDevice;
+
+    fn catalog(min_vram: f64, weight: f64, min_ram: f64) -> CatalogModel {
+        CatalogModel {
+            model_id: "qwen-3-8b".into(),
+            display_name: "Qwen3 8B".into(),
+            runtime_model: "Qwen/Qwen3-8B".into(),
+            max_context_tokens: 4096,
+            regions: vec![],
+            weight_size_gb: Some(weight),
+            min_vram_gb: Some(min_vram),
+            min_ram_gb: Some(min_ram),
+            weights: None,
+        }
+    }
+
+    #[test]
+    fn vulkan_amd_can_host_with_enough_ram() {
+        if !vulkan_runtime_supported() {
+            return;
+        }
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "amd:0".into(),
+            kind: "discrete".into(),
+            name: "AMD Radeon".into(),
+            vram_gb: Some(8),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(can_host_model(&catalog(4.0, 5.0, 8.0), &card, 32, 2));
+    }
+
+    #[test]
+    fn cpu_only_hosts_when_ram_allows() {
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "cpu:0".into(),
+            kind: "cpu".into(),
+            name: "CPU".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(can_host_model(&catalog(4.0, 5.0, 8.0), &card, 16, 2));
+        assert!(!can_host_model(&catalog(4.0, 5.0, 8.0), &card, 4, 2));
+    }
 }
