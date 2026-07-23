@@ -3,8 +3,10 @@
 //! Small GPUs (≤8 GB) only keep one model resident. Warming or switching without
 //! eviction was causing cudaMalloc OOM on context create when a prior 7B stayed in VRAM.
 //!
-//! Weight load can succeed with aggressive GPU offload while context/KV alloc still
-//! OOMs; in that case we evict and walk the same reduced-offload → CPU cascade.
+//! Every CUDA pool tries full use of all enabled GPUs first. If weight load or
+//! context/KV alloc OOMs, we walk:
+//!   gpu-full → gpu-offload → gpu-offload-reduced → cpu-only
+//! Size cutoffs are not used for placement — cascade failure is the safety net.
 
 use crate::compute_pool::VirtualCard;
 use anyhow::{Context, Result};

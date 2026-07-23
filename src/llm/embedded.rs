@@ -1,6 +1,6 @@
 //! Embedded llama.cpp inference (no external llama-cli binary required).
 
-use crate::compute_pool::{PoolStrategy, VirtualCard};
+use crate::compute_pool::{primary_cuda_device, PoolStrategy, VirtualCard};
 use crate::protocol::ChatMessage;
 use anyhow::{anyhow, Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -232,25 +232,24 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
                 .context("configure primary GPU device")?
                 .with_n_gpu_layers(999);
         }
-        PoolStrategy::GpuWithCpuOffload => {
-            if !ggml_devices.is_empty() {
-                model_params = model_params
-                    .with_devices(std::slice::from_ref(&ggml_devices[0]))
-                    .context("configure GPU for CPU offload path")?
-                    .with_use_mmap(true);
-            }
-            model_params = model_params.with_n_gpu_layers(pool.gpu_layer_budget);
-        }
         PoolStrategy::CpuOnly => {
             model_params = model_params.with_n_gpu_layers(0);
         }
         _ => {
-            // Vulkan / ROCm / fallback: compiled backends are selected automatically.
+            // Vulkan / ROCm / single-device fallback: let compiled backends pick devices.
             model_params = model_params.with_n_gpu_layers(999);
         }
     }
 
     Ok(model_params)
+}
+
+fn offload_params(device: usize, layers: u32) -> Result<LlamaModelParams> {
+    Ok(LlamaModelParams::default()
+        .with_devices(std::slice::from_ref(&device))
+        .context("configure GPU for CPU-offload fallback")?
+        .with_use_mmap(true)
+        .with_n_gpu_layers(layers))
 }
 
 /// Load the model for this pool, degrading gracefully instead of hard-failing.
@@ -274,7 +273,7 @@ pub(crate) fn load_model_for_pool(
 /// Like [`load_model_for_pool`], but skips candidates before `start_at`.
 ///
 /// Used after context create OOM: weights already loaded at a greedy tier, so the
-/// next attempt must start at the following cascade step (not `configured` again).
+/// next attempt must start at the following cascade step (not `gpu-full` again).
 pub(crate) fn load_model_for_pool_starting_at(
     backend: &LlamaBackend,
     model_path: &Path,
@@ -287,7 +286,7 @@ pub(crate) fn load_model_for_pool_starting_at(
     for (idx, (label, params)) in candidates.into_iter().enumerate().skip(start_at) {
         match LlamaModel::load_from_file(backend, model_path, &params) {
             Ok(model) => {
-                if start_at == 0 && label != "configured" {
+                if start_at == 0 && idx > 0 {
                     warn!("model loaded via '{label}' fallback after primary load failed");
                 }
                 return Ok((model, idx));
@@ -302,7 +301,7 @@ pub(crate) fn load_model_for_pool_starting_at(
     Err(last_err.unwrap_or_else(|| anyhow!("model failed to load")))
 }
 
-/// Number of ordered load configurations for this pool (configured → reduced → cpu).
+/// Number of ordered load configurations for this pool.
 pub(crate) fn load_candidate_count(pool: &VirtualCard) -> Result<usize> {
     Ok(load_param_candidates(pool)?.len())
 }
@@ -314,33 +313,142 @@ pub(crate) fn load_candidate_label(pool: &VirtualCard, index: usize) -> Result<O
         .map(|(label, _)| *label))
 }
 
-/// Ordered load configurations to try: the pool's configured strategy first,
-/// then reduced GPU offload, then a CPU-only floor.
+/// Ordered load configurations — same ladder for every CUDA size.
+///
+/// 1. `gpu-full` — all enabled GPUs as one pool (single device or tensor-parallel)
+/// 2. `gpu-offload` — largest GPU + CPU RAM for leftover layers (budget from total VRAM)
+/// 3. `gpu-offload-reduced` — half that budget
+/// 4. `cpu-only` — last resort
+///
+/// No VRAM-size special cases: tiny cards try full first and fall through quickly on OOM;
+/// large cards usually stick the landing on step 1.
 fn load_param_candidates(pool: &VirtualCard) -> Result<Vec<(&'static str, LlamaModelParams)>> {
     let mut candidates = Vec::new();
-    candidates.push(("configured", model_params_for_pool(pool)?));
 
-    if matches!(pool.strategy, PoolStrategy::GpuWithCpuOffload) && pool.gpu_layer_budget > 1 {
-        if let Some(primary) = pool.cuda_device_ids.first() {
-            let device = *primary as usize;
-            let reduced = (pool.gpu_layer_budget / 2).max(1);
-            let params = LlamaModelParams::default()
-                .with_devices(std::slice::from_ref(&device))
-                .context("configure GPU for reduced offload fallback")?
-                .with_use_mmap(true)
-                .with_n_gpu_layers(reduced);
-            candidates.push(("gpu-offload-reduced", params));
-        }
-    }
-
-    if !matches!(pool.strategy, PoolStrategy::CpuOnly) {
+    if matches!(pool.strategy, PoolStrategy::CpuOnly) || pool.cuda_device_ids.is_empty() {
         candidates.push((
             "cpu-only",
             LlamaModelParams::default()
                 .with_use_mmap(true)
                 .with_n_gpu_layers(0),
         ));
+        return Ok(candidates);
     }
 
+    candidates.push(("gpu-full", model_params_for_pool(pool)?));
+
+    if let Some(primary) = primary_cuda_device(pool) {
+        let device = primary as usize;
+        let budget = pool.gpu_layer_budget.max(1);
+        // Skip redundant tiers when budget is already "everything".
+        if budget < 999 {
+            candidates.push(("gpu-offload", offload_params(device, budget)?));
+            let reduced = (budget / 2).max(1);
+            if reduced < budget {
+                candidates.push(("gpu-offload-reduced", offload_params(device, reduced)?));
+            }
+        }
+    }
+
+    candidates.push((
+        "cpu-only",
+        LlamaModelParams::default()
+            .with_use_mmap(true)
+            .with_n_gpu_layers(0),
+    ));
+
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compute_pool::build_virtual_card;
+    use crate::specs::ComputeDevice;
+
+    fn gpu_and_cpu(vram_gb: u32) -> VirtualCard {
+        build_virtual_card(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "Test GPU".into(),
+                vram_gb: Some(vram_gb),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap()
+    }
+
+    fn dual_gpu(a_gb: u32, b_gb: u32) -> VirtualCard {
+        build_virtual_card(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GPU A".into(),
+                vram_gb: Some(a_gb),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "GPU B".into(),
+                vram_gb: Some(b_gb),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap()
+    }
+
+    fn cascade_labels(pool: &VirtualCard) -> Vec<&'static str> {
+        (0..load_candidate_count(pool).unwrap())
+            .map(|i| load_candidate_label(pool, i).unwrap().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn any_single_gpu_tries_full_then_offload_cascade() {
+        for vram in [4u32, 8, 24] {
+            let pool = gpu_and_cpu(vram);
+            assert_eq!(pool.strategy, PoolStrategy::Single);
+            assert_eq!(
+                cascade_labels(&pool),
+                vec![
+                    "gpu-full",
+                    "gpu-offload",
+                    "gpu-offload-reduced",
+                    "cpu-only",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn multi_gpu_tries_tensor_parallel_full_first() {
+        let pool = dual_gpu(4, 4);
+        assert_eq!(pool.strategy, PoolStrategy::TensorParallel);
+        assert_eq!(
+            cascade_labels(&pool),
+            vec![
+                "gpu-full",
+                "gpu-offload",
+                "gpu-offload-reduced",
+                "cpu-only",
+            ]
+        );
+    }
 }

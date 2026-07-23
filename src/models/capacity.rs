@@ -25,17 +25,17 @@ pub fn can_host_model(
     let weight_gb = gb_ceil(model.weight_size_gb);
     let ram_needed = weight_gb.saturating_add(cpu_ram_headroom_gb).max(min_ram);
 
-    // Fits entirely on GPU VRAM.
+    // Fits entirely on pooled GPU VRAM (single card or multi-GPU sum).
     if min_vram > 0 && card.total_vram_gb >= min_vram {
         return ram_gb >= min_ram;
     }
 
-    // Laptop / partial VRAM: offload weights to system RAM (mmap + CPU layers).
+    // Partial VRAM: full-GPU may OOM, but offload cascade can still serve via CPU RAM.
     if !card.cuda_device_ids.is_empty()
         && card.total_vram_gb >= 4
         && matches!(
             card.strategy,
-            PoolStrategy::GpuWithCpuOffload | PoolStrategy::Single
+            PoolStrategy::Single | PoolStrategy::TensorParallel
         )
     {
         return ram_gb >= ram_needed;
