@@ -377,9 +377,60 @@ fn full_placement_vram_gb(pool: &VirtualCard) -> u32 {
     }
 }
 
-/// Tensor-parallel gpu-full is safe for *this* model when each GPU can hold its
-/// weight slice plus local KV/compute overhead (derived from on-disk size — no
-/// fixed VRAM tier cutoff).
+/// Normalize NVIDIA marketing names so "NVIDIA GeForce RTX 4090" == "RTX 4090".
+fn normalize_cuda_sku(name: &str) -> String {
+    let mut s = name.trim().to_ascii_lowercase();
+    for prefix in [
+        "nvidia ",
+        "geforce ",
+        "tesla ",
+        "quadro ",
+        "rtx ",
+        "gtx ",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start().to_string();
+        }
+    }
+    // Re-add a short family token for matching (rtx/gtx stripped above for compare).
+    let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact
+}
+
+/// llama.cpp CUDA tensor-parallel across mismatched consumer cards (e.g. 1650 Super +
+/// 1050 Ti) commonly `abort()`s. Require same SKU + near-equal VRAM.
+pub(crate) fn cuda_devices_compatible_for_tp(pool: &VirtualCard) -> bool {
+    let cuda_devs: Vec<&crate::compute_pool::PoolDevice> = pool
+        .devices
+        .iter()
+        .filter(|d| d.cuda_index.is_some())
+        .collect();
+    if cuda_devs.len() < 2 {
+        return false;
+    }
+    let skus: Vec<String> = cuda_devs
+        .iter()
+        .map(|d| normalize_cuda_sku(&d.name))
+        .collect();
+    if skus.iter().any(|s| s.is_empty()) {
+        return false;
+    }
+    if !skus.iter().all(|s| s == &skus[0]) {
+        return false;
+    }
+    let vrams = cuda_device_vram_gb(pool);
+    if vrams.len() != cuda_devs.len() {
+        return false;
+    }
+    let min_v = *vrams.iter().min().unwrap_or(&0);
+    let max_v = *vrams.iter().max().unwrap_or(&0);
+    // Allow 1GB nvidia-smi rounding noise; refuse real skew.
+    max_v.saturating_sub(min_v) <= 1
+}
+
+/// Tensor-parallel gpu-full is safe for *this* model when GPUs are homogeneous and
+/// each can hold its weight slice plus local KV/compute overhead. Prefer single-GPU
+/// full when the model fits the largest card — TP is for models that need pooled VRAM.
 pub(crate) fn should_attempt_tensor_parallel(
     pool: &VirtualCard,
     weight_gb: Option<f64>,
@@ -387,10 +438,17 @@ pub(crate) fn should_attempt_tensor_parallel(
     if pool.cuda_device_ids.len() < 2 {
         return false;
     }
+    if !cuda_devices_compatible_for_tp(pool) {
+        return false;
+    }
     let Some(w) = weight_gb.filter(|w| *w > 0.05) else {
         // Unknown size → do not risk a CUDA abort() on TP.
         return false;
     };
+    // If the largest GPU can take the whole model, TP adds crash risk for no gain.
+    if should_attempt_single_gpu_full(pool, weight_gb) {
+        return false;
+    }
     let vrams = cuda_device_vram_gb(pool);
     if vrams.len() != pool.cuda_device_ids.len() || vrams.is_empty() {
         return false;
@@ -427,7 +485,10 @@ pub(crate) fn should_attempt_single_gpu_full(
 /// which kills the agent process and looks like a disconnect.
 pub(crate) fn should_attempt_gpu_full(pool: &VirtualCard, weight_gb: Option<f64>) -> bool {
     match pool.strategy {
-        PoolStrategy::TensorParallel => should_attempt_tensor_parallel(pool, weight_gb),
+        PoolStrategy::TensorParallel => {
+            should_attempt_single_gpu_full(pool, weight_gb)
+                || should_attempt_tensor_parallel(pool, weight_gb)
+        }
         PoolStrategy::Single => should_attempt_single_gpu_full(pool, weight_gb),
         PoolStrategy::Vulkan => {
             let available = f64::from(full_placement_vram_gb(pool));
@@ -478,18 +539,27 @@ fn load_param_candidates_with_weight(
 
     match pool.strategy {
         PoolStrategy::TensorParallel => {
-            if should_attempt_tensor_parallel(pool, weight_gb) {
-                candidates.push(("gpu-full", model_params_for_pool(pool)?));
-            } else if should_attempt_single_gpu_full(pool, weight_gb) {
+            // Prefer largest single GPU whenever the model fits there. TP on mixed
+            // consumer cards (and on tiny models that already fit one GPU) has been
+            // aborting the process via ggml-cuda.cu.
+            if should_attempt_single_gpu_full(pool, weight_gb) {
                 if let Some(primary) = primary_cuda_device(pool) {
                     info!(
                         weight_gb = weight_gb.unwrap_or(-1.0),
                         primary_vram_gb = primary_cuda_vram_gb(pool),
                         gpus = pool.cuda_device_ids.len(),
-                        "tensor-parallel unsafe for this model size; trying largest GPU full"
+                        "model fits largest GPU; using single-device full (not tensor-parallel)"
                     );
                     candidates.push(("gpu-full", single_gpu_full_params(primary as usize)?));
                 }
+            } else if should_attempt_tensor_parallel(pool, weight_gb) {
+                info!(
+                    weight_gb = weight_gb.unwrap_or(-1.0),
+                    gpus = pool.cuda_device_ids.len(),
+                    total_vram_gb = pool.total_vram_gb,
+                    "using tensor-parallel gpu-full (model exceeds single GPU)"
+                );
+                candidates.push(("gpu-full", model_params_for_pool(pool)?));
             } else {
                 info!(
                     weight_gb = weight_gb.unwrap_or(-1.0),
@@ -498,6 +568,7 @@ fn load_param_candidates_with_weight(
                         .min()
                         .unwrap_or(0),
                     primary_vram_gb = primary_cuda_vram_gb(pool),
+                    tp_compatible = cuda_devices_compatible_for_tp(pool),
                     "skipping gpu-full (model does not fit GPUs safely); starting at offload"
                 );
             }
@@ -584,11 +655,15 @@ mod tests {
     }
 
     fn dual_gpu(a_gb: u32, b_gb: u32) -> VirtualCard {
+        dual_gpu_named(a_gb, b_gb, "RTX 4090", "RTX 4090")
+    }
+
+    fn dual_gpu_named(a_gb: u32, b_gb: u32, name_a: &str, name_b: &str) -> VirtualCard {
         build_virtual_card(&[
             ComputeDevice {
                 id: "nvidia:0".into(),
                 kind: "discrete".into(),
-                name: "GPU A".into(),
+                name: name_a.into(),
                 vram_gb: Some(a_gb),
                 vram_used_gb: None,
                 util_pct: None,
@@ -597,7 +672,7 @@ mod tests {
             ComputeDevice {
                 id: "nvidia:1".into(),
                 kind: "discrete".into(),
-                name: "GPU B".into(),
+                name: name_b.into(),
                 vram_gb: Some(b_gb),
                 vram_used_gb: None,
                 util_pct: None,
@@ -674,11 +749,49 @@ mod tests {
     }
 
     #[test]
-    fn dual_gpus_use_tp_when_model_fits_per_device() {
+    fn chillblast_mixed_gpus_never_tensor_parallel() {
+        // Real Chillblast box: 1650 Super + 1050 Ti. TP abort()s in ggml-cuda.
+        let pool = dual_gpu_named(4, 4, "GTX 1650 SUPER", "GTX 1050 Ti");
+        assert!(!cuda_devices_compatible_for_tp(&pool));
+        assert!(!should_attempt_tensor_parallel(&pool, Some(1.2)));
+        // Tiny model still runs full on the largest single card.
+        assert!(should_attempt_single_gpu_full(&pool, Some(1.2)));
+        assert_eq!(
+            cascade_labels(&pool, Some(1.2)),
+            vec![
+                "gpu-full",
+                "gpu-offload",
+                "gpu-offload-reduced",
+                "cpu-only",
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_gpus_prefer_single_when_model_fits_one_card() {
         let pool = dual_gpu(24, 24);
-        assert!(should_attempt_tensor_parallel(&pool, Some(20.0)));
+        // Fits one 24GB card → must not open TP (even though TP math would pass).
+        assert!(should_attempt_single_gpu_full(&pool, Some(20.0)));
+        assert!(!should_attempt_tensor_parallel(&pool, Some(20.0)));
         assert_eq!(
             cascade_labels(&pool, Some(20.0)),
+            vec![
+                "gpu-full",
+                "gpu-offload",
+                "gpu-offload-reduced",
+                "cpu-only",
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_gpus_use_tp_when_model_exceeds_single_gpu() {
+        let pool = dual_gpu(24, 24);
+        // 30GB weights: too big for one 24GB card, OK as TP slices on 2×24.
+        assert!(!should_attempt_single_gpu_full(&pool, Some(30.0)));
+        assert!(should_attempt_tensor_parallel(&pool, Some(30.0)));
+        assert_eq!(
+            cascade_labels(&pool, Some(30.0)),
             vec![
                 "gpu-full",
                 "gpu-offload",
@@ -701,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn roomy_multi_gpu_tries_tensor_parallel_full_first() {
+    fn roomy_multi_gpu_uses_single_full_for_small_model() {
         let pool = dual_gpu(24, 24);
         assert_eq!(pool.strategy, PoolStrategy::TensorParallel);
         assert_eq!(
@@ -713,6 +826,8 @@ mod tests {
                 "cpu-only",
             ]
         );
+        assert!(!should_attempt_tensor_parallel(&pool, Some(4.0)));
+        assert!(should_attempt_single_gpu_full(&pool, Some(4.0)));
     }
 
     #[test]
