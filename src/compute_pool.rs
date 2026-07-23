@@ -79,82 +79,53 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     // Prefer CUDA when any NVIDIA device is enabled. Otherwise use Vulkan accelerators
     // (AMD discrete / Intel Arc / iGPU). CPU alone → CpuOnly.
     //
-    // Multi-GPU: only use TensorParallel when every CUDA GPU has enough VRAM.
-    // On small cards (e.g. 2×4GB), llama.cpp TP + gpu-full often CUDA-abort()s the
-    // whole process — cascade never runs. Demote to Single on the largest GPU.
-    let (strategy, total_vram_gb, display_name, tensor_split, uses_vulkan, cuda_ids) =
-        if !cuda_ids.is_empty() {
-            if cuda_ids.len() > 1 && tensor_parallel_viable(&cuda_vram) {
-                let total: u32 = cuda_vram.iter().copied().sum();
-                let name = format!("Virtual {} ({} GPUs)", format_vram(total), cuda_names.len());
-                let split = vram_proportions(&cuda_vram);
-                (
-                    PoolStrategy::TensorParallel,
-                    total,
-                    name,
-                    split,
-                    false,
-                    cuda_ids,
-                )
-            } else {
-                // Single GPU, or multi-GPU demoted to the largest device only.
-                let (best_i, &best_vram) = cuda_vram
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, v)| *v)
-                    .expect("cuda_vram non-empty");
-                if cuda_ids.len() > 1 {
-                    tracing::info!(
-                        kept = %cuda_names[best_i],
-                        kept_vram_gb = best_vram,
-                        enabled_gpus = cuda_ids.len(),
-                        min_vram_gb = cuda_vram.iter().copied().min().unwrap_or(0),
-                        "multi-GPU tensor-parallel unsafe on small VRAM; using largest GPU only"
-                    );
-                }
-                (
-                    PoolStrategy::Single,
-                    best_vram,
-                    cuda_names[best_i].clone(),
-                    Vec::new(),
-                    false,
-                    vec![cuda_ids[best_i]],
-                )
-            }
-        } else if !vulkan_names.is_empty() && vulkan_runtime_supported() {
-            let total: u32 = vulkan_vram.iter().copied().sum::<u32>().max(1);
-            let name = match vulkan_names.len() {
-                1 => vulkan_names[0].clone(),
-                n => format!("Virtual {} ({} GPUs · Vulkan)", format_vram(total), n),
-            };
-            (
-                PoolStrategy::Vulkan,
-                total,
-                name,
-                Vec::new(),
-                true,
-                Vec::new(),
-            )
-        } else {
-            let name = if pool_devices.len() == 1 {
-                pool_devices[0].name.clone()
-            } else {
-                format!("CPU pool ({} devices)", pool_devices.len())
-            };
-            (
-                PoolStrategy::CpuOnly,
-                0,
-                name,
-                Vec::new(),
-                false,
-                Vec::new(),
-            )
+    // Multi-GPU pools keep TensorParallel topology; whether a *given model* may use
+    // TP gpu-full is decided at load time from on-disk weight vs per-GPU VRAM
+    // (see `should_attempt_tensor_parallel`) — no fixed GB cutoff here.
+    let (strategy, total_vram_gb, display_name, tensor_split, uses_vulkan) = if !cuda_ids.is_empty()
+    {
+        let total: u32 = cuda_vram.iter().copied().sum();
+        let name = match cuda_names.len() {
+            1 => cuda_names[0].clone(),
+            n => format!("Virtual {} ({} GPUs)", format_vram(total), n),
         };
+        let strategy = if cuda_ids.len() > 1 {
+            PoolStrategy::TensorParallel
+        } else {
+            PoolStrategy::Single
+        };
+        let split = if cuda_ids.len() > 1 {
+            vram_proportions(&cuda_vram)
+        } else {
+            Vec::new()
+        };
+        (strategy, total, name, split, false)
+    } else if !vulkan_names.is_empty() && vulkan_runtime_supported() {
+        let total: u32 = vulkan_vram.iter().copied().sum::<u32>().max(1);
+        let name = match vulkan_names.len() {
+            1 => vulkan_names[0].clone(),
+            n => format!("Virtual {} ({} GPUs · Vulkan)", format_vram(total), n),
+        };
+        (PoolStrategy::Vulkan, total, name, Vec::new(), true)
+    } else {
+        let name = if pool_devices.len() == 1 {
+            pool_devices[0].name.clone()
+        } else {
+            format!("CPU pool ({} devices)", pool_devices.len())
+        };
+        (PoolStrategy::CpuOnly, 0, name, Vec::new(), false)
+    };
 
+    // Offload budgets are for the primary GPU (largest), even on TP pools — cascade
+    // offload tiers always pin a single device.
+    let budget_vram = if !cuda_vram.is_empty() {
+        cuda_vram.iter().copied().max().unwrap_or(1)
+    } else {
+        total_vram_gb.max(1)
+    };
     let gpu_layer_budget = match strategy {
         PoolStrategy::CpuOnly => 0,
-        // Budget from the VRAM we will actually place on (primary / TP total).
-        _ => offload_layer_budget(total_vram_gb.max(1)),
+        _ => offload_layer_budget(budget_vram),
     };
 
     Ok(VirtualCard {
@@ -167,12 +138,6 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
         uses_vulkan,
         gpu_layer_budget,
     })
-}
-
-/// Tensor-parallel across consumer GPUs below this per-GPU VRAM routinely hard-aborts
-/// inside llama.cpp CUDA (process death — no Rust cascade). Require every GPU ≥ 8GB.
-pub fn tensor_parallel_viable(cuda_vram_gb: &[u32]) -> bool {
-    cuda_vram_gb.len() >= 2 && cuda_vram_gb.iter().copied().min().unwrap_or(0) >= 8
 }
 
 /// AMD discrete, Intel Arc, or integrated GPUs — served via Vulkan when CUDA is absent.
@@ -221,17 +186,35 @@ pub fn offload_layer_budget(total_discrete_vram_gb: u32) -> u32 {
     (usable_mib / 300.0).round().clamp(1.0, 80.0) as u32
 }
 
-/// CUDA index of the GPU used for offload / Single placement.
+/// CUDA index of the largest enabled NVIDIA GPU (offload / Single fallbacks).
 pub fn primary_cuda_device(pool: &VirtualCard) -> Option<u32> {
-    // After multi-GPU demotion, cuda_device_ids is already the chosen device.
-    if pool.cuda_device_ids.len() == 1 {
-        return pool.cuda_device_ids.first().copied();
-    }
     pool.devices
         .iter()
         .filter(|d| d.kind == "discrete" && d.cuda_index.is_some())
         .max_by_key(|d| d.vram_gb)
         .and_then(|d| d.cuda_index)
+}
+
+pub fn primary_cuda_vram_gb(pool: &VirtualCard) -> u32 {
+    pool.devices
+        .iter()
+        .filter(|d| d.kind == "discrete" && d.cuda_index.is_some())
+        .map(|d| d.vram_gb)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Per-device VRAM for CUDA ids in the pool (same order as `cuda_device_ids`).
+pub fn cuda_device_vram_gb(pool: &VirtualCard) -> Vec<u32> {
+    pool.cuda_device_ids
+        .iter()
+        .filter_map(|id| {
+            pool.devices
+                .iter()
+                .find(|d| d.cuda_index == Some(*id))
+                .map(|d| d.vram_gb)
+        })
+        .collect()
 }
 
 pub fn format_vram(gb: u32) -> String {
@@ -289,7 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn small_multi_gpu_demotes_to_largest_single() {
+    fn small_multi_gpu_keeps_tp_topology() {
+        // Placement safety is decided per-model at load time, not via a GB cutoff.
         let card = build_virtual_card(&[
             ComputeDevice {
                 id: "nvidia:0".into(),
@@ -321,11 +305,12 @@ mod tests {
         ])
         .unwrap();
 
-        // 2×4GB TP abort()s in llama.cpp — use one GPU with offload cascade instead.
-        assert_eq!(card.strategy, PoolStrategy::Single);
-        assert_eq!(card.total_vram_gb, 4);
-        assert_eq!(card.cuda_device_ids.len(), 1);
-        assert!(!card.uses_vulkan);
+        assert_eq!(card.strategy, PoolStrategy::TensorParallel);
+        assert_eq!(card.total_vram_gb, 8);
+        assert_eq!(card.cuda_device_ids, vec![0, 1]);
+        assert_eq!(card.display_name, "Virtual 8GB (2 GPUs)");
+        // Offload budget from largest single GPU (4GB), not the summed total.
+        assert_eq!(card.gpu_layer_budget, offload_layer_budget(4));
     }
 
     #[test]
@@ -359,38 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn heterogeneous_keeps_largest_when_sibling_too_small_for_tp() {
-        let card = build_virtual_card(&[
-            ComputeDevice {
-                id: "nvidia:0".into(),
-                kind: "discrete".into(),
-                name: "GTX 1650".into(),
-                vram_gb: Some(4),
-                vram_used_gb: None,
-                util_pct: None,
-                enabled: true,
-            },
-            ComputeDevice {
-                id: "nvidia:1".into(),
-                kind: "discrete".into(),
-                name: "RTX 4090".into(),
-                vram_gb: Some(24),
-                vram_used_gb: None,
-                util_pct: None,
-                enabled: true,
-            },
-        ])
-        .unwrap();
-
-        assert_eq!(card.strategy, PoolStrategy::Single);
-        assert_eq!(card.total_vram_gb, 24);
-        assert_eq!(card.cuda_device_ids, vec![1]);
-        assert_eq!(card.display_name, "RTX 4090");
-    }
-
-    #[test]
-    fn multi_gpu_is_one_tensor_parallel_pool_regardless_of_size() {
-        // Kept name for git blame; size now matters — roomy cards only.
+    fn multi_gpu_is_one_tensor_parallel_pool() {
         let card = build_virtual_card(&[
             ComputeDevice {
                 id: "nvidia:0".into(),

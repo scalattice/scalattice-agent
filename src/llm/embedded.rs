@@ -1,6 +1,8 @@
 //! Embedded llama.cpp inference (no external llama-cli binary required).
 
-use crate::compute_pool::{primary_cuda_device, PoolStrategy, VirtualCard};
+use crate::compute_pool::{
+    primary_cuda_device, primary_cuda_vram_gb, cuda_device_vram_gb, PoolStrategy, VirtualCard,
+};
 use crate::protocol::ChatMessage;
 use anyhow::{anyhow, Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -366,43 +368,91 @@ pub(crate) fn gguf_weight_gb(path: &Path) -> Option<f64> {
 
 fn full_placement_vram_gb(pool: &VirtualCard) -> u32 {
     match pool.strategy {
+        // Single-GPU full fit uses the primary card only.
+        PoolStrategy::Single => primary_cuda_vram_gb(pool).max(pool.total_vram_gb),
+        // TP full fit uses pooled VRAM (only when should_attempt_tensor_parallel).
         PoolStrategy::TensorParallel => pool.total_vram_gb,
-        PoolStrategy::Single => pool
-            .devices
-            .iter()
-            .filter(|d| d.cuda_index.is_some())
-            .map(|d| d.vram_gb)
-            .max()
-            .unwrap_or(pool.total_vram_gb),
         PoolStrategy::Vulkan => pool.total_vram_gb,
         PoolStrategy::CpuOnly => 0,
     }
 }
 
-/// Whether a greedy all-layers GPU load is safe to *attempt*.
-///
-/// llama.cpp's CUDA backend often `abort()`s on OOM instead of returning an error,
-/// which kills the agent process and looks like a disconnect. Never attempt full
-/// placement when weights + KV/compute headroom cannot fit.
-pub(crate) fn should_attempt_gpu_full(pool: &VirtualCard, weight_gb: Option<f64>) -> bool {
-    let available = full_placement_vram_gb(pool) as f64;
-    if available < 1.0 {
+/// Tensor-parallel gpu-full is safe for *this* model when each GPU can hold its
+/// weight slice plus local KV/compute overhead (derived from on-disk size — no
+/// fixed VRAM tier cutoff).
+pub(crate) fn should_attempt_tensor_parallel(
+    pool: &VirtualCard,
+    weight_gb: Option<f64>,
+) -> bool {
+    if pool.cuda_device_ids.len() < 2 {
         return false;
     }
+    let Some(w) = weight_gb.filter(|w| *w > 0.05) else {
+        // Unknown size → do not risk a CUDA abort() on TP.
+        return false;
+    };
+    let vrams = cuda_device_vram_gb(pool);
+    if vrams.len() != pool.cuda_device_ids.len() || vrams.is_empty() {
+        return false;
+    }
+    let n = vrams.len() as f64;
+    let min_v = f64::from(*vrams.iter().min().unwrap_or(&0));
+    let total = f64::from(vrams.iter().copied().sum::<u32>());
+
+    // llama.cpp TP is not a perfect weight/n split — reserve overhead per device
+    // and for the pool so we never ask CUDA for an allocation that abort()s.
+    const PER_GPU_OVERHEAD_GB: f64 = 2.0;
+    const TOTAL_OVERHEAD_GB: f64 = 2.0;
+    let per_need = w / n + PER_GPU_OVERHEAD_GB;
+    let tot_need = w + TOTAL_OVERHEAD_GB;
+    min_v + 0.05 >= per_need && total + 0.05 >= tot_need
+}
+
+/// Whether a greedy all-layers load on the *primary* GPU is safe to attempt.
+pub(crate) fn should_attempt_single_gpu_full(
+    pool: &VirtualCard,
+    weight_gb: Option<f64>,
+) -> bool {
+    let available = f64::from(primary_cuda_vram_gb(pool).max(1));
     const HEADROOM_GB: f64 = 2.0;
     match weight_gb {
         Some(w) if w > 0.05 => available + 0.05 >= w + HEADROOM_GB,
-        // Unknown size: only risk gpu-full on roomy cards.
-        _ => available >= 10.0,
+        _ => false,
     }
+}
+
+/// Whether a greedy all-layers GPU load is safe to *attempt* for this pool/model.
+///
+/// llama.cpp's CUDA backend often `abort()`s on OOM instead of returning an error,
+/// which kills the agent process and looks like a disconnect.
+pub(crate) fn should_attempt_gpu_full(pool: &VirtualCard, weight_gb: Option<f64>) -> bool {
+    match pool.strategy {
+        PoolStrategy::TensorParallel => should_attempt_tensor_parallel(pool, weight_gb),
+        PoolStrategy::Single => should_attempt_single_gpu_full(pool, weight_gb),
+        PoolStrategy::Vulkan => {
+            let available = f64::from(full_placement_vram_gb(pool));
+            const HEADROOM_GB: f64 = 2.0;
+            match weight_gb {
+                Some(w) if w > 0.05 => available + 0.05 >= w + HEADROOM_GB,
+                _ => false,
+            }
+        }
+        PoolStrategy::CpuOnly => false,
+    }
+}
+
+fn single_gpu_full_params(device: usize) -> Result<LlamaModelParams> {
+    Ok(LlamaModelParams::default()
+        .with_devices(std::slice::from_ref(&device))
+        .context("configure primary GPU for single-device full load")?
+        .with_use_mmap(true)
+        .with_n_gpu_layers(999))
 }
 
 /// Ordered load configurations — CUDA and Vulkan share the same ladder.
 ///
-/// 1. `gpu-full` — only when [`should_attempt_gpu_full`] (avoids CUDA abort)
-/// 2. `gpu-offload` — partial layers + CPU RAM
-/// 3. `gpu-offload-reduced`
-/// 4. `cpu-only`
+/// For multi-GPU pools, TP gpu-full is only queued when the model fits per-GPU;
+/// otherwise we try largest-GPU full, then offload — never a blind TP that abort()s.
 fn load_param_candidates(
     pool: &VirtualCard,
     model_path: Option<&Path>,
@@ -426,14 +476,44 @@ fn load_param_candidates_with_weight(
         return Ok(candidates);
     }
 
-    if should_attempt_gpu_full(pool, weight_gb) {
-        candidates.push(("gpu-full", model_params_for_pool(pool)?));
-    } else {
-        info!(
-            available_vram_gb = full_placement_vram_gb(pool),
-            weight_gb = weight_gb.unwrap_or(-1.0),
-            "skipping gpu-full placement (would not fit / risk CUDA abort); starting at offload"
-        );
+    match pool.strategy {
+        PoolStrategy::TensorParallel => {
+            if should_attempt_tensor_parallel(pool, weight_gb) {
+                candidates.push(("gpu-full", model_params_for_pool(pool)?));
+            } else if should_attempt_single_gpu_full(pool, weight_gb) {
+                if let Some(primary) = primary_cuda_device(pool) {
+                    info!(
+                        weight_gb = weight_gb.unwrap_or(-1.0),
+                        primary_vram_gb = primary_cuda_vram_gb(pool),
+                        gpus = pool.cuda_device_ids.len(),
+                        "tensor-parallel unsafe for this model size; trying largest GPU full"
+                    );
+                    candidates.push(("gpu-full", single_gpu_full_params(primary as usize)?));
+                }
+            } else {
+                info!(
+                    weight_gb = weight_gb.unwrap_or(-1.0),
+                    min_vram_gb = cuda_device_vram_gb(pool)
+                        .into_iter()
+                        .min()
+                        .unwrap_or(0),
+                    primary_vram_gb = primary_cuda_vram_gb(pool),
+                    "skipping gpu-full (model does not fit GPUs safely); starting at offload"
+                );
+            }
+        }
+        PoolStrategy::Single | PoolStrategy::Vulkan => {
+            if should_attempt_gpu_full(pool, weight_gb) {
+                candidates.push(("gpu-full", model_params_for_pool(pool)?));
+            } else {
+                info!(
+                    available_vram_gb = full_placement_vram_gb(pool),
+                    weight_gb = weight_gb.unwrap_or(-1.0),
+                    "skipping gpu-full placement (would not fit / risk CUDA abort); starting at offload"
+                );
+            }
+        }
+        PoolStrategy::CpuOnly => {}
     }
 
     let budget = pool.gpu_layer_budget.max(1);
@@ -580,12 +660,42 @@ mod tests {
     }
 
     #[test]
-    fn dual_small_gpus_demote_to_single_offload_cascade() {
+    fn dual_small_gpus_skip_unsafe_full_for_large_model() {
         let pool = dual_gpu(4, 4);
-        assert_eq!(pool.strategy, PoolStrategy::Single);
-        assert_eq!(pool.cuda_device_ids.len(), 1);
+        assert_eq!(pool.strategy, PoolStrategy::TensorParallel);
+        assert_eq!(pool.cuda_device_ids, vec![0, 1]);
+        // ~4.7GB weights: per-GPU need ≈ 2.35+2 > 4GB → no TP; single also too small.
+        assert!(!should_attempt_tensor_parallel(&pool, Some(4.7)));
+        assert!(!should_attempt_single_gpu_full(&pool, Some(4.7)));
         assert_eq!(
             cascade_labels(&pool, Some(4.7)),
+            vec!["gpu-offload", "gpu-offload-reduced", "cpu-only"]
+        );
+    }
+
+    #[test]
+    fn dual_gpus_use_tp_when_model_fits_per_device() {
+        let pool = dual_gpu(24, 24);
+        assert!(should_attempt_tensor_parallel(&pool, Some(20.0)));
+        assert_eq!(
+            cascade_labels(&pool, Some(20.0)),
+            vec![
+                "gpu-full",
+                "gpu-offload",
+                "gpu-offload-reduced",
+                "cpu-only",
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_gpus_fall_back_to_largest_full_when_tp_slice_too_big() {
+        // 14GB model on 2×8GB: TP slice ≈7+2 > 8 → skip TP; primary 8 < 14+2 → offload.
+        let pool = dual_gpu(8, 8);
+        assert!(!should_attempt_tensor_parallel(&pool, Some(14.0)));
+        assert!(!should_attempt_single_gpu_full(&pool, Some(14.0)));
+        assert_eq!(
+            cascade_labels(&pool, Some(14.0)),
             vec!["gpu-offload", "gpu-offload-reduced", "cpu-only"]
         );
     }
