@@ -22,6 +22,15 @@ fn next_req_id() -> String {
     format!("r{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+fn warm_model_weight_mb(runtime_model: &str) -> u64 {
+    let Some(path) = crate::models::resolve_model_gguf(runtime_model) else {
+        return u64::MAX / 4;
+    };
+    std::fs::metadata(path)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(u64::MAX / 4)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SlotStatus {
     pub id: String,
@@ -104,6 +113,32 @@ impl Hypervisor {
             .lock()
             .await
             .order_by_demand(models, Duration::from_secs(30 * 60))
+    }
+
+    /// Demand first; ties prefer models that fit in `max_vram_gb`, then lightest on disk.
+    /// Avoids cold-start alphabetical picks like `Qwen/…-7B` over `qwen/qwen3-1.7b`.
+    pub async fn order_models_for_warm(&self, models: &[String], max_vram_gb: u32) -> Vec<String> {
+        let window = Duration::from_secs(30 * 60);
+        let demand = self.demand.lock().await;
+        let mut scored: Vec<(u32, u8, u64, String)> = models
+            .iter()
+            .map(|m| {
+                let hits = demand.score(m, window);
+                let weight_mb = warm_model_weight_mb(m);
+                let fits = max_vram_gb > 0
+                    && weight_mb > 0
+                    && weight_mb <= u64::from(max_vram_gb).saturating_mul(1024);
+                let fit_penalty: u8 = if fits { 0 } else { 1 };
+                (hits, fit_penalty, weight_mb, m.clone())
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.to_ascii_lowercase().cmp(&b.3.to_ascii_lowercase()))
+        });
+        scored.into_iter().map(|(_, _, _, m)| m).collect()
     }
 
     pub async fn slot_statuses(&self) -> Vec<SlotStatus> {
@@ -199,61 +234,50 @@ impl Hypervisor {
         if runtime_models.is_empty() {
             return Ok(());
         }
-        let ordered = self.order_models_by_demand(runtime_models).await;
-        // ≤8GB: only the top-demand model is a warm candidate (one resident per card).
-        let ordered = {
-            let small = self.plan.slots.iter().any(|s| {
-                s.kind != "cpu"
-                    && s.card.total_vram_gb > 0
-                    && s.card.total_vram_gb <= 8
-            });
-            if small && ordered.len() > 1 {
-                ordered.into_iter().take(1).collect::<Vec<_>>()
-            } else {
-                ordered
-            }
-        };
         let idle = self.idle_slot_ids().await;
         let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
-        let accel: Vec<&str> = idle
-            .iter()
-            .filter(|id| !id.starts_with("cpu-"))
-            .map(|s| s.as_str())
+        // Never fall back to warming cpu-0 while GPUs exist but are busy.
+        let targets: Vec<String> = idle
+            .into_iter()
+            .filter(|id| {
+                if id.starts_with("cpu-") {
+                    !has_accel
+                } else {
+                    true
+                }
+            })
             .collect();
-        // Never fall back to warming cpu-0 while GPUs exist but are busy — that
-        // spammed 1.7b onto CPU during 8B jobs and fought RAM with offload.
-        let targets = if !accel.is_empty() {
-            accel
-        } else if has_accel {
+        if targets.is_empty() {
             return Ok(());
-        } else {
-            idle.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-        };
+        }
 
-        for (i, slot_id) in targets.into_iter().enumerate() {
-            let Some(model) = ordered.get(i % ordered.len().max(1)) else {
-                break;
+        for slot_id in targets {
+            let slot_vram = self
+                .plan
+                .slots
+                .iter()
+                .find(|s| s.id == slot_id)
+                .map(|s| s.card.total_vram_gb)
+                .unwrap_or(0);
+            // Per-slot pick: demand → fits this card → lightest.
+            let ordered = self.order_models_for_warm(runtime_models, slot_vram).await;
+            let Some(model) = ordered.first().cloned() else {
+                continue;
             };
-            // ≤8GB slots: only one warm model.
+
             let mut workers = self.workers.lock().await;
-            let Some(worker) = workers.get_mut(slot_id) else {
+            let Some(worker) = workers.get_mut(&slot_id) else {
                 continue;
             };
             if worker.busy || !worker.healthy {
                 continue;
             }
-            if worker.spec.card.total_vram_gb > 0 && worker.spec.card.total_vram_gb <= 8 {
-                if !worker.loaded_models.is_empty()
-                    && worker.loaded_models.iter().any(|m| m == model)
-                {
-                    continue;
-                }
-                if !worker.loaded_models.is_empty() {
-                    let req_id = next_req_id();
-                    let _ = worker_rpc(worker, WorkerRequest::Evict { id: req_id }).await;
-                    worker.loaded_models.clear();
-                }
+            // Already resident — keep it. Advisory warm must not evict/offload a
+            // warm model just to chase a different catalog preference.
+            if !worker.loaded_models.is_empty() {
+                continue;
             }
+
             let req_id = next_req_id();
             match worker_rpc(
                 worker,
@@ -265,7 +289,7 @@ impl Hypervisor {
             .await
             {
                 Ok(WorkerResponse::Ok { .. }) => {
-                    if !worker.loaded_models.iter().any(|m| m == model) {
+                    if !worker.loaded_models.iter().any(|m| m == &model) {
                         worker.loaded_models.push(model.clone());
                     }
                     info!(slot = %slot_id, model = %model, "warmed model on slot");
