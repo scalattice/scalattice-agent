@@ -1,5 +1,8 @@
-use crate::compute_pool::{PoolStrategy, VirtualCard};
+use crate::compute_pool::{
+    build_compute_slots, build_tp_card_for_group, build_virtual_card, PoolStrategy, VirtualCard,
+};
 use crate::protocol::CatalogModel;
+use crate::specs::ComputeDevice;
 
 fn gb_ceil(v: Option<f64>) -> u32 {
     let n = v.unwrap_or(0.0);
@@ -47,11 +50,51 @@ pub fn can_host_model(
     false
 }
 
+/// True if any independent slot or homogeneous TP group can host the model.
+pub fn can_host_on_machine(
+    model: &CatalogModel,
+    devices: &[ComputeDevice],
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+) -> bool {
+    let Ok(plan) = build_compute_slots(devices) else {
+        return build_virtual_card(devices)
+            .map(|card| can_host_model(model, &card, ram_gb, cpu_ram_headroom_gb))
+            .unwrap_or(false);
+    };
+    if plan
+        .slots
+        .iter()
+        .any(|slot| can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb))
+    {
+        return true;
+    }
+    for phys in plan.tp_groups.values() {
+        if let Ok(tp) = build_tp_card_for_group(devices, phys) {
+            if can_host_model(model, &tp, ram_gb, cpu_ram_headroom_gb) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Best card for weight download sizing (largest single slot, else legacy virtual card).
+pub fn preferred_download_card(devices: &[ComputeDevice]) -> anyhow::Result<VirtualCard> {
+    let plan = build_compute_slots(devices)?;
+    plan.slots
+        .iter()
+        .filter(|s| s.kind != "cpu")
+        .max_by_key(|s| s.card.total_vram_gb)
+        .map(|s| s.card.clone())
+        .or_else(|| plan.slots.first().map(|s| s.card.clone()))
+        .ok_or_else(|| anyhow::anyhow!("no compute slots"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compute_pool::{build_virtual_card, vulkan_runtime_supported};
-    use crate::specs::ComputeDevice;
+    use crate::compute_pool::vulkan_runtime_supported;
 
     fn catalog(min_vram: f64, weight: f64, min_ram: f64) -> CatalogModel {
         CatalogModel {
@@ -99,5 +142,44 @@ mod tests {
         .unwrap();
         assert!(can_host_model(&catalog(4.0, 5.0, 8.0), &card, 16, 2));
         assert!(!can_host_model(&catalog(4.0, 5.0, 8.0), &card, 4, 2));
+    }
+
+    #[test]
+    fn mixed_gpus_either_slot_can_host_small_model() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1650 SUPER".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "GTX 1050 Ti".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        assert!(can_host_on_machine(
+            &catalog(4.0, 1.2, 4.0),
+            &devices,
+            32,
+            2
+        ));
     }
 }

@@ -223,6 +223,13 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
 
     match pool.strategy {
         PoolStrategy::TensorParallel if ggml_devices.len() > 1 => {
+            if !pool.tensor_split.is_empty() {
+                info!(
+                    devices = ?ggml_devices,
+                    tensor_split = ?pool.tensor_split,
+                    "tensor-parallel load (VRAM proportions; llama.cpp uses equal split when unset via API)"
+                );
+            }
             model_params = model_params
                 .with_split_mode(LlamaSplitMode::Tensor)
                 .with_devices(&ggml_devices)

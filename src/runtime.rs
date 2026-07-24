@@ -1,3 +1,4 @@
+use crate::hypervisor::SlotStatus;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -38,6 +39,15 @@ pub struct AgentRuntime {
     /// Agent can emit invoke_delta tokens for true SSE streaming.
     #[serde(rename = "supportsStream")]
     pub supports_stream: bool,
+    /// Independent compute slots (per GPU / Vulkan / CPU).
+    #[serde(rename = "slots", skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<SlotStatus>,
+    /// Max concurrent invokes this machine can accept.
+    #[serde(rename = "maxConcurrentJobs", skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_jobs: Option<u32>,
+    /// Idle healthy slots available for new work.
+    #[serde(rename = "idleSlots", skip_serializing_if = "Option::is_none")]
+    pub idle_slots: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,21 +71,34 @@ pub fn build_runtime(
     blocked_enabled_models: usize,
     models_disk_gb: u32,
     model_disk: HashMap<String, SerializedModelDiskStatus>,
+    slots: Vec<SlotStatus>,
+    max_concurrent_jobs: u32,
+    idle_slots: u32,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
+    // Routable when any slot is idle — report idle so cloud can still schedule.
+    let reported_state = if idle_slots > 0 {
+        JobState::Idle
+    } else if job_state == JobState::Busy || max_concurrent_jobs > 0 {
+        JobState::Busy
+    } else {
+        job_state
+    };
     let status_label = status_label(
         ready,
-        job_state,
+        reported_state,
         active_model_id.as_deref(),
         enabled_compute_devices,
         downloading_model,
         blocked_enabled_models,
+        idle_slots,
+        slots.len() as u32,
     );
 
     AgentRuntime {
         ready,
-        job_state: job_state.as_str().to_string(),
-        active_job_id: if job_state == JobState::Busy {
+        job_state: reported_state.as_str().to_string(),
+        active_job_id: if reported_state == JobState::Busy || job_state == JobState::Busy {
             active_job_id
         } else {
             None
@@ -95,6 +118,9 @@ pub fn build_runtime(
         },
         model_disk,
         supports_stream: true,
+        slots,
+        max_concurrent_jobs: Some(max_concurrent_jobs.max(1)),
+        idle_slots: Some(idle_slots),
     }
 }
 
@@ -126,18 +152,27 @@ fn status_label(
     enabled_compute_devices: usize,
     downloading_model: Option<&str>,
     blocked_enabled_models: usize,
+    idle_slots: u32,
+    total_slots: u32,
 ) -> String {
-    if job_state == JobState::Busy {
+    if job_state == JobState::Busy && idle_slots == 0 {
         let model = active_model_id.unwrap_or("inference");
-        if enabled_compute_devices > 1 {
-            return format!("Running {model} across {enabled_compute_devices} devices");
+        if total_slots > 1 {
+            return format!("Running {model} · all {total_slots} slots busy");
         }
         return format!("Running {model}");
+    }
+    if idle_slots > 0 && idle_slots < total_slots && total_slots > 1 {
+        let model = active_model_id.unwrap_or("inference");
+        return format!("Running {model} · {idle_slots}/{total_slots} slots free");
     }
     if let Some(model) = downloading_model {
         return format!("Downloading {model}");
     }
     if ready {
+        if total_slots > 1 {
+            return format!("Ready · {total_slots} compute slots");
+        }
         return "Ready for inference".to_string();
     }
     if enabled_compute_devices == 0 {

@@ -1,5 +1,7 @@
 use crate::specs::ComputeDevice;
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tracing::warn;
 
 #[derive(Debug, Clone)]
@@ -42,10 +44,15 @@ pub struct VirtualCard {
     pub gpu_layer_budget: u32,
 }
 
-/// Must run **before** `init_backend()`. Mixed NVIDIA gens (e.g. 1650 Super + 1050 Ti)
-/// make llama.cpp CUDA abort even on "single device" loads while both cards stay visible.
-/// Hide everything except the largest card from the CUDA runtime.
+/// Must run **before** `init_backend()` when the supervisor still hosts llama in-process.
+/// Mixed NVIDIA gens (e.g. 1650 Super + 1050 Ti) make llama.cpp CUDA abort even on
+/// "single device" loads while both cards stay visible. Prefer per-slot workers with
+/// `apply_slot_cuda_visibility` instead; this remains for legacy single-process paths.
+#[allow(dead_code)]
 pub fn restrict_heterogeneous_cuda_visibility(devices: &[ComputeDevice]) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+
     let mut cuda: Vec<(u32, String, u32)> = Vec::new();
     for device in devices.iter().filter(|d| d.enabled) {
         let Some(idx) = parse_cuda_index(&device.id) else {
@@ -72,13 +79,15 @@ pub fn restrict_heterogeneous_cuda_visibility(devices: &[ComputeDevice]) {
     let (physical, name, vram) = &cuda[primary_pos];
     // SAFETY: must be set before the first CUDA / llama.cpp backend init in this process.
     std::env::set_var("CUDA_VISIBLE_DEVICES", physical.to_string());
-    warn!(
-        kept_cuda_index = physical,
-        kept_name = %name,
-        kept_vram_gb = vram,
-        hidden_gpus = cuda.len() - 1,
-        "mixed NVIDIA GPUs: CUDA_VISIBLE_DEVICES limited to the largest card so llama.cpp cannot abort on multi-arch init"
-    );
+    WARNED.call_once(|| {
+        warn!(
+            kept_cuda_index = physical,
+            kept_name = %name,
+            kept_vram_gb = vram,
+            hidden_gpus = cuda.len() - 1,
+            "mixed NVIDIA GPUs: CUDA_VISIBLE_DEVICES limited to the largest card so llama.cpp cannot abort on multi-arch init"
+        );
+    });
 }
 
 fn cuda_visibility_remapped_to_zero(physical: u32) -> bool {
@@ -133,6 +142,399 @@ fn pick_primary_cuda_pos(ids: &[u32], vrams: &[u32]) -> usize {
                 .then_with(|| ids[j].cmp(&ids[i]))
         })
         .unwrap_or(0)
+}
+
+/// Schedulable compute unit: one accelerator (or CPU) the hypervisor can assign a job to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeSlot {
+    pub id: String,
+    /// discrete_cuda | discrete_vulkan | integrated | cpu
+    pub kind: String,
+    pub priority: u32,
+    pub card: VirtualCard,
+    /// Physical CUDA indices this slot owns (for CVD). Empty for Vulkan/CPU.
+    pub cuda_visible: Vec<u32>,
+    /// Homogeneous CUDA siblings that can be claimed together for tensor-parallel.
+    pub tp_group: Option<String>,
+}
+
+/// Machine-wide slot plan: independent workers plus optional TP groups.
+#[derive(Debug, Clone)]
+pub struct ComputePlan {
+    pub slots: Vec<ComputeSlot>,
+    /// group_id → physical CUDA indices (homogeneous only).
+    pub tp_groups: HashMap<String, Vec<u32>>,
+}
+
+impl PoolStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PoolStrategy::Single => "single",
+            PoolStrategy::TensorParallel => "tensor_parallel",
+            PoolStrategy::Vulkan => "vulkan",
+            PoolStrategy::CpuOnly => "cpu",
+        }
+    }
+}
+
+impl Serialize for VirtualCard {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("VirtualCard", 8)?;
+        state.serialize_field("devices", &self.devices)?;
+        state.serialize_field("strategy", self.strategy.as_str())?;
+        state.serialize_field("display_name", &self.display_name)?;
+        state.serialize_field("total_vram_gb", &self.total_vram_gb)?;
+        state.serialize_field("tensor_split", &self.tensor_split)?;
+        state.serialize_field("cuda_device_ids", &self.cuda_device_ids)?;
+        state.serialize_field("uses_vulkan", &self.uses_vulkan)?;
+        state.serialize_field("gpu_layer_budget", &self.gpu_layer_budget)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for VirtualCard {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            devices: Vec<PoolDevice>,
+            strategy: String,
+            display_name: String,
+            total_vram_gb: u32,
+            #[serde(default)]
+            tensor_split: Vec<f32>,
+            #[serde(default)]
+            cuda_device_ids: Vec<u32>,
+            #[serde(default)]
+            uses_vulkan: bool,
+            #[serde(default)]
+            gpu_layer_budget: u32,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let strategy = match raw.strategy.as_str() {
+            "tensor_parallel" => PoolStrategy::TensorParallel,
+            "vulkan" => PoolStrategy::Vulkan,
+            "cpu" => PoolStrategy::CpuOnly,
+            _ => PoolStrategy::Single,
+        };
+        Ok(VirtualCard {
+            devices: raw.devices,
+            strategy,
+            display_name: raw.display_name,
+            total_vram_gb: raw.total_vram_gb,
+            tensor_split: raw.tensor_split,
+            cuda_device_ids: raw.cuda_device_ids,
+            uses_vulkan: raw.uses_vulkan,
+            gpu_layer_budget: raw.gpu_layer_budget,
+        })
+    }
+}
+
+impl Serialize for PoolDevice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("PoolDevice", 5)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("vram_gb", &self.vram_gb)?;
+        state.serialize_field("cuda_index", &self.cuda_index)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PoolDevice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            id: String,
+            kind: String,
+            name: String,
+            vram_gb: u32,
+            #[serde(default)]
+            cuda_index: Option<u32>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(PoolDevice {
+            id: raw.id,
+            kind: raw.kind,
+            name: raw.name,
+            vram_gb: raw.vram_gb,
+            cuda_index: raw.cuda_index,
+        })
+    }
+}
+
+fn card_for_devices(
+    pool_devices: Vec<PoolDevice>,
+    strategy: PoolStrategy,
+    total_vram_gb: u32,
+    display_name: String,
+    tensor_split: Vec<f32>,
+    cuda_device_ids: Vec<u32>,
+    uses_vulkan: bool,
+) -> VirtualCard {
+    let budget_vram = if strategy == PoolStrategy::CpuOnly {
+        0
+    } else if !cuda_device_ids.is_empty() {
+        pool_devices
+            .iter()
+            .filter(|d| d.cuda_index.is_some())
+            .map(|d| d.vram_gb)
+            .max()
+            .unwrap_or(total_vram_gb.max(1))
+    } else {
+        total_vram_gb.max(1)
+    };
+    let gpu_layer_budget = match strategy {
+        PoolStrategy::CpuOnly => 0,
+        _ => offload_layer_budget(budget_vram),
+    };
+    VirtualCard {
+        devices: pool_devices,
+        strategy,
+        display_name,
+        total_vram_gb,
+        tensor_split,
+        cuda_device_ids,
+        uses_vulkan,
+        gpu_layer_budget,
+    }
+}
+
+/// Partition enabled devices into independent compute slots.
+///
+/// - Each discrete NVIDIA GPU → its own Single slot (CVD pin in the worker).
+/// - Homogeneous NVIDIA siblings share a `tp_group` so large models can claim them together.
+/// - Each AMD/Intel discrete / iGPU → Vulkan slot (when feature enabled).
+/// - CPU → always present as overflow.
+pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
+    let enabled: Vec<&ComputeDevice> = devices.iter().filter(|d| d.enabled).collect();
+    if enabled.is_empty() {
+        bail!("no compute devices enabled");
+    }
+
+    let mut cuda: Vec<(&ComputeDevice, u32, u32)> = Vec::new(); // device, index, vram
+    let mut vulkan_discrete: Vec<&ComputeDevice> = Vec::new();
+    let mut integrated: Vec<&ComputeDevice> = Vec::new();
+    let mut cpu: Option<&ComputeDevice> = None;
+
+    for device in &enabled {
+        if let Some(idx) = parse_cuda_index(&device.id) {
+            if device.kind == "discrete" {
+                cuda.push((*device, idx, effective_vram_gb(device)));
+                continue;
+            }
+        }
+        if device.kind == "cpu" {
+            cpu = Some(*device);
+            continue;
+        }
+        if device.kind == "integrated" {
+            integrated.push(*device);
+            continue;
+        }
+        if is_vulkan_accelerator(device) {
+            vulkan_discrete.push(*device);
+        }
+    }
+
+    let mut slots = Vec::new();
+    let mut tp_groups: HashMap<String, Vec<u32>> = HashMap::new();
+
+    let cuda_homogeneous = {
+        let names: Vec<String> = cuda.iter().map(|(d, _, _)| d.name.clone()).collect();
+        let vrams: Vec<u32> = cuda.iter().map(|(_, _, v)| *v).collect();
+        cuda.len() >= 2 && cuda_name_vram_homogeneous(&names, &vrams)
+    };
+    let tp_group_id = if cuda_homogeneous {
+        Some("cuda-tp-0".to_string())
+    } else {
+        None
+    };
+    if let Some(ref gid) = tp_group_id {
+        tp_groups.insert(gid.clone(), cuda.iter().map(|(_, idx, _)| *idx).collect());
+    }
+
+    // Prefer larger VRAM first for stable slot ordering / primary pick.
+    let mut cuda_sorted = cuda.clone();
+    cuda_sorted.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+
+    for (device, idx, vram) in &cuda_sorted {
+        let pool_dev = PoolDevice {
+            id: device.id.clone(),
+            kind: device.kind.clone(),
+            name: device.name.clone(),
+            vram_gb: *vram,
+            cuda_index: Some(*idx),
+        };
+        // Worker remaps CVD so llama always sees device 0.
+        let card = card_for_devices(
+            vec![pool_dev],
+            PoolStrategy::Single,
+            *vram,
+            device.name.clone(),
+            Vec::new(),
+            vec![0],
+            false,
+        );
+        slots.push(ComputeSlot {
+            id: format!("cuda-{idx}"),
+            kind: "discrete_cuda".into(),
+            priority: 10,
+            card,
+            cuda_visible: vec![*idx],
+            tp_group: tp_group_id.clone(),
+        });
+    }
+
+    if vulkan_runtime_supported() {
+        for (i, device) in vulkan_discrete.iter().enumerate() {
+            let vram = effective_vram_gb(device);
+            let pool_dev = PoolDevice {
+                id: device.id.clone(),
+                kind: device.kind.clone(),
+                name: device.name.clone(),
+                vram_gb: vram,
+                cuda_index: None,
+            };
+            let card = card_for_devices(
+                vec![pool_dev],
+                PoolStrategy::Vulkan,
+                vram.max(1),
+                device.name.clone(),
+                Vec::new(),
+                Vec::new(),
+                true,
+            );
+            slots.push(ComputeSlot {
+                id: format!("vulkan-{i}"),
+                kind: "discrete_vulkan".into(),
+                priority: 20,
+                card,
+                cuda_visible: Vec::new(),
+                tp_group: None,
+            });
+        }
+        for (i, device) in integrated.iter().enumerate() {
+            let vram = effective_vram_gb(device);
+            let pool_dev = PoolDevice {
+                id: device.id.clone(),
+                kind: device.kind.clone(),
+                name: device.name.clone(),
+                vram_gb: vram,
+                cuda_index: None,
+            };
+            let card = card_for_devices(
+                vec![pool_dev],
+                PoolStrategy::Vulkan,
+                vram.max(1),
+                device.name.clone(),
+                Vec::new(),
+                Vec::new(),
+                true,
+            );
+            slots.push(ComputeSlot {
+                id: format!("igpu-{i}"),
+                kind: "integrated".into(),
+                priority: 40,
+                card,
+                cuda_visible: Vec::new(),
+                tp_group: None,
+            });
+        }
+    }
+
+    let cpu_device = cpu.cloned().unwrap_or_else(|| ComputeDevice {
+        id: "cpu:0".into(),
+        kind: "cpu".into(),
+        name: "CPU".into(),
+        vram_gb: None,
+        vram_used_gb: None,
+        util_pct: None,
+        enabled: true,
+    });
+    let cpu_pool = PoolDevice {
+        id: cpu_device.id.clone(),
+        kind: "cpu".into(),
+        name: cpu_device.name.clone(),
+        vram_gb: 0,
+        cuda_index: None,
+    };
+    slots.push(ComputeSlot {
+        id: "cpu-0".into(),
+        kind: "cpu".into(),
+        priority: 90,
+        card: card_for_devices(
+            vec![cpu_pool],
+            PoolStrategy::CpuOnly,
+            0,
+            cpu_device.name,
+            Vec::new(),
+            Vec::new(),
+            false,
+        ),
+        cuda_visible: Vec::new(),
+        tp_group: None,
+    });
+
+    if slots.is_empty() {
+        bail!("no compute slots built");
+    }
+    Ok(ComputePlan { slots, tp_groups })
+}
+
+/// Build a TensorParallel VirtualCard for a homogeneous CUDA group (worker-local ids 0..n-1).
+pub fn build_tp_card_for_group(
+    devices: &[ComputeDevice],
+    physical_cuda_ids: &[u32],
+) -> Result<VirtualCard> {
+    let mut pool_devices = Vec::new();
+    let mut vrams = Vec::new();
+    let mut names = Vec::new();
+    for phys in physical_cuda_ids {
+        let device = devices
+            .iter()
+            .find(|d| parse_cuda_index(&d.id) == Some(*phys))
+            .ok_or_else(|| anyhow::anyhow!("missing CUDA device {phys}"))?;
+        let vram = effective_vram_gb(device);
+        vrams.push(vram);
+        names.push(device.name.clone());
+        pool_devices.push(PoolDevice {
+            id: device.id.clone(),
+            kind: device.kind.clone(),
+            name: device.name.clone(),
+            vram_gb: vram,
+            // Remapped: worker CVD lists physical ids in order → llama 0..n-1
+            cuda_index: Some(pool_devices.len() as u32),
+        });
+    }
+    let total: u32 = vrams.iter().copied().sum();
+    let llama_ids: Vec<u32> = (0..physical_cuda_ids.len() as u32).collect();
+    Ok(card_for_devices(
+        pool_devices,
+        PoolStrategy::TensorParallel,
+        total,
+        format!("Virtual {} ({} GPUs)", format_vram(total), physical_cuda_ids.len()),
+        vram_proportions(&vrams),
+        llama_ids,
+        false,
+    ))
+}
+
+/// Apply CUDA_VISIBLE_DEVICES for a worker before llama backend init.
+pub fn apply_slot_cuda_visibility(cuda_visible: &[u32]) {
+    if cuda_visible.is_empty() {
+        // Non-CUDA worker: hide all NVIDIA devices so mixed boxes don't abort.
+        std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+        return;
+    }
+    let joined = cuda_visible
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    std::env::set_var("CUDA_VISIBLE_DEVICES", joined);
 }
 
 pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
@@ -505,7 +907,7 @@ mod tests {
             ComputeDevice {
                 id: "nvidia:0".into(),
                 kind: "discrete".into(),
-                name: "A".into(),
+                name: "RTX 3080".into(),
                 vram_gb: Some(16),
                 vram_used_gb: None,
                 util_pct: None,
@@ -514,7 +916,7 @@ mod tests {
             ComputeDevice {
                 id: "nvidia:1".into(),
                 kind: "discrete".into(),
-                name: "B".into(),
+                name: "RTX 3080".into(),
                 vram_gb: Some(16),
                 vram_used_gb: None,
                 util_pct: None,
@@ -674,5 +1076,82 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(primary_cuda_device(&card), Some(1));
+    }
+
+    #[test]
+    fn mixed_gpus_become_independent_slots() {
+        let plan = build_compute_slots(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1650 SUPER".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "GTX 1050 Ti".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+        assert!(plan.tp_groups.is_empty());
+        let cuda: Vec<_> = plan
+            .slots
+            .iter()
+            .filter(|s| s.kind == "discrete_cuda")
+            .collect();
+        assert_eq!(cuda.len(), 2);
+        assert!(plan.slots.iter().any(|s| s.id == "cpu-0"));
+        assert!(cuda.iter().all(|s| s.tp_group.is_none()));
+        assert_eq!(cuda[0].card.cuda_device_ids, vec![0]);
+    }
+
+    #[test]
+    fn matched_gpus_share_tp_group_and_per_gpu_slots() {
+        let plan = build_compute_slots(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "RTX 4090".into(),
+                vram_gb: Some(24),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "RTX 4090".into(),
+                vram_gb: Some(24),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+        assert!(plan.tp_groups.contains_key("cuda-tp-0"));
+        let cuda: Vec<_> = plan
+            .slots
+            .iter()
+            .filter(|s| s.kind == "discrete_cuda")
+            .collect();
+        assert_eq!(cuda.len(), 2);
+        assert!(cuda.iter().all(|s| s.tp_group.as_deref() == Some("cuda-tp-0")));
     }
 }

@@ -36,6 +36,11 @@ impl InferenceEngine {
         Ok(Self { pool })
     }
 
+    #[allow(dead_code)]
+pub fn from_card(pool: VirtualCard) -> Self {
+        Self { pool }
+    }
+
     pub fn pool(&self) -> &VirtualCard {
         &self.pool
     }
@@ -239,6 +244,7 @@ fn timings_from_generate(t: &GenerateTimings) -> InvokeTimings {
 }
 
 /// Load enabled model weights into GPU memory so the first invoke skips disk load.
+#[allow(dead_code)]
 pub async fn warm_cached_models(pool: &VirtualCard, runtime_models: &[String]) -> Result<()> {
     if runtime_models.is_empty() {
         return Ok(());

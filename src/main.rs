@@ -3,6 +3,7 @@
 mod agent;
 mod compute_pool;
 mod config;
+mod hypervisor;
 mod inference;
 mod llm;
 mod logging;
@@ -83,6 +84,12 @@ enum Commands {
     },
     /// Restart the background agent (and Windows tray) using the saved token
     Restart,
+    /// Internal: run a per-slot inference worker (spawned by the hypervisor)
+    Worker {
+        /// JSON WorkerBootConfig (or set SCALATTICE_WORKER_CONFIG)
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -97,6 +104,16 @@ fn main() -> Result<()> {
     prepare_windows_process(&cli)?;
 
     logging::init_logging(verbose);
+
+    if let Some(Commands::Worker { config }) = &cli.command {
+        let config = config
+            .clone()
+            .or_else(|| std::env::var("SCALATTICE_WORKER_CONFIG").ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("worker requires --config or SCALATTICE_WORKER_CONFIG")
+            })?;
+        return hypervisor::run_worker(&config);
+    }
 
     #[cfg(windows)]
     if should_run_tray_ui(&cli) {
@@ -228,6 +245,7 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
             service::restart_runtime_from_saved_token()?;
             println!("Scalattice Agent restarted.");
         }
+        Some(Commands::Worker { .. }) => unreachable!("worker handled in main"),
     }
 
     Ok(())

@@ -5,11 +5,11 @@ use crate::protocol::{
     InvokeResultMessage, ModelPolicyEntry, RegisterMessage,
 };
 use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecycleState, VramTickAction};
-use crate::compute_pool::build_virtual_card;
-use crate::inference::{InferenceEngine, InferenceRequest};
+use crate::hypervisor::{Hypervisor, SlotStatus};
+use crate::inference::InferenceEngine;
 use crate::models::{
-    can_host_model, catalog_model_weights_ready, handle_weight_load_failure,
-    purge_incomplete_model_weights,
+    can_host_on_machine, catalog_model_weights_ready, handle_weight_load_failure,
+    preferred_download_card, purge_incomplete_model_weights,
     should_skip_preload, spawn_delete_staged_dirs, stage_purge_model_weights,
     sweep_staged_purge_dirs, spawn_catalog_sync,
 };
@@ -36,6 +36,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{info, warn};
 
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type SharedWsWrite = Arc<Mutex<WsWrite>>;
 
 /// Full Windows specs detection (PowerShell + nvidia-smi) is expensive. Cache it so the
 /// WebSocket loop is not blocked for tens of seconds every heartbeat / invoke.
@@ -52,6 +53,7 @@ struct SessionState {
     job_state: JobState,
     active_job_id: Option<String>,
     active_model_id: Option<String>,
+    active_job_count: u32,
     advertised_models: Vec<String>,
     node_id: Option<String>,
     catalog: Vec<CatalogModel>,
@@ -63,6 +65,12 @@ struct SessionState {
     vram_lifecycle: VramLifecycleState,
     /// Cached machine specs. RefCell: SessionState is only accessed while holding the tokio Mutex.
     specs_cache: RefCell<Option<(Instant, MachineSpecs)>>,
+    hypervisor: Option<Arc<Hypervisor>>,
+    cached_slots: Vec<SlotStatus>,
+    cached_idle_slots: u32,
+    cached_max_jobs: u32,
+    cached_loaded_models: Vec<String>,
+    pending_hypervisor_restart: bool,
 }
 
 impl SessionState {
@@ -76,6 +84,7 @@ impl SessionState {
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
+            active_job_count: 0,
             advertised_models: Vec::new(),
             node_id: None,
             catalog: Vec::new(),
@@ -86,6 +95,12 @@ impl SessionState {
             logged_download_blockers: false,
             vram_lifecycle: VramLifecycleState::default(),
             specs_cache: RefCell::new(None),
+            hypervisor: None,
+            cached_slots: Vec::new(),
+            cached_idle_slots: 0,
+            cached_max_jobs: 1,
+            cached_loaded_models: Vec::new(),
+            pending_hypervisor_restart: false,
         }
     }
 
@@ -95,7 +110,14 @@ impl SessionState {
 
     fn evict_vram_cache(&self) {
         info!("evicting in-memory model weights from VRAM");
-        crate::llm::evict_all();
+        if let Some(hv) = &self.hypervisor {
+            let hv = hv.clone();
+            tokio::spawn(async move {
+                hv.evict_all().await;
+            });
+        } else {
+            crate::llm::evict_all();
+        }
     }
 
     fn apply_max_completion_tokens(&mut self, raw: u32) {
@@ -153,7 +175,13 @@ impl SessionState {
             })
             .collect::<Vec<_>>();
         // ≤8GB cards can only keep one model warm; warming all of them OOMs on switch.
-        let vram = self.enabled_devices().vram_gb.unwrap_or(0);
+        let vram = self
+            .cached_slots
+            .iter()
+            .filter(|s| s.kind != "cpu")
+            .map(|s| s.vram_gb)
+            .max()
+            .unwrap_or_else(|| self.enabled_devices().vram_gb.unwrap_or(0));
         if vram > 0 && vram <= 8 && models.len() > 1 {
             models.truncate(1);
         }
@@ -211,7 +239,7 @@ impl SessionState {
         }
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
-        let card = match build_virtual_card(&specs.compute_devices) {
+        let card = match preferred_download_card(&specs.compute_devices) {
             Ok(card) => card,
             Err(err) => {
                 warn!("model downloads skipped: {err:#}");
@@ -252,24 +280,17 @@ impl SessionState {
         }
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
-        let card = match build_virtual_card(&specs.compute_devices) {
-            Ok(card) => card,
-            Err(err) => {
-                warn!("model downloads blocked: {err:#}");
-                return;
-            }
-        };
         for model in enabled {
             if catalog_model_weights_ready(model) {
                 continue;
             }
-            if !can_host_model(model, &card, ram_gb, self.cpu_ram_headroom_gb) {
+            if !can_host_on_machine(model, &specs.compute_devices, ram_gb, self.cpu_ram_headroom_gb)
+            {
                 warn!(
-                    "model {} cannot run on this machine (needs {} GB VRAM / {} GB RAM; virtual card has {} GB VRAM, {} GB RAM)",
+                    "model {} cannot run on this machine (needs {} GB VRAM / {} GB RAM; machine has {} GB RAM)",
                     model.model_id,
                     model.min_vram_gb.unwrap_or(0.0),
                     model.min_ram_gb.unwrap_or(0.0),
-                    card.total_vram_gb,
                     ram_gb
                 );
             }
@@ -372,15 +393,18 @@ impl SessionState {
     fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
-        let card = match build_virtual_card(&specs.compute_devices) {
-            Ok(card) => card,
-            Err(_) => return Vec::new(),
-        };
 
         self.catalog
             .iter()
             .filter(|model| self.is_model_enabled(&model.model_id))
-            .filter(|model| can_host_model(model, &card, ram_gb, self.cpu_ram_headroom_gb))
+            .filter(|model| {
+                can_host_on_machine(
+                    model,
+                    &specs.compute_devices,
+                    ram_gb,
+                    self.cpu_ram_headroom_gb,
+                )
+            })
             .cloned()
             .collect()
     }
@@ -397,11 +421,16 @@ impl SessionState {
         if devices.is_empty() {
             return;
         }
-        self.compute_policy = devices
+        let next: Vec<(String, bool)> = devices
             .iter()
             .map(|device| (device.id.clone(), device.enabled))
             .collect();
+        if self.compute_policy == next {
+            return;
+        }
+        self.compute_policy = next;
         self.invalidate_specs_cache();
+        self.pending_hypervisor_restart = true;
     }
 
     fn invalidate_specs_cache(&self) {
@@ -452,26 +481,22 @@ impl SessionState {
 
     fn live_specs(&self) -> MachineSpecs {
         let mut specs = self.enabled_devices();
-        if let Ok(engine) = InferenceEngine::new(&specs.compute_devices) {
-            if engine.pool().devices.len() > 1 {
-                specs.gpu_name = Some(engine.pool().display_name.clone());
-                specs.vram_gb = Some(engine.pool().total_vram_gb);
+        if let Some(slot) = self
+            .cached_slots
+            .iter()
+            .filter(|s| s.kind != "cpu" && s.healthy)
+            .max_by_key(|s| s.vram_gb)
+        {
+            specs.gpu_name = Some(slot.display_name.clone());
+            specs.vram_gb = Some(slot.vram_gb);
+        } else if self.cached_slots.len() > 1 {
+            let total: u32 = self.cached_slots.iter().map(|s| s.vram_gb).sum();
+            if total > 0 {
+                specs.vram_gb = Some(total);
+                specs.gpu_name = Some(format!("{} compute slots", self.cached_slots.len()));
             }
         }
         specs
-    }
-
-    fn refresh_inference(&self) -> Result<InferenceEngine> {
-        let specs = self.enabled_devices();
-        let engine = InferenceEngine::new(&specs.compute_devices)?;
-        if engine.pool().devices.len() > 1 {
-            info!(
-                "virtual compute card: {} · {:?}",
-                engine.pool().display_name,
-                engine.pool().strategy
-            );
-        }
-        Ok(engine)
     }
 
     fn count_blocked_enabled_models(&self) -> usize {
@@ -486,25 +511,30 @@ impl SessionState {
         if enabled_models.is_empty() {
             return 0;
         }
-        // No enabled devices: every enabled model is blocked (do not pretend weights are pending).
-        let card = match build_virtual_card(&specs.compute_devices) {
-            Ok(card) => card,
-            Err(_) => return enabled_models.len(),
-        };
+        if specs.compute_devices.iter().all(|d| !d.enabled) {
+            return enabled_models.len();
+        }
 
         enabled_models
             .into_iter()
-            // Count models that need more VRAM than the enabled pool, even when weights
-            // are already on disk (e.g. provider disabled the GPU they require).
-            .filter(|model| !can_host_model(model, &card, ram_gb, self.cpu_ram_headroom_gb))
+            .filter(|model| {
+                !can_host_on_machine(
+                    model,
+                    &specs.compute_devices,
+                    ram_gb,
+                    self.cpu_ram_headroom_gb,
+                )
+            })
             .count()
     }
 
     fn runtime(&self) -> crate::runtime::AgentRuntime {
         let specs = self.enabled_devices();
-        let loaded_models = InferenceEngine::new(&specs.compute_devices)
-            .map(|engine| engine.loaded_models())
-            .unwrap_or_default();
+        let loaded_models = if !self.cached_loaded_models.is_empty() {
+            self.cached_loaded_models.clone()
+        } else {
+            crate::models::list_cached_runtime_models()
+        };
         let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
         let downloading = crate::state::downloading_model();
         let blocked_models = if downloading.is_some() || !loaded_models.is_empty() {
@@ -525,6 +555,9 @@ impl SessionState {
             blocked_models,
             crate::models::models_cache_disk_gb(),
             crate::runtime::serialize_model_disk(&crate::models::list_model_disk_status()),
+            self.cached_slots.clone(),
+            self.cached_max_jobs.max(1),
+            self.cached_idle_slots,
         )
     }
 
@@ -549,15 +582,18 @@ const TOKEN_UPDATED: &str = "token_updated";
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
-    // Probe GPUs before CUDA init so we can hide mismatched cards from llama.cpp.
+    // Supervisor never touches CUDA — per-slot workers set CUDA_VISIBLE_DEVICES themselves.
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
-    crate::compute_pool::restrict_heterogeneous_cuda_visibility(&specs.compute_devices);
-
-    if let Err(err) = crate::llm::init_backend() {
-        warn!("embedded llama.cpp backend init failed: {err:#}");
-    }
     sweep_staged_purge_dirs();
+
+    let hypervisor = Hypervisor::start(&specs.compute_devices)
+        .await
+        .context("start compute hypervisor")?;
+    info!(
+        slots = hypervisor.plan().slots.len(),
+        "compute hypervisor online"
+    );
 
     loop {
         if let Some(fresh) = read_saved_agent_token() {
@@ -570,7 +606,7 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
             }
         }
 
-        match run_agent_session(&config).await {
+        match run_agent_session(&config, hypervisor.clone()).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 let err_str = format!("{err:#}");
@@ -617,12 +653,17 @@ fn is_token_auth_error(message: &str) -> bool {
         || message.contains("invalid agent token")
 }
 
-async fn run_agent_session(config: &AgentConfig) -> Result<()> {
+async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) -> Result<()> {
     info!(
         "connecting with provider token {}",
         token_snippet(&config.token)
     );
     let state = Arc::new(Mutex::new(SessionState::new()));
+    {
+        let mut guard = state.lock().await;
+        guard.hypervisor = Some(hypervisor.clone());
+    }
+    refresh_slot_cache(&state).await;
 
     let mut request = SCALATTICE_WS_URL
         .into_client_request()
@@ -642,7 +683,8 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
         guard.persist_local_state();
     }
 
-    let (mut write, mut read) = ws.split();
+    let (write, mut read) = ws.split();
+    let write = Arc::new(Mutex::new(write));
     // Prime specs once before the read loop so the first heartbeat/invoke is cheap.
     refresh_specs_cache(&state).await;
     let mut heartbeat = interval(Duration::from_secs(12));
@@ -657,7 +699,7 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
                     bail!("connection closed by server");
                 };
                 let msg = msg.context("websocket read error")?;
-                if !handle_server_message(config, &state, &mut write, msg).await? {
+                if !handle_server_message(config, &state, &write, msg).await? {
                     break;
                 }
             }
@@ -683,18 +725,17 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
                     guard.registered
                 };
                 if registered {
-                    // Never await specs detection on this task — that blocked Windows
-                    // invokes for ~28s while PowerShell/nvidia-smi ran.
                     let state_bg = state.clone();
                     tokio::spawn(async move {
                         refresh_specs_cache(&state_bg).await;
                     });
+                    refresh_slot_cache(&state).await;
                     maybe_warm_models(state.clone()).await;
                     let reregister = state.lock().await.needs_reregister();
                     if reregister {
-                        send_register_message(&state, &mut write).await?;
+                        send_register_message(&state, &write).await?;
                     } else {
-                        send_heartbeat(&state, &mut write).await?;
+                        send_heartbeat(&state, &write).await?;
                     }
                 }
             }
@@ -706,6 +747,46 @@ async fn run_agent_session(config: &AgentConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
+    // Restart workers when provider toggles devices.
+    let restart = {
+        let guard = state.lock().await;
+        guard.pending_hypervisor_restart && guard.active_job_count == 0
+    };
+    if restart {
+        let policy = state.lock().await.compute_policy.clone();
+        let specs = tokio::task::spawn_blocking(move || {
+            SessionState::detect_enabled_devices(&policy)
+        })
+        .await;
+        if let Ok(specs) = specs {
+            match Hypervisor::start(&specs.compute_devices).await {
+                Ok(hv) => {
+                    let mut guard = state.lock().await;
+                    guard.hypervisor = Some(hv);
+                    guard.pending_hypervisor_restart = false;
+                    info!("compute hypervisor restarted after device policy change");
+                }
+                Err(err) => warn!("hypervisor restart failed: {err:#}"),
+            }
+        }
+    }
+
+    let hv = state.lock().await.hypervisor.clone();
+    let Some(hv) = hv else {
+        return;
+    };
+    let slots = hv.slot_statuses().await;
+    let idle = hv.idle_slot_count().await;
+    let max = hv.max_concurrent_jobs().await;
+    let loaded = hv.loaded_models_union().await;
+    let mut guard = state.lock().await;
+    guard.cached_slots = slots;
+    guard.cached_idle_slots = idle;
+    guard.cached_max_jobs = max;
+    guard.cached_loaded_models = loaded;
 }
 
 async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
@@ -732,7 +813,7 @@ async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
 }
 
 async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
-    let (should_preload, warm_models, pool) = {
+    let (should_preload, warm_models, hv) = {
         let guard = state.lock().await;
         let config = guard.vram_config();
         if !guard.vram_lifecycle.should_preload(&config) {
@@ -742,27 +823,26 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
         if warm_models.is_empty() {
             return;
         }
-        let Ok(engine) = guard.refresh_inference() else {
+        let Some(hv) = guard.hypervisor.clone() else {
             return;
         };
-        (true, warm_models, engine.pool().clone())
+        (true, warm_models, hv)
     };
     if !should_preload {
         return;
     }
     let state_for_task = state.clone();
     tokio::spawn(async move {
-        if crate::inference::warm_cached_models(&pool, &warm_models)
-            .await
-            .is_ok()
-        {
+        if hv.warm_models(&warm_models).await.is_ok() {
             let mut guard = state_for_task.lock().await;
             guard.vram_lifecycle.on_vram_loaded();
         }
+        refresh_slot_cache(&state_for_task).await;
     });
 }
 
-async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -> Result<()> {
+async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite) -> Result<()> {
+    refresh_slot_cache(state).await;
     let register = {
         let mut guard = state.lock().await;
         let models = guard.register_model_ids();
@@ -779,13 +859,15 @@ async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &mut WsW
         }
     };
     write
+        .lock()
+        .await
         .send(Message::Text(serde_json::to_string(&register)?))
         .await?;
     Ok(())
 }
 
-async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -> Result<()> {
-    // Use cached specs only — never block the WS task on PowerShell/nvidia-smi here.
+async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite) -> Result<()> {
+    refresh_slot_cache(state).await;
     let (specs, runtime) = {
         let guard = state.lock().await;
         (guard.live_specs(), guard.runtime())
@@ -795,7 +877,7 @@ async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -
         specs: Some(specs),
         runtime: Some(runtime),
     })?;
-    write.send(Message::Text(hb)).await?;
+    write.lock().await.send(Message::Text(hb)).await?;
     {
         let guard = state.lock().await;
         guard.persist_local_state();
@@ -806,7 +888,7 @@ async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &mut WsWrite) -
 async fn handle_server_message(
     config: &AgentConfig,
     state: &Arc<Mutex<SessionState>>,
-    write: &mut WsWrite,
+    write: &SharedWsWrite,
     msg: Message,
 ) -> Result<bool> {
     match msg {
@@ -855,11 +937,23 @@ async fn handle_server_message(
                 }
                 "invoke" => {
                     let invoke = parse_invoke(data)?;
-                    respond_invoke(state, write, invoke).await?;
+                    let state = state.clone();
+                    let write = write.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = respond_invoke(&state, &write, invoke).await {
+                            warn!("invoke task failed: {err:#}");
+                        }
+                    });
                 }
                 "invoke_split" => {
                     let invoke = parse_invoke_split(data)?;
-                    respond_invoke_split(state, write, invoke).await?;
+                    let state = state.clone();
+                    let write = write.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = respond_invoke_split(&state, &write, invoke).await {
+                            warn!("invoke_split task failed: {err:#}");
+                        }
+                    });
                 }
                 "pong" | "policy" => {
                     if let Ok(pong) = parse_pong(data) {
@@ -880,13 +974,9 @@ async fn handle_server_message(
                         if transition.entered_earning {
                             maybe_warm_models(state.clone()).await;
                         }
-                        // Re-advertise immediately so disabled models leave the pool
-                        // without waiting for the next heartbeat.
                         if state.lock().await.needs_reregister() {
                             send_register_message(state, write).await?;
                         } else if purge_requested {
-                            // Fast disk remove: rename already cleared inventory; push runtime now
-                            // so the dashboard leaves "Removing…" without waiting ~12s.
                             send_heartbeat(state, write).await?;
                         }
                     }
@@ -911,7 +1001,7 @@ async fn handle_server_message(
             }
         }
         Message::Ping(payload) => {
-            write.send(Message::Pong(payload)).await?;
+            write.lock().await.send(Message::Pong(payload)).await?;
         }
         Message::Close(_) => return Ok(false),
         _ => {}
@@ -921,7 +1011,7 @@ async fn handle_server_message(
 
 async fn respond_invoke(
     state: &Arc<Mutex<SessionState>>,
-    write: &mut WsWrite,
+    write: &SharedWsWrite,
     invoke: crate::protocol::InvokeMessage,
 ) -> Result<()> {
     info!(
@@ -929,117 +1019,115 @@ async fn respond_invoke(
         invoke.id, invoke.model_id, invoke.runtime_model, invoke.stream
     );
 
-    {
+    let (hv, catalog_model, ram_gb, headroom, max_tokens) = {
         let mut guard = state.lock().await;
+        guard.active_job_count = guard.active_job_count.saturating_add(1);
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
         guard.vram_lifecycle.on_job_started();
-    }
-    send_heartbeat(state, write).await?;
-
-    let engine = {
-        let guard = state.lock().await;
-        guard
-            .refresh_inference()
-            .context("no enabled compute devices for inference")?
+        let hv = guard
+            .hypervisor
+            .clone()
+            .context("compute hypervisor not started")?;
+        let catalog_model = guard
+            .catalog
+            .iter()
+            .find(|m| m.model_id == invoke.model_id)
+            .cloned()
+            .unwrap_or(CatalogModel {
+                model_id: invoke.model_id.clone(),
+                display_name: invoke.model_id.clone(),
+                runtime_model: invoke.runtime_model.clone(),
+                max_context_tokens: 4096,
+                regions: vec![],
+                weight_size_gb: None,
+                min_vram_gb: None,
+                min_ram_gb: None,
+                weights: None,
+            });
+        let specs = guard.enabled_devices();
+        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
+        let headroom = guard.cpu_ram_headroom_gb;
+        let max_tokens = guard.effective_max_tokens(invoke.max_tokens);
+        (hv, catalog_model, ram_gb, headroom, max_tokens)
     };
+    let _ = send_heartbeat(state, write).await;
 
-    let max_tokens = {
-        let guard = state.lock().await;
-        guard.effective_max_tokens(invoke.max_tokens)
-    };
+    let invoke_id = invoke.id.clone();
+    let runtime_model = invoke.runtime_model.clone();
+    let stream = invoke.stream;
 
     let result = async {
-        let req = InferenceRequest {
-            job_id: &invoke.id,
-            model_id: &invoke.model_id,
-            runtime_model: &invoke.runtime_model,
-            messages: &invoke.messages,
-            max_tokens,
-        };
-
-        let output = if invoke.stream {
-            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let invoke_id = invoke.id.clone();
-            let gen = engine.invoke_streaming(req, delta_tx);
-            tokio::pin!(gen);
-
-            loop {
-                tokio::select! {
-                    maybe_delta = delta_rx.recv() => {
-                        match maybe_delta {
-                            Some(delta) if !delta.is_empty() => {
-                                let msg = InvokeDeltaMessage {
-                                    kind: "invoke_delta",
-                                    id: invoke_id.clone(),
-                                    delta,
-                                };
-                                write
-                                    .send(Message::Text(serde_json::to_string(&msg)?))
-                                    .await?;
-                            }
-                            Some(_) => {}
-                            None => {
-                                // Sender dropped; wait for the generate future.
-                                break gen.await;
-                            }
-                        }
-                    }
-                    out = &mut gen => {
-                        while let Ok(delta) = delta_rx.try_recv() {
-                            if delta.is_empty() {
-                                continue;
-                            }
-                            let msg = InvokeDeltaMessage {
-                                kind: "invoke_delta",
-                                id: invoke_id.clone(),
-                                delta,
-                            };
-                            write
-                                .send(Message::Text(serde_json::to_string(&msg)?))
-                                .await?;
-                        }
-                        break out;
-                    }
+        let on_delta: Option<Box<dyn FnMut(String) + Send>> = if stream {
+            let write = write.clone();
+            let invoke_id = invoke_id.clone();
+            Some(Box::new(move |delta: String| {
+                if delta.is_empty() {
+                    return;
                 }
-            }
+                let write = write.clone();
+                let invoke_id = invoke_id.clone();
+                tokio::spawn(async move {
+                    let msg = InvokeDeltaMessage {
+                        kind: "invoke_delta",
+                        id: invoke_id,
+                        delta,
+                    };
+                    if let Ok(text) = serde_json::to_string(&msg) {
+                        let _ = write.lock().await.send(Message::Text(text)).await;
+                    }
+                });
+            }))
         } else {
-            engine.invoke(req).await
+            None
         };
 
-        match output {
-            Ok(output) => {
+        match hv
+            .invoke(
+                &invoke.id,
+                &invoke.model_id,
+                &runtime_model,
+                &invoke.messages,
+                max_tokens,
+                &catalog_model,
+                ram_gb,
+                headroom,
+                on_delta,
+            )
+            .await
+        {
+            Ok((content, prompt_tokens, completion_tokens, timings, slot_id)) => {
+                info!(slot = %slot_id, "invoke {} completed", invoke_id);
                 let result = InvokeResultMessage {
                     kind: "invoke_result",
-                    id: invoke.id,
-                    content: output.content,
-                    prompt_tokens: output.prompt_tokens,
-                    completion_tokens: output.completion_tokens,
-                    timings: Some(output.timings),
+                    id: invoke_id.clone(),
+                    content,
+                    prompt_tokens,
+                    completion_tokens,
+                    timings: Some(timings),
                 };
                 write
+                    .lock()
+                    .await
                     .send(Message::Text(serde_json::to_string(&result)?))
                     .await?;
                 Ok(())
             }
             Err(err) => {
-                warn!(
-                    "inference invoke failed on pool {}: {err:#}",
-                    engine.pool().display_name
-                );
+                warn!("inference invoke failed: {err:#}");
                 let code = invoke_error_code(&err);
-                // Only classify weight health on actual load failures — inference-time
-                // errors (and capacity/device misses) must not quarantine healthy GGUFs.
                 if code == "model_load_failed" {
-                    handle_weight_load_failure(&invoke.runtime_model, &err);
+                    handle_weight_load_failure(&runtime_model, &err);
                 }
                 let msg = InvokeErrorMessage {
                     kind: "invoke_error",
-                    id: invoke.id,
+                    id: invoke_id.clone(),
                     error: code.to_string(),
                 };
                 write
+                    .lock()
+                    .await
                     .send(Message::Text(serde_json::to_string(&msg)?))
                     .await?;
                 Ok(())
@@ -1050,21 +1138,25 @@ async fn respond_invoke(
 
     {
         let mut guard = state.lock().await;
-        guard.job_state = JobState::Idle;
-        guard.active_job_id = None;
-        guard.active_model_id = None;
-        guard.vram_lifecycle.on_job_finished();
+        guard.active_job_count = guard.active_job_count.saturating_sub(1);
+        if guard.active_job_count == 0 {
+            guard.job_state = JobState::Idle;
+            guard.active_job_id = None;
+            guard.active_model_id = None;
+            guard.vram_lifecycle.on_job_finished();
+        }
     }
-    send_heartbeat(state, write).await?;
-
+    let _ = send_heartbeat(state, write).await;
     result
 }
 
 async fn respond_invoke_split(
     state: &Arc<Mutex<SessionState>>,
-    write: &mut WsWrite,
+    write: &SharedWsWrite,
     invoke: crate::protocol::InvokeSplitMessage,
 ) -> Result<()> {
+    // Split inference stays in-process on the best idle single slot via a temporary engine.
+    // Cross-node KV handoff is unchanged; local multi-GPU split uses one worker card.
     info!(
         "invoke_split {} · segment {} · model {}",
         invoke.id, invoke.segment, invoke.model_id
@@ -1072,19 +1164,17 @@ async fn respond_invoke_split(
 
     {
         let mut guard = state.lock().await;
+        guard.active_job_count = guard.active_job_count.saturating_add(1);
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
         guard.vram_lifecycle.on_job_started();
     }
-    send_heartbeat(state, write).await?;
+    let _ = send_heartbeat(state, write).await;
 
-    let engine = {
-        let guard = state.lock().await;
-        guard
-            .refresh_inference()
-            .context("no enabled compute devices for inference")?
-    };
+    let specs = state.lock().await.enabled_devices();
+    let engine = InferenceEngine::new(&specs.compute_devices)
+        .context("no enabled compute devices for split inference")?;
 
     let segment = invoke.segment.to_lowercase();
     let result = async {
@@ -1103,6 +1193,8 @@ async fn respond_invoke_split(
                         completion_tokens: 0,
                     };
                     write
+                        .lock()
+                        .await
                         .send(Message::Text(serde_json::to_string(&result)?))
                         .await?;
                     Ok(())
@@ -1115,28 +1207,26 @@ async fn respond_invoke_split(
                     guard.effective_max_tokens(invoke.max_tokens)
                 };
                 match engine
-                .invoke_split_upper(
-                    &invoke.runtime_model,
-                    &invoke.state_b64,
-                    max_tokens,
-                )
-                .await
-            {
-                Ok(output) => {
-                    let result = crate::protocol::InvokeSplitResultMessage {
-                        kind: "invoke_split_result",
-                        id: invoke.id,
-                        state_b64: String::new(),
-                        content: output.content,
-                        prompt_tokens: output.prompt_tokens,
-                        completion_tokens: output.completion_tokens,
-                    };
-                    write
-                        .send(Message::Text(serde_json::to_string(&result)?))
-                        .await?;
-                    Ok(())
-                }
-                Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
+                    .invoke_split_upper(&invoke.runtime_model, &invoke.state_b64, max_tokens)
+                    .await
+                {
+                    Ok(output) => {
+                        let result = crate::protocol::InvokeSplitResultMessage {
+                            kind: "invoke_split_result",
+                            id: invoke.id,
+                            state_b64: String::new(),
+                            content: output.content,
+                            prompt_tokens: output.prompt_tokens,
+                            completion_tokens: output.completion_tokens,
+                        };
+                        write
+                            .lock()
+                            .await
+                            .send(Message::Text(serde_json::to_string(&result)?))
+                            .await?;
+                        Ok(())
+                    }
+                    Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
                 }
             }
             "warm" => match engine.invoke_split_warm(&invoke.runtime_model).await {
@@ -1150,6 +1240,8 @@ async fn respond_invoke_split(
                         completion_tokens: 0,
                     };
                     write
+                        .lock()
+                        .await
                         .send(Message::Text(serde_json::to_string(&result)?))
                         .await?;
                     Ok(())
@@ -1163,6 +1255,8 @@ async fn respond_invoke_split(
                     error: format!("unknown split segment: {other}"),
                 };
                 write
+                    .lock()
+                    .await
                     .send(Message::Text(serde_json::to_string(&err)?))
                     .await?;
                 Ok(())
@@ -1173,18 +1267,20 @@ async fn respond_invoke_split(
 
     {
         let mut guard = state.lock().await;
-        guard.job_state = JobState::Idle;
-        guard.active_job_id = None;
-        guard.active_model_id = None;
-        guard.vram_lifecycle.on_job_finished();
+        guard.active_job_count = guard.active_job_count.saturating_sub(1);
+        if guard.active_job_count == 0 {
+            guard.job_state = JobState::Idle;
+            guard.active_job_id = None;
+            guard.active_model_id = None;
+            guard.vram_lifecycle.on_job_finished();
+        }
     }
-    send_heartbeat(state, write).await?;
-
+    let _ = send_heartbeat(state, write).await;
     result
 }
 
 async fn send_invoke_split_error(
-    write: &mut WsWrite,
+    write: &SharedWsWrite,
     id: &str,
     engine: &InferenceEngine,
     err: anyhow::Error,
@@ -1199,16 +1295,13 @@ async fn send_invoke_split_error(
         error: invoke_error_code(&err).to_string(),
     };
     write
+        .lock()
+        .await
         .send(Message::Text(serde_json::to_string(&err)?))
         .await?;
     Ok(())
 }
 
-/// Classify an inference failure into a stable, provider-agnostic code.
-///
-/// Scalattice Cloud and API clients may see whatever we put here, so it must
-/// never contain filesystem paths, device names, hostnames, or model file
-/// locations. Full detail is logged locally on the provider instead.
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     let detail = format!("{err:#}").to_lowercase();
     if detail.contains("out of memory")
