@@ -1,5 +1,5 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
-use crate::compute_pool::apply_slot_cuda_visibility;
+use crate::compute_pool::apply_slot_backend_visibility;
 use crate::llm::{
     evict_all, generate, generate_with_callback, init_backend, preload_model, GenerateConfig,
 };
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 pub fn run_worker(config_json: &str) -> Result<()> {
     let boot: WorkerBootConfig =
         serde_json::from_str(config_json).context("parse worker boot config")?;
-    apply_slot_cuda_visibility(&boot.cuda_visible);
+    apply_slot_backend_visibility(boot.card.strategy, &boot.cuda_visible);
     info!(
         slot = %boot.slot_id,
         strategy = ?boot.card.strategy,

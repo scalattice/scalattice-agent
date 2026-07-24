@@ -522,19 +522,48 @@ pub fn build_tp_card_for_group(
     ))
 }
 
-/// Apply CUDA_VISIBLE_DEVICES for a worker before llama backend init.
+/// Apply CUDA_VISIBLE_DEVICES / GGML_VK_VISIBLE_DEVICES for a worker before llama init.
+///
+/// CpuOnly workers must hide **both** CUDA and Vulkan. Hiding only CUDA still lets
+/// ggml-vulkan see NVIDIA devices and allocate VRAM — under concurrent CUDA offload
+/// that OOMs (`ErrorOutOfDeviceMemory`) and damages the machine.
+/// Legacy helper: pin CUDA devices and hide Vulkan (CUDA worker default).
 pub fn apply_slot_cuda_visibility(cuda_visible: &[u32]) {
-    if cuda_visible.is_empty() {
-        // Non-CUDA worker: hide all NVIDIA devices so mixed boxes don't abort.
-        std::env::set_var("CUDA_VISIBLE_DEVICES", "");
-        return;
+    let strategy = if cuda_visible.is_empty() {
+        PoolStrategy::CpuOnly
+    } else {
+        PoolStrategy::Single
+    };
+    apply_slot_backend_visibility(strategy, cuda_visible);
+}
+
+pub fn apply_slot_backend_visibility(strategy: PoolStrategy, cuda_visible: &[u32]) {
+    match strategy {
+        PoolStrategy::Vulkan => {
+            // Vulkan slot: no CUDA; leave VK devices visible for ggml.
+            std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+            std::env::remove_var("GGML_VK_VISIBLE_DEVICES");
+        }
+        PoolStrategy::CpuOnly => {
+            std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+            // Empty = no Vulkan devices (same convention as CUDA_VISIBLE_DEVICES).
+            std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
+        }
+        PoolStrategy::Single | PoolStrategy::TensorParallel => {
+            if cuda_visible.is_empty() {
+                std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+            } else {
+                let joined = cuda_visible
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                std::env::set_var("CUDA_VISIBLE_DEVICES", joined);
+            }
+            // CUDA workers must not also bind Vulkan (dual-backend VRAM fights).
+            std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
+        }
     }
-    let joined = cuda_visible
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    std::env::set_var("CUDA_VISIBLE_DEVICES", joined);
 }
 
 pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {

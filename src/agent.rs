@@ -1338,7 +1338,12 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     if detail.contains("agent_busy")
         || detail.contains("no idle compute slot")
         || detail.contains("not available")
-        || detail.contains("sibling slot") && detail.contains("busy")
+        || (detail.contains("sibling slot") && detail.contains("busy"))
+        // Backend memory fights under fanout (esp. Vulkan on a "CPU" overflow slot).
+        || detail.contains("erroroutdevicememory")
+        || detail.contains("out of device memory")
+        || detail.contains("create llama context")
+        || detail.contains("null reference")
     {
         "agent_busy"
     } else if detail.contains("out of memory")
