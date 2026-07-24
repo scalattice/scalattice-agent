@@ -154,7 +154,7 @@ impl SessionState {
     }
 
     fn warm_runtime_models(&self) -> Vec<String> {
-        let mut models = self
+        let models = self
             .register_model_ids()
             .into_iter()
             .filter_map(|model_id| {
@@ -174,17 +174,7 @@ impl SessionState {
                 })
             })
             .collect::<Vec<_>>();
-        // ≤8GB cards can only keep one model warm; warming all of them OOMs on switch.
-        let vram = self
-            .cached_slots
-            .iter()
-            .filter(|s| s.kind != "cpu")
-            .map(|s| s.vram_gb)
-            .max()
-            .unwrap_or_else(|| self.enabled_devices().vram_gb.unwrap_or(0));
-        if vram > 0 && vram <= 8 && models.len() > 1 {
-            models.truncate(1);
-        }
+        // Demand ordering + one-resident-per-small-slot happens in warm_models.
         models
     }
 

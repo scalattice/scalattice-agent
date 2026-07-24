@@ -76,13 +76,14 @@ pub fn build_runtime(
     idle_slots: u32,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
-    // Routable when any slot is idle — report idle so cloud can still schedule.
-    let reported_state = if idle_slots > 0 {
-        JobState::Idle
-    } else if job_state == JobState::Busy || max_concurrent_jobs > 0 {
+    // Report real busyness for dashboards. Routing uses claim slots / idleSlots,
+    // not this flag — forcing Idle whenever any slot (often cpu-0) was free hid
+    // active GPU jobs as "in the inference pool".
+    let reported_state = if job_state == JobState::Busy || (idle_slots == 0 && max_concurrent_jobs > 0)
+    {
         JobState::Busy
     } else {
-        job_state
+        JobState::Idle
     };
     let status_label = status_label(
         ready,
@@ -103,7 +104,7 @@ pub fn build_runtime(
         } else {
             None
         },
-        active_model_id: if job_state == JobState::Busy {
+        active_model_id: if job_state == JobState::Busy || reported_state == JobState::Busy {
             active_model_id
         } else {
             None

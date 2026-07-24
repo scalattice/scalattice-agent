@@ -200,20 +200,35 @@ impl Hypervisor {
             return Ok(());
         }
         let ordered = self.order_models_by_demand(runtime_models).await;
+        // ≤8GB: only the top-demand model is a warm candidate (one resident per card).
+        let ordered = {
+            let small = self.plan.slots.iter().any(|s| {
+                s.kind != "cpu"
+                    && s.card.total_vram_gb > 0
+                    && s.card.total_vram_gb <= 8
+            });
+            if small && ordered.len() > 1 {
+                ordered.into_iter().take(1).collect::<Vec<_>>()
+            } else {
+                ordered
+            }
+        };
         let idle = self.idle_slot_ids().await;
-        let workers_guard = self.workers.lock().await;
-        // Warm highest-demand model onto each idle accelerator (skip CPU unless only option).
+        let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
         let accel: Vec<&str> = idle
             .iter()
             .filter(|id| !id.starts_with("cpu-"))
             .map(|s| s.as_str())
             .collect();
-        let targets = if accel.is_empty() {
-            idle.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-        } else {
+        // Never fall back to warming cpu-0 while GPUs exist but are busy — that
+        // spammed 1.7b onto CPU during 8B jobs and fought RAM with offload.
+        let targets = if !accel.is_empty() {
             accel
+        } else if has_accel {
+            return Ok(());
+        } else {
+            idle.iter().map(|s| s.as_str()).collect::<Vec<_>>()
         };
-        drop(workers_guard);
 
         for (i, slot_id) in targets.into_iter().enumerate() {
             let Some(model) = ordered.get(i % ordered.len().max(1)) else {
