@@ -112,10 +112,11 @@ impl Hypervisor {
             .slots
             .iter()
             .map(|spec| {
+                // Missing from the map = temporarily checked out for an in-flight invoke.
                 let (busy, healthy, loaded) = workers
                     .get(&spec.id)
                     .map(|w| (w.busy, w.healthy, w.loaded_models.clone()))
-                    .unwrap_or((false, false, Vec::new()));
+                    .unwrap_or((true, true, Vec::new()));
                 SlotStatus {
                     id: spec.id.clone(),
                     kind: spec.kind.clone(),
@@ -153,8 +154,14 @@ impl Hypervisor {
 
     pub async fn max_concurrent_jobs(&self) -> u32 {
         // CPU counts; accelerator slots are the main parallelism.
+        // Missing map entry = in-flight checkout, still a live capacity unit.
         let workers = self.workers.lock().await;
-        workers.values().filter(|w| w.healthy).count().max(1) as u32
+        self.plan
+            .slots
+            .iter()
+            .filter(|s| workers.get(&s.id).map(|w| w.healthy).unwrap_or(true))
+            .count()
+            .max(1) as u32
     }
 
     #[allow(dead_code)]
@@ -269,16 +276,44 @@ impl Hypervisor {
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         self.record_demand(runtime_model).await;
 
-        let idle = self.idle_slot_ids().await;
-        let placement = pick_placement(
-            &self.plan,
-            &idle,
-            model,
-            ram_gb,
-            cpu_ram_headroom_gb,
-            &self.devices,
-        )
-        .ok_or_else(|| anyhow!("no idle compute slot can host model {model_id}"))?;
+        // Atomic pick+claim under one lock — prevents concurrent invokes all
+        // selecting the same idle slot (TOCTOU → "slot not available" → damage).
+        let placement = {
+            let mut workers = self.workers.lock().await;
+            let idle: Vec<String> = self
+                .plan
+                .slots
+                .iter()
+                .filter(|s| {
+                    workers
+                        .get(&s.id)
+                        .map(|w| w.healthy && !w.busy)
+                        .unwrap_or(false)
+                })
+                .map(|s| s.id.clone())
+                .collect();
+            let placement = pick_placement(
+                &self.plan,
+                &idle,
+                model,
+                ram_gb,
+                cpu_ram_headroom_gb,
+                &self.devices,
+            )
+            .ok_or_else(|| anyhow!("agent_busy: no idle compute slot for {model_id}"))?;
+
+            for sid in &placement.slot_ids {
+                let worker = workers
+                    .get_mut(sid)
+                    .ok_or_else(|| anyhow!("slot worker {sid} missing"))?;
+                if worker.busy || !worker.healthy {
+                    bail!("agent_busy: slot {sid} not available");
+                }
+                worker.busy = true;
+            }
+            placement
+        };
+        self.changed.notify_waiters();
 
         if placement.use_tp_worker {
             self.invoke_tp(
@@ -320,54 +355,50 @@ impl Hypervisor {
             .first()
             .cloned()
             .ok_or_else(|| anyhow!("empty placement"))?;
-        let mut workers = self.workers.lock().await;
-        let worker = workers
-            .get_mut(&slot_id)
-            .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?;
-        if worker.busy || !worker.healthy {
-            bail!("slot {slot_id} not available");
-        }
-        worker.busy = true;
-        drop(workers);
-        self.changed.notify_waiters();
+        // Take worker out of the map so other slots can run in parallel
+        // (busy flag was already set under the claim lock in invoke()).
+        let mut worker = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .remove(&slot_id)
+                .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?
+        };
 
         let req_id = next_req_id();
         let stream = on_delta.is_some();
-        let result = {
+        let outcome = worker_rpc_invoke(
+            &mut worker,
+            WorkerRequest::Invoke {
+                id: req_id,
+                job_id: job_id.to_string(),
+                model_id: model_id.to_string(),
+                runtime_model: runtime_model.to_string(),
+                messages: messages.to_vec(),
+                max_tokens,
+                stream,
+            },
+            on_delta,
+        )
+        .await;
+
+        worker.busy = false;
+        if let Ok((_, _, _, _, loaded)) = &outcome {
+            worker.loaded_models = loaded.clone();
+        }
+        if let Ok(Some(status)) = worker.child.try_wait() {
+            warn!(slot = %slot_id, ?status, "slot worker exited; respawning");
+            worker.healthy = false;
+            if let Ok(new_w) = spawn_worker(&worker.spec).await {
+                worker = new_w;
+            }
+        }
+
+        {
             let mut workers = self.workers.lock().await;
-            let worker = workers
-                .get_mut(&slot_id)
-                .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?;
-            let outcome = worker_rpc_invoke(
-                worker,
-                WorkerRequest::Invoke {
-                    id: req_id,
-                    job_id: job_id.to_string(),
-                    model_id: model_id.to_string(),
-                    runtime_model: runtime_model.to_string(),
-                    messages: messages.to_vec(),
-                    max_tokens,
-                    stream,
-                },
-                on_delta,
-            )
-            .await;
-            worker.busy = false;
-            if let Ok((_, _, _, _, loaded)) = &outcome {
-                worker.loaded_models = loaded.clone();
-            }
-            // Detect dead child.
-            if let Ok(Some(status)) = worker.child.try_wait() {
-                warn!(slot = %slot_id, ?status, "slot worker exited; respawning");
-                worker.healthy = false;
-                if let Ok(new_w) = spawn_worker(&worker.spec).await {
-                    *worker = new_w;
-                }
-            }
-            outcome
-        };
+            workers.insert(slot_id.clone(), worker);
+        }
         self.changed.notify_waiters();
-        result.map(|(c, p, t, timings, _)| (c, p, t, timings, slot_id))
+        outcome.map(|(c, p, t, timings, _)| (c, p, t, timings, slot_id))
     }
 
     async fn invoke_tp(
@@ -380,21 +411,18 @@ impl Hypervisor {
         max_tokens: u32,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
-        // Pause sibling single-GPU workers, run ephemeral TP worker, then restore.
-        let mut workers = self.workers.lock().await;
-        for sid in &placement.slot_ids {
-            let Some(w) = workers.get_mut(sid) else {
-                bail!("missing sibling slot {sid}");
-            };
-            if w.busy {
-                bail!("sibling slot {sid} busy");
+        // Slots already claimed busy by invoke(). Pause siblings, run TP, restore.
+        {
+            let mut workers = self.workers.lock().await;
+            for sid in &placement.slot_ids {
+                let Some(w) = workers.get_mut(sid) else {
+                    bail!("missing sibling slot {sid}");
+                };
+                // Stop the process so CVD can be reused by TP worker.
+                let _ = w.child.kill().await;
+                w.healthy = false;
             }
-            w.busy = true;
-            // Stop the process so CVD can be reused by TP worker.
-            let _ = w.child.kill().await;
-            w.healthy = false;
         }
-        drop(workers);
 
         let tp_key = placement.slot_ids.join("+");
         let tp_spec = ComputeSlot {
@@ -406,9 +434,36 @@ impl Hypervisor {
             tp_group: None,
         };
 
-        let mut tp_worker = spawn_worker(&tp_spec)
-            .await
-            .context("spawn tensor-parallel worker")?;
+        let mut tp_worker = match spawn_worker(&tp_spec).await {
+            Ok(w) => w,
+            Err(err) => {
+                // Restore siblings so slots aren't stuck busy after a failed claim.
+                let mut workers = self.workers.lock().await;
+                for sid in &placement.slot_ids {
+                    if let Some(spec) = self.plan.slots.iter().find(|s| s.id == *sid) {
+                        match spawn_worker(spec).await {
+                            Ok(mut w) => {
+                                w.busy = false;
+                                workers.insert(sid.clone(), w);
+                            }
+                            Err(restore_err) => {
+                                warn!(
+                                    slot = %sid,
+                                    error = %restore_err,
+                                    "failed to restore slot worker after TP spawn failure"
+                                );
+                                if let Some(w) = workers.get_mut(sid) {
+                                    w.busy = false;
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(workers);
+                self.changed.notify_waiters();
+                return Err(err).context("spawn tensor-parallel worker");
+            }
+        };
         tp_worker.busy = true;
 
         let req_id = next_req_id();

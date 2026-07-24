@@ -421,11 +421,15 @@ impl SessionState {
         if devices.is_empty() {
             return;
         }
-        let next: Vec<(String, bool)> = devices
+        let mut next: Vec<(String, bool)> = devices
             .iter()
             .map(|device| (device.id.clone(), device.enabled))
             .collect();
-        if self.compute_policy == next {
+        // Order-independent compare — server may reshuffle the same set.
+        next.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut current = self.compute_policy.clone();
+        current.sort_by(|a, b| a.0.cmp(&b.0));
+        if current == next {
             return;
         }
         self.compute_policy = next;
@@ -751,12 +755,18 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
 
 async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
     // Restart workers when provider toggles devices.
-    let restart = {
-        let guard = state.lock().await;
-        guard.pending_hypervisor_restart && guard.active_job_count == 0
+    // Claim the pending flag immediately so concurrent refresh callers don't
+    // start a second Hypervisor::start in parallel.
+    let policy = {
+        let mut guard = state.lock().await;
+        if !(guard.pending_hypervisor_restart && guard.active_job_count == 0) {
+            None
+        } else {
+            guard.pending_hypervisor_restart = false;
+            Some(guard.compute_policy.clone())
+        }
     };
-    if restart {
-        let policy = state.lock().await.compute_policy.clone();
+    if let Some(policy) = policy {
         let specs = tokio::task::spawn_blocking(move || {
             SessionState::detect_enabled_devices(&policy)
         })
@@ -766,11 +776,16 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
                 Ok(hv) => {
                     let mut guard = state.lock().await;
                     guard.hypervisor = Some(hv);
-                    guard.pending_hypervisor_restart = false;
                     info!("compute hypervisor restarted after device policy change");
                 }
-                Err(err) => warn!("hypervisor restart failed: {err:#}"),
+                Err(err) => {
+                    warn!("hypervisor restart failed: {err:#}");
+                    // Allow a later refresh to retry.
+                    state.lock().await.pending_hypervisor_restart = true;
+                }
             }
+        } else {
+            state.lock().await.pending_hypervisor_restart = true;
         }
     }
 
@@ -1304,7 +1319,14 @@ async fn send_invoke_split_error(
 
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     let detail = format!("{err:#}").to_lowercase();
-    if detail.contains("out of memory")
+    // Capacity / contention — router must not damage the machine.
+    if detail.contains("agent_busy")
+        || detail.contains("no idle compute slot")
+        || detail.contains("not available")
+        || detail.contains("sibling slot") && detail.contains("busy")
+    {
+        "agent_busy"
+    } else if detail.contains("out of memory")
         || detail.contains("oom")
         || detail.contains("cudamalloc")
         || detail.contains("failed to allocate")
