@@ -153,15 +153,18 @@ impl Hypervisor {
     }
 
     pub async fn max_concurrent_jobs(&self) -> u32 {
-        // CPU counts; accelerator slots are the main parallelism.
-        // Missing map entry = in-flight checkout, still a live capacity unit.
+        // Advertise accelerator parallelism only. Counting CPU made the router
+        // claim 3-wide on dual-4GB boxes; overflow onto cpu-0 then OOMs / damages
+        // under 8B offload fanout. CPU remains a placement fallback when claimed.
         let workers = self.workers.lock().await;
-        self.plan
+        let accel = self
+            .plan
             .slots
             .iter()
+            .filter(|s| s.kind != "cpu")
             .filter(|s| workers.get(&s.id).map(|w| w.healthy).unwrap_or(true))
-            .count()
-            .max(1) as u32
+            .count();
+        accel.max(1) as u32
     }
 
     #[allow(dead_code)]

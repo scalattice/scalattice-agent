@@ -1339,11 +1339,12 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || detail.contains("no idle compute slot")
         || detail.contains("not available")
         || (detail.contains("sibling slot") && detail.contains("busy"))
-        // Backend memory fights under fanout (esp. Vulkan on a "CPU" overflow slot).
+        // Backend memory fights / failed load under fanout (llama null ptr).
         || detail.contains("erroroutdevicememory")
         || detail.contains("out of device memory")
         || detail.contains("create llama context")
         || detail.contains("null reference")
+        || detail.contains("null result")
     {
         "agent_busy"
     } else if detail.contains("out of memory")
@@ -1356,10 +1357,7 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || detail.contains("ggml_backend_cuda")
     {
         "model_out_of_memory"
-    } else if detail.contains("null result")
-        || detail.contains("load model")
-        || detail.contains("load_from_file")
-    {
+    } else if detail.contains("load model") || detail.contains("load_from_file") {
         "model_load_failed"
     } else if detail.contains("context window") || detail.contains("too long") {
         "prompt_too_long"
