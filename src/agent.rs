@@ -534,11 +534,10 @@ impl SessionState {
 
     fn runtime(&self) -> crate::runtime::AgentRuntime {
         let specs = self.enabled_devices();
-        let loaded_models = if !self.cached_loaded_models.is_empty() {
-            self.cached_loaded_models.clone()
-        } else {
-            crate::models::list_cached_runtime_models()
-        };
+        // Always report disk-cached weights here. VRAM-resident models live on
+        // slot status; substituting them made the dashboard flicker to "only the
+        // running model is installed" under load.
+        let loaded_models = crate::models::list_cached_runtime_models();
         let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
         let downloading = crate::state::downloading_model();
         let blocked_models = if downloading.is_some() || !loaded_models.is_empty() {
@@ -1057,6 +1056,17 @@ async fn respond_invoke(
 
     let (hv, catalog_model, ram_gb, headroom, max_tokens) = {
         let mut guard = state.lock().await;
+        let max_jobs = guard.cached_max_jobs.max(1);
+        if guard.active_job_count >= max_jobs {
+            // Defense in depth: router claim can free while we still run stragglers.
+            let msg = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke.id.clone(),
+                error: "agent_busy".to_string(),
+            };
+            let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+            return Ok(());
+        }
         guard.active_job_count = guard.active_job_count.saturating_add(1);
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
