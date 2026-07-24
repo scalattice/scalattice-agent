@@ -549,13 +549,15 @@ const TOKEN_UPDATED: &str = "token_updated";
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
+    // Probe GPUs before CUDA init so we can hide mismatched cards from llama.cpp.
+    let specs = detect_machine_specs();
+    info!("{}", crate::specs::status_line(&specs));
+    crate::compute_pool::restrict_heterogeneous_cuda_visibility(&specs.compute_devices);
+
     if let Err(err) = crate::llm::init_backend() {
         warn!("embedded llama.cpp backend init failed: {err:#}");
     }
     sweep_staged_purge_dirs();
-
-    let specs = detect_machine_specs();
-    info!("{}", crate::specs::status_line(&specs));
 
     loop {
         if let Some(fresh) = read_saved_agent_token() {

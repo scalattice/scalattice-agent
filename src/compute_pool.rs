@@ -1,5 +1,6 @@
 use crate::specs::ComputeDevice;
 use anyhow::{bail, Result};
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -41,6 +42,99 @@ pub struct VirtualCard {
     pub gpu_layer_budget: u32,
 }
 
+/// Must run **before** `init_backend()`. Mixed NVIDIA gens (e.g. 1650 Super + 1050 Ti)
+/// make llama.cpp CUDA abort even on "single device" loads while both cards stay visible.
+/// Hide everything except the largest card from the CUDA runtime.
+pub fn restrict_heterogeneous_cuda_visibility(devices: &[ComputeDevice]) {
+    let mut cuda: Vec<(u32, String, u32)> = Vec::new();
+    for device in devices.iter().filter(|d| d.enabled) {
+        let Some(idx) = parse_cuda_index(&device.id) else {
+            continue;
+        };
+        if device.kind != "discrete" {
+            continue;
+        }
+        cuda.push((idx, device.name.clone(), effective_vram_gb(device)));
+    }
+    if cuda.len() < 2 {
+        return;
+    }
+    let names: Vec<String> = cuda.iter().map(|c| c.1.clone()).collect();
+    let vrams: Vec<u32> = cuda.iter().map(|c| c.2).collect();
+    if cuda_name_vram_homogeneous(&names, &vrams) {
+        return;
+    }
+
+    let primary_pos = pick_primary_cuda_pos(
+        &cuda.iter().map(|c| c.0).collect::<Vec<_>>(),
+        &vrams,
+    );
+    let (physical, name, vram) = &cuda[primary_pos];
+    // SAFETY: must be set before the first CUDA / llama.cpp backend init in this process.
+    std::env::set_var("CUDA_VISIBLE_DEVICES", physical.to_string());
+    warn!(
+        kept_cuda_index = physical,
+        kept_name = %name,
+        kept_vram_gb = vram,
+        hidden_gpus = cuda.len() - 1,
+        "mixed NVIDIA GPUs: CUDA_VISIBLE_DEVICES limited to the largest card so llama.cpp cannot abort on multi-arch init"
+    );
+}
+
+fn cuda_visibility_remapped_to_zero(physical: u32) -> bool {
+    let Ok(raw) = std::env::var("CUDA_VISIBLE_DEVICES") else {
+        return false;
+    };
+    let parts: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.len() == 1 && parts[0].parse::<u32>().ok() == Some(physical)
+}
+
+/// Normalize NVIDIA marketing names so "NVIDIA GeForce RTX 4090" == "rtx 4090" family match.
+pub fn normalize_cuda_sku(name: &str) -> String {
+    let mut s = name.trim().to_ascii_lowercase();
+    for prefix in [
+        "nvidia ",
+        "geforce ",
+        "tesla ",
+        "quadro ",
+        "rtx ",
+        "gtx ",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start().to_string();
+        }
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn cuda_name_vram_homogeneous(names: &[String], vrams: &[u32]) -> bool {
+    if names.len() < 2 || names.len() != vrams.len() {
+        return false;
+    }
+    let skus: Vec<String> = names.iter().map(|n| normalize_cuda_sku(n)).collect();
+    if skus.iter().any(|s| s.is_empty()) || !skus.iter().all(|s| s == &skus[0]) {
+        return false;
+    }
+    let min_v = *vrams.iter().min().unwrap_or(&0);
+    let max_v = *vrams.iter().max().unwrap_or(&0);
+    max_v.saturating_sub(min_v) <= 1
+}
+
+fn pick_primary_cuda_pos(ids: &[u32], vrams: &[u32]) -> usize {
+    (0..ids.len())
+        .max_by(|&i, &j| {
+            vrams[i]
+                .cmp(&vrams[j])
+                // On equal VRAM prefer the lower CUDA index (usually the primary slot).
+                .then_with(|| ids[j].cmp(&ids[i]))
+        })
+        .unwrap_or(0)
+}
+
 pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     let enabled: Vec<&ComputeDevice> = devices.iter().filter(|d| d.enabled).collect();
     if enabled.is_empty() {
@@ -79,42 +173,82 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     // Prefer CUDA when any NVIDIA device is enabled. Otherwise use Vulkan accelerators
     // (AMD discrete / Intel Arc / iGPU). CPU alone → CpuOnly.
     //
-    // Multi-GPU pools keep TensorParallel topology; whether a *given model* may use
-    // TP gpu-full is decided at load time from on-disk weight vs per-GPU VRAM
-    // (see `should_attempt_tensor_parallel`) — no fixed GB cutoff here.
-    let (strategy, total_vram_gb, display_name, tensor_split, uses_vulkan) = if !cuda_ids.is_empty()
-    {
-        let total: u32 = cuda_vram.iter().copied().sum();
-        let name = match cuda_names.len() {
-            1 => cuda_names[0].clone(),
-            n => format!("Virtual {} ({} GPUs)", format_vram(total), n),
-        };
-        let strategy = if cuda_ids.len() > 1 {
-            PoolStrategy::TensorParallel
+    // Matched multi-GPU → TensorParallel topology (per-model TP still gated at load).
+    // Mixed SKU/VRAM → demote to Single on the largest card (and ideally CUDA_VISIBLE_DEVICES).
+    let (strategy, total_vram_gb, display_name, tensor_split, uses_vulkan, cuda_ids) =
+        if !cuda_ids.is_empty() {
+            if cuda_ids.len() > 1 && !cuda_name_vram_homogeneous(&cuda_names, &cuda_vram) {
+                let primary_pos = pick_primary_cuda_pos(&cuda_ids, &cuda_vram);
+                let physical = cuda_ids[primary_pos];
+                let llama_id = if cuda_visibility_remapped_to_zero(physical) {
+                    0
+                } else {
+                    physical
+                };
+                let vram = cuda_vram[primary_pos];
+                let name = cuda_names[primary_pos].clone();
+                warn!(
+                    kept = %name,
+                    llama_cuda_id = llama_id,
+                    physical_cuda_id = physical,
+                    ignored_gpus = cuda_ids.len() - 1,
+                    "mixed NVIDIA GPUs: inference pool demoted to single largest card"
+                );
+                (
+                    PoolStrategy::Single,
+                    vram,
+                    name,
+                    Vec::new(),
+                    false,
+                    vec![llama_id],
+                )
+            } else {
+                let total: u32 = cuda_vram.iter().copied().sum();
+                let name = match cuda_names.len() {
+                    1 => cuda_names[0].clone(),
+                    n => format!("Virtual {} ({} GPUs)", format_vram(total), n),
+                };
+                let strategy = if cuda_ids.len() > 1 {
+                    PoolStrategy::TensorParallel
+                } else {
+                    PoolStrategy::Single
+                };
+                let split = if cuda_ids.len() > 1 {
+                    vram_proportions(&cuda_vram)
+                } else {
+                    Vec::new()
+                };
+                (strategy, total, name, split, false, cuda_ids)
+            }
+        } else if !vulkan_names.is_empty() && vulkan_runtime_supported() {
+            let total: u32 = vulkan_vram.iter().copied().sum::<u32>().max(1);
+            let name = match vulkan_names.len() {
+                1 => vulkan_names[0].clone(),
+                n => format!("Virtual {} ({} GPUs · Vulkan)", format_vram(total), n),
+            };
+            (
+                PoolStrategy::Vulkan,
+                total,
+                name,
+                Vec::new(),
+                true,
+                Vec::new(),
+            )
         } else {
-            PoolStrategy::Single
+            let name = if pool_devices.len() == 1 {
+                pool_devices[0].name.clone()
+            } else {
+                format!("CPU pool ({} devices)", pool_devices.len())
+            };
+            (
+                PoolStrategy::CpuOnly,
+                0,
+                name,
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
         };
-        let split = if cuda_ids.len() > 1 {
-            vram_proportions(&cuda_vram)
-        } else {
-            Vec::new()
-        };
-        (strategy, total, name, split, false)
-    } else if !vulkan_names.is_empty() && vulkan_runtime_supported() {
-        let total: u32 = vulkan_vram.iter().copied().sum::<u32>().max(1);
-        let name = match vulkan_names.len() {
-            1 => vulkan_names[0].clone(),
-            n => format!("Virtual {} ({} GPUs · Vulkan)", format_vram(total), n),
-        };
-        (PoolStrategy::Vulkan, total, name, Vec::new(), true)
-    } else {
-        let name = if pool_devices.len() == 1 {
-            pool_devices[0].name.clone()
-        } else {
-            format!("CPU pool ({} devices)", pool_devices.len())
-        };
-        (PoolStrategy::CpuOnly, 0, name, Vec::new(), false)
-    };
 
     // Offload budgets are for the primary GPU (largest), even on TP pools — cascade
     // offload tiers always pin a single device.
@@ -188,14 +322,34 @@ pub fn offload_layer_budget(total_discrete_vram_gb: u32) -> u32 {
 
 /// CUDA index of the largest enabled NVIDIA GPU (offload / Single fallbacks).
 pub fn primary_cuda_device(pool: &VirtualCard) -> Option<u32> {
-    pool.devices
-        .iter()
-        .filter(|d| d.kind == "discrete" && d.cuda_index.is_some())
-        .max_by_key(|d| d.vram_gb)
-        .and_then(|d| d.cuda_index)
+    let mut best: Option<(u32, u32)> = None; // (vram, cuda_index)
+    for d in pool.devices.iter().filter(|d| d.kind == "discrete") {
+        let Some(idx) = d.cuda_index else {
+            continue;
+        };
+        let vram = d.vram_gb;
+        best = Some(match best {
+            None => (vram, idx),
+            Some((bv, bi)) => {
+                if vram > bv || (vram == bv && idx < bi) {
+                    (vram, idx)
+                } else {
+                    (bv, bi)
+                }
+            }
+        });
+    }
+    // After mixed-GPU demotion the pool's llama device list is authoritative.
+    if pool.strategy == PoolStrategy::Single && pool.cuda_device_ids.len() == 1 {
+        return pool.cuda_device_ids.first().copied();
+    }
+    best.map(|(_, idx)| idx)
 }
 
 pub fn primary_cuda_vram_gb(pool: &VirtualCard) -> u32 {
+    if pool.strategy == PoolStrategy::Single && pool.cuda_device_ids.len() == 1 {
+        return pool.total_vram_gb.max(1);
+    }
     pool.devices
         .iter()
         .filter(|d| d.kind == "discrete" && d.cuda_index.is_some())
@@ -206,6 +360,9 @@ pub fn primary_cuda_vram_gb(pool: &VirtualCard) -> u32 {
 
 /// Per-device VRAM for CUDA ids in the pool (same order as `cuda_device_ids`).
 pub fn cuda_device_vram_gb(pool: &VirtualCard) -> Vec<u32> {
+    if pool.strategy == PoolStrategy::Single && pool.cuda_device_ids.len() == 1 {
+        return vec![pool.total_vram_gb.max(1)];
+    }
     pool.cuda_device_ids
         .iter()
         .filter_map(|id| {
@@ -272,8 +429,8 @@ mod tests {
     }
 
     #[test]
-    fn small_multi_gpu_keeps_tp_topology() {
-        // Placement safety is decided per-model at load time, not via a GB cutoff.
+    fn mixed_multi_gpu_demotes_to_single_largest() {
+        // Chillblast-like: placement must not keep TensorParallel topology.
         let card = build_virtual_card(&[
             ComputeDevice {
                 id: "nvidia:0".into(),
@@ -305,11 +462,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(card.strategy, PoolStrategy::TensorParallel);
-        assert_eq!(card.total_vram_gb, 8);
-        assert_eq!(card.cuda_device_ids, vec![0, 1]);
-        assert_eq!(card.display_name, "Virtual 8GB (2 GPUs)");
-        // Offload budget from largest single GPU (4GB), not the summed total.
+        assert_eq!(card.strategy, PoolStrategy::Single);
+        assert_eq!(card.total_vram_gb, 4);
+        assert_eq!(card.cuda_device_ids, vec![0]);
+        assert_eq!(card.display_name, "GTX 1650 SUPER");
         assert_eq!(card.gpu_layer_budget, offload_layer_budget(4));
     }
 

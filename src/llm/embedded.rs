@@ -377,55 +377,20 @@ fn full_placement_vram_gb(pool: &VirtualCard) -> u32 {
     }
 }
 
-/// Normalize NVIDIA marketing names so "NVIDIA GeForce RTX 4090" == "RTX 4090".
-fn normalize_cuda_sku(name: &str) -> String {
-    let mut s = name.trim().to_ascii_lowercase();
-    for prefix in [
-        "nvidia ",
-        "geforce ",
-        "tesla ",
-        "quadro ",
-        "rtx ",
-        "gtx ",
-    ] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest.trim_start().to_string();
-        }
-    }
-    // Re-add a short family token for matching (rtx/gtx stripped above for compare).
-    let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact
-}
-
 /// llama.cpp CUDA tensor-parallel across mismatched consumer cards (e.g. 1650 Super +
 /// 1050 Ti) commonly `abort()`s. Require same SKU + near-equal VRAM.
 pub(crate) fn cuda_devices_compatible_for_tp(pool: &VirtualCard) -> bool {
-    let cuda_devs: Vec<&crate::compute_pool::PoolDevice> = pool
+    if pool.cuda_device_ids.len() < 2 {
+        return false;
+    }
+    let names: Vec<String> = pool
         .devices
         .iter()
         .filter(|d| d.cuda_index.is_some())
+        .map(|d| d.name.clone())
         .collect();
-    if cuda_devs.len() < 2 {
-        return false;
-    }
-    let skus: Vec<String> = cuda_devs
-        .iter()
-        .map(|d| normalize_cuda_sku(&d.name))
-        .collect();
-    if skus.iter().any(|s| s.is_empty()) {
-        return false;
-    }
-    if !skus.iter().all(|s| s == &skus[0]) {
-        return false;
-    }
     let vrams = cuda_device_vram_gb(pool);
-    if vrams.len() != cuda_devs.len() {
-        return false;
-    }
-    let min_v = *vrams.iter().min().unwrap_or(&0);
-    let max_v = *vrams.iter().max().unwrap_or(&0);
-    // Allow 1GB nvidia-smi rounding noise; refuse real skew.
-    max_v.saturating_sub(min_v) <= 1
+    crate::compute_pool::cuda_name_vram_homogeneous(&names, &vrams)
 }
 
 /// Tensor-parallel gpu-full is safe for *this* model when GPUs are homogeneous and
@@ -749,12 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn chillblast_mixed_gpus_never_tensor_parallel() {
-        // Real Chillblast box: 1650 Super + 1050 Ti. TP abort()s in ggml-cuda.
+    fn chillblast_mixed_gpus_pool_is_single_not_tp() {
+        // Real Chillblast box: 1650 Super + 1050 Ti. Pool demotes to Single.
         let pool = dual_gpu_named(4, 4, "GTX 1650 SUPER", "GTX 1050 Ti");
+        assert_eq!(pool.strategy, PoolStrategy::Single);
+        assert_eq!(pool.cuda_device_ids.len(), 1);
         assert!(!cuda_devices_compatible_for_tp(&pool));
         assert!(!should_attempt_tensor_parallel(&pool, Some(1.2)));
-        // Tiny model still runs full on the largest single card.
         assert!(should_attempt_single_gpu_full(&pool, Some(1.2)));
         assert_eq!(
             cascade_labels(&pool, Some(1.2)),
