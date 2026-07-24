@@ -103,9 +103,8 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     prepare_windows_process(&cli)?;
 
-    logging::init_logging(verbose);
-
     if let Some(Commands::Worker { config }) = &cli.command {
+        logging::init_worker_logging(verbose);
         let config = config
             .clone()
             .or_else(|| std::env::var("SCALATTICE_WORKER_CONFIG").ok())
@@ -114,6 +113,8 @@ fn main() -> Result<()> {
             })?;
         return hypervisor::run_worker(&config);
     }
+
+    logging::init_logging(verbose);
 
     #[cfg(windows)]
     if should_run_tray_ui(&cli) {

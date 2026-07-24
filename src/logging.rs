@@ -45,6 +45,15 @@ pub fn init_logging(verbose: bool) {
         .init();
 }
 
+/// Slot workers speak JSON on stdout — keep all logs on stderr so IPC stays clean.
+pub fn init_worker_logging(verbose: bool) {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(build_env_filter(verbose))
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 fn build_env_filter(verbose: bool) -> EnvFilter {
     let mut filter = EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
     if !verbose {

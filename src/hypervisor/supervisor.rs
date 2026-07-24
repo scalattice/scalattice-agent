@@ -448,8 +448,7 @@ impl Hypervisor {
 
         outcome.map(|(c, p, t, timings, _)| (c, p, t, timings, tp_spec.id))
     }
-
-    }
+}
 
 async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
     let boot = WorkerBootConfig {
@@ -458,19 +457,24 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
         cuda_visible: slot.cuda_visible.clone(),
     };
     let boot_json = serde_json::to_string(&boot)?;
-    let bin = crate::paths::resolve_agent_binary().unwrap_or_else(|_| {
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("scalattice-agent"))
+    // Always re-exec this binary so PATH can't pick an older agent without `worker`.
+    let bin = std::env::current_exe().unwrap_or_else(|_| {
+        crate::paths::resolve_agent_binary().unwrap_or_else(|_| {
+            std::path::PathBuf::from("scalattice-agent")
+        })
     });
 
     let mut child = Command::new(&bin)
         .arg("worker")
         .env("SCALATTICE_WORKER_CONFIG", &boot_json)
+        // Keep worker logs out of the IPC pipe (belt-and-braces with stderr logging).
+        .env("RUST_LOG", "warn")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawn worker for slot {}", slot.id))?;
+        .with_context(|| format!("spawn worker for slot {} ({})", slot.id, bin.display()))?;
 
     let stdin = child.stdin.take().context("worker stdin")?;
     let stdout = child.stdout.take().context("worker stdout")?;
@@ -499,6 +503,14 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
     }
 }
 
+fn try_parse_worker_response(line: &str) -> Option<WorkerResponse> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
+}
+
 async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<WorkerResponse> {
     let expect_id = request_id(&req);
     let mut line = serde_json::to_string(&req)?;
@@ -507,6 +519,7 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
     worker.stdin.flush().await?;
 
     let mut buf = String::new();
+    let mut skipped = 0u32;
     loop {
         buf.clear();
         let n = worker
@@ -516,10 +529,19 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
             .context("read worker response")?;
         if n == 0 {
             worker.healthy = false;
-            bail!("worker closed stdout");
+            bail!("worker closed stdout (after {skipped} non-json line(s))");
         }
-        let resp: WorkerResponse =
-            serde_json::from_str(buf.trim()).context("parse worker response")?;
+        let Some(resp) = try_parse_worker_response(&buf) else {
+            skipped += 1;
+            if skipped <= 8 {
+                warn!(
+                    slot = %worker.spec.id,
+                    line = %buf.trim(),
+                    "ignoring non-json worker stdout"
+                );
+            }
+            continue;
+        };
         match &resp {
             WorkerResponse::Delta { .. } => continue,
             WorkerResponse::Pong { id }
@@ -558,8 +580,14 @@ async fn worker_rpc_invoke(
             worker.healthy = false;
             bail!("worker closed stdout during invoke");
         }
-        let resp: WorkerResponse =
-            serde_json::from_str(buf.trim()).context("parse worker response")?;
+        let Some(resp) = try_parse_worker_response(&buf) else {
+            warn!(
+                slot = %worker.spec.id,
+                line = %buf.trim(),
+                "ignoring non-json worker stdout during invoke"
+            );
+            continue;
+        };
         match resp {
             WorkerResponse::Delta { id, text } if id == expect_id => {
                 if let Some(cb) = on_delta.as_mut() {
