@@ -1,5 +1,7 @@
 #[cfg(windows)]
 mod ui;
+#[cfg(windows)]
+mod notify;
 
 #[cfg(windows)]
 pub fn open_panel(force: bool) -> anyhow::Result<()> {

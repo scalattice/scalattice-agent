@@ -180,7 +180,8 @@ pub fn persist_agent_token(token: &str) -> Result<bool> {
     }
 
     if changed {
-        fs::write(&env_file, format!("{}\n", lines.join("\n")))?;
+        let body = format!("{}\n", lines.join("\n"));
+        write_file_replace(&env_file, body.as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -190,6 +191,39 @@ pub fn persist_agent_token(token: &str) -> Result<bool> {
     }
 
     Ok(changed)
+}
+
+/// Write via temp + rename, retrying Windows sharing violations (os error 32) when
+/// tray/background/AV briefly lock the same config file.
+fn write_file_replace(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("config file parent")?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("scalattice"),
+        std::process::id()
+    ));
+    let mut last_err = None;
+    for attempt in 0..8 {
+        match fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, path)) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp);
+                let retry = err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.raw_os_error() == Some(32) // ERROR_SHARING_VIOLATION
+                    || err.raw_os_error() == Some(5); // ERROR_ACCESS_DENIED
+                if !retry || attempt == 7 {
+                    return Err(err).with_context(|| format!("write {}", path.display()));
+                }
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(40 * (attempt as u64 + 1)));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("write_file_replace failed")))
+        .with_context(|| format!("write {}", path.display()))
 }
 
 pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {

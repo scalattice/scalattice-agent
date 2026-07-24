@@ -422,6 +422,18 @@ impl SessionState {
         if current == next {
             return;
         }
+        let enabled = next.iter().filter(|(_, on)| *on).count();
+        info!(
+            enabled,
+            total = next.len(),
+            "dashboard compute device policy updated"
+        );
+        if enabled == 0 {
+            warn!(
+                "{} compute device(s) detected (none enabled in dashboard)",
+                next.len()
+            );
+        }
         self.compute_policy = next;
         self.invalidate_specs_cache();
         self.pending_hypervisor_restart = true;
@@ -967,6 +979,10 @@ async fn handle_server_message(
                     tokio::spawn(async move {
                         if let Err(err) = respond_invoke(&state, &write, invoke).await {
                             warn!("invoke task failed: {err:#}");
+                            let code = invoke_error_code(&err);
+                            if code != "agent_busy" {
+                                state::record_inference_failure(code, &format!("{err:#}"));
+                            }
                         }
                     });
                 }
@@ -977,6 +993,10 @@ async fn handle_server_message(
                     tokio::spawn(async move {
                         if let Err(err) = respond_invoke_split(&state, &write, invoke).await {
                             warn!("invoke_split task failed: {err:#}");
+                            let code = invoke_error_code(&err);
+                            if code != "agent_busy" {
+                                state::record_inference_failure(code, &format!("{err:#}"));
+                            }
                         }
                     });
                 }
@@ -1152,6 +1172,7 @@ async fn respond_invoke(
                     debug!("inference invoke busy: {err:#}");
                 } else {
                     warn!("inference invoke failed: {err:#}");
+                    state::record_inference_failure(code, &format!("{err:#}"));
                 }
                 if code == "model_load_failed" {
                     handle_weight_load_failure(&runtime_model, &err);
@@ -1319,10 +1340,14 @@ async fn send_invoke_split_error(
         "split inference failed on pool {}: {err:#}",
         engine.pool().display_name
     );
+    let code = invoke_error_code(&err);
+    if code != "agent_busy" {
+        state::record_inference_failure(code, &format!("{err:#}"));
+    }
     let err = InvokeErrorMessage {
         kind: "invoke_error",
         id: id.to_string(),
-        error: invoke_error_code(&err).to_string(),
+        error: code.to_string(),
     };
     write
         .lock()

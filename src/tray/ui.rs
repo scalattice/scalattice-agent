@@ -23,6 +23,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const DASHBOARD_URL: &str = "https://scalattice.cloud/providers";
 const WINDOW_TITLE: &str = "Scalattice Agent";
 const TRAY_MUTEX: &str = "ScalatticeAgentTray";
+/// How long blue action notices stay visible (save token, open dashboard, etc.).
+const ACTION_MESSAGE_TTL: Duration = Duration::from_secs(8);
+const ACTION_MESSAGE_ERROR_TTL: Duration = Duration::from_secs(14);
 
 enum UpdateWorkerCmd {
     Check,
@@ -38,6 +41,13 @@ enum UpdateWorkerMsg {
 enum TokenWorkerMsg {
     Saved,
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudLinkState {
+    Connected,
+    Connecting,
+    Disconnected,
 }
 
 fn spawn_update_worker() -> (mpsc::Sender<UpdateWorkerCmd>, mpsc::Receiver<UpdateWorkerMsg>) {
@@ -100,6 +110,7 @@ pub fn activate_existing_panel() -> bool {
 
 fn run_tray_ui_inner(force: bool) -> Result<()> {
     std::env::set_var("SCALATTICE_TRAY", "1");
+    super::notify::set_process_app_id();
     if force {
         clear_stale_tray_pid()?;
     }
@@ -251,6 +262,8 @@ struct TrayApp {
     token_revealed: bool,
     status_lines: Vec<String>,
     action_message: String,
+    /// When set, `action_message` is cleared after this instant (None = sticky until replaced).
+    action_message_until: Option<Instant>,
     /// Raw agent.log text (always full file tail).
     log_buffer: String,
     /// Displayed Live log (Simplified or Verbose).
@@ -261,6 +274,10 @@ struct TrayApp {
     next_data_poll: Instant,
     next_agent_watchdog: Instant,
     last_outer_rect: Option<egui::Rect>,
+    /// None until the first status sample (avoids toasting on tray open).
+    cloud_link_state: Option<CloudLinkState>,
+    /// Last inference failure toast we already surfaced (ms).
+    last_notified_inference_error_at_ms: Option<u64>,
 }
 
 impl TrayApp {
@@ -319,6 +336,7 @@ impl TrayApp {
             token_revealed,
             status_lines: Vec::new(),
             action_message: String::new(),
+            action_message_until: None,
             log_buffer: String::new(),
             logs: String::new(),
             log_path,
@@ -327,6 +345,8 @@ impl TrayApp {
             next_data_poll: Instant::now(),
             next_agent_watchdog: Instant::now() + Duration::from_secs(5),
             last_outer_rect: None,
+            cloud_link_state: None,
+            last_notified_inference_error_at_ms: None,
         };
         if should_check_now {
             app.kick_update_check();
@@ -440,7 +460,7 @@ impl TrayApp {
         self.update_notice =
             "Downloading update… Scalattice will restart in the background when ready."
                 .to_string();
-        self.action_message.clear();
+        self.clear_action_message();
         let _ = self.update_cmd_tx.send(UpdateWorkerCmd::Install);
     }
 
@@ -462,6 +482,10 @@ impl TrayApp {
                             write_tray_log(&format!("auto-update: installing v{latest}"));
                             self.settings.mark_auto_update_attempt(&latest);
                             let _ = self.settings.save();
+                            self.notify_desktop(
+                                "Installing update",
+                                &format!("Scalattice Agent v{latest} is downloading."),
+                            );
                             self.start_update_install();
                         } else {
                             write_tray_log(&format!(
@@ -470,7 +494,17 @@ impl TrayApp {
                             self.update_notice = format!(
                                 "Update available: v{latest}. Open Updates to install manually."
                             );
+                            self.notify_desktop(
+                                "Update available",
+                                &format!("Scalattice Agent v{latest} is ready to install."),
+                            );
                         }
+                    } else if self.update_available {
+                        let latest = outcome.info().latest_version.clone();
+                        self.notify_desktop(
+                            "Update available",
+                            &format!("Scalattice Agent v{latest} is ready to install."),
+                        );
                     }
                     ctx.request_repaint();
                 }
@@ -486,7 +520,8 @@ impl TrayApp {
                     self.update_busy = false;
                     write_tray_log(&format!("update install failed: {err}"));
                     self.update_notice = format!("Update failed: {err}");
-                    self.action_message.clear();
+                    self.clear_action_message();
+                    self.notify_desktop("Update failed", &err);
                     ctx.request_repaint();
                 }
             }
@@ -494,16 +529,91 @@ impl TrayApp {
     }
 
     fn save_settings_if_needed(&mut self, prev: &UserSettings) {
-        if self.settings.auto_update != prev.auto_update {
+        if self.settings.auto_update != prev.auto_update
+            || self.settings.desktop_notifications != prev.desktop_notifications
+        {
             let _ = self.settings.save();
-            self.schedule_next_update_check();
+            if self.settings.auto_update != prev.auto_update {
+                self.schedule_next_update_check();
+            }
         }
+    }
+
+    fn notify_desktop(&self, title: &str, body: &str) {
+        if !self.settings.desktop_notifications {
+            return;
+        }
+        super::notify::show(title, body);
+    }
+
+    fn poll_inference_failure_toasts(&mut self) {
+        if !self.settings.desktop_notifications {
+            return;
+        }
+        let Some(state) = state::read_state() else {
+            return;
+        };
+        let Some(at) = state.last_inference_error_at_ms else {
+            return;
+        };
+        // Ignore failures older than 2 minutes (stale state after tray restart).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now.saturating_sub(at) > 120_000 {
+            self.last_notified_inference_error_at_ms = Some(at);
+            return;
+        }
+        if self.last_notified_inference_error_at_ms == Some(at) {
+            return;
+        }
+        // First sample after tray open: remember without toasting.
+        if self.last_notified_inference_error_at_ms.is_none() {
+            self.last_notified_inference_error_at_ms = Some(at);
+            return;
+        }
+        self.last_notified_inference_error_at_ms = Some(at);
+        let code = state
+            .last_inference_error_code
+            .as_deref()
+            .unwrap_or("inference_failed");
+        let detail = state
+            .last_inference_error
+            .as_deref()
+            .unwrap_or("Inference failed");
+        let title = match code {
+            "model_out_of_memory" => "Inference failed · out of memory",
+            "model_load_failed" => "Inference failed · model load",
+            "prompt_too_long" => "Inference failed · prompt too long",
+            _ => "Inference failed",
+        };
+        self.notify_desktop(title, detail);
+    }
+
+    fn apply_cloud_link_transition(&mut self, next: CloudLinkState) {
+        match (self.cloud_link_state, next) {
+            (Some(CloudLinkState::Disconnected) | Some(CloudLinkState::Connecting), CloudLinkState::Connected) => {
+                self.notify_desktop("Connected", "Scalattice Agent is online and ready.");
+            }
+            (Some(CloudLinkState::Connected), CloudLinkState::Disconnected) => {
+                self.notify_desktop(
+                    "Disconnected",
+                    "Lost connection to Scalattice Cloud. Reconnecting…",
+                );
+            }
+            _ => {}
+        }
+        self.cloud_link_state = Some(next);
     }
 
     fn poll_status_results(&mut self, ctx: &egui::Context) {
         while let Ok(lines) = self.status_rx.try_recv() {
             self.status_refresh_inflight = false;
             if lines != self.status_lines {
+                if let Some(next) = cloud_link_state_from_lines(&lines) {
+                    self.apply_cloud_link_transition(next);
+                }
                 self.status_lines = lines;
                 ctx.request_repaint();
             }
@@ -585,28 +695,54 @@ impl TrayApp {
         self.rebuild_displayed_logs();
     }
 
+    fn set_action_message(&mut self, message: impl Into<String>, ttl: Option<Duration>) {
+        self.action_message = message.into();
+        self.action_message_until = ttl.map(|d| Instant::now() + d);
+    }
+
+    fn clear_action_message(&mut self) {
+        self.action_message.clear();
+        self.action_message_until = None;
+    }
+
+    fn tick_action_message(&mut self, ctx: &egui::Context) {
+        let Some(until) = self.action_message_until else {
+            return;
+        };
+        if Instant::now() < until {
+            ctx.request_repaint_after(until.saturating_duration_since(Instant::now()));
+            return;
+        }
+        self.clear_action_message();
+        ctx.request_repaint();
+    }
+
     fn save_token(&mut self) {
         if self.token_save_inflight {
-            self.action_message = "Saving token…".to_string();
+            self.set_action_message("Saving token…", None);
             return;
         }
         let token = self.token_input.trim().to_string();
         if !token.starts_with("slt_provider_") {
-            self.action_message = "Token must start with slt_provider_".to_string();
+            self.set_action_message(
+                "Token must start with slt_provider_",
+                Some(ACTION_MESSAGE_ERROR_TTL),
+            );
             return;
         }
 
         let config = match AgentConfig::from_env_and_cli(Some(token)) {
             Ok(config) => config,
             Err(err) => {
-                self.action_message = err.to_string();
+                self.set_action_message(err.to_string(), Some(ACTION_MESSAGE_ERROR_TTL));
                 return;
             }
         };
 
         self.token_revealed = false;
         self.token_save_inflight = true;
-        self.action_message = "Saving token…".to_string();
+        // Sticky until the worker replies — then we set a timed result message.
+        self.set_action_message("Saving token…", None);
         let tx = self.token_msg_tx.clone();
         std::thread::spawn(move || {
             let msg = match service::save_agent_token(&config) {
@@ -622,12 +758,23 @@ impl TrayApp {
             self.token_save_inflight = false;
             match msg {
                 TokenWorkerMsg::Saved => {
-                    self.action_message = "Token saved. Reconnecting…".to_string();
+                    self.set_action_message(
+                        "Token saved. Reconnecting…",
+                        Some(ACTION_MESSAGE_TTL),
+                    );
+                    self.notify_desktop(
+                        "Token saved",
+                        "Reconnecting to Scalattice Cloud with the new token.",
+                    );
                     self.kick_status_refresh();
                     ctx.request_repaint();
                 }
                 TokenWorkerMsg::Failed(err) => {
-                    self.action_message = format!("Could not save token: {err}");
+                    self.set_action_message(
+                        format!("Could not save token: {err}"),
+                        Some(ACTION_MESSAGE_ERROR_TTL),
+                    );
+                    self.notify_desktop("Could not save token", &err);
                     self.kick_status_refresh();
                     ctx.request_repaint();
                 }
@@ -637,10 +784,16 @@ impl TrayApp {
 
     fn open_dashboard(&mut self) {
         if let Err(err) = open_dashboard_url(DASHBOARD_URL) {
-            self.action_message = format!("Could not open dashboard: {err}");
+            self.set_action_message(
+                format!("Could not open dashboard: {err}"),
+                Some(ACTION_MESSAGE_ERROR_TTL),
+            );
             return;
         }
-        self.action_message = "Opened provider dashboard in your browser.".to_string();
+        self.set_action_message(
+            "Opened provider dashboard in your browser.",
+            Some(ACTION_MESSAGE_TTL),
+        );
     }
 }
 
@@ -655,6 +808,7 @@ impl eframe::App for TrayApp {
         self.poll_tray(ctx);
         self.poll_update_results(ctx);
         self.poll_token_results(ctx);
+        self.tick_action_message(ctx);
         self.tick_agent_watchdog(ctx);
 
         if Instant::now() >= self.next_update_check
@@ -689,6 +843,7 @@ impl eframe::App for TrayApp {
         if !window_moving && !pointer_busy && Instant::now() >= self.next_data_poll {
             self.next_data_poll = Instant::now() + Duration::from_secs(3);
             self.kick_status_refresh();
+            self.poll_inference_failure_toasts();
             if self.refresh_logs() {
                 ctx.request_repaint();
             }
@@ -782,6 +937,10 @@ impl eframe::App for TrayApp {
                         ui.checkbox(
                             &mut self.settings.auto_update,
                             "Automatically install updates in the background",
+                        );
+                        ui.checkbox(
+                            &mut self.settings.desktop_notifications,
+                            "Show desktop notifications",
                         );
                         self.save_settings_if_needed(&prev_settings);
 
@@ -943,6 +1102,23 @@ fn gather_status_lines() -> Vec<String> {
     }
 
     lines
+}
+
+fn cloud_link_state_from_lines(lines: &[String]) -> Option<CloudLinkState> {
+    for line in lines {
+        let Some(rest) = line.strip_prefix("Scalattice Cloud: ") else {
+            continue;
+        };
+        let lower = rest.to_ascii_lowercase();
+        if lower.starts_with("connected") {
+            return Some(CloudLinkState::Connected);
+        }
+        if lower.contains("connecting") {
+            return Some(CloudLinkState::Connecting);
+        }
+        return Some(CloudLinkState::Disconnected);
+    }
+    None
 }
 
 fn render_status_line(ui: &mut egui::Ui, line: &str) {

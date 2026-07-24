@@ -23,9 +23,16 @@ pub struct UserSettings {
     /// Windows tray Live log: show full llama.cpp detail when true.
     #[serde(default)]
     pub log_verbose: bool,
+    /// Windows tray: show desktop toast notifications for connect/disconnect and key actions.
+    #[serde(default = "default_desktop_notifications")]
+    pub desktop_notifications: bool,
 }
 
 fn default_auto_update() -> bool {
+    true
+}
+
+fn default_desktop_notifications() -> bool {
     true
 }
 
@@ -38,6 +45,7 @@ impl Default for UserSettings {
             last_auto_update_attempt_version: String::new(),
             last_auto_update_attempt_unix: 0,
             log_verbose: false,
+            desktop_notifications: true,
         }
     }
 }

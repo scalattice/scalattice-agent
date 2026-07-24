@@ -21,6 +21,13 @@ pub struct AgentLocalState {
     pub compute_devices: Vec<ComputeDevice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Last non-busy inference failure (tray toasts off this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_inference_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_inference_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_inference_error_at_ms: Option<u64>,
     pub updated_at_ms: u64,
 }
 
@@ -53,6 +60,9 @@ pub fn update_connection_state(
         server_registered: false,
         compute_devices: Vec::new(),
         last_error: None,
+        last_inference_error: None,
+        last_inference_error_code: None,
+        last_inference_error_at_ms: None,
         updated_at_ms: 0,
     });
     if let Some(label) = status_label {
@@ -89,6 +99,9 @@ pub fn mark_disconnected(error: Option<String>) {
         server_registered: false,
         compute_devices: Vec::new(),
         last_error: None,
+        last_inference_error: None,
+        last_inference_error_code: None,
+        last_inference_error_at_ms: None,
         updated_at_ms: 0,
     });
     state.server_connected = false;
@@ -119,6 +132,9 @@ pub fn set_downloading_model(model_id: Option<&str>) {
         server_registered: false,
         compute_devices: Vec::new(),
         last_error: None,
+        last_inference_error: None,
+        last_inference_error_code: None,
+        last_inference_error_at_ms: None,
         updated_at_ms: 0,
     });
 
@@ -126,6 +142,40 @@ pub fn set_downloading_model(model_id: Option<&str>) {
     if let Some(id) = model_id {
         state.status_label = Some(format!("Downloading {id}"));
     }
+    state.updated_at_ms = now_ms();
+    write_state(&state);
+}
+
+/// Record a real inference failure for the tray (skips expected capacity/`agent_busy`).
+pub fn record_inference_failure(code: &str, detail: &str) {
+    if code == "agent_busy" {
+        return;
+    }
+    if state_file_path().is_none() {
+        return;
+    }
+    let mut state = read_state().unwrap_or(AgentLocalState {
+        status_label: None,
+        downloading_model: None,
+        node_id: None,
+        server_connected: false,
+        server_registered: false,
+        compute_devices: Vec::new(),
+        last_error: None,
+        last_inference_error: None,
+        last_inference_error_code: None,
+        last_inference_error_at_ms: None,
+        updated_at_ms: 0,
+    });
+    let summary = detail.lines().next().unwrap_or(detail).trim();
+    let summary = if summary.len() > 180 {
+        format!("{}…", &summary[..177])
+    } else {
+        summary.to_string()
+    };
+    state.last_inference_error_code = Some(code.to_string());
+    state.last_inference_error = Some(summary);
+    state.last_inference_error_at_ms = Some(now_ms());
     state.updated_at_ms = now_ms();
     write_state(&state);
 }
@@ -286,8 +336,27 @@ fn write_state(state: &AgentLocalState) {
     let Some(path) = state_file_path() else {
         return;
     };
-    if let Ok(raw) = serde_json::to_string_pretty(state) {
-        let _ = fs::write(path, raw);
+    let Ok(raw) = serde_json::to_string_pretty(state) else {
+        return;
+    };
+    // Prefer temp+rename so a locked tray/reader cannot leave a half-written state
+    // file; fall back to direct write. Sharing violations are retried briefly.
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let _ = fs::create_dir_all(parent);
+    let tmp = parent.join(format!(".agent-state.tmp.{}", std::process::id()));
+    for attempt in 0..6 {
+        if fs::write(&tmp, raw.as_bytes()).is_ok() && fs::rename(&tmp, &path).is_ok() {
+            return;
+        }
+        let _ = fs::remove_file(&tmp);
+        if attempt == 5 {
+            let _ = fs::write(&path, raw.as_bytes());
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25 * (attempt as u64 + 1)));
     }
 }
 
