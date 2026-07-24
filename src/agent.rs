@@ -33,7 +33,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type SharedWsWrite = Arc<Mutex<WsWrite>>;
@@ -900,6 +900,27 @@ async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite)
     Ok(())
 }
 
+/// Best-effort WS write. Returns Ok even if the peer already reset — invoke tasks
+/// must not treat a dying socket as a logic failure that races the reconnect loop.
+async fn ws_send_text(write: &SharedWsWrite, text: &str) -> Result<()> {
+    match write.lock().await.send(Message::Text(text.to_string())).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let msg = err.to_string().to_lowercase();
+            if msg.contains("closed")
+                || msg.contains("reset")
+                || msg.contains("broken pipe")
+                || msg.contains("connection")
+            {
+                debug!("websocket write skipped (connection closing): {err}");
+                Ok(())
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
 async fn handle_server_message(
     config: &AgentConfig,
     state: &Arc<Mutex<SessionState>>,
@@ -1067,7 +1088,8 @@ async fn respond_invoke(
         let max_tokens = guard.effective_max_tokens(invoke.max_tokens);
         (hv, catalog_model, ram_gb, headroom, max_tokens)
     };
-    let _ = send_heartbeat(state, write).await;
+    // Do not heartbeat per-invoke — under concurrency that floods the WS with
+    // heartbeat/pong/policy traffic and resets the provider connection.
 
     let invoke_id = invoke.id.clone();
     let runtime_model = invoke.runtime_model.clone();
@@ -1122,16 +1144,15 @@ async fn respond_invoke(
                     completion_tokens,
                     timings: Some(timings),
                 };
-                write
-                    .lock()
-                    .await
-                    .send(Message::Text(serde_json::to_string(&result)?))
-                    .await?;
-                Ok(())
+                ws_send_text(write, &serde_json::to_string(&result)?).await
             }
             Err(err) => {
-                warn!("inference invoke failed: {err:#}");
                 let code = invoke_error_code(&err);
+                if code == "agent_busy" {
+                    debug!("inference invoke busy: {err:#}");
+                } else {
+                    warn!("inference invoke failed: {err:#}");
+                }
                 if code == "model_load_failed" {
                     handle_weight_load_failure(&runtime_model, &err);
                 }
@@ -1140,11 +1161,8 @@ async fn respond_invoke(
                     id: invoke_id.clone(),
                     error: code.to_string(),
                 };
-                write
-                    .lock()
-                    .await
-                    .send(Message::Text(serde_json::to_string(&msg)?))
-                    .await?;
+                // Capacity rejects must not tear down the session if the socket is racing.
+                let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
                 Ok(())
             }
         }
@@ -1161,7 +1179,6 @@ async fn respond_invoke(
             guard.vram_lifecycle.on_job_finished();
         }
     }
-    let _ = send_heartbeat(state, write).await;
     result
 }
 
@@ -1185,7 +1202,6 @@ async fn respond_invoke_split(
         guard.active_model_id = Some(invoke.model_id.clone());
         guard.vram_lifecycle.on_job_started();
     }
-    let _ = send_heartbeat(state, write).await;
 
     let specs = state.lock().await.enabled_devices();
     let engine = InferenceEngine::new(&specs.compute_devices)
@@ -1290,7 +1306,6 @@ async fn respond_invoke_split(
             guard.vram_lifecycle.on_job_finished();
         }
     }
-    let _ = send_heartbeat(state, write).await;
     result
 }
 
