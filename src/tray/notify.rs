@@ -2,7 +2,7 @@
 
 use crate::paths::install_dir;
 use std::path::PathBuf;
-use winrt_notification::{Duration, IconCrop, Toast};
+use tauri_winrt_notification::{Duration, IconCrop, Toast};
 
 /// Must match the Inno Setup `AppUserModelID` on the Start Menu shortcut.
 pub const APP_USER_MODEL_ID: &str = "RobottikSoftware.Scalattice.Agent";

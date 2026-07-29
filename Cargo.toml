@@ -38,11 +38,12 @@ url = "2"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-tray-icon = "0.19"
+# No default features: omit Linux gtk/libappindicator from the lockfile (glib advisory).
+tray-icon = { version = "0.24", default-features = false }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 image = "0.25"
-winrt-notification = "0.5"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+tauri-winrt-notification = "0.8"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["gpu"]
