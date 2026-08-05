@@ -91,6 +91,29 @@ pub fn follow_service_logs(verbose: bool) -> Result<()> {
         );
     }
 
+    // Prefer the on-disk full log (same as Windows). Fall back to journald for older agents.
+    if let Ok(log_path) = crate::paths::agent_log_path() {
+        if log_path.is_file() {
+            let mut child = Command::new("tail")
+                .args(["-n", "30", "-F"])
+                .arg(&log_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .with_context(|| format!("failed to tail {}", log_path.display()))?;
+
+            let stdout = child.stdout.take().context("tail stdout missing")?;
+            crate::logging::pipe_log_lines(stdout, verbose)?;
+
+            return match child.wait().context("wait for log tail")?.code() {
+                Some(0) | Some(130) => Ok(()),
+                Some(code) => anyhow::bail!("log tail exited with status {code}"),
+                None => anyhow::bail!("log tail terminated by signal"),
+            };
+        }
+    }
+
     let mut child = Command::new("journalctl")
         .args([
             "--user",

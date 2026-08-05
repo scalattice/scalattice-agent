@@ -19,6 +19,8 @@ source ~/.config/scalattice/agent.env
 scalattice-agent status
 ```
 
+Full agent logs go to `~/.local/share/scalattice/agent.log` (always verbose; rotated at 8 MiB with one backup). `scalattice-agent logs` tails that file.
+
 ### Windows
 
 Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/scalattice/scalattice-agent/releases/latest/download/ScalatticeAgentSetup-x86_64.exe)** from [GitHub Releases](https://github.com/scalattice/scalattice-agent/releases) (or use **Download Windows installer** on the Providers dashboard).
@@ -29,7 +31,7 @@ Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/scalatti
 
 Setup guide: https://scalattice.cloud/install/agent-setup
 
-The agent runs as a logon scheduled task. Use the notification area icon for status, token changes, and live logs. Log file: `%LOCALAPPDATA%\Scalattice\logs\agent.log`.
+The agent runs as a logon scheduled task. Use the notification area icon for status, token changes, and live logs. Full detail is written to `%LOCALAPPDATA%\Scalattice\logs\agent.log` (rotated at 8 MiB, one backup). The tray Live log can show a Simplified view; the file itself is always verbose.
 
 ### Uninstall
 

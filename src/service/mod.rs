@@ -248,6 +248,11 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
     {
         targets.push(config.join("agent.systemd.env"));
         targets.push(platform::systemd_unit_path()?);
+        if let Ok(log) = crate::paths::agent_log_path() {
+            if let Some(logs_dir) = log.parent() {
+                targets.push(logs_dir.to_path_buf());
+            }
+        }
     }
 
     #[cfg(windows)]

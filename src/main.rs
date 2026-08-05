@@ -394,12 +394,6 @@ fn print_status() -> Result<()> {
     }
 
     println!();
-    #[cfg(windows)]
-    {
-        if let Ok(log) = crate::paths::agent_log_path() {
-            println!("Log file {}", log.display());
-        }
-    }
     #[cfg(not(windows))]
     {
         if let Ok(bin) = crate::paths::install_dir() {
@@ -408,13 +402,14 @@ fn print_status() -> Result<()> {
         if let Ok(lib) = crate::paths::lib_dir() {
             println!("Lib      {}", lib.display());
         }
-        if let Ok(log) = crate::paths::agent_log_path() {
-            println!("Log      {}", log.display());
-            if let Some(parent) = log.parent() {
-                let tray_log = parent.join("tray.log");
-                if tray_log.is_file() {
-                    println!("Tray log {}", tray_log.display());
-                }
+    }
+    if let Ok(log) = crate::paths::agent_log_path() {
+        println!("Log file {}", log.display());
+        #[cfg(not(windows))]
+        if let Some(parent) = log.parent() {
+            let tray_log = parent.join("tray.log");
+            if tray_log.is_file() {
+                println!("Tray log {}", tray_log.display());
             }
         }
     }
