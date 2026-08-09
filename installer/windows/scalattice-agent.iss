@@ -75,6 +75,7 @@ Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray-interactive.vbs"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\dist\launch-background.vbs"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\launch-background-delayed.vbs"; DestDir: "{app}"; Flags: ignoreversion
 ; Processes are stopped in PrepareToInstall / CurStep so the exe replaces immediately
 ; and Apps & Features / File version match MyAppVersion.
 Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -84,7 +85,7 @@ Type: files; Name: "{autoprograms}\{#MyAppName} (debug).lnk"
 Type: files; Name: "{app}\open-tray-debug.cmd"
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "wscript.exe"; Parameters: "//nologo ""{app}\launch-tray.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open Scalattice Agent in the notification area"; AppUserModelID: "{#MyAppUserModelId}"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "wscript.exe"; Parameters: "//nologo ""{app}\launch-tray-interactive.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open Scalattice Agent control panel"; AppUserModelID: "{#MyAppUserModelId}"
 Name: "{autoprograms}\Scalattice Provider Dashboard"; Filename: "{#MyAppURL}/providers"; Comment: "Manage GPUs and models"
 
 [Code]
@@ -256,8 +257,10 @@ var
   I: Integer;
 begin
   Exec('schtasks.exe', '/End /TN ScalatticeAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('schtasks.exe', '/End /TN ScalatticeAgentRetry', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('schtasks.exe', '/End /TN ScalatticeAgentTray', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('schtasks.exe', '/Delete /TN ScalatticeAgent /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('schtasks.exe', '/Delete /TN ScalatticeAgentRetry /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('schtasks.exe', '/Delete /TN ScalatticeAgentTray /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   for I := 1 to 10 do
   begin
@@ -270,10 +273,12 @@ end;
 procedure RemoveScalatticeStartupShortcuts;
 var
   Startup: String;
+  ResultCode: Integer;
 begin
   Startup := ExpandConstant('{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup');
   DeleteFile(Startup + '\ScalatticeAgent.vbs');
   DeleteFile(Startup + '\ScalatticeAgentTray.vbs');
+  Exec('reg.exe', 'delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ScalatticeAgent /f', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 procedure WipeScalatticeUserData;
@@ -286,7 +291,12 @@ begin
 end;
 
 function InitializeUninstall(): Boolean;
+var
+  ResultCode: Integer;
 begin
+  { Notify Scalattice Cloud while the token/config still exist, then stop runtime. }
+  Exec(ExpandConstant('{app}\scalattice-agent.exe'), 'notify-uninstall',
+    ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
   { Kill agent/tray and clear Startup stubs BEFORE files are deleted, otherwise
     reboot shows "Can not find script file ... launch-*.vbs". }
   StopScalatticeRuntime;

@@ -11,6 +11,12 @@ use std::path::PathBuf;
 mod linux;
 #[cfg(windows)]
 mod windows;
+mod uninstall_notify;
+
+/// Best-effort cloud notify used by the Inno uninstaller before process kill.
+pub fn notify_server_uninstall(reason: &str) {
+    uninstall_notify::notify_server_uninstall(reason);
+}
 
 #[cfg(unix)]
 use linux as platform;
@@ -263,6 +269,7 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         targets.push(install.join("launch-tray.vbs"));
         targets.push(install.join("launch-tray-interactive.vbs"));
         targets.push(install.join("launch-background.vbs"));
+        targets.push(install.join("launch-background-delayed.vbs"));
         targets.push(install.join("open-tray-debug.cmd"));
         targets.push(install.join("tray.pid"));
         targets.push(install.join("background.pid"));
@@ -295,6 +302,9 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         }
         bail!("Re-run with --yes to confirm: scalattice-agent uninstall --yes");
     }
+
+    // Tell Scalattice Cloud this machine is going away (best-effort, before wipe).
+    uninstall_notify::notify_server_uninstall("uninstall");
 
     // Always clear autostart (Startup folder + scheduled tasks) and stop processes,
     // even when nothing looks "installed" — leftovers cause reboot Script Host errors.

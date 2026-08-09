@@ -10,9 +10,12 @@ use std::process::{Command, Stdio};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const TASK_NAME: &str = "ScalatticeAgent";
+const TASK_NAME_RETRY: &str = "ScalatticeAgentRetry";
 const TRAY_TASK_NAME: &str = "ScalatticeAgentTray";
 const STARTUP_AGENT_VBS: &str = "ScalatticeAgent.vbs";
 const STARTUP_TRAY_VBS: &str = "ScalatticeAgentTray.vbs";
+const RUN_KEY_AGENT: &str = "ScalatticeAgent";
+const RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 pub fn background_status() -> BackgroundStatus {
     if service_active() {
@@ -57,10 +60,7 @@ fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()>
     let _ = crate::service::persist_agent_token(&config.token)?;
     let _ = write_background_runner_with_token(&config.token)?;
     sync_launch_scripts()?;
-
-    if !autostart_configured() {
-        ensure_agent_autostart_registered()?;
-    }
+    ensure_agent_autostart_registered()?;
 
     stop_background_for_token_restart()?;
     spawn_background_detached()?;
@@ -154,6 +154,10 @@ pub fn remove_background_service() -> Result<()> {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = Command::new("schtasks")
+        .args(["/End", "/TN", TASK_NAME_RETRY])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let _ = Command::new("schtasks")
         .args(["/End", "/TN", TRAY_TASK_NAME])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -162,10 +166,15 @@ pub fn remove_background_service() -> Result<()> {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", TASK_NAME_RETRY, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", TRAY_TASK_NAME, "/F"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     remove_startup_shortcuts();
+    remove_run_key_agent();
     stop_background_agent_only();
     stop_tray_agent_only();
     // Uninstall / wipe: force-kill any remaining agent processes so DLLs and
@@ -197,23 +206,32 @@ pub fn systemd_unit_path() -> Result<PathBuf> {
 }
 
 pub fn autostart_method_line() -> Option<String> {
-    let agent = if startup_agent_shortcut_exists() {
-        "agent: Startup folder"
-    } else if task_exists() {
-        "agent: scheduled task (legacy)"
-    } else {
+    let mut agent_parts = Vec::new();
+    if startup_agent_shortcut_exists() {
+        agent_parts.push("Startup");
+    }
+    if task_exists() {
+        agent_parts.push("Task");
+    }
+    if retry_task_exists() {
+        agent_parts.push("RetryTask");
+    }
+    if run_key_agent_exists() {
+        agent_parts.push("Run");
+    }
+    if agent_parts.is_empty() {
         return None;
-    };
+    }
 
     let tray = if startup_tray_shortcut_exists() {
-        "tray: Startup folder"
+        "tray: Startup"
     } else if tray_task_exists() {
-        "tray: scheduled task (legacy)"
+        "tray: Task"
     } else {
         "tray: not configured"
     };
 
-    Some(format!("{agent}; {tray}"))
+    Some(format!("agent: {}; {tray}", agent_parts.join("+")))
 }
 
 fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
@@ -527,6 +545,7 @@ exit /b 0\r\n";
         ("launch-tray.vbs", LAUNCH_TRAY_VBS),
         ("launch-tray-interactive.vbs", LAUNCH_TRAY_INTERACTIVE_VBS),
         ("launch-background.vbs", LAUNCH_BACKGROUND_VBS),
+        ("launch-background-delayed.vbs", LAUNCH_BACKGROUND_DELAYED_VBS),
     ] {
         fs::write(install.join(name), content)?;
     }
@@ -585,11 +604,58 @@ Sub LogCudaMissing(sh, fso, lib)
 End Sub
 "#;
 
-const LAUNCH_TRAY_INTERACTIVE_VBS: &str = LAUNCH_TRAY_VBS;
+const LAUNCH_TRAY_INTERACTIVE_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
+lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
+If Not fso.FolderExists(lib) Then lib = install & "\lib"
+If Not CudaRuntimeOk(fso, lib, install) Then
+  LogCudaMissing sh, fso, lib
+  MsgBox "Scalattice Agent cannot start because the CUDA 12 runtime is missing." & vbCrLf & vbCrLf & _
+    "Expected under:" & vbCrLf & "  " & lib & vbCrLf & vbCrLf & _
+    "Reinstall Scalattice Agent from https://scalattice.cloud", _
+    vbCritical, "Scalattice Agent"
+  WScript.Quit 1
+End If
+Set env = sh.Environment("PROCESS")
+env("SCALATTICE_TRAY_OPEN") = "1"
+env("SCALATTICE_TRAY") = "1"
+env("PATH") = install & ";" & lib & ";" & env("PATH")
+sh.CurrentDirectory = install
+sh.Run """" & install & "\scalattice-agent.exe"" tray --open", 0, False
+
+Function CudaRuntimeOk(fso, lib, install)
+  Dim names, i, name
+  names = Array("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+  For i = 0 To UBound(names)
+    name = names(i)
+    If Not fso.FileExists(lib & "\" & name) And Not fso.FileExists(install & "\" & name) Then
+      CudaRuntimeOk = False
+      Exit Function
+    End If
+  Next
+  CudaRuntimeOk = True
+End Function
+
+Sub LogCudaMissing(sh, fso, lib)
+  Dim logDir, logPath, ts, stream
+  On Error Resume Next
+  logDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\logs")
+  If Not fso.FolderExists(logDir) Then fso.CreateFolder logDir
+  logPath = logDir & "\agent.log"
+  ts = Now
+  Set stream = fso.OpenTextFile(logPath, 8, True)
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — reinstall Scalattice Agent"
+  stream.Close
+  On Error Goto 0
+End Sub
+"#;
 
 // Launch the agent exe directly (no cmd.exe host). A blocking .cmd console used to
 // survive reboot paths and kill the agent when closed. Crash recovery is handled by
 // the tray watchdog (and Linux systemd Restart=always).
+// CUDA missing: log and still start — Vulkan/CPU paths should not block reboot bring-up.
 const LAUNCH_BACKGROUND_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
@@ -598,7 +664,6 @@ lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 If Not CudaRuntimeOk(fso, lib, install) Then
   LogCudaMissing sh, fso, lib
-  WScript.Quit 1
 End If
 Set env = sh.Environment("PROCESS")
 env("SCALATTICE_BACKGROUND") = "1"
@@ -627,10 +692,21 @@ Sub LogCudaMissing(sh, fso, lib)
   logPath = logDir & "\agent.log"
   ts = Now
   Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — reinstall Scalattice Agent"
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — starting agent anyway (Vulkan/CPU)"
   stream.Close
   On Error Goto 0
 End Sub
+"#;
+
+/// Delayed second chance after logon (slow disks / Fast Startup). Mutex prevents doubles.
+const LAUNCH_BACKGROUND_DELAYED_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
+target = install & "\launch-background.vbs"
+If Not fso.FileExists(target) Then WScript.Quit 0
+WScript.Sleep 45000
+sh.Run "wscript.exe //nologo """ & target & """", 0, False
 "#;
 
 const STARTUP_AGENT_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")
@@ -669,7 +745,7 @@ fn startup_dir() -> Result<PathBuf> {
 }
 
 fn autostart_configured() -> bool {
-    startup_agent_shortcut_exists() || task_exists()
+    startup_agent_shortcut_exists() || task_exists() || run_key_agent_exists()
 }
 
 fn task_exists() -> bool {
@@ -703,31 +779,29 @@ fn startup_tray_shortcut_exists() -> bool {
 }
 
 fn ensure_agent_autostart_registered() -> Result<()> {
-    // Prefer the Startup folder only. Dual schtasks + Startup previously caused
-    // double launches; the Background mutex stops duplicates but Startup alone is
-    // more reliable for interactive Windows sessions after reboot.
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", TASK_NAME, "/F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    // Triple rail + delayed retry. Local\ScalatticeAgentBackground mutex prevents
+    // double-start when Startup, Run, and ONLOGON tasks all fire.
+    sync_launch_scripts()?;
     install_startup_agent_shortcut()?;
-    if startup_agent_shortcut_exists() {
+    let _ = install_run_key_agent();
+    let _ = try_create_scheduled_task();
+    let _ = try_create_retry_task();
+
+    if startup_agent_shortcut_exists() || task_exists() || run_key_agent_exists() {
         Ok(())
     } else {
-        bail!("failed to register agent Startup shortcut")
+        bail!("failed to register agent autostart (Startup / Task / Run)")
     }
 }
 
 fn ensure_tray_autostart_registered() -> Result<()> {
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", TRAY_TASK_NAME, "/F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    // Tray stays Startup-primary; also keep ONLOGON task as backup.
     install_startup_tray_shortcut()?;
-    if startup_tray_shortcut_exists() {
+    let _ = try_create_tray_task();
+    if startup_tray_shortcut_exists() || tray_task_exists() {
         Ok(())
     } else {
-        bail!("failed to register tray Startup shortcut")
+        bail!("failed to register tray autostart")
     }
 }
 
@@ -755,7 +829,7 @@ fn try_create_scheduled_task() -> Result<()> {
         .output()
         .context("failed to run schtasks")?;
 
-    if output.status.success() {
+    if output.status.success() || task_exists() {
         return Ok(());
     }
 
@@ -765,6 +839,97 @@ fn try_create_scheduled_task() -> Result<()> {
     }
 
     bail!("schtasks failed: {}", stderr.trim());
+}
+
+fn try_create_retry_task() -> Result<()> {
+    let vbs = install_dir()?.join("launch-background-delayed.vbs");
+    if !vbs.is_file() {
+        bail!("failed to write {}", vbs.display());
+    }
+
+    let tr = format!("wscript.exe //nologo \"{}\"", vbs.display());
+    let output = Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            TASK_NAME_RETRY,
+            "/TR",
+            &tr,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "LIMITED",
+            "/F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed to create retry scheduled task")?;
+
+    if output.status.success() || retry_task_exists() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Access is denied") || stderr.contains("denied") {
+        bail!("schtasks access denied");
+    }
+
+    bail!("failed to register retry task: {}", stderr.trim());
+}
+
+fn retry_task_exists() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME_RETRY])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn install_run_key_agent() -> Result<()> {
+    let vbs = install_dir()?.join("launch-background.vbs");
+    if !vbs.is_file() {
+        bail!("launch-background.vbs missing");
+    }
+    let value = format!("wscript.exe //nologo \"{}\"", vbs.display());
+    let output = Command::new("reg")
+        .args([
+            "add",
+            RUN_KEY_PATH,
+            "/v",
+            RUN_KEY_AGENT,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &value,
+            "/f",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed to write HKCU Run key")?;
+    if output.status.success() || run_key_agent_exists() {
+        return Ok(());
+    }
+    bail!(
+        "reg add failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+}
+
+fn remove_run_key_agent() {
+    let _ = Command::new("reg")
+        .args(["delete", RUN_KEY_PATH, "/v", RUN_KEY_AGENT, "/f"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+fn run_key_agent_exists() -> bool {
+    Command::new("reg")
+        .args(["query", RUN_KEY_PATH, "/v", RUN_KEY_AGENT])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn try_create_tray_task() -> Result<()> {

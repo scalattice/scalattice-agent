@@ -89,12 +89,12 @@ fn spawn_update_worker() -> (mpsc::Sender<UpdateWorkerCmd>, mpsc::Receiver<Updat
     (cmd_tx, msg_rx)
 }
 
-pub fn run_tray_ui(force: bool) -> Result<()> {
+pub fn run_tray_ui(force: bool, open: bool) -> Result<()> {
     write_tray_log(&format!(
-        "tray starting pid={} force={force}",
+        "tray starting pid={} force={force} open={open}",
         std::process::id()
     ));
-    if let Err(err) = run_tray_ui_inner(force) {
+    if let Err(err) = run_tray_ui_inner(force, open) {
         write_tray_log(&format!("tray exited with error: {err:#}"));
         eprintln!("Scalattice tray error: {err:#}");
         return Err(err);
@@ -108,7 +108,16 @@ pub fn activate_existing_panel() -> bool {
     activate_tray_window()
 }
 
-fn run_tray_ui_inner(force: bool) -> Result<()> {
+/// True when a tray panel window already exists (does not show it).
+pub fn tray_window_exists() -> bool {
+    let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        !hwnd.is_null()
+    }
+}
+
+fn run_tray_ui_inner(force: bool, open: bool) -> Result<()> {
     std::env::set_var("SCALATTICE_TRAY", "1");
     super::notify::set_process_app_id();
     if force {
@@ -116,12 +125,14 @@ fn run_tray_ui_inner(force: bool) -> Result<()> {
     }
     write_tray_pid()?;
 
-    let interactive = has_attached_console() && !launched_hidden();
+    // Autostart / reboot must stay tray-icon-only. Panel opens only via menu,
+    // `tray --open`, or SCALATTICE_TRAY_OPEN=1.
+    let interactive = open || launched_open();
     maybe_detach_console();
 
     if !acquire_tray_instance(force)? {
         if interactive {
-            println!("Activated existing Scalattice tray window.");
+            let _ = activate_tray_window();
         }
         clear_tray_pid();
         return Ok(());
@@ -805,6 +816,12 @@ impl eframe::App for TrayApp {
             self.panel_hidden = true;
         }
 
+        // Some Windows/eframe builds ignore with_visible(false) on create — re-hide
+        // until the user explicitly opens the panel from the tray menu.
+        if self.panel_hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         self.poll_tray(ctx);
         self.poll_update_results(ctx);
         self.poll_token_results(ctx);
@@ -1341,16 +1358,10 @@ fn process_exists(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn launched_hidden() -> bool {
-    std::env::var("SCALATTICE_TRAY_HIDDEN")
+fn launched_open() -> bool {
+    std::env::var("SCALATTICE_TRAY_OPEN")
         .ok()
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-}
-
-fn has_attached_console() -> bool {
-    unsafe {
-        !windows_sys::Win32::System::Console::GetConsoleWindow().is_null()
-    }
 }
 
 fn maybe_detach_console() {

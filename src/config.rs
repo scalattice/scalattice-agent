@@ -5,6 +5,9 @@ use std::env;
 /// Hard-coded Scalattice Cloud WebSocket endpoint (not configurable).
 pub const SCALATTICE_WS_URL: &str = "wss://api.scalattice.cloud/v1/operators/agent/ws";
 
+/// Hard-coded Scalattice Cloud HTTPS API base for agent control calls.
+pub const SCALATTICE_API_BASE: &str = "https://api.scalattice.cloud/v1/operators/agent";
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub token: String,

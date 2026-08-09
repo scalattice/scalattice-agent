@@ -98,6 +98,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\scalattice
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-tray.vbs") -Destination "dist\launch-tray.vbs" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-tray-interactive.vbs") -Destination "dist\launch-tray-interactive.vbs" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-background.vbs") -Destination "dist\launch-background.vbs" -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\launch-background-delayed.vbs") -Destination "dist\launch-background-delayed.vbs" -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\open-tray-debug.cmd") -Destination "dist\open-tray-debug.cmd" -Force
 & (Join-Path $PSScriptRoot "bundle-release-windows.ps1") -Binary "dist\scalattice-agent.exe" -OutDir "dist" -BuildRoot $releaseDir
 

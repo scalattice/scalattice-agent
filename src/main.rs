@@ -63,12 +63,18 @@ enum Commands {
         #[arg(long)]
         purge: bool,
     },
+    /// Internal: tell Scalattice Cloud this machine is uninstalling (best-effort)
+    #[command(hide = true)]
+    NotifyUninstall,
     /// Windows only: run the notification-area control panel
     #[cfg(windows)]
     Tray {
         /// Start even if another tray instance appears stuck (kills stale tray PID file)
         #[arg(long, hide = true)]
         force: bool,
+        /// Show the control panel window (default: tray icon only)
+        #[arg(long)]
+        open: bool,
     },
     /// Check for and install the latest release
     Update {
@@ -118,8 +124,11 @@ fn main() -> Result<()> {
 
     #[cfg(windows)]
     if should_run_tray_ui(&cli) {
-        let force = matches!(&cli.command, Some(Commands::Tray { force: true }));
-        return tray::open_panel(force);
+        let (force, open) = match &cli.command {
+            Some(Commands::Tray { force, open }) => (*force, *open),
+            _ => (false, false),
+        };
+        return tray::open_panel(force, open);
     }
 
     tokio::runtime::Builder::new_multi_thread()
@@ -232,6 +241,9 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
                 yes,
                 purge_models: purge,
             })?;
+        }
+        Some(Commands::NotifyUninstall) => {
+            service::notify_server_uninstall("uninstall");
         }
         #[cfg(windows)]
         Some(Commands::Tray { .. }) => unreachable!("tray handled in main"),

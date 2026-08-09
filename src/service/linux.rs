@@ -235,7 +235,8 @@ Environment=PATH={path}
 EnvironmentFile={env}
 ExecStart={bin} foreground
 Restart=always
-RestartSec=5
+RestartSec=2
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=default.target

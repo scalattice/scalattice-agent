@@ -13,11 +13,11 @@ If Not CudaRuntimeOk(fso, lib, install) Then
   WScript.Quit 1
 End If
 Set env = sh.Environment("PROCESS")
-env("SCALATTICE_TRAY_HIDDEN") = "1"
+env("SCALATTICE_TRAY_OPEN") = "1"
 env("SCALATTICE_TRAY") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.CurrentDirectory = install
-sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
+sh.Run """" & install & "\scalattice-agent.exe"" tray --open", 0, False
 
 Function CudaRuntimeOk(fso, lib, install)
   Dim names, i, name
