@@ -237,7 +237,33 @@ pub struct InvokeErrorMessage {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub id: String,
+    /// Stable code for routing / damage policy (agent_busy, model_load_failed, …).
     pub error: String,
+    /// Truncated human detail for Scalattice admin / ops (not shown to API customers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Short operator-facing detail for cloud admin tooling. Avoid dumping megabyte traces.
+pub fn cloud_invoke_error_detail(err: &anyhow::Error) -> String {
+    let mut s = format!("{err:#}");
+    // Soft-redact home directories so provider usernames are less exposed in admin UI.
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            s = s.replace(&home, "~");
+        }
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            s = s.replace(&profile, "%USERPROFILE%");
+        }
+    }
+    const MAX: usize = 400;
+    if s.len() > MAX {
+        s.truncate(MAX);
+        s.push('…');
+    }
+    s
 }
 
 #[derive(Debug, Serialize)]

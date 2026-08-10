@@ -1073,6 +1073,7 @@ async fn respond_invoke(
                 kind: "invoke_error",
                 id: invoke.id.clone(),
                 error: "agent_busy".to_string(),
+                detail: Some("agent_busy: max concurrent jobs reached".to_string()),
             };
             let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
             return Ok(());
@@ -1181,6 +1182,7 @@ async fn respond_invoke(
                     kind: "invoke_error",
                     id: invoke_id.clone(),
                     error: code.to_string(),
+                    detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
                 };
                 // Capacity rejects must not tear down the session if the socket is racing.
                 let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
@@ -1304,7 +1306,8 @@ async fn respond_invoke_split(
                 let err = InvokeErrorMessage {
                     kind: "invoke_error",
                     id: invoke.id,
-                    error: format!("unknown split segment: {other}"),
+                    error: "inference_failed".to_string(),
+                    detail: Some(format!("unknown split segment: {other}")),
                 };
                 write
                     .lock()
@@ -1348,6 +1351,7 @@ async fn send_invoke_split_error(
         kind: "invoke_error",
         id: id.to_string(),
         error: code.to_string(),
+        detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
     };
     write
         .lock()
@@ -1382,7 +1386,12 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || detail.contains("ggml_backend_cuda")
     {
         "model_out_of_memory"
-    } else if detail.contains("load model") || detail.contains("load_from_file") {
+    } else if detail.contains("load model")
+        || detail.contains("load_from_file")
+        || detail.contains("weights not found")
+        || detail.contains("model weights not found")
+        || (detail.contains("gguf") && detail.contains("not found"))
+    {
         "model_load_failed"
     } else if detail.contains("context window") || detail.contains("too long") {
         "prompt_too_long"
