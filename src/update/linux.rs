@@ -45,7 +45,17 @@ pub async fn install_latest_update() -> Result<()> {
     let staging = download_and_extract(&info.latest_tag).await?;
     println!("Installing update...");
     apply_update(&staging)?;
-    println!("Updated to v{}. Background agent restarted.", info.latest_version);
+    if running_as_live_agent() {
+        println!(
+            "Updated to v{}. Live agent will restart onto the new binary.",
+            info.latest_version
+        );
+    } else {
+        println!(
+            "Updated to v{}. Background agent restarted.",
+            info.latest_version
+        );
+    }
     Ok(())
 }
 
@@ -121,17 +131,110 @@ fn update_staging_dir(tag: &str) -> Result<PathBuf> {
 }
 
 fn extract_tarball(archive: &Path, dest: &Path) -> Result<()> {
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
-        .status()
-        .context("run tar to extract release archive")?;
-    if !status.success() {
-        bail!("tar failed extracting {}", archive.display());
+    // Prefer in-process extract: systemd user units often run with a PATH that
+    // does not include `tar` (ENOENT → "run tar to extract… No such file or directory").
+    match extract_tarball_rust(archive, dest) {
+        Ok(()) => return Ok(()),
+        Err(rust_err) => {
+            if let Some(tar_bin) = resolve_tar_binary() {
+                let status = Command::new(&tar_bin)
+                    .arg("-xzf")
+                    .arg(archive)
+                    .arg("-C")
+                    .arg(dest)
+                    .status()
+                    .with_context(|| {
+                        format!(
+                            "run {} to extract release archive (rust extract also failed: {rust_err:#})",
+                            tar_bin.display()
+                        )
+                    })?;
+                if status.success() {
+                    return Ok(());
+                }
+                bail!(
+                    "{} failed extracting {} (rust extract also failed: {rust_err:#})",
+                    tar_bin.display(),
+                    archive.display()
+                );
+            }
+            return Err(rust_err).context(
+                "extract release archive (no tar binary on PATH either; install tar or use a full agent build)",
+            );
+        }
+    }
+}
+
+fn extract_tarball_rust(archive: &Path, dest: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let file = fs::File::open(archive)
+        .with_context(|| format!("open release archive {}", archive.display()))?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+    archive
+        .unpack(dest)
+        .with_context(|| format!("unpack release archive into {}", dest.display()))?;
+
+    // Some releases nest files under a top-level directory — flatten one level if needed.
+    let direct_bin = dest.join("scalattice-agent");
+    if direct_bin.is_file() {
+        return Ok(());
+    }
+    let entries: Vec<_> = fs::read_dir(dest)
+        .with_context(|| format!("read staging {}", dest.display()))?
+        .filter_map(|e| e.ok())
+        .collect();
+    if entries.len() == 1 && entries[0].path().is_dir() {
+        let nested = entries[0].path();
+        let nested_bin = nested.join("scalattice-agent");
+        if nested_bin.is_file() {
+            for entry in fs::read_dir(&nested).context("read nested release directory")? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let from = entry.path();
+                let to = dest.join(&name);
+                if from.is_dir() {
+                    copy_dir_recursive(&from, &to)?;
+                } else {
+                    fs::copy(&from, &to)
+                        .with_context(|| format!("flatten {}", name.to_string_lossy()))?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_tar_binary() -> Option<PathBuf> {
+    const CANDIDATES: &[&str] = &["/usr/bin/tar", "/bin/tar", "/usr/local/bin/tar"];
+    for path in CANDIDATES {
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Last resort: whatever PATH the process has (often empty/minimal under systemd).
+    Command::new("tar")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|_| PathBuf::from("tar"))
 }
 
 fn apply_update(staging: &Path) -> Result<()> {
@@ -143,12 +246,26 @@ fn apply_update(staging: &Path) -> Result<()> {
         );
     }
 
-    service::stop_background_for_update()?;
+    // Remote/website update runs inside `foreground` (the live agent). Stopping the
+    // systemd unit here kills this process before the binary is replaced — that is
+    // why Linux force-update from the dashboard failed while Windows (detached
+    // installer) worked. CLI `scalattice-agent update` is a separate process and
+    // should still stop the service first.
+    let self_replace = running_as_live_agent();
+    if self_replace {
+        eprintln!(
+            "self-update: replacing binary in place (not stopping this process)"
+        );
+    } else {
+        service::stop_background_for_update()?;
+    }
 
     let install_bin = install_dir().context("resolve install directory")?;
     fs::create_dir_all(&install_bin).context("create install directory")?;
     let dest_bin = install_bin.join("scalattice-agent");
     let tmp_bin = install_bin.join("scalattice-agent.update");
+    // Atomic replace via rename is safe while this process is still mapped to the
+    // old inode; Linux keeps the running image until exit.
     fs::copy(&source_bin, &tmp_bin).context("copy new agent binary")?;
     fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755))
         .context("set executable bit on new agent binary")?;
@@ -169,9 +286,19 @@ fn apply_update(staging: &Path) -> Result<()> {
         }
     }
 
-    service::restart_background_after_update()?;
+    if self_replace {
+        // Caller (remote control) acks then restarts/exits so systemd picks up the
+        // new binary. Restarting here would race the websocket ack.
+    } else {
+        service::restart_background_after_update()?;
+    }
     fs::remove_dir_all(staging.parent().unwrap_or(staging)).ok();
     Ok(())
+}
+
+/// True when this process is the long-lived agent (`foreground`), not the CLI updater.
+fn running_as_live_agent() -> bool {
+    std::env::args().any(|arg| arg == "foreground")
 }
 
 fn write_update_units() -> Result<()> {

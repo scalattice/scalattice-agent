@@ -27,6 +27,7 @@ impl DemandTracker {
     }
 
     /// Sort runtime models by recent demand (highest first), stable for ties.
+    #[allow(dead_code)]
     pub fn order_by_demand(&self, models: &[String], window: Duration) -> Vec<String> {
         let mut scored: Vec<(u32, String)> = models
             .iter()

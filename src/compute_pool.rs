@@ -528,6 +528,7 @@ pub fn build_tp_card_for_group(
 /// ggml-vulkan see NVIDIA devices and allocate VRAM — under concurrent CUDA offload
 /// that OOMs (`ErrorOutOfDeviceMemory`) and damages the machine.
 /// Legacy helper: pin CUDA devices and hide Vulkan (CUDA worker default).
+#[allow(dead_code)]
 pub fn apply_slot_cuda_visibility(cuda_visible: &[u32]) {
     let strategy = if cuda_visible.is_empty() {
         PoolStrategy::CpuOnly

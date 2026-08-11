@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct InferenceRequest<'a> {
     pub job_id: &'a str,
     pub model_id: &'a str,
@@ -23,6 +24,7 @@ pub struct InferenceResult {
     pub content: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    #[allow(dead_code)]
     pub timings: InvokeTimings,
 }
 
@@ -45,6 +47,7 @@ pub fn from_card(pool: VirtualCard) -> Self {
         &self.pool
     }
 
+    #[allow(dead_code)]
     pub fn loaded_models(&self) -> Vec<String> {
         list_cached_runtime_models()
     }
@@ -129,6 +132,7 @@ pub fn from_card(pool: VirtualCard) -> Self {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn invoke(&self, req: InferenceRequest<'_>) -> Result<InferenceResult> {
         let model_path = resolve_model_gguf(req.runtime_model)
             .with_context(|| {
@@ -177,6 +181,7 @@ pub fn from_card(pool: VirtualCard) -> Self {
     }
 
     /// Stream token pieces on `delta_tx`, then return the final sanitized result.
+    #[allow(dead_code)]
     pub async fn invoke_streaming(
         &self,
         req: InferenceRequest<'_>,
@@ -234,6 +239,7 @@ pub fn from_card(pool: VirtualCard) -> Self {
     }
 }
 
+#[allow(dead_code)]
 fn timings_from_generate(t: &GenerateTimings) -> InvokeTimings {
     InvokeTimings {
         model_load_ms: Some(t.model_load_ms),

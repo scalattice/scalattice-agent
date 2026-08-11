@@ -36,6 +36,8 @@ url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # No default features: omit Linux gtk/libappindicator from the lockfile (glib advisory).

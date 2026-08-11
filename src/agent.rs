@@ -1207,10 +1207,21 @@ async fn handle_remote_control(write: &SharedWsWrite, action: &str) -> Result<()
                         let _ = ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default()).await;
                         if will_restart {
                             tokio::time::sleep(Duration::from_millis(800)).await;
-                            let _ = tokio::task::spawn_blocking(|| {
+                            // Linux: binary already replaced in place; restart the unit
+                            // (or exit and let Restart=always respawn the new image).
+                            match tokio::task::spawn_blocking(|| {
                                 crate::service::restart_runtime_from_saved_token()
                             })
-                            .await;
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => {
+                                    warn!("post-update restart failed (exiting anyway): {err:#}");
+                                }
+                                Err(err) => {
+                                    warn!("post-update restart task failed (exiting anyway): {err:#}");
+                                }
+                            }
                             std::process::exit(0);
                         }
                     }

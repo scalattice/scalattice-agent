@@ -137,6 +137,7 @@ impl Hypervisor {
         true
     }
 
+    #[allow(dead_code)]
     pub async fn order_models_by_demand(&self, models: &[String]) -> Vec<String> {
         self.demand
             .lock()
