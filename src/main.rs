@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod agent;
+mod cloud_log;
 mod compute_pool;
 mod config;
 mod hypervisor;

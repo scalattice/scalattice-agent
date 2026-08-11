@@ -1,8 +1,9 @@
 use crate::config::{read_saved_agent_token, token_snippet, AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
-    AgentSchedule, CatalogModel, ComputeDevicePolicy, HeartbeatMessage, InvokeDeltaMessage, InvokeErrorMessage,
-    InvokeResultMessage, ModelPolicyEntry, RegisterMessage,
+    AgentSchedule, CatalogModel, ComputeDevicePolicy, ControlAckMessage, ControlMessage, HeartbeatMessage,
+    InvokeDeltaMessage, InvokeErrorMessage, InvokeResultMessage, LogsBatchMessage, LogsLinePayload,
+    LogsSubscribeMessage, ModelPolicyEntry, RegisterMessage,
 };
 use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecycleState, VramTickAction};
 use crate::hypervisor::{Hypervisor, SlotStatus};
@@ -659,6 +660,14 @@ fn is_token_auth_error(message: &str) -> bool {
 }
 
 async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) -> Result<()> {
+    struct StreamingGuard;
+    impl Drop for StreamingGuard {
+        fn drop(&mut self) {
+            crate::cloud_log::set_streaming(false);
+        }
+    }
+    let _streaming_guard = StreamingGuard;
+
     info!(
         "connecting with provider token {}",
         token_snippet(&config.token)
@@ -694,6 +703,8 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     refresh_specs_cache(&state).await;
     let mut heartbeat = interval(Duration::from_secs(12));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut logs_flush = interval(Duration::from_secs(1));
+    logs_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut token_poll = interval(Duration::from_secs(1));
     token_poll.tick().await;
 
@@ -717,6 +728,11 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                         );
                         bail!(TOKEN_UPDATED);
                     }
+                }
+            }
+            _ = logs_flush.tick() => {
+                if crate::cloud_log::is_streaming() {
+                    let _ = flush_live_logs(&write).await;
                 }
             }
             _ = heartbeat.tick() => {
@@ -1040,6 +1056,16 @@ async fn handle_server_message(
                     }
                     return Err(anyhow!("server error: {message}"));
                 }
+                "logs_subscribe" => {
+                    if let Ok(msg) = serde_json::from_slice::<LogsSubscribeMessage>(data) {
+                        handle_logs_subscribe(&write, &msg.action).await?;
+                    }
+                }
+                "control" => {
+                    if let Ok(msg) = serde_json::from_slice::<ControlMessage>(data) {
+                        handle_remote_control(&write, &msg.action).await?;
+                    }
+                }
                 other => {
                     info!("ignored message type: {other}");
                 }
@@ -1052,6 +1078,154 @@ async fn handle_server_message(
         _ => {}
     }
     Ok(true)
+}
+
+async fn handle_logs_subscribe(write: &SharedWsWrite, action: &str) -> Result<()> {
+    let action = action.trim().to_ascii_lowercase();
+    if action == "unsubscribe" || action == "stop" || action == "off" {
+        crate::cloud_log::set_streaming(false);
+        info!("cloud log streaming stopped");
+        return Ok(());
+    }
+    crate::cloud_log::set_streaming(true);
+    info!("cloud log streaming started");
+    let lines: Vec<LogsLinePayload> = crate::cloud_log::snapshot()
+        .into_iter()
+        .map(|l| LogsLinePayload {
+            ts_ms: l.ts_ms,
+            level: l.level,
+            msg: l.msg,
+        })
+        .collect();
+    let batch = LogsBatchMessage {
+        kind: "logs_batch",
+        mode: "snapshot",
+        lines,
+    };
+    let _ = ws_send_text(write, &serde_json::to_string(&batch)?).await;
+    Ok(())
+}
+
+async fn flush_live_logs(write: &SharedWsWrite) -> Result<()> {
+    let pending = crate::cloud_log::drain_pending();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<LogsLinePayload> = pending
+        .into_iter()
+        .map(|l| LogsLinePayload {
+            ts_ms: l.ts_ms,
+            level: l.level,
+            msg: l.msg,
+        })
+        .collect();
+    let batch = LogsBatchMessage {
+        kind: "logs_batch",
+        mode: "live",
+        lines,
+    };
+    let _ = ws_send_text(write, &serde_json::to_string(&batch)?).await;
+    Ok(())
+}
+
+async fn handle_remote_control(write: &SharedWsWrite, action: &str) -> Result<()> {
+    let action = action.trim().to_ascii_lowercase();
+    match action.as_str() {
+        "restart" => {
+            let ack = ControlAckMessage {
+                kind: "control_ack",
+                action: "restart".to_string(),
+                ok: true,
+                detail: Some("Restarting agent…".to_string()),
+            };
+            let _ = ws_send_text(write, &serde_json::to_string(&ack)?).await;
+            info!("remote control: restart requested");
+            // Detach so the WS ack can flush before this process is replaced.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                match tokio::task::spawn_blocking(|| crate::service::restart_runtime_from_saved_token())
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        // Process should be going down; exit as a fallback.
+                        std::process::exit(0);
+                    }
+                    Ok(Err(err)) => {
+                        warn!("remote restart failed: {err:#}");
+                    }
+                    Err(err) => {
+                        warn!("remote restart task failed: {err:#}");
+                    }
+                }
+            });
+        }
+        "update" => {
+            let ack = ControlAckMessage {
+                kind: "control_ack",
+                action: "update".to_string(),
+                ok: true,
+                detail: Some("Checking for agent update…".to_string()),
+            };
+            let _ = ws_send_text(write, &serde_json::to_string(&ack)?).await;
+            info!("remote control: update requested");
+            let write = write.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let outcome = crate::update::check_for_update().await?;
+                    if !outcome.info().update_available {
+                        anyhow::Ok((
+                            false,
+                            format!("Already on latest ({})", outcome.info().current_version),
+                        ))
+                    } else {
+                        let latest = outcome.info().latest_version.clone();
+                        crate::update::install_latest_update().await?;
+                        anyhow::Ok((true, format!("Updated to {latest}; restarting…")))
+                    }
+                }
+                .await;
+                match result {
+                    Ok((will_restart, detail)) => {
+                        let ack = ControlAckMessage {
+                            kind: "control_ack",
+                            action: "update".to_string(),
+                            ok: true,
+                            detail: Some(detail),
+                        };
+                        let _ = ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default()).await;
+                        if will_restart {
+                            tokio::time::sleep(Duration::from_millis(800)).await;
+                            let _ = tokio::task::spawn_blocking(|| {
+                                crate::service::restart_runtime_from_saved_token()
+                            })
+                            .await;
+                            std::process::exit(0);
+                        }
+                    }
+                    Err(err) => {
+                        warn!("remote update failed: {err:#}");
+                        let ack = ControlAckMessage {
+                            kind: "control_ack",
+                            action: "update".to_string(),
+                            ok: false,
+                            detail: Some(format!("{err:#}").chars().take(240).collect()),
+                        };
+                        let _ = ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default()).await;
+                    }
+                }
+            });
+        }
+        other => {
+            let ack = ControlAckMessage {
+                kind: "control_ack",
+                action: other.to_string(),
+                ok: false,
+                detail: Some("Unknown control action".to_string()),
+            };
+            let _ = ws_send_text(write, &serde_json::to_string(&ack)?).await;
+        }
+    }
+    Ok(())
 }
 
 async fn respond_invoke(

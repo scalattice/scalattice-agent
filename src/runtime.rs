@@ -39,6 +39,9 @@ pub struct AgentRuntime {
     /// Agent can emit invoke_delta tokens for true SSE streaming.
     #[serde(rename = "supportsStream")]
     pub supports_stream: bool,
+    /// Dashboard can request live logs / remote restart / update (1.1.14+).
+    #[serde(rename = "supportsRemoteControl")]
+    pub supports_remote_control: bool,
     /// Independent compute slots (per GPU / Vulkan / CPU).
     #[serde(rename = "slots", skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<SlotStatus>,
@@ -119,6 +122,7 @@ pub fn build_runtime(
         },
         model_disk,
         supports_stream: true,
+        supports_remote_control: true,
         slots,
         max_concurrent_jobs: Some(max_concurrent_jobs.max(1)),
         idle_slots: Some(idle_slots),

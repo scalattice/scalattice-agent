@@ -244,6 +244,50 @@ pub struct InvokeErrorMessage {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ControlMessage {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub kind: String,
+    pub action: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ControlAckMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub action: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogsSubscribeMessage {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub kind: String,
+    /// subscribe | unsubscribe
+    pub action: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogsBatchMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// snapshot | live
+    pub mode: &'static str,
+    pub lines: Vec<LogsLinePayload>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogsLinePayload {
+    #[serde(rename = "tsMs")]
+    pub ts_ms: u64,
+    pub level: String,
+    pub msg: String,
+}
+
 /// Short operator-facing detail for cloud admin tooling. Avoid dumping megabyte traces.
 pub fn cloud_invoke_error_detail(err: &anyhow::Error) -> String {
     let mut s = format!("{err:#}");

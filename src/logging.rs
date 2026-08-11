@@ -77,6 +77,8 @@ struct TeeLogWriter {
 
 impl Write for TeeLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        crate::cloud_log::ingest_log_chunk(buf);
+
         if let Some(file) = &self.file {
             if let Ok(mut guard) = file.lock() {
                 let _ = guard.write_all(buf);
