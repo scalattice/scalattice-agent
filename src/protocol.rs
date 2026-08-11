@@ -192,6 +192,14 @@ pub struct InvokeMessage {
     pub max_tokens: u32,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct InvokeCancelMessage {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub kind: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InvokeTimings {
     #[serde(rename = "modelLoadMs", skip_serializing_if = "Option::is_none")]
@@ -341,6 +349,10 @@ pub fn parse_invoke_split(data: &[u8]) -> anyhow::Result<InvokeSplitMessage> {
 }
 
 pub fn parse_invoke(data: &[u8]) -> anyhow::Result<InvokeMessage> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+pub fn parse_invoke_cancel(data: &[u8]) -> anyhow::Result<InvokeCancelMessage> {
     Ok(serde_json::from_slice(data)?)
 }
 

@@ -66,7 +66,13 @@ pub struct Hypervisor {
     workers: Mutex<HashMap<String, SlotWorker>>,
     demand: Mutex<DemandTracker>,
     changed: Notify,
+    /// In-flight job_id → cancel signal (kill worker when router abandons).
+    job_cancels: Mutex<HashMap<String, Arc<Notify>>>,
 }
+
+/// Wall-clock ceiling for a single worker invoke. Protects against CUDA hangs.
+/// Normal abandon uses invoke_cancel well before this (backend ~180s).
+const INVOKE_HARD_TIMEOUT: Duration = Duration::from_secs(900);
 
 impl Hypervisor {
     pub async fn start(devices: &[ComputeDevice]) -> Result<Arc<Self>> {
@@ -97,6 +103,7 @@ impl Hypervisor {
             workers: Mutex::new(workers),
             demand: Mutex::new(DemandTracker::default()),
             changed: Notify::new(),
+            job_cancels: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -106,6 +113,28 @@ impl Hypervisor {
 
     pub async fn record_demand(&self, runtime_model: &str) {
         self.demand.lock().await.record_hit(runtime_model);
+    }
+
+    async fn register_job_cancel(&self, job_id: &str) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.job_cancels
+            .lock()
+            .await
+            .insert(job_id.to_string(), notify.clone());
+        notify
+    }
+
+    async fn clear_job_cancel(&self, job_id: &str) {
+        self.job_cancels.lock().await.remove(job_id);
+    }
+
+    /// Kill an in-flight invoke (router abandon / timeout). Returns true if a job was signaled.
+    pub async fn cancel_invoke(&self, job_id: &str) -> bool {
+        let Some(notify) = self.job_cancels.lock().await.get(job_id).cloned() else {
+            return false;
+        };
+        notify.notify_waiters();
+        true
     }
 
     pub async fn order_models_by_demand(&self, models: &[String]) -> Vec<String> {
@@ -317,6 +346,7 @@ impl Hypervisor {
         mut on_delta: Option<Box<dyn FnMut(String) + Send>>,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         self.record_demand(runtime_model).await;
+        let cancel = self.register_job_cancel(job_id).await;
 
         // Atomic pick+claim under one lock — prevents concurrent invokes all
         // selecting the same idle slot (TOCTOU → "slot not available" → damage).
@@ -334,21 +364,40 @@ impl Hypervisor {
                 })
                 .map(|s| s.id.clone())
                 .collect();
-            let placement = pick_placement(
+            let placement = match pick_placement(
                 &self.plan,
                 &idle,
                 model,
                 ram_gb,
                 cpu_ram_headroom_gb,
                 &self.devices,
-            )
-            .ok_or_else(|| anyhow!("agent_busy: no idle compute slot for {model_id}"))?;
+            ) {
+                Some(p) => p,
+                None => {
+                    self.clear_job_cancel(job_id).await;
+                    return Err(anyhow!("agent_busy: no idle compute slot for {model_id}"));
+                }
+            };
 
             for sid in &placement.slot_ids {
-                let worker = workers
-                    .get_mut(sid)
-                    .ok_or_else(|| anyhow!("slot worker {sid} missing"))?;
+                let worker = match workers.get_mut(sid) {
+                    Some(w) => w,
+                    None => {
+                        self.clear_job_cancel(job_id).await;
+                        return Err(anyhow!("slot worker {sid} missing"));
+                    }
+                };
                 if worker.busy || !worker.healthy {
+                    // Roll back busy claims from this placement.
+                    for claimed in &placement.slot_ids {
+                        if claimed == sid {
+                            break;
+                        }
+                        if let Some(w) = workers.get_mut(claimed) {
+                            w.busy = false;
+                        }
+                    }
+                    self.clear_job_cancel(job_id).await;
                     bail!("agent_busy: slot {sid} not available");
                 }
                 worker.busy = true;
@@ -357,7 +406,7 @@ impl Hypervisor {
         };
         self.changed.notify_waiters();
 
-        if placement.use_tp_worker {
+        let result = if placement.use_tp_worker {
             self.invoke_tp(
                 &placement,
                 job_id,
@@ -366,6 +415,7 @@ impl Hypervisor {
                 messages,
                 max_tokens,
                 on_delta.as_mut(),
+                &cancel,
             )
             .await
         } else {
@@ -377,9 +427,12 @@ impl Hypervisor {
                 messages,
                 max_tokens,
                 on_delta.as_mut(),
+                &cancel,
             )
             .await
-        }
+        };
+        self.clear_job_cancel(job_id).await;
+        result
     }
 
     async fn invoke_single(
@@ -391,6 +444,7 @@ impl Hypervisor {
         messages: &[ChatMessage],
         max_tokens: u32,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
+        cancel: &Notify,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         let slot_id = placement
             .slot_ids
@@ -408,7 +462,7 @@ impl Hypervisor {
 
         let req_id = next_req_id();
         let stream = on_delta.is_some();
-        let outcome = worker_rpc_invoke(
+        let outcome = worker_rpc_invoke_cancellable(
             &mut worker,
             WorkerRequest::Invoke {
                 id: req_id,
@@ -420,6 +474,7 @@ impl Hypervisor {
                 stream,
             },
             on_delta,
+            cancel,
         )
         .await;
 
@@ -427,8 +482,12 @@ impl Hypervisor {
         if let Ok((_, _, _, _, loaded)) = &outcome {
             worker.loaded_models = loaded.clone();
         }
-        if let Ok(Some(status)) = worker.child.try_wait() {
-            warn!(slot = %slot_id, ?status, "slot worker exited; respawning");
+        if outcome.is_err() || worker.child.try_wait().ok().flatten().is_some() {
+            if outcome.is_err() {
+                warn!(slot = %slot_id, "slot worker invoke ended with error; respawning");
+            } else {
+                warn!(slot = %slot_id, "slot worker exited; respawning");
+            }
             worker.healthy = false;
             if let Ok(new_w) = spawn_worker(&worker.spec).await {
                 worker = new_w;
@@ -452,6 +511,7 @@ impl Hypervisor {
         messages: &[ChatMessage],
         max_tokens: u32,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
+        cancel: &Notify,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         // Slots already claimed busy by invoke(). Pause siblings, run TP, restore.
         {
@@ -510,7 +570,7 @@ impl Hypervisor {
 
         let req_id = next_req_id();
         let stream = on_delta.is_some();
-        let outcome = worker_rpc_invoke(
+        let outcome = worker_rpc_invoke_cancellable(
             &mut tp_worker,
             WorkerRequest::Invoke {
                 id: req_id,
@@ -522,6 +582,7 @@ impl Hypervisor {
                 stream,
             },
             on_delta,
+            cancel,
         )
         .await;
 
@@ -543,7 +604,8 @@ impl Hypervisor {
         drop(workers);
         self.changed.notify_waiters();
 
-        outcome.map(|(c, p, t, timings, _)| (c, p, t, timings, tp_spec.id))
+        let tp_label = format!("tp:{}", placement.slot_ids.join("+"));
+        outcome.map(|(c, p, t, timings, _)| (c, p, t, timings, tp_label))
     }
 }
 
@@ -650,6 +712,32 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
                     return Ok(resp);
                 }
             }
+        }
+    }
+}
+
+async fn worker_rpc_invoke_cancellable(
+    worker: &mut SlotWorker,
+    req: WorkerRequest,
+    on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
+    cancel: &Notify,
+) -> Result<(String, u32, u32, InvokeTimings, Vec<String>)> {
+    tokio::select! {
+        biased;
+        outcome = worker_rpc_invoke(worker, req, on_delta) => outcome,
+        _ = cancel.notified() => {
+            info!(slot = %worker.spec.id, "killing worker for canceled invoke");
+            let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            worker.healthy = false;
+            bail!("request_canceled");
+        }
+        _ = tokio::time::sleep(INVOKE_HARD_TIMEOUT) => {
+            warn!(slot = %worker.spec.id, "killing worker after hard invoke timeout");
+            let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            worker.healthy = false;
+            bail!("invoke_timeout: worker wall-clock exceeded");
         }
     }
 }

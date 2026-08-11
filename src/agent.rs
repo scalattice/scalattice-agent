@@ -1,6 +1,6 @@
 use crate::config::{read_saved_agent_token, token_snippet, AgentConfig, SCALATTICE_WS_URL};
 use crate::protocol::{
-    parse_envelope, parse_error, parse_invoke, parse_invoke_split, parse_pong, parse_ready, parse_registered,
+    parse_envelope, parse_error, parse_invoke, parse_invoke_cancel, parse_invoke_split, parse_pong, parse_ready, parse_registered,
     AgentSchedule, CatalogModel, ComputeDevicePolicy, ControlAckMessage, ControlMessage, HeartbeatMessage,
     InvokeDeltaMessage, InvokeErrorMessage, InvokeResultMessage, LogsBatchMessage, LogsLinePayload,
     LogsSubscribeMessage, ModelPolicyEntry, RegisterMessage,
@@ -996,11 +996,23 @@ async fn handle_server_message(
                         if let Err(err) = respond_invoke(&state, &write, invoke).await {
                             warn!("invoke task failed: {err:#}");
                             let code = invoke_error_code(&err);
-                            if code != "agent_busy" {
+                            if code != "agent_busy" && code != "request_canceled" {
                                 state::record_inference_failure(code, &format!("{err:#}"));
                             }
                         }
                     });
+                }
+                "invoke_cancel" => {
+                    if let Ok(msg) = parse_invoke_cancel(data) {
+                        let hv = state.lock().await.hypervisor.clone();
+                        if let Some(hv) = hv {
+                            if hv.cancel_invoke(&msg.id).await {
+                                info!("canceled in-flight invoke {}", msg.id);
+                            } else {
+                                debug!("invoke_cancel for unknown/finished job {}", msg.id);
+                            }
+                        }
+                    }
                 }
                 "invoke_split" => {
                     let invoke = parse_invoke_split(data)?;
@@ -1345,6 +1357,8 @@ async fn respond_invoke(
                 let code = invoke_error_code(&err);
                 if code == "agent_busy" {
                     debug!("inference invoke busy: {err:#}");
+                } else if code == "request_canceled" {
+                    info!("inference invoke canceled: {err:#}");
                 } else {
                     warn!("inference invoke failed: {err:#}");
                     state::record_inference_failure(code, &format!("{err:#}"));
@@ -1538,7 +1552,12 @@ async fn send_invoke_split_error(
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     let detail = format!("{err:#}").to_lowercase();
     // Capacity / contention — router must not damage the machine.
-    if detail.contains("agent_busy")
+    if detail.contains("request_canceled")
+        || detail.contains("request_cancelled")
+        || detail.contains("invoke_timeout")
+    {
+        "request_canceled"
+    } else if detail.contains("agent_busy")
         || detail.contains("no idle compute slot")
         || detail.contains("not available")
         || (detail.contains("sibling slot") && detail.contains("busy"))
