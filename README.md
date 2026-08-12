@@ -31,7 +31,7 @@ Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/scalatti
 
 Setup guide: https://scalattice.cloud/install/agent-setup
 
-The agent runs as a logon scheduled task. Use the notification area icon for status, token changes, and live logs. Full detail is written to `%LOCALAPPDATA%\Scalattice\logs\agent.log` (rotated at 8 MiB, one backup). The tray Live log can show a Simplified view; the file itself is always verbose.
+The agent registers a **boot** scheduled task (runs as SYSTEM before sign-in) plus logon Startup/Task rails. Use the notification area icon for status, token changes, and live logs. Full detail is written to `%LOCALAPPDATA%\Scalattice\logs\agent.log` (rotated at 8 MiB, one backup). The tray Live log can show a Simplified view; the file itself is always verbose.
 
 ### Uninstall
 

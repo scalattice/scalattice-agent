@@ -11,11 +11,15 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const TASK_NAME: &str = "ScalatticeAgent";
 const TASK_NAME_RETRY: &str = "ScalatticeAgentRetry";
+/// Starts the agent at machine boot (before interactive login), as SYSTEM.
+const TASK_NAME_BOOT: &str = "ScalatticeAgentBoot";
 const TRAY_TASK_NAME: &str = "ScalatticeAgentTray";
 const STARTUP_AGENT_VBS: &str = "ScalatticeAgent.vbs";
 const STARTUP_TRAY_VBS: &str = "ScalatticeAgentTray.vbs";
 const RUN_KEY_AGENT: &str = "ScalatticeAgent";
 const RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// Cross-session single-instance lock (Session 0 boot agent + interactive logon).
+const BACKGROUND_MUTEX: &str = "Global\\ScalatticeAgentBackground";
 
 pub fn background_status() -> BackgroundStatus {
     if service_active() {
@@ -150,6 +154,14 @@ pub fn sync_background_env() -> Result<()> {
 
 pub fn remove_background_service() -> Result<()> {
     let _ = Command::new("schtasks")
+        .args(["/End", "/TN", TASK_NAME_BOOT])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let _ = Command::new("schtasks")
+        .args(["/Delete", "/TN", TASK_NAME_BOOT, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let _ = Command::new("schtasks")
         .args(["/End", "/TN", TASK_NAME])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -212,6 +224,9 @@ pub fn autostart_method_line() -> Option<String> {
     }
     if task_exists() {
         agent_parts.push("Task");
+    }
+    if boot_task_exists() {
+        agent_parts.push("Boot");
     }
     if retry_task_exists() {
         agent_parts.push("RetryTask");
@@ -287,7 +302,7 @@ fn background_agent_running() -> bool {
 }
 
 fn background_mutex_held() -> bool {
-    let name: Vec<u16> = "Local\\ScalatticeAgentBackground\0".encode_utf16().collect();
+    let name: Vec<u16> = format!("{BACKGROUND_MUTEX}\0").encode_utf16().collect();
     unsafe {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
@@ -745,12 +760,24 @@ fn startup_dir() -> Result<PathBuf> {
 }
 
 fn autostart_configured() -> bool {
-    startup_agent_shortcut_exists() || task_exists() || run_key_agent_exists()
+    startup_agent_shortcut_exists()
+        || task_exists()
+        || run_key_agent_exists()
+        || boot_task_exists()
 }
 
 fn task_exists() -> bool {
     Command::new("schtasks")
         .args(["/Query", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn boot_task_exists() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME_BOOT])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map(|o| o.status.success())
@@ -779,19 +806,171 @@ fn startup_tray_shortcut_exists() -> bool {
 }
 
 fn ensure_agent_autostart_registered() -> Result<()> {
-    // Triple rail + delayed retry. Local\ScalatticeAgentBackground mutex prevents
-    // double-start when Startup, Run, and ONLOGON tasks all fire.
+    // Triple rail + delayed retry + boot-before-login. Global\ScalatticeAgentBackground
+    // mutex prevents double-start across Session 0 (boot) and interactive logon.
     sync_launch_scripts()?;
+    let _ = write_boot_runner_script();
     install_startup_agent_shortcut()?;
     let _ = install_run_key_agent();
     let _ = try_create_scheduled_task();
     let _ = try_create_retry_task();
+    let _ = ensure_boot_start_registered();
 
-    if startup_agent_shortcut_exists() || task_exists() || run_key_agent_exists() {
+    if startup_agent_shortcut_exists() || task_exists() || run_key_agent_exists() || boot_task_exists()
+    {
         Ok(())
     } else {
-        bail!("failed to register agent autostart (Startup / Task / Run)")
+        bail!("failed to register agent autostart (Startup / Task / Run / Boot)")
     }
+}
+
+/// Write a boot launcher that pins this user's profile paths so SYSTEM (Session 0)
+/// can load the same token, models, and CUDA libs before anyone signs in.
+fn write_boot_runner_script() -> Result<PathBuf> {
+    let install = install_dir()?;
+    fs::create_dir_all(&install)?;
+    let userprofile = std::env::var("USERPROFILE").context("USERPROFILE is not set")?;
+    let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
+        format!("{}\\AppData\\Local", userprofile.trim_end_matches('\\'))
+    });
+    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| {
+        format!("{}\\AppData\\Roaming", userprofile.trim_end_matches('\\'))
+    });
+    let lib = lib_dir().unwrap_or_else(|_| install.join("lib"));
+    let exe = install.join("scalattice-agent.exe");
+
+    let homedrive = userprofile
+        .chars()
+        .take(2)
+        .collect::<String>();
+    let homepath = if userprofile.len() > 2 {
+        userprofile[2..].to_string()
+    } else {
+        String::new()
+    };
+
+    let script = format!(
+        "@echo off\r\n\
+setlocal\r\n\
+rem Generated by Scalattice — starts the agent at boot before interactive login.\r\n\
+set \"USERPROFILE={userprofile}\"\r\n\
+set \"HOMEDRIVE={homedrive}\"\r\n\
+set \"HOMEPATH={homepath}\"\r\n\
+set \"LOCALAPPDATA={localappdata}\"\r\n\
+set \"APPDATA={appdata}\"\r\n\
+set \"SCALATTICE_BACKGROUND=1\"\r\n\
+set \"PATH={install};{lib};%PATH%\"\r\n\
+cd /d \"{install}\"\r\n\
+\"{exe}\" foreground\r\n\
+",
+        userprofile = userprofile,
+        homedrive = homedrive,
+        homepath = homepath,
+        localappdata = localappdata,
+        appdata = appdata,
+        install = install.display(),
+        lib = lib.display(),
+        exe = exe.display(),
+    );
+
+    let path = install.join("run-boot.cmd");
+    fs::write(&path, script).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Register ONSTART SYSTEM task (needs elevation). Best-effort from set-token;
+/// prompts UAC once when missing.
+fn ensure_boot_start_registered() -> Result<()> {
+    let _ = write_boot_runner_script()?;
+    if boot_task_exists() {
+        // Refresh the action path in case the install dir moved.
+        let _ = try_create_boot_task();
+        return Ok(());
+    }
+    match try_create_boot_task() {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let msg = format!("{err:#}").to_lowercase();
+            if msg.contains("access is denied") || msg.contains("denied") || msg.contains("elevation")
+            {
+                // Prompt UAC at most once per install dir so set-token does not loop.
+                let marker = install_dir().ok().map(|d| d.join("boot-uac-attempted"));
+                let already = marker.as_ref().is_some_and(|p| p.is_file());
+                if !already {
+                    if let Some(path) = &marker {
+                        let _ = fs::write(path, b"1");
+                    }
+                    let _ = request_elevated_boot_install();
+                }
+                if boot_task_exists() {
+                    return Ok(());
+                }
+            }
+            // Non-fatal: logon autostart still works.
+            Ok(())
+        }
+    }
+}
+
+fn try_create_boot_task() -> Result<()> {
+    let cmd = write_boot_runner_script()?;
+    if !cmd.is_file() {
+        bail!("boot runner missing at {}", cmd.display());
+    }
+    let tr = format!("cmd.exe /c \"{}\"", cmd.display());
+    let output = Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            TASK_NAME_BOOT,
+            "/TR",
+            &tr,
+            "/SC",
+            "ONSTART",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed to run schtasks for boot task")?;
+
+    if output.status.success() || boot_task_exists() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Access is denied") || stderr.contains("denied") {
+        bail!("schtasks boot task access denied (elevation required)");
+    }
+    bail!("schtasks boot task failed: {}", stderr.trim());
+}
+
+/// Public entry for elevated `scalattice-agent install-boot-start`.
+pub fn install_boot_start_elevated() -> Result<()> {
+    write_boot_runner_script()?;
+    try_create_boot_task()?;
+    if let Ok(marker) = install_dir().map(|d| d.join("boot-uac-attempted")) {
+        let _ = fs::remove_file(marker);
+    }
+    println!("Scalattice Agent will now start at Windows boot (before sign-in).");
+    Ok(())
+}
+
+fn request_elevated_boot_install() -> Result<()> {
+    let bin = resolve_agent_binary()?;
+    // PowerShell Start-Process -Verb RunAs shows UAC; wait so set-token can detect success.
+    let ps = format!(
+        "Start-Process -FilePath '{}' -ArgumentList 'install-boot-start' -Verb RunAs -Wait",
+        bin.display().to_string().replace('\'', "''")
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    Ok(())
 }
 
 fn ensure_tray_autostart_registered() -> Result<()> {

@@ -91,6 +91,10 @@ enum Commands {
     },
     /// Restart the background agent (and Windows tray) using the saved token
     Restart,
+    /// Internal/elevated: register ONSTART SYSTEM task so the agent runs before sign-in
+    #[cfg(windows)]
+    #[command(hide = true)]
+    InstallBootStart,
     /// Internal: run a per-slot inference worker (spawned by the hypervisor)
     Worker {
         /// JSON WorkerBootConfig (or set SCALATTICE_WORKER_CONFIG)
@@ -153,7 +157,7 @@ fn prepare_windows_process(cli: &Cli) -> Result<()> {
 
     if background {
         // Single-instance: Startup folder + scheduled task can both fire on logon.
-        let name: Vec<u16> = "Local\\ScalatticeAgentBackground\0".encode_utf16().collect();
+        let name: Vec<u16> = "Global\\ScalatticeAgentBackground\0".encode_utf16().collect();
         unsafe {
             let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
             if handle.is_null() {
@@ -258,6 +262,10 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
         Some(Commands::Restart) => {
             service::restart_runtime_from_saved_token()?;
             println!("Scalattice Agent restarted.");
+        }
+        #[cfg(windows)]
+        Some(Commands::InstallBootStart) => {
+            service::install_boot_start_elevated()?;
         }
         Some(Commands::Worker { .. }) => unreachable!("worker handled in main"),
     }
@@ -371,7 +379,13 @@ fn print_status() -> Result<()> {
         {
             let service_line = match service::background_status() {
                 service::BackgroundStatus::Running => "running",
-                service::BackgroundStatus::Stopped => "stopped (starts when you sign in)",
+                service::BackgroundStatus::Stopped => {
+                    if cfg!(windows) {
+                        "stopped (starts at boot / when you sign in)"
+                    } else {
+                        "stopped"
+                    }
+                }
                 service::BackgroundStatus::NotInstalled => "not set up",
             };
             println!("Agent    {service_line}");

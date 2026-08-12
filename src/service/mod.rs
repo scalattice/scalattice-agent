@@ -117,6 +117,11 @@ pub fn in_tray_process() -> bool {
     platform::in_tray_process()
 }
 
+#[cfg(windows)]
+pub fn install_boot_start_elevated() -> Result<()> {
+    platform::install_boot_start_elevated()
+}
+
 pub fn invoked_by_systemd() -> bool {
     platform::invoked_by_systemd()
 }
