@@ -141,7 +141,12 @@ async fn download_release_asset_once(
         .with_context(|| format!("asset download failed for {asset_name}"))?;
 
     let total = response.content_length();
-    let tmp = dest.with_extension("part");
+    let tmp = dest.with_file_name(format!(
+        "{}.part",
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download")
+    ));
     if tmp.exists() {
         tokio::fs::remove_file(&tmp)
             .await
@@ -181,6 +186,14 @@ async fn download_release_asset_once(
         tokio::fs::remove_file(&tmp).await.ok();
         bail!("download for {asset_name} looks too small ({downloaded} bytes)");
     }
+    if let Some(expected_len) = total {
+        if downloaded != expected_len {
+            tokio::fs::remove_file(&tmp).await.ok();
+            bail!(
+                "incomplete download for {asset_name}: got {downloaded} of {expected_len} bytes"
+            );
+        }
+    }
 
     let actual = format!("{:x}", hasher.finalize());
     if actual != expected_sha256 {
@@ -190,6 +203,17 @@ async fn download_release_asset_once(
         );
     }
 
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("recreate download directory before finalize")?;
+    }
+    if !tmp.exists() {
+        bail!(
+            "download temp {} vanished before install (another update may be running; stop the agent and retry)",
+            tmp.display()
+        );
+    }
     tokio::fs::rename(&tmp, dest)
         .await
         .with_context(|| format!("finalize {}", dest.display()))?;

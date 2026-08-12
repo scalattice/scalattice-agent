@@ -66,7 +66,15 @@ async fn download_setup(tag: &str) -> Result<PathBuf> {
 fn update_setup_path(tag: &str) -> Result<PathBuf> {
     let base = std::env::temp_dir().join("Scalattice").join("updates");
     let safe_tag = tag.replace('/', "_");
-    Ok(base.join(safe_tag).join(INSTALLER_NAME))
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    Ok(base.join(safe_tag).join(unique).join(INSTALLER_NAME))
 }
 
 /// Launch Inno Setup with no UI. The ISS already handles `/UPDATE=1` and `WizardSilent`:

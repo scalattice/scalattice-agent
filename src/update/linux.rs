@@ -37,6 +37,12 @@ pub async fn install_latest_update() -> Result<()> {
         return Ok(());
     }
 
+    if !running_as_live_agent() {
+        // Stop the live agent before the (long) download so a dashboard remote
+        // update cannot clobber the same /tmp archive while this CLI runs.
+        service::stop_background_for_update()?;
+    }
+
     println!(
         "Downloading Scalattice Agent v{} ({})...",
         info.latest_version,
@@ -103,31 +109,35 @@ async fn download_and_extract(tag: &str) -> Result<PathBuf> {
         .with_context(|| {
             format!("Cloud release {tag} has no SHA-256 checksum for {archive_name}; refusing to update")
         })?;
-    let archive_path = update_download_path(tag, &archive_name)?;
+    let work = update_work_dir(tag)?;
+    fs::create_dir_all(&work).context("create update work directory")?;
+    let archive_path = work.join(&archive_name);
     download_release_asset(tag, &archive_name, &archive_path, &expected).await?;
 
-    let staging = update_staging_dir(tag)?;
-    if staging.exists() {
-        fs::remove_dir_all(&staging).ok();
-    }
+    let staging = work.join("staging");
     fs::create_dir_all(&staging).context("create update staging directory")?;
-    extract_tarball(&archive_path, &staging)?;
+    if let Err(err) = extract_tarball(&archive_path, &staging) {
+        let _ = fs::remove_dir_all(&work);
+        return Err(err);
+    }
     Ok(staging)
 }
 
-fn update_download_path(tag: &str, archive_name: &str) -> Result<PathBuf> {
-    let base = std::env::temp_dir().join("scalattice").join("updates");
+fn update_work_dir(tag: &str) -> Result<PathBuf> {
     let safe_tag = tag.replace('/', "_");
-    Ok(base.join(safe_tag).join(archive_name))
-}
-
-fn update_staging_dir(tag: &str) -> Result<PathBuf> {
-    let safe_tag = tag.replace('/', "_");
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
     Ok(std::env::temp_dir()
         .join("scalattice")
         .join("updates")
         .join(safe_tag)
-        .join("staging"))
+        .join(unique))
 }
 
 fn extract_tarball(archive: &Path, dest: &Path) -> Result<()> {
