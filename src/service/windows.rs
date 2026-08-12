@@ -298,21 +298,81 @@ fn wait_for_background_start_gentle() {
 /// True when the background single-instance mutex is held.
 /// Prefer this over WMI/`Get-CimInstance` — that path can hang while CUDA/driver init is wedged.
 fn background_agent_running() -> bool {
-    background_mutex_held() || background_pid_alive()
+    background_mutex_held() || background_pid_alive() || background_agent_process_listed()
 }
 
-fn background_mutex_held() -> bool {
-    let name: Vec<u16> = format!("{BACKGROUND_MUTEX}\0").encode_utf16().collect();
+fn mutex_openable(name: &str) -> bool {
+    let wide: Vec<u16> = format!("{name}\0").encode_utf16().collect();
     unsafe {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
-        let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide.as_ptr());
         if handle.is_null() {
             false
         } else {
             CloseHandle(handle);
             true
         }
+    }
+}
+
+fn background_mutex_held() -> bool {
+    mutex_openable(BACKGROUND_MUTEX) || mutex_openable("Local\\ScalatticeAgentBackground")
+}
+
+/// Create the cross-session background mutex with a DACL the user tray can query.
+/// SYSTEM boot agents used to create a default-ACL Global mutex → tray OpenMutex
+/// failed and the UI showed "stopped · auto-restarting…" while the agent was live.
+pub fn try_acquire_background_instance_mutex() -> Result<bool> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, LocalFree, SetLastError, ERROR_ALREADY_EXISTS,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    const SDDL_REVISION_1: u32 = 1;
+    // SYSTEM + Administrators full; Everyone can SYNCHRONIZE + query (tray status).
+    let sddl: Vec<u16> = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100001;;;WD)\0"
+        .encode_utf16()
+        .collect();
+    let name: Vec<u16> = format!("{BACKGROUND_MUTEX}\0").encode_utf16().collect();
+
+    unsafe {
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let converted = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        );
+        let mut sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let sa_ptr = if converted != 0 && !sd.is_null() {
+            &sa as *const SECURITY_ATTRIBUTES
+        } else {
+            std::ptr::null()
+        };
+        SetLastError(0);
+        let handle = CreateMutexW(sa_ptr, 1, name.as_ptr());
+        if !sd.is_null() {
+            LocalFree(sd as _);
+        }
+        if handle.is_null() {
+            bail!(
+                "failed to create background instance mutex (err {})",
+                GetLastError()
+            );
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(handle);
+            return Ok(false);
+        }
+        std::mem::forget(handle);
+        Ok(true)
     }
 }
 
@@ -344,12 +404,98 @@ fn process_id_alive(pid: u32) -> bool {
         };
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return false;
+            // SYSTEM boot agent: users often cannot OpenProcess it. Snapshot still lists it.
+            return process_id_listed(pid);
         }
         let mut code: u32 = 0;
         let ok = GetExitCodeProcess(handle, &mut code) != 0;
         CloseHandle(handle);
         ok && code == STILL_ACTIVE as u32
+    }
+}
+
+fn process_id_listed(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return false;
+        }
+        let mut entry = std::mem::zeroed::<PROCESSENTRY32W>();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == pid {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        found
+    }
+}
+
+fn tray_pid_from_file() -> Option<u32> {
+    let path = install_dir().ok()?.join("tray.pid");
+    let raw = fs::read_to_string(path).ok()?;
+    raw.trim().parse().ok()
+}
+
+/// True if another scalattice-agent.exe is running besides this process / the tray.
+/// Covers SYSTEM boot agents whose mutex/PID the user session cannot open.
+fn background_agent_process_listed() -> bool {
+    let me = std::process::id();
+    let tray_pid = tray_pid_from_file();
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return false;
+        }
+        let mut entry = std::mem::zeroed::<PROCESSENTRY32W>();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let pid = entry.th32ProcessID;
+                if pid != 0 && pid != me && Some(pid) != tray_pid {
+                    let name = String::from_utf16_lossy(
+                        entry
+                            .szExeFile
+                            .iter()
+                            .copied()
+                            .take_while(|&c| c != 0)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    );
+                    if name.eq_ignore_ascii_case("scalattice-agent.exe") {
+                        found = true;
+                        break;
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        found
     }
 }
 

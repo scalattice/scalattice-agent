@@ -128,6 +128,12 @@ pub fn install_boot_start_elevated() -> Result<()> {
     platform::install_boot_start_elevated()
 }
 
+/// Background single-instance lock. `Ok(false)` = another instance already owns it.
+#[cfg(windows)]
+pub fn try_acquire_background_instance_mutex() -> Result<bool> {
+    platform::try_acquire_background_instance_mutex()
+}
+
 pub fn invoked_by_systemd() -> bool {
     platform::invoked_by_systemd()
 }

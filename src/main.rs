@@ -147,28 +147,16 @@ fn main() -> Result<()> {
 /// visible window and can loop with installers / autostart).
 #[cfg(windows)]
 fn prepare_windows_process(cli: &Cli) -> Result<()> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, ATTACH_PARENT_PROCESS};
-    use windows_sys::Win32::System::Threading::CreateMutexW;
 
     let background = matches!(cli.command, Some(Commands::Foreground { .. }))
         && service::invoked_by_background_service();
     let tray = should_run_tray_ui(cli);
 
     if background {
-        // Single-instance: Startup folder + scheduled task can both fire on logon.
-        let name: Vec<u16> = "Global\\ScalatticeAgentBackground\0".encode_utf16().collect();
-        unsafe {
-            let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
-            if handle.is_null() {
-                anyhow::bail!("failed to create background instance mutex");
-            }
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                CloseHandle(handle);
-                std::process::exit(0);
-            }
-            // Keep mutex for process lifetime.
-            std::mem::forget(handle);
+        match service::try_acquire_background_instance_mutex()? {
+            true => {}
+            false => std::process::exit(0),
         }
         write_background_pid();
         unsafe {
