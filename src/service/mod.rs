@@ -99,7 +99,13 @@ pub fn save_agent_token(config: &AgentConfig) -> Result<()> {
     if !background_service_available() {
         return Ok(());
     }
-    start_background_from_config(config)
+    start_background_from_config(config)?;
+    #[cfg(windows)]
+    {
+        // Interactive set-token / tray Save only — may show UAC once if boot task missing.
+        let _ = platform::ensure_boot_start_interactive();
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

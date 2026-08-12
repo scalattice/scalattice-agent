@@ -878,38 +878,11 @@ cd /d \"{install}\"\r\n\
     Ok(path)
 }
 
-/// Register ONSTART SYSTEM task (needs elevation). Best-effort from set-token;
-/// prompts UAC once when missing.
+/// Keep the boot runner script fresh. Never recreate the SYSTEM task from normal
+/// launches — `/Create /RU SYSTEM` elevates and pops UAC on every sign-in.
 fn ensure_boot_start_registered() -> Result<()> {
     let _ = write_boot_runner_script()?;
-    if boot_task_exists() {
-        // Refresh the action path in case the install dir moved.
-        let _ = try_create_boot_task();
-        return Ok(());
-    }
-    match try_create_boot_task() {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let msg = format!("{err:#}").to_lowercase();
-            if msg.contains("access is denied") || msg.contains("denied") || msg.contains("elevation")
-            {
-                // Prompt UAC at most once per install dir so set-token does not loop.
-                let marker = install_dir().ok().map(|d| d.join("boot-uac-attempted"));
-                let already = marker.as_ref().is_some_and(|p| p.is_file());
-                if !already {
-                    if let Some(path) = &marker {
-                        let _ = fs::write(path, b"1");
-                    }
-                    let _ = request_elevated_boot_install();
-                }
-                if boot_task_exists() {
-                    return Ok(());
-                }
-            }
-            // Non-fatal: logon autostart still works.
-            Ok(())
-        }
-    }
+    Ok(())
 }
 
 fn try_create_boot_task() -> Result<()> {
@@ -948,14 +921,39 @@ fn try_create_boot_task() -> Result<()> {
     bail!("schtasks boot task failed: {}", stderr.trim());
 }
 
-/// Public entry for elevated `scalattice-agent install-boot-start`.
+/// One-shot elevated registration (set-token / tray Save). Never call from boot or
+/// background watchdog — that re-prompts UAC on every sign-in.
 pub fn install_boot_start_elevated() -> Result<()> {
     write_boot_runner_script()?;
+    if boot_task_exists() {
+        println!("Scalattice Agent already starts at Windows boot (before sign-in).");
+        return Ok(());
+    }
     try_create_boot_task()?;
     if let Ok(marker) = install_dir().map(|d| d.join("boot-uac-attempted")) {
         let _ = fs::remove_file(marker);
     }
     println!("Scalattice Agent will now start at Windows boot (before sign-in).");
+    Ok(())
+}
+
+/// Interactive path only: if the boot task is missing, ask for admin once.
+pub fn ensure_boot_start_interactive() -> Result<()> {
+    let _ = write_boot_runner_script()?;
+    if boot_task_exists() {
+        return Ok(());
+    }
+    if try_create_boot_task().is_ok() {
+        return Ok(());
+    }
+    let marker = install_dir().ok().map(|d| d.join("boot-uac-attempted"));
+    if marker.as_ref().is_some_and(|p| p.is_file()) {
+        return Ok(());
+    }
+    if let Some(path) = &marker {
+        let _ = fs::write(path, b"1");
+    }
+    let _ = request_elevated_boot_install();
     Ok(())
 }
 
