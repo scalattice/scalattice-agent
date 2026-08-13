@@ -1568,6 +1568,19 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || detail.contains("invoke_timeout")
     {
         "request_canceled"
+    // Weight load failures must win over bare "null result from llama cpp".
+    // Unsupported arch / bad GGUF often surfaces as: load model <path>: null result…
+    // Misclassifying that as agent_busy makes debug UI say "Agent is busy" for a
+    // model that simply cannot load on this agent build.
+    } else if detail.contains("load model")
+        || detail.contains("load_from_file")
+        || detail.contains("weights not found")
+        || detail.contains("model weights not found")
+        || detail.contains("unknown model architecture")
+        || detail.contains("unknown architecture")
+        || (detail.contains("gguf") && detail.contains("not found"))
+    {
+        "model_load_failed"
     } else if detail.contains("agent_busy")
         || detail.contains("no idle compute slot")
         || detail.contains("not available")
@@ -1590,16 +1603,34 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || detail.contains("ggml_backend_cuda")
     {
         "model_out_of_memory"
-    } else if detail.contains("load model")
-        || detail.contains("load_from_file")
-        || detail.contains("weights not found")
-        || detail.contains("model weights not found")
-        || (detail.contains("gguf") && detail.contains("not found"))
-    {
-        "model_load_failed"
     } else if detail.contains("context window") || detail.contains("too long") {
         "prompt_too_long"
     } else {
         "inference_failed"
+    }
+}
+
+#[cfg(test)]
+mod invoke_error_code_tests {
+    use super::invoke_error_code;
+
+    #[test]
+    fn load_model_null_result_is_model_load_failed_not_busy() {
+        let err = anyhow::anyhow!(
+            "load model C:\\Users\\x\\.cache\\scalattice\\models\\Qwen__Qwen3.5-9B\\Qwen_Qwen3.5-9B-Q4_K_M.gguf: null result from llama cpp"
+        );
+        assert_eq!(invoke_error_code(&err), "model_load_failed");
+    }
+
+    #[test]
+    fn bare_null_result_still_agent_busy() {
+        let err = anyhow::anyhow!("null result from llama cpp");
+        assert_eq!(invoke_error_code(&err), "agent_busy");
+    }
+
+    #[test]
+    fn unknown_architecture_is_model_load_failed() {
+        let err = anyhow::anyhow!("unknown model architecture: 'qwen35'");
+        assert_eq!(invoke_error_code(&err), "model_load_failed");
     }
 }
