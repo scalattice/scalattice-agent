@@ -98,7 +98,34 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
         bail!("empty download for {}", dest.display());
     }
 
-    std::fs::rename(tmp, dest).with_context(|| format!("finalize {}", dest.display()))?;
+    std::fs::rename(&tmp, dest).with_context(|| format!("finalize {}", dest.display()))?;
+
+    // HF/CDN streams often omit Content-Length; reject truncated GGUFs that
+    // would otherwise look "complete" (non-empty file) and fail at load time.
+    if dest
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        match super::gguf_check::gguf_payload_in_bounds(dest) {
+            Ok(true) => {}
+            Ok(false) => {
+                let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+                let _ = tokio::fs::remove_file(dest).await;
+                bail!(
+                    "truncated download for {}: GGUF tensor payloads exceed file size ({size} bytes on disk)",
+                    dest.display()
+                );
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_file(dest).await;
+                return Err(err).with_context(|| {
+                    format!("validate downloaded GGUF {}", dest.display())
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 

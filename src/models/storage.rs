@@ -468,7 +468,19 @@ pub fn weight_filenames(weights: &crate::protocol::ModelWeights) -> Vec<&str> {
 }
 
 pub fn is_download_complete(path: &Path) -> bool {
-    path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    if !(path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)) {
+        return false;
+    }
+    // Non-empty is not enough: interrupted HF/mirror streams can leave a partial
+    // GGUF that still has a valid header. Require tensor payloads to fit.
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        return super::gguf_check::gguf_payload_in_bounds(path).unwrap_or(false);
+    }
+    true
 }
 
 /// A weight file counts as cached only when listed in the model manifest.

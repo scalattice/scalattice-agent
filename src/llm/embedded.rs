@@ -342,7 +342,17 @@ pub(crate) fn load_model_for_pool_starting_at(
             }
             Err(err) => {
                 warn!("model load attempt '{label}' failed: {err}");
-                last_err = Some(anyhow!(err));
+                let mut wrapped = anyhow!(err);
+                // llama-cpp-2 often only returns "null result from llama cpp" even when
+                // the log line said "tensor … not within the file bounds". Attach that
+                // so health quarantine / model_load_failed classify correctly.
+                if crate::models::gguf_payload_in_bounds(model_path).unwrap_or(true) == false
+                {
+                    wrapped = wrapped.context(
+                        "corrupted or incomplete GGUF (tensor payloads exceed file size)",
+                    );
+                }
+                last_err = Some(wrapped);
             }
         }
     }

@@ -8,6 +8,7 @@ mod sync;
 pub use capacity::{
     can_host_model, can_host_on_machine, preferred_download_card, DEFAULT_CPU_RAM_HEADROOM_GB,
 };
+pub use gguf_check::gguf_payload_in_bounds;
 pub use health::{
     clear_weight_health, handle_weight_load_failure, process_preload_paused, should_skip_preload,
     spawn_delete_staged_dirs, stage_purge_model_weights, sweep_staged_purge_dirs,

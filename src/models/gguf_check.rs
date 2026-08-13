@@ -53,8 +53,10 @@ pub fn gguf_payload_in_bounds(path: &Path) -> std::io::Result<bool> {
         let ggml_type = read_u32(&mut file)?;
         let offset = read_u64(&mut file)?;
         let Some(nbytes) = ggml_type_nbytes(ggml_type, elements) else {
-            // Unknown type - don't claim corruption.
-            return Ok(true);
+            // Unknown quant (e.g. newer MXFP4 variants): skip this tensor's size
+            // contribution but keep checking known tensors. Returning Ok(true) here
+            // previously marked truncated gpt-oss files as healthy.
+            continue;
         };
         let end = offset.saturating_add(nbytes);
         if end > max_end {
@@ -179,8 +181,8 @@ fn ggml_type_nbytes(ggml_type: u32, nelements: u64) -> Option<u64> {
         13 => (256, 176),    // Q5_K
         14 => (256, 210),    // Q6_K
         15 => (256, 292),    // Q8_K
-        24 => (1, 2),        // BF16 (varies by ggml version; treat as 2)
-        25 => (1, 2),
+        30 => (1, 2),        // BF16
+        39 => (32, 17),      // MXFP4 (QK_MXFP4=32, 17 bytes/block)
         _ => return None,
     };
     let blocks = nelements.div_ceil(block_size);
@@ -201,5 +203,24 @@ mod tests {
         f.write_all(b"GGUF").unwrap();
         assert!(!gguf_payload_in_bounds(&path).unwrap_or(true));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn detects_onsite_truncated_gpt_oss_if_present() {
+        let path = Path::new(
+            "/home/romulus/.cache/scalattice/models/openai__gpt-oss-20b/openai_gpt-oss-20b-Q4_K_M.gguf",
+        );
+        if !path.is_file() {
+            return;
+        }
+        let meta = path.metadata().unwrap();
+        // Full bartowski Q4_K_M is ~11.7GB; this fixture is the known truncated copy.
+        if meta.len() >= 10_000_000_000 {
+            return;
+        }
+        assert!(
+            !gguf_payload_in_bounds(path).unwrap_or(true),
+            "truncated gpt-oss GGUF must fail bounds check"
+        );
     }
 }
