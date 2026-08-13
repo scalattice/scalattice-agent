@@ -627,8 +627,9 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
     let mut child = Command::new(&bin)
         .arg("worker")
         .env("SCALATTICE_WORKER_CONFIG", &boot_json)
-        // Keep worker logs out of the IPC pipe (belt-and-braces with stderr logging).
-        .env("RUST_LOG", "warn")
+        // Worker logging owns its EnvFilter (full llama detail → agent.log).
+        // Do not inherit a supervisor `RUST_LOG=warn` that would drop INFO thoughts.
+        .env_remove("RUST_LOG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

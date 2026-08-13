@@ -54,11 +54,30 @@ pub fn init_logging(verbose: bool) {
         .init();
 }
 
-/// Slot workers speak JSON on stdout — keep all logs on stderr so IPC stays clean.
+/// Slot workers speak JSON on stdout — keep tracing off stdout.
+/// Disk `agent.log` always gets full llama.cpp detail (same contract as the supervisor);
+/// stderr stays Simplified unless `--verbose` / `SCALATTICE_VERBOSE`.
 pub fn init_worker_logging(verbose: bool) {
+    // Always capture llama-cpp-2 INFO on disk; do not inherit a parent `RUST_LOG=warn`.
+    let filter = build_env_filter(true);
+    if let Some(file) = open_agent_log_writer() {
+        let file = Arc::new(Mutex::new(file));
+        let writer = TeeLogWriter {
+            file: Some(file),
+            also_stderr: true,
+            stderr_verbose: verbose,
+        };
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .with_writer(Mutex::new(writer))
+            .init();
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter(build_env_filter(verbose))
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 }

@@ -707,6 +707,9 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     logs_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut token_poll = interval(Duration::from_secs(1));
     token_poll.tick().await;
+    // Only one background maintenance pass at a time so warm/refresh cannot
+    // stack and starve the WS select loop (Cloudflare idle ~100s).
+    let maintenance_busy = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -739,24 +742,42 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                 let registered = {
                     let mut guard = state.lock().await;
                     guard.tick_vram_lifecycle();
-                    if guard.registered {
-                        let hf_token = guard.hf_token.clone();
-                        guard.sync_model_weights(hf_token, &config.token);
-                    }
                     guard.registered
                 };
                 if registered {
-                    let state_bg = state.clone();
-                    tokio::spawn(async move {
-                        refresh_specs_cache(&state_bg).await;
-                    });
-                    refresh_slot_cache(&state).await;
-                    maybe_warm_models(state.clone()).await;
-                    let reregister = state.lock().await.needs_reregister();
-                    if reregister {
-                        send_register_message(&state, &write).await?;
-                    } else {
-                        send_heartbeat(&state, &write).await?;
+                    // Keepalive frame FIRST — never await warm/hypervisor work before
+                    // putting bytes on the wire (edge proxies idle-close ~100s).
+                    send_heartbeat(&state, &write).await?;
+                    if maintenance_busy
+                        .compare_exchange(
+                            false,
+                            true,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        let state_bg = state.clone();
+                        let write_bg = write.clone();
+                        let token = config.token.clone();
+                        let busy = maintenance_busy.clone();
+                        tokio::spawn(async move {
+                            let _guard = MaintenanceGuard(busy);
+                            {
+                                let mut guard = state_bg.lock().await;
+                                let hf_token = guard.hf_token.clone();
+                                guard.sync_model_weights(hf_token, &token);
+                            }
+                            refresh_specs_cache(&state_bg).await;
+                            refresh_slot_cache(&state_bg).await;
+                            maybe_warm_models(state_bg.clone()).await;
+                            let reregister = state_bg.lock().await.needs_reregister();
+                            if reregister {
+                                if let Err(err) = send_register_message(&state_bg, &write_bg).await {
+                                    debug!("background re-register failed: {err:#}");
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -768,6 +789,13 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     }
 
     Ok(())
+}
+
+struct MaintenanceGuard(Arc<AtomicBool>);
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
@@ -874,7 +902,8 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
 }
 
 async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite) -> Result<()> {
-    refresh_slot_cache(state).await;
+    // Do not await hypervisor restart here — that can stall the WS loop past edge
+    // idle timeouts. Slot cache is refreshed on the background maintenance path.
     let register = {
         let mut guard = state.lock().await;
         let models = guard.register_model_ids();
@@ -899,7 +928,7 @@ async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &SharedW
 }
 
 async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite) -> Result<()> {
-    refresh_slot_cache(state).await;
+    // Intentionally light: keepalive must not await hypervisor/warm work.
     let (specs, runtime) = {
         let guard = state.lock().await;
         (guard.live_specs(), guard.runtime())
@@ -969,7 +998,20 @@ async fn handle_server_message(
                             maybe_warm_models(state.clone()).await;
                         }
                     }
+                    // Register immediately so the session stays alive; restart workers
+                    // and warm in the background (can take tens of seconds).
                     send_register_message(state, write).await?;
+                    let state_bg = state.clone();
+                    let write_bg = write.clone();
+                    tokio::spawn(async move {
+                        refresh_slot_cache(&state_bg).await;
+                        maybe_warm_models(state_bg.clone()).await;
+                        if state_bg.lock().await.needs_reregister() {
+                            if let Err(err) = send_register_message(&state_bg, &write_bg).await {
+                                debug!("post-ready re-register failed: {err:#}");
+                            }
+                        }
+                    });
                 }
                 "registered" => {
                     let reg = parse_registered(data)?;
@@ -1260,6 +1302,8 @@ async fn respond_invoke(
         "invoke {} · model {} · runtime {} · stream={}",
         invoke.id, invoke.model_id, invoke.runtime_model, invoke.stream
     );
+    // Push the invoke line to live cloud logs immediately (don't wait for the 1s ticker).
+    let _ = flush_live_logs(write).await;
 
     let (hv, catalog_model, ram_gb, headroom, max_tokens) = {
         let mut guard = state.lock().await;
