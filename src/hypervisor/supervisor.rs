@@ -307,28 +307,44 @@ impl Hypervisor {
             if !worker.loaded_models.is_empty() {
                 continue;
             }
+            worker.busy = true;
+            drop(workers);
 
+            // Take the worker out so invoke can claim other slots while this
+            // load runs (holding the map lock during Warm blocked debug for minutes).
+            let mut worker = {
+                let mut workers = self.workers.lock().await;
+                match workers.remove(&slot_id) {
+                    Some(w) => w,
+                    None => continue,
+                }
+            };
             let req_id = next_req_id();
-            match worker_rpc(
-                worker,
+            let outcome = worker_rpc(
+                &mut worker,
                 WorkerRequest::Warm {
                     id: req_id,
                     runtime_model: model.clone(),
                 },
             )
-            .await
+            .await;
             {
-                Ok(WorkerResponse::Ok { .. }) => {
-                    if !worker.loaded_models.iter().any(|m| m == &model) {
-                        worker.loaded_models.push(model.clone());
+                let mut workers = self.workers.lock().await;
+                match &outcome {
+                    Ok(WorkerResponse::Ok { .. }) => {
+                        if !worker.loaded_models.iter().any(|m| m == &model) {
+                            worker.loaded_models.push(model.clone());
+                        }
+                        info!(slot = %slot_id, model = %model, "warmed model on slot");
                     }
-                    info!(slot = %slot_id, model = %model, "warmed model on slot");
+                    Ok(WorkerResponse::Error { error, .. }) => {
+                        warn!(slot = %slot_id, model = %model, error = %error, "warm failed");
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(slot = %slot_id, error = %err, "warm rpc failed"),
                 }
-                Ok(WorkerResponse::Error { error, .. }) => {
-                    warn!(slot = %slot_id, model = %model, error = %error, "warm failed");
-                }
-                Ok(_) => {}
-                Err(err) => warn!(slot = %slot_id, error = %err, "warm rpc failed"),
+                worker.busy = false;
+                workers.insert(slot_id, worker);
             }
         }
         Ok(())

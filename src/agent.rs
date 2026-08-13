@@ -9,7 +9,7 @@ use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecyc
 use crate::hypervisor::{Hypervisor, SlotStatus};
 use crate::inference::InferenceEngine;
 use crate::models::{
-    can_host_on_machine, catalog_model_weights_ready, handle_weight_load_failure,
+    can_host_on_machine, handle_weight_load_failure,
     preferred_download_card, purge_incomplete_model_weights,
     should_skip_preload, spawn_delete_staged_dirs, stage_purge_model_weights,
     sweep_staged_purge_dirs, spawn_catalog_sync,
@@ -72,6 +72,12 @@ struct SessionState {
     cached_max_jobs: u32,
     cached_loaded_models: Vec<String>,
     pending_hypervisor_restart: bool,
+    /// Disk inventory for heartbeats. Refreshed off the WS thread — walking GGUFs
+    /// inline stalls invoke/log frames for tens of seconds on some machines.
+    disk_inventory_primed: bool,
+    cached_disk_ready: Vec<String>,
+    cached_disk_gb: u32,
+    cached_model_disk: Vec<(String, crate::models::ModelDiskStatus)>,
 }
 
 impl SessionState {
@@ -102,7 +108,33 @@ impl SessionState {
             cached_max_jobs: 1,
             cached_loaded_models: Vec::new(),
             pending_hypervisor_restart: false,
+            disk_inventory_primed: false,
+            cached_disk_ready: Vec::new(),
+            cached_disk_gb: 0,
+            cached_model_disk: Vec::new(),
         }
+    }
+
+    fn disk_has_runtime(&self, runtime_or_id: &str) -> bool {
+        let want = runtime_or_id.trim();
+        if want.is_empty() {
+            return false;
+        }
+        self.cached_disk_ready.iter().any(|id| id.eq_ignore_ascii_case(want))
+    }
+
+    fn catalog_ready_on_disk(&self, model: &CatalogModel) -> bool {
+        if !self.disk_inventory_primed {
+            // Unprimed: skip GGUF walks on the WS thread. Inventory fills this in
+            // spawn_blocking; the agent re-registers once the scan lands.
+            return false;
+        }
+        let runtime = if model.runtime_model.trim().is_empty() {
+            model.model_id.as_str()
+        } else {
+            model.runtime_model.as_str()
+        };
+        self.disk_has_runtime(runtime) || self.disk_has_runtime(&model.model_id)
     }
 
     fn vram_config(&self) -> VramLifecycleConfig {
@@ -191,9 +223,7 @@ impl SessionState {
         self.eligible_catalog_models()
             .into_iter()
             .filter(|model| model.weights.is_some())
-            .filter(|model| {
-                !catalog_model_weights_ready(model)
-            })
+            .filter(|model| !self.catalog_ready_on_disk(model))
             .collect()
     }
 
@@ -272,7 +302,7 @@ impl SessionState {
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         for model in enabled {
-            if catalog_model_weights_ready(model) {
+            if self.catalog_ready_on_disk(model) {
                 continue;
             }
             if !can_host_on_machine(model, &specs.compute_devices, ram_gb, self.cpu_ram_headroom_gb)
@@ -403,7 +433,7 @@ impl SessionState {
     fn register_model_ids(&self) -> Vec<String> {
         self.eligible_catalog_models()
             .iter()
-            .filter(|model| catalog_model_weights_ready(model))
+            .filter(|model| self.catalog_ready_on_disk(model))
             .map(|m| m.model_id.clone())
             .collect()
     }
@@ -540,7 +570,13 @@ impl SessionState {
         // Always report disk-cached weights here. VRAM-resident models live on
         // slot status; substituting them made the dashboard flicker to "only the
         // running model is installed" under load.
-        let loaded_models = crate::models::list_cached_runtime_models();
+        let loaded_models = if self.disk_inventory_primed {
+            self.cached_disk_ready.clone()
+        } else {
+            // Never walk GGUFs on the WS/heartbeat path; inventory refreshes in the
+            // background. Empty until the first off-thread scan completes.
+            Vec::new()
+        };
         let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
         let downloading = crate::state::downloading_model();
         let blocked_models = if downloading.is_some() || !loaded_models.is_empty() {
@@ -559,8 +595,8 @@ impl SessionState {
             enabled_count,
             downloading.as_deref(),
             blocked_models,
-            crate::models::models_cache_disk_gb(),
-            crate::runtime::serialize_model_disk(&crate::models::list_model_disk_status()),
+            self.cached_disk_gb,
+            crate::runtime::serialize_model_disk(&self.cached_model_disk),
             self.cached_slots.clone(),
             self.cached_max_jobs.max(1),
             self.cached_idle_slots,
@@ -701,6 +737,14 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     let write = Arc::new(Mutex::new(write));
     // Prime specs once before the read loop so the first heartbeat/invoke is cheap.
     refresh_specs_cache(&state).await;
+    // Disk inventory is slow (GGUF bounds checks). Do it off-thread so the first
+    // invoke is not queued behind a cache walk.
+    {
+        let state_disk = state.clone();
+        tokio::spawn(async move {
+            refresh_disk_inventory(&state_disk).await;
+        });
+    }
     let mut heartbeat = interval(Duration::from_secs(12));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut logs_flush = interval(Duration::from_secs(1));
@@ -770,6 +814,7 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                             }
                             refresh_specs_cache(&state_bg).await;
                             refresh_slot_cache(&state_bg).await;
+                            refresh_disk_inventory(&state_bg).await;
                             maybe_warm_models(state_bg.clone()).await;
                             let reregister = state_bg.lock().await.needs_reregister();
                             if reregister {
@@ -939,11 +984,27 @@ async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite)
         runtime: Some(runtime),
     })?;
     write.lock().await.send(Message::Text(hb)).await?;
-    {
-        let guard = state.lock().await;
-        guard.persist_local_state();
-    }
     Ok(())
+}
+
+async fn refresh_disk_inventory(state: &Arc<Mutex<SessionState>>) {
+    let snap = tokio::task::spawn_blocking(|| {
+        (
+            crate::models::list_cached_runtime_models(),
+            crate::models::models_cache_disk_gb(),
+            crate::models::list_model_disk_status(),
+        )
+    })
+    .await;
+    let Ok((ready, disk_gb, model_disk)) = snap else {
+        return;
+    };
+    let mut guard = state.lock().await;
+    guard.cached_disk_ready = ready;
+    guard.cached_disk_gb = disk_gb;
+    guard.cached_model_disk = model_disk;
+    guard.disk_inventory_primed = true;
+    guard.persist_local_state();
 }
 
 /// Best-effort WS write. Returns Ok even if the peer already reset — invoke tasks
@@ -1004,6 +1065,7 @@ async fn handle_server_message(
                     let state_bg = state.clone();
                     let write_bg = write.clone();
                     tokio::spawn(async move {
+                        refresh_disk_inventory(&state_bg).await;
                         refresh_slot_cache(&state_bg).await;
                         maybe_warm_models(state_bg.clone()).await;
                         if state_bg.lock().await.needs_reregister() {
