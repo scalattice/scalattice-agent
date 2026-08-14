@@ -193,7 +193,7 @@ fn run_invoke(
             }
         },
         || {
-            crate::llm::progress::report("start", 0.0);
+            crate::llm::report_work_progress("start", 0.0);
             generate_with_callback(&config, |piece| {
                 if piece.is_empty() {
                     return;

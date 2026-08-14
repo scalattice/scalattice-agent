@@ -121,7 +121,7 @@ pub fn generate_with_callback(
             super::progress::report("context", 1.0);
 
             let prompt = build_chat_prompt(model, &config.messages)?;
-            let mut prompt_tokens = model
+            let prompt_tokens = model
                 .str_to_token(&prompt, AddBos::Never)
                 .context("tokenize prompt")?;
 
