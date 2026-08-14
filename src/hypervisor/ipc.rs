@@ -70,4 +70,11 @@ pub enum WorkerResponse {
         id: String,
         error: String,
     },
+    /// Keepalive from a still-working invoke (load / decode). Not a token.
+    Progress {
+        id: String,
+        phase: String,
+        #[serde(default)]
+        pct: Option<f32>,
+    },
 }

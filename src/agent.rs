@@ -1421,29 +1421,49 @@ async fn respond_invoke(
     let stream = invoke.stream;
 
     let result = async {
-        let on_delta: Option<Box<dyn FnMut(String) + Send>> = if stream {
-            let write = write.clone();
-            let invoke_id = invoke_id.clone();
-            Some(Box::new(move |delta: String| {
-                if delta.is_empty() {
-                    return;
-                }
-                let write = write.clone();
-                let invoke_id = invoke_id.clone();
-                tokio::spawn(async move {
-                    let msg = InvokeDeltaMessage {
+        let write_delta = write.clone();
+        let invoke_id_cb = invoke_id.clone();
+        let on_delta: Option<Box<dyn FnMut(String) + Send>> = Some(Box::new(move |delta: String| {
+            let write = write_delta.clone();
+            let invoke_id = invoke_id_cb.clone();
+            let forward_tokens = stream;
+            tokio::spawn(async move {
+                let text = if let Some(rest) = delta.strip_prefix('\u{1e}') {
+                    let mut parts = rest.split('\u{1e}');
+                    let phase = parts.next().unwrap_or("working").to_string();
+                    let pct = parts
+                        .next()
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .filter(|v| *v >= 0.0);
+                    serde_json::to_string(&crate::protocol::InvokeProgressMessage {
+                        kind: "invoke_progress",
+                        id: invoke_id,
+                        phase,
+                        pct,
+                    })
+                } else if delta.is_empty() || !forward_tokens {
+                    serde_json::to_string(&crate::protocol::InvokeProgressMessage {
+                        kind: "invoke_progress",
+                        id: invoke_id,
+                        phase: if delta.is_empty() {
+                            "working".into()
+                        } else {
+                            "decode".into()
+                        },
+                        pct: None,
+                    })
+                } else {
+                    serde_json::to_string(&InvokeDeltaMessage {
                         kind: "invoke_delta",
                         id: invoke_id,
                         delta,
-                    };
-                    if let Ok(text) = serde_json::to_string(&msg) {
-                        let _ = write.lock().await.send(Message::Text(text)).await;
-                    }
-                });
-            }))
-        } else {
-            None
-        };
+                    })
+                };
+                if let Ok(text) = text {
+                    let _ = write.lock().await.send(Message::Text(text)).await;
+                }
+            });
+        }));
 
         match hv
             .invoke(

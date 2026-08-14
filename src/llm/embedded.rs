@@ -114,9 +114,11 @@ pub fn generate_with_callback(
                 NonZeroU32::new(4096).context("invalid default context size")?,
             ));
             let prefill_start = Instant::now();
+            super::progress::report("context", 0.0);
             let mut ctx = model
                 .new_context(backend, ctx_params)
                 .context("create llama context")?;
+            super::progress::report("context", 1.0);
 
             let prompt = build_chat_prompt(model, &config.messages)?;
             let mut prompt_tokens = model
@@ -134,14 +136,25 @@ pub fn generate_with_callback(
             }
 
             let prompt_token_count = prompt_tokens.len() as u32;
-            let mut batch = LlamaBatch::new(prompt_tokens.len().max(1), 1);
-            let last = prompt_tokens.len().saturating_sub(1);
-            for (pos, token) in prompt_tokens.drain(..).enumerate() {
-                batch
-                    .add(token, pos as i32, &[0], pos == last)
-                    .context("add prompt token to batch")?;
+            let tokens = prompt_tokens;
+            let n = tokens.len();
+            const PREFILL_CHUNK: usize = 64;
+            let mut batch = LlamaBatch::new(PREFILL_CHUNK.max(1), 1);
+            let mut i = 0usize;
+            super::progress::report("prefill", 0.0);
+            while i < n {
+                batch.clear();
+                let end = (i + PREFILL_CHUNK).min(n);
+                for pos in i..end {
+                    let want_logits = pos + 1 == n;
+                    batch
+                        .add(tokens[pos], pos as i32, &[0], want_logits)
+                        .context("add prompt token to batch")?;
+                }
+                ctx.decode(&mut batch).context("decode prompt")?;
+                super::progress::report("prefill", end as f32 / n.max(1) as f32);
+                i = end;
             }
-            ctx.decode(&mut batch).context("decode prompt")?;
 
             let mut sampler = LlamaSampler::chain_simple([
                 LlamaSampler::dist(0x5CA1A7CE),
@@ -149,7 +162,7 @@ pub fn generate_with_callback(
             ]);
 
             let mut content = String::new();
-            let mut position = last as i32;
+            let mut position = n.saturating_sub(1) as i32;
             let mut generated = 0u32;
             let mut prefill_ms = 0u64;
             let mut decode_ms = 0u64;
@@ -171,6 +184,10 @@ pub fn generate_with_callback(
                 let decode_piece_start = Instant::now();
                 content.push_str(&piece);
                 on_token(&piece);
+                super::progress::report(
+                    "decode",
+                    generated as f32 / (max_tokens as u32).max(1) as f32,
+                );
 
                 batch.clear();
                 position += 1;
@@ -333,6 +350,8 @@ pub(crate) fn load_model_for_pool_starting_at(
     let mut last_err: Option<anyhow::Error> = None;
 
     for (idx, (label, params)) in candidates.into_iter().enumerate().skip(start_at) {
+        super::progress::report("load", 0.0);
+        let params = super::progress::attach_llama_progress(params);
         match LlamaModel::load_from_file(backend, model_path, &params) {
             Ok(model) => {
                 if start_at == 0 && idx > 0 {
@@ -365,9 +384,11 @@ pub(crate) fn load_cpu_mmap_model(
     backend: &LlamaBackend,
     model_path: &Path,
 ) -> Result<LlamaModel> {
-    let params = LlamaModelParams::default()
-        .with_use_mmap(true)
-        .with_n_gpu_layers(0);
+    let params = super::progress::attach_llama_progress(
+        LlamaModelParams::default()
+            .with_use_mmap(true)
+            .with_n_gpu_layers(0),
+    );
     LlamaModel::load_from_file(backend, model_path, &params)
         .map_err(|err| anyhow!(err))
         .with_context(|| format!("cpu mmap load {}", model_path.display()))

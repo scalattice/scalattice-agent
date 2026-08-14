@@ -1,7 +1,7 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use crate::compute_pool::apply_slot_backend_visibility;
 use crate::llm::{
-    evict_all, generate, generate_with_callback, init_backend, preload_model, GenerateConfig,
+    evict_all, generate_with_callback, init_backend, preload_model, GenerateConfig,
 };
 use crate::models::{list_cached_runtime_models, resolve_model_gguf};
 use crate::protocol::InvokeTimings;
@@ -176,22 +176,40 @@ fn run_invoke(
         model_id: model_id.to_string(),
     };
 
-    let output = if stream {
-        generate_with_callback(&config, |piece| {
-            if piece.is_empty() {
-                return;
+    let job_id = id.to_string();
+    let output = crate::llm::with_work_progress(
+        {
+            let job_id = job_id.clone();
+            move |phase, pct| {
+                let mut out = std::io::stdout();
+                let _ = write_response(
+                    &mut out,
+                    &WorkerResponse::Progress {
+                        id: job_id.clone(),
+                        phase: phase.to_string(),
+                        pct: Some(pct),
+                    },
+                );
             }
-            let _ = write_response(
-                stdout,
-                &WorkerResponse::Delta {
-                    id: id.to_string(),
-                    text: piece.to_string(),
-                },
-            );
-        })
-    } else {
-        generate(&config)
-    };
+        },
+        || {
+            crate::llm::progress::report("start", 0.0);
+            generate_with_callback(&config, |piece| {
+                if piece.is_empty() {
+                    return;
+                }
+                if stream {
+                    let _ = write_response(
+                        stdout,
+                        &WorkerResponse::Delta {
+                            id: job_id.clone(),
+                            text: piece.to_string(),
+                        },
+                    );
+                }
+            })
+        },
+    );
 
     match output {
         Ok(out) => write_response(

@@ -70,9 +70,9 @@ pub struct Hypervisor {
     job_cancels: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
-/// Wall-clock ceiling for a single worker invoke. Protects against CUDA hangs.
-/// Normal abandon uses invoke_cancel well before this (backend ~180s).
-const INVOKE_HARD_TIMEOUT: Duration = Duration::from_secs(900);
+/// Give up only when the worker stops sending progress/token lines.
+/// Load/prefill/decode emit those lines while they are actually working.
+const WORKER_COMMS_SILENCE: Duration = Duration::from_secs(45);
 
 impl Hypervisor {
     pub async fn start(devices: &[ComputeDevice]) -> Result<Arc<Self>> {
@@ -720,7 +720,7 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
             continue;
         };
         match &resp {
-            WorkerResponse::Delta { .. } => continue,
+            WorkerResponse::Delta { .. } | WorkerResponse::Progress { .. } => continue,
             WorkerResponse::Pong { id }
             | WorkerResponse::Ok { id }
             | WorkerResponse::Result { id, .. }
@@ -737,33 +737,8 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
 async fn worker_rpc_invoke_cancellable(
     worker: &mut SlotWorker,
     req: WorkerRequest,
-    on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
-    cancel: &Notify,
-) -> Result<(String, u32, u32, InvokeTimings, Vec<String>)> {
-    tokio::select! {
-        biased;
-        outcome = worker_rpc_invoke(worker, req, on_delta) => outcome,
-        _ = cancel.notified() => {
-            info!(slot = %worker.spec.id, "killing worker for canceled invoke");
-            let _ = worker.child.kill().await;
-            let _ = worker.child.wait().await;
-            worker.healthy = false;
-            bail!("request_canceled");
-        }
-        _ = tokio::time::sleep(INVOKE_HARD_TIMEOUT) => {
-            warn!(slot = %worker.spec.id, "killing worker after hard invoke timeout");
-            let _ = worker.child.kill().await;
-            let _ = worker.child.wait().await;
-            worker.healthy = false;
-            bail!("invoke_timeout: worker wall-clock exceeded");
-        }
-    }
-}
-
-async fn worker_rpc_invoke(
-    worker: &mut SlotWorker,
-    req: WorkerRequest,
     mut on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
+    cancel: &Notify,
 ) -> Result<(String, u32, u32, InvokeTimings, Vec<String>)> {
     let expect_id = request_id(&req);
     let mut line = serde_json::to_string(&req)?;
@@ -774,50 +749,77 @@ async fn worker_rpc_invoke(
     let mut buf = String::new();
     loop {
         buf.clear();
-        let n = worker
-            .reader
-            .read_line(&mut buf)
-            .await
-            .context("read worker invoke response")?;
-        if n == 0 {
-            worker.healthy = false;
-            bail!("worker closed stdout during invoke");
-        }
-        let Some(resp) = try_parse_worker_response(&buf) else {
-            warn!(
-                slot = %worker.spec.id,
-                line = %buf.trim(),
-                "ignoring non-json worker stdout during invoke"
-            );
-            continue;
-        };
-        match resp {
-            WorkerResponse::Delta { id, text } if id == expect_id => {
-                if let Some(cb) = on_delta.as_mut() {
-                    cb(text);
+        tokio::select! {
+            biased;
+            _ = cancel.notified() => {
+                info!(slot = %worker.spec.id, "killing worker for canceled invoke");
+                let _ = worker.child.kill().await;
+                let _ = worker.child.wait().await;
+                worker.healthy = false;
+                bail!("request_canceled");
+            }
+            n = worker.reader.read_line(&mut buf) => {
+                let n = n.context("read worker invoke response")?;
+                if n == 0 {
+                    worker.healthy = false;
+                    bail!("worker closed stdout during invoke");
+                }
+                let Some(resp) = try_parse_worker_response(&buf) else {
+                    warn!(
+                        slot = %worker.spec.id,
+                        line = %buf.trim(),
+                        "ignoring non-json worker stdout during invoke"
+                    );
+                    continue;
+                };
+                match resp {
+                    WorkerResponse::Progress { id, phase, pct } if id == expect_id => {
+                        if let Some(cb) = on_delta.as_mut() {
+                            cb(format!(
+                                "\u{1e}{}\u{1e}{}",
+                                phase,
+                                pct.unwrap_or(-1.0)
+                            ));
+                        }
+                    }
+                    WorkerResponse::Delta { id, text } if id == expect_id => {
+                        if let Some(cb) = on_delta.as_mut() {
+                            cb(text);
+                        }
+                    }
+                    WorkerResponse::Result {
+                        id,
+                        content,
+                        prompt_tokens,
+                        completion_tokens,
+                        timings,
+                        loaded_models,
+                    } if id == expect_id => {
+                        return Ok((
+                            content,
+                            prompt_tokens,
+                            completion_tokens,
+                            timings,
+                            loaded_models,
+                        ));
+                    }
+                    WorkerResponse::Error { id, error } if id == expect_id => {
+                        bail!("{error}");
+                    }
+                    other => {
+                        warn!(?other, "ignoring unexpected worker message during invoke");
+                    }
                 }
             }
-            WorkerResponse::Result {
-                id,
-                content,
-                prompt_tokens,
-                completion_tokens,
-                timings,
-                loaded_models,
-            } if id == expect_id => {
-                return Ok((
-                    content,
-                    prompt_tokens,
-                    completion_tokens,
-                    timings,
-                    loaded_models,
-                ));
-            }
-            WorkerResponse::Error { id, error } if id == expect_id => {
-                bail!("{error}");
-            }
-            other => {
-                warn!(?other, "ignoring unexpected worker message during invoke");
+            _ = tokio::time::sleep(WORKER_COMMS_SILENCE) => {
+                warn!(
+                    slot = %worker.spec.id,
+                    "killing worker; progress comms went silent"
+                );
+                let _ = worker.child.kill().await;
+                let _ = worker.child.wait().await;
+                worker.healthy = false;
+                bail!("invoke_timeout: worker made no progress");
             }
         }
     }

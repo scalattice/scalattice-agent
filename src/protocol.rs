@@ -220,6 +220,16 @@ pub struct InvokeDeltaMessage {
     pub delta: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct InvokeProgressMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub id: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pct: Option<f32>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
