@@ -204,10 +204,12 @@ fn make_gpu_room(
         .collect();
     if max <= 1 {
         for key in victims {
+            crate::llm::report_work_progress("evict", 0.0);
             if inner.gpu.remove(&key).is_some() {
                 info!("evicted GPU resident so only one model stays in VRAM on ≤8GB");
                 try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
             }
+            crate::llm::report_work_progress("evict", 1.0);
         }
         return;
     }
@@ -216,12 +218,14 @@ fn make_gpu_room(
         if key == keep_key {
             continue;
         }
+        crate::llm::report_work_progress("evict", 0.0);
         if inner.gpu.remove(&key).is_some() {
             info!(
                 evicted = %path_from_gpu_key(&key),
                 "evicting GPU resident to free VRAM"
             );
             try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
+            crate::llm::report_work_progress("evict", 1.0);
         }
     }
 }
