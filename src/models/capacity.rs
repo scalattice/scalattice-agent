@@ -79,15 +79,27 @@ pub fn can_host_on_machine(
     false
 }
 
-/// Best card for weight download sizing (largest single slot, else legacy virtual card).
+/// Best card for weight download sizing: largest single slot, else homogeneous TP pool.
 pub fn preferred_download_card(devices: &[ComputeDevice]) -> anyhow::Result<VirtualCard> {
     let plan = build_compute_slots(devices)?;
-    plan.slots
+    let mut best = plan
+        .slots
         .iter()
         .filter(|s| s.kind != "cpu")
         .max_by_key(|s| s.card.total_vram_gb)
-        .map(|s| s.card.clone())
-        .or_else(|| plan.slots.first().map(|s| s.card.clone()))
+        .map(|s| s.card.clone());
+    for phys in plan.tp_groups.values() {
+        if let Ok(tp) = build_tp_card_for_group(devices, phys) {
+            let take = best
+                .as_ref()
+                .map(|card| tp.total_vram_gb > card.total_vram_gb)
+                .unwrap_or(true);
+            if take {
+                best = Some(tp);
+            }
+        }
+    }
+    best.or_else(|| plan.slots.first().map(|s| s.card.clone()))
         .ok_or_else(|| anyhow::anyhow!("no compute slots"))
 }
 
@@ -179,6 +191,40 @@ mod tests {
             &catalog(4.0, 1.2, 4.0),
             &devices,
             32,
+            2
+        ));
+    }
+
+    #[test]
+    fn dual_2gb_tp_uses_pooled_card_for_download_and_ram_offload() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA T400".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA T400".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let card = preferred_download_card(&devices).unwrap();
+        assert_eq!(card.total_vram_gb, 4);
+        // 12 GB catalog minVram still hosts via TP + system RAM offload.
+        assert!(can_host_model(&catalog(12.0, 11.7, 16.0), &card, 16, 2));
+        assert!(can_host_on_machine(
+            &catalog(12.0, 11.7, 16.0),
+            &devices,
+            16,
             2
         ));
     }
