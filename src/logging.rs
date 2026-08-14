@@ -64,7 +64,8 @@ pub fn init_worker_logging(verbose: bool) {
         let file = Arc::new(Mutex::new(file));
         let writer = TeeLogWriter {
             file: Some(file),
-            also_stderr: true,
+            // Disk is the record. Extra stderr can block a GUI-parented worker on Windows.
+            also_stderr: verbose,
             stderr_verbose: verbose,
         };
         tracing_subscriber::fmt()

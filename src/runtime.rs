@@ -167,10 +167,17 @@ fn status_label(
     idle_slots: u32,
     total_slots: u32,
 ) -> String {
-    if job_state == JobState::Busy && idle_slots == 0 {
+    if job_state == JobState::Busy {
         let model = active_model_id.unwrap_or("inference");
         if total_slots > 1 {
-            return format!("Running {model} · all {total_slots} slots busy");
+            if idle_slots == 0 {
+                return format!("Running {model} · all {total_slots} slots busy");
+            }
+            if idle_slots < total_slots {
+                return format!("Running {model} · {idle_slots}/{total_slots} slots free");
+            }
+            // Slot cache still shows all idle — the job has started; don't say Ready.
+            return format!("Running {model}");
         }
         return format!("Running {model}");
     }

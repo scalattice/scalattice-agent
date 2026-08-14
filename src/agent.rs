@@ -1386,6 +1386,9 @@ async fn respond_invoke(
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
+        if guard.cached_idle_slots > 0 {
+            guard.cached_idle_slots = guard.cached_idle_slots.saturating_sub(1);
+        }
         guard.vram_lifecycle.on_job_started();
         let hv = guard
             .hypervisor
@@ -1549,6 +1552,9 @@ async fn respond_invoke_split(
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
+        if guard.cached_idle_slots > 0 {
+            guard.cached_idle_slots = guard.cached_idle_slots.saturating_sub(1);
+        }
         guard.vram_lifecycle.on_job_started();
     }
 

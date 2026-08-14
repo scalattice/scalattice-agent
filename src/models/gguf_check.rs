@@ -6,11 +6,60 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 
+#[derive(Clone, Copy)]
+struct BoundsCacheEntry {
+    len: u64,
+    mtime_secs: u64,
+    ok: bool,
+}
+
+fn bounds_cache() -> &'static Mutex<std::collections::HashMap<PathBuf, BoundsCacheEntry>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, BoundsCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn gguf_payload_in_bounds(path: &Path) -> std::io::Result<bool> {
+    let meta = std::fs::metadata(path)?;
+    let len = meta.len();
+    let mtime = mtime_secs(&meta);
+    if let Ok(cache) = bounds_cache().lock() {
+        if let Some(hit) = cache.get(path) {
+            if hit.len == len && hit.mtime_secs == mtime {
+                return Ok(hit.ok);
+            }
+        }
+    }
+
+    let ok = gguf_payload_in_bounds_uncached(path)?;
+    if let Ok(mut cache) = bounds_cache().lock() {
+        cache.insert(
+            path.to_path_buf(),
+            BoundsCacheEntry {
+                len,
+                mtime_secs: mtime,
+                ok,
+            },
+        );
+    }
+    Ok(ok)
+}
+
+fn gguf_payload_in_bounds_uncached(path: &Path) -> std::io::Result<bool> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     if file_len < 24 {

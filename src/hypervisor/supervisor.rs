@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -468,6 +468,12 @@ impl Hypervisor {
             .first()
             .cloned()
             .ok_or_else(|| anyhow!("empty placement"))?;
+        info!(
+            slot = %slot_id,
+            job_id,
+            model = %model_id,
+            "claimed compute slot"
+        );
         // Take worker out of the map so other slots can run in parallel
         // (busy flag was already set under the claim lock in invoke()).
         let mut worker = {
@@ -648,10 +654,33 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
         .env_remove("RUST_LOG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        // Never inherit stderr into a GUI parent: Windows tray apps often don't
+        // drain it, so llama/tracing fills the pipe and the worker stalls for minutes.
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn worker for slot {} ({})", slot.id, bin.display()))?;
+
+    let slot_log_id = slot.id.clone();
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let t = line.trim();
+                        if !t.is_empty() {
+                            debug!(slot = %slot_log_id, "{t}");
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     let stdin = child.stdin.take().context("worker stdin")?;
     let stdout = child.stdout.take().context("worker stdout")?;

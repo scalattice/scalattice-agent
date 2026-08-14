@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn};
 
 /// Entry point for `scalattice-agent worker` — owns one slot's llama backend.
@@ -165,9 +166,21 @@ fn run_invoke(
     stream: bool,
     stdout: &mut impl Write,
 ) -> Result<()> {
+    let started = Instant::now();
+    info!(
+        slot = %boot.slot_id,
+        model = %runtime_model,
+        "worker invoke accepted"
+    );
     let model_path = resolve_model_gguf(runtime_model).with_context(|| {
         format!("model weights not found for {runtime_model}")
     })?;
+    info!(
+        slot = %boot.slot_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        path = %model_path.display(),
+        "worker resolved gguf"
+    );
     let config = GenerateConfig {
         model_path,
         pool: boot.card.clone(),

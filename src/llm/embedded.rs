@@ -113,13 +113,18 @@ pub fn generate_with_callback(
             let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
                 NonZeroU32::new(4096).context("invalid default context size")?,
             ));
-            let prefill_start = Instant::now();
             super::progress::report("context", 0.0);
+            let context_start = Instant::now();
             let mut ctx = model
                 .new_context(backend, ctx_params)
                 .context("create llama context")?;
+            tracing::info!(
+                elapsed_ms = context_start.elapsed().as_millis() as u64,
+                "llama context ready"
+            );
             super::progress::report("context", 1.0);
 
+            let prefill_start = Instant::now();
             let prompt = build_chat_prompt(model, &config.messages)?;
             let prompt_tokens = model
                 .str_to_token(&prompt, AddBos::Never)
