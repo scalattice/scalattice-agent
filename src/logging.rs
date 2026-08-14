@@ -259,8 +259,8 @@ pub fn pipe_log_lines(reader: impl std::io::Read, verbose: bool) -> anyhow::Resu
     Ok(())
 }
 
-/// Filter a multi-line log chunk for the Simplified view (Windows tray Live log).
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Filter a multi-line log chunk for the Simplified view.
+#[allow(dead_code)]
 pub fn simplify_log_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() / 2);
     for line in raw.lines() {
@@ -276,6 +276,31 @@ pub fn simplify_log_text(raw: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Keep agent/status lines across llama.cpp floods that would otherwise wipe a small tail buffer.
+pub fn retain_simplified_history(
+    lines: &mut Vec<String>,
+    chunk: &str,
+    max_lines: usize,
+    max_chars: usize,
+) {
+    for line in chunk.lines() {
+        if is_verbose_only_log_line(line) {
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    let max_lines = max_lines.max(1);
+    if lines.len() > max_lines {
+        let drop = lines.len() - max_lines;
+        lines.drain(..drop);
+    }
+    let mut chars: usize = lines.iter().map(|s| s.len().saturating_add(1)).sum();
+    let max_chars = max_chars.max(1);
+    while chars > max_chars && !lines.is_empty() {
+        chars = chars.saturating_sub(lines.remove(0).len().saturating_add(1));
+    }
 }
 
 fn env_truthy(key: &str) -> bool {
@@ -341,6 +366,22 @@ INFO scalattice_agent::llm::model_cache: context OOM; reloading via 'gpu-offload
         assert!(simple.contains("connected"));
         assert!(simple.contains("context OOM"));
         assert!(!simple.contains("n_ctx"));
+    }
+
+    #[test]
+    fn simplified_history_survives_llama_flood() {
+        let mut lines = vec!["invoke started".to_string()];
+        let flood = "INFO llama-cpp-2: .\n".repeat(4000);
+        retain_simplified_history(&mut lines, &flood, 50, 8_000);
+        retain_simplified_history(
+            &mut lines,
+            "INFO scalattice_agent::agent: invoke completed\n",
+            50,
+            8_000,
+        );
+        assert!(lines.iter().any(|l| l.contains("invoke started")));
+        assert!(lines.iter().any(|l| l.contains("invoke completed")));
+        assert!(!lines.iter().any(|l| l.contains("llama-cpp-2")));
     }
 
     #[test]

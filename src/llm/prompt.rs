@@ -35,9 +35,13 @@ pub fn build_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result
         .context("build llama chat messages")?;
 
     match model.chat_template(None) {
-        Ok(tmpl) => model
-            .apply_chat_template(&tmpl, &llama_messages, true)
-            .context("apply model chat template"),
+        Ok(tmpl) => match model.apply_chat_template(&tmpl, &llama_messages, true) {
+            Ok(prompt) => Ok(prompt),
+            Err(err) => {
+                tracing::warn!(error = %err, "chat template apply failed; using plaintext fallback");
+                Ok(messages_to_prompt_fallback(&prepared))
+            }
+        },
         Err(_) => Ok(messages_to_prompt_fallback(&prepared)),
     }
 }

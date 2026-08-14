@@ -360,6 +360,19 @@ pub(crate) fn load_model_for_pool_starting_at(
     Err(last_err.unwrap_or_else(|| anyhow!("model failed to load")))
 }
 
+/// mmap GGUF into RAM with no GPU layers. Used to keep idle models hot for a later VRAM load.
+pub(crate) fn load_cpu_mmap_model(
+    backend: &LlamaBackend,
+    model_path: &Path,
+) -> Result<LlamaModel> {
+    let params = LlamaModelParams::default()
+        .with_use_mmap(true)
+        .with_n_gpu_layers(0);
+    LlamaModel::load_from_file(backend, model_path, &params)
+        .map_err(|err| anyhow!(err))
+        .with_context(|| format!("cpu mmap load {}", model_path.display()))
+}
+
 /// Number of ordered load configurations for this pool / model.
 pub(crate) fn load_candidate_count(pool: &VirtualCard, model_path: &Path) -> Result<usize> {
     Ok(load_param_candidates(pool, Some(model_path))?.len())

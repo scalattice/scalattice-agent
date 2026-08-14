@@ -279,8 +279,11 @@ struct TrayApp {
     log_buffer: String,
     /// Displayed Live log (Simplified or Verbose).
     logs: String,
+    /// Simplified lines kept even when llama.cpp floods the file tail.
+    simplified_lines: Vec<String>,
     log_path: Option<PathBuf>,
     log_offset: u64,
+    log_primed: bool,
     log_verbose: bool,
     next_data_poll: Instant,
     next_agent_watchdog: Instant,
@@ -350,8 +353,10 @@ impl TrayApp {
             action_message_until: None,
             log_buffer: String::new(),
             logs: String::new(),
+            simplified_lines: Vec::new(),
             log_path,
             log_offset: 0,
+            log_primed: false,
             log_verbose,
             next_data_poll: Instant::now(),
             next_agent_watchdog: Instant::now() + Duration::from_secs(5),
@@ -642,6 +647,13 @@ impl TrayApp {
     }
 
     fn refresh_logs(&mut self) -> bool {
+        const TAIL_BYTES: u64 = 256 * 1024;
+        const BUFFER_MAX: usize = 48_000;
+        const BUFFER_KEEP: usize = 40_000;
+        const SIMPLE_LINES: usize = 400;
+        const SIMPLE_CHARS: usize = 80_000;
+        const READ_CHUNK: usize = 64 * 1024;
+
         let Some(path) = self.log_path.as_ref() else {
             return false;
         };
@@ -658,33 +670,55 @@ impl TrayApp {
         if len < self.log_offset {
             self.log_offset = 0;
             self.log_buffer.clear();
+            self.log_primed = false;
+        }
+        if !self.log_primed {
+            self.log_primed = true;
+            if len > TAIL_BYTES {
+                self.log_offset = len - TAIL_BYTES;
+            }
         }
         if len == self.log_offset {
             return false;
         }
 
-        let read_from = if len > self.log_offset {
-            self.log_offset
-        } else {
-            0
-        };
-
+        let read_from = self.log_offset.min(len);
         let Ok(mut file) = std::fs::File::open(path) else {
             return false;
         };
         if file.seek(SeekFrom::Start(read_from)).is_err() {
             return false;
         }
-        let to_read = (len - read_from) as usize;
-        let mut buf = vec![0u8; to_read];
-        if file.read_exact(&mut buf).is_err() {
-            return false;
+        let mut tmp = vec![0u8; READ_CHUNK];
+        let mut read_any = false;
+        loop {
+            let n = match file.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            read_any = true;
+            let chunk = strip_ansi_escapes(&String::from_utf8_lossy(&tmp[..n]));
+            crate::logging::retain_simplified_history(
+                &mut self.simplified_lines,
+                &chunk,
+                SIMPLE_LINES,
+                SIMPLE_CHARS,
+            );
+            self.log_buffer.push_str(&chunk);
+            if self.log_buffer.len() > BUFFER_MAX {
+                let drop_by = self.log_buffer.len().saturating_sub(BUFFER_KEEP);
+                let drop_at = self
+                    .log_buffer
+                    .char_indices()
+                    .find(|(i, _)| *i >= drop_by)
+                    .map(|(i, _)| i)
+                    .unwrap_or(drop_by);
+                self.log_buffer.drain(..drop_at);
+            }
         }
-        let chunk = strip_ansi_escapes(&String::from_utf8_lossy(&buf));
-        self.log_buffer.push_str(&chunk);
-        if self.log_buffer.len() > 48_000 {
-            let drop_by = self.log_buffer.len().saturating_sub(40_000);
-            self.log_buffer.drain(..drop_by);
+        if !read_any {
+            return false;
         }
         self.log_offset = len;
         self.rebuild_displayed_logs();
@@ -695,7 +729,7 @@ impl TrayApp {
         if self.log_verbose {
             self.logs = self.log_buffer.clone();
         } else {
-            self.logs = crate::logging::simplify_log_text(&self.log_buffer);
+            self.logs = self.simplified_lines.join("\n");
         }
     }
 

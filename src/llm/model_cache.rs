@@ -1,7 +1,9 @@
 //! In-process GGUF cache - avoids reloading multi-GB weights on every invoke.
 //!
-//! Small GPUs (≤8 GB) only keep one model resident. Warming or switching without
-//! eviction was causing cudaMalloc OOM on context create when a prior 7B stayed in VRAM.
+//! Small GPUs (≤8 GB) only keep one model **on the GPU**. Idle models are demoted to a
+//! CPU mmap shelf (no CUDA layers) so switching back skips a cold disk read. llama.cpp
+//! cannot migrate layers in place; the next invoke still uploads to VRAM, but the GGUF
+//! stays mapped in RAM when the machine has room.
 //!
 //! Every CUDA / Vulkan pool tries the safest placement first. If weight load or
 //! context/KV alloc OOMs *and returns an error*, we walk:
@@ -11,6 +13,7 @@
 //! llama.cpp CUDA often abort()s on OOM (kills the agent) instead of returning Err.
 
 use crate::compute_pool::VirtualCard;
+use crate::specs::{detect_ram_gb, detect_ram_used_gb};
 use anyhow::{Context, Result};
 use llama_cpp_2::model::LlamaModel;
 use std::collections::HashMap;
@@ -20,9 +23,13 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use super::embedded::{
-    backend, load_candidate_count, load_candidate_label, load_model_for_pool,
+    backend, load_candidate_count, load_candidate_label, load_cpu_mmap_model, load_model_for_pool,
     load_model_for_pool_starting_at,
 };
+
+const GIB: u64 = 1024 * 1024 * 1024;
+/// Do not keep a RAM duplicate of a large offload model that is also on the GPU.
+const DROP_SHELF_WHEN_PROMOTING_BYTES: u64 = 3 * GIB;
 
 struct CachedModel {
     model: LlamaModel,
@@ -30,7 +37,29 @@ struct CachedModel {
     load_tier: usize,
 }
 
-static CACHE: OnceLock<Mutex<HashMap<String, CachedModel>>> = OnceLock::new();
+struct RamShelfEntry {
+    /// Held so llama.cpp keeps the GGUF mmap'd; not read until the model returns to GPU.
+    #[allow(dead_code)]
+    model: LlamaModel,
+    bytes: u64,
+    last_used: Instant,
+}
+
+struct CacheInner {
+    gpu: HashMap<String, CachedModel>,
+    ram: HashMap<String, RamShelfEntry>,
+}
+
+static CACHE: OnceLock<Mutex<CacheInner>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<CacheInner> {
+    CACHE.get_or_init(|| {
+        Mutex::new(CacheInner {
+            gpu: HashMap::new(),
+            ram: HashMap::new(),
+        })
+    })
+}
 
 fn cache_key(model_path: &Path, pool: &VirtualCard) -> String {
     format!(
@@ -42,12 +71,115 @@ fn cache_key(model_path: &Path, pool: &VirtualCard) -> String {
     )
 }
 
-fn cache() -> &'static Mutex<HashMap<String, CachedModel>> {
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn path_key(model_path: &Path) -> String {
+    model_path.display().to_string()
 }
 
-fn max_resident_models(pool: &VirtualCard) -> usize {
-    // Q4_K_M 7B/8B weights alone are ~4–5 GB; two residents will OOM on context alloc.
+fn path_from_gpu_key(key: &str) -> &str {
+    key.split('|').next().unwrap_or(key)
+}
+
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn ram_reserve_gb(ram_gb: u32) -> u32 {
+    match ram_gb {
+        0..=8 => (ram_gb / 2).max(2),
+        9..=16 => 8,
+        _ => 10,
+    }
+}
+
+fn ram_budget_bytes(ram_gb: u32) -> u64 {
+    u64::from(ram_gb.saturating_sub(ram_reserve_gb(ram_gb))) * GIB
+}
+
+fn ram_used_bytes(inner: &CacheInner) -> u64 {
+    inner.ram.values().map(|e| e.bytes).sum()
+}
+
+fn can_shelve(inner: &CacheInner, add_bytes: u64) -> bool {
+    if add_bytes == 0 {
+        return false;
+    }
+    let ram_gb = detect_ram_gb().unwrap_or(16);
+    let budget = ram_budget_bytes(ram_gb);
+    if ram_used_bytes(inner).saturating_add(add_bytes) > budget {
+        return false;
+    }
+    if let (Some(total), Some(used)) = (detect_ram_gb(), detect_ram_used_gb()) {
+        let avail_gb = total.saturating_sub(used);
+        let need_gb = ((add_bytes + GIB - 1) / GIB) as u32 + 2;
+        if avail_gb < need_gb {
+            return false;
+        }
+    }
+    true
+}
+
+fn trim_ram_lru(inner: &mut CacheInner, extra_bytes: u64) {
+    let ram_gb = detect_ram_gb().unwrap_or(16);
+    let budget = ram_budget_bytes(ram_gb);
+    while ram_used_bytes(inner).saturating_add(extra_bytes) > budget && !inner.ram.is_empty() {
+        let victim = inner
+            .ram
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(k, _)| k.clone());
+        let Some(key) = victim else { break };
+        info!(evicted = %key, "evicting RAM-shelved model to stay under RAM budget");
+        inner.ram.remove(&key);
+    }
+}
+
+fn try_shelve_cpu(inner: &mut CacheInner, backend: &llama_cpp_2::llama_backend::LlamaBackend, path: &Path) {
+    let key = path_key(path);
+    if inner.ram.contains_key(&key) {
+        if let Some(entry) = inner.ram.get_mut(&key) {
+            entry.last_used = Instant::now();
+        }
+        return;
+    }
+    let bytes = file_bytes(path);
+    trim_ram_lru(inner, bytes);
+    if !can_shelve(inner, bytes) {
+        info!(
+            path = %path.display(),
+            weight_gb = bytes as f64 / GIB as f64,
+            "not enough RAM to keep unloaded model mapped"
+        );
+        return;
+    }
+    match load_cpu_mmap_model(backend, path) {
+        Ok(model) => {
+            inner.ram.insert(
+                key,
+                RamShelfEntry {
+                    model,
+                    bytes,
+                    last_used: Instant::now(),
+                },
+            );
+            info!(
+                path = %path.display(),
+                weight_gb = format!("{:.1}", bytes as f64 / GIB as f64),
+                shelved = inner.ram.len(),
+                shelf_gb = format!("{:.1}", ram_used_bytes(inner) as f64 / GIB as f64),
+                "kept model mmap'd in RAM for faster GPU reload"
+            );
+        }
+        Err(err) => warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to shelve model in RAM"
+        ),
+    }
+}
+
+/// How many models may occupy VRAM (not the RAM shelf).
+fn max_gpu_residents(pool: &VirtualCard) -> usize {
+    // Q4_K_M 7B/8B weights alone are ~4–5 GB; two GPU residents will OOM on context alloc.
     if pool.total_vram_gb <= 8 {
         1
     } else if pool.total_vram_gb <= 16 {
@@ -57,35 +189,40 @@ fn max_resident_models(pool: &VirtualCard) -> usize {
     }
 }
 
-fn make_room(guard: &mut HashMap<String, CachedModel>, keep_key: &str, pool: &VirtualCard) {
-    let max = max_resident_models(pool);
-    if max <= 1 {
-        let before = guard.len();
-        guard.retain(|k, _| k == keep_key);
-        if before > guard.len() {
-            info!("evicted cached model(s) so only one stays resident on ≤8GB VRAM");
-        }
-        return;
-    }
-    let victims: Vec<String> = guard
+fn make_gpu_room(
+    inner: &mut CacheInner,
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    keep_key: &str,
+    pool: &VirtualCard,
+) {
+    let max = max_gpu_residents(pool);
+    let mut victims: Vec<String> = inner
+        .gpu
         .keys()
         .filter(|k| k.as_str() != keep_key)
         .cloned()
         .collect();
-    for key in victims {
-        if guard.len() < max {
-            break;
+    if max <= 1 {
+        for key in victims {
+            if inner.gpu.remove(&key).is_some() {
+                info!("evicted GPU resident so only one model stays in VRAM on ≤8GB");
+                try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
+            }
         }
-        // If keep is absent, leave (max-1) others so the upcoming insert fits.
-        let room_for_keep = usize::from(!guard.contains_key(keep_key));
-        if guard.len() + room_for_keep <= max {
-            break;
+        return;
+    }
+    while inner.gpu.len() + usize::from(!inner.gpu.contains_key(keep_key)) > max {
+        let Some(key) = victims.pop() else { break };
+        if key == keep_key {
+            continue;
         }
-        info!(
-            evicted = %key.split('|').next().unwrap_or(key.as_str()),
-            "evicting cached model to free VRAM"
-        );
-        guard.remove(&key);
+        if inner.gpu.remove(&key).is_some() {
+            info!(
+                evicted = %path_from_gpu_key(&key),
+                "evicting GPU resident to free VRAM"
+            );
+            try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
+        }
     }
 }
 
@@ -98,17 +235,12 @@ fn is_vram_pressure(err: &anyhow::Error) -> bool {
         || detail.contains("ggml_backend_cuda")
 }
 
-fn insert_loaded(
-    guard: &mut HashMap<String, CachedModel>,
-    key: String,
-    model: LlamaModel,
-    load_tier: usize,
-) {
-    guard.insert(key, CachedModel { model, load_tier });
+fn insert_loaded(inner: &mut CacheInner, key: String, model: LlamaModel, load_tier: usize) {
+    inner.gpu.insert(key, CachedModel { model, load_tier });
 }
 
 fn ensure_loaded(
-    guard: &mut HashMap<String, CachedModel>,
+    inner: &mut CacheInner,
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model_path: &Path,
     pool: &VirtualCard,
@@ -120,8 +252,8 @@ fn ensure_loaded(
         match load_model_for_pool(backend, model_path, pool) {
             Ok(loaded) => loaded,
             Err(err) if is_vram_pressure(&err) => {
-                info!("model load hit VRAM pressure; clearing cache and retrying");
-                guard.clear();
+                info!("model load hit VRAM pressure; clearing GPU cache and retrying");
+                inner.gpu.clear();
                 load_model_for_pool(backend, model_path, pool).with_context(|| {
                     format!("load model {} after VRAM eviction", model_path.display())
                 })?
@@ -139,7 +271,7 @@ fn ensure_loaded(
         })?
     };
     let model_load_ms = load_start.elapsed().as_millis() as u64;
-    insert_loaded(guard, key.to_string(), model, load_tier);
+    insert_loaded(inner, key.to_string(), model, load_tier);
     Ok((model_load_ms, load_tier))
 }
 
@@ -159,7 +291,7 @@ pub fn with_loaded_model<R>(
 /// Like [`with_loaded_model`], but returns model-load wall time in ms (0 on cache hit).
 ///
 /// If the callback fails with VRAM pressure (typical: KV/context alloc after a greedy
-/// weight load), evicts the resident and reloads from the next cascade tier, retrying
+/// weight load), evicts the GPU resident and reloads from the next cascade tier, retrying
 /// the callback until a tier succeeds or the cascade is exhausted.
 pub fn with_loaded_model_timed<R>(
     model_path: &Path,
@@ -172,15 +304,23 @@ pub fn with_loaded_model_timed<R>(
         .lock()
         .map_err(|_| anyhow::anyhow!("model cache lock poisoned"))?;
 
-    make_room(&mut guard, &key, pool);
+    make_gpu_room(&mut guard, backend, &key, pool);
 
     let mut model_load_ms = 0u64;
-    if !guard.contains_key(&key) {
+    if !guard.gpu.contains_key(&key) {
+        let pk = path_key(model_path);
+        if file_bytes(model_path) >= DROP_SHELF_WHEN_PROMOTING_BYTES {
+            guard.ram.remove(&pk);
+        }
         let (ms, _) = ensure_loaded(&mut guard, backend, model_path, pool, &key, 0)?;
         model_load_ms = ms;
+        if let Some(entry) = guard.ram.get_mut(&pk) {
+            entry.last_used = Instant::now();
+        }
     }
 
     let mut load_tier = guard
+        .gpu
         .get(&key)
         .context("model missing immediately after cache insert")?
         .load_tier;
@@ -188,6 +328,7 @@ pub fn with_loaded_model_timed<R>(
     loop {
         let out = {
             let model = &guard
+                .gpu
                 .get(&key)
                 .context("model missing immediately after cache insert")?
                 .model;
@@ -204,7 +345,7 @@ pub fn with_loaded_model_timed<R>(
                 }
                 let label = load_candidate_label(pool, model_path, next_tier)?.unwrap_or("next");
                 warn!("context OOM; reloading via '{label}'");
-                guard.clear();
+                guard.gpu.clear();
                 let (ms, new_tier) =
                     ensure_loaded(&mut guard, backend, model_path, pool, &key, next_tier)?;
                 model_load_ms = model_load_ms.saturating_add(ms);
@@ -217,14 +358,16 @@ pub fn with_loaded_model_timed<R>(
 
 pub fn evict_all() {
     if let Ok(mut guard) = cache().lock() {
-        guard.clear();
+        guard.gpu.clear();
+        guard.ram.clear();
     }
 }
 
 pub fn evict_all_for_path(model_path: &Path) {
     let prefix = model_path.display().to_string();
     if let Ok(mut guard) = cache().lock() {
-        guard.retain(|key, _| !key.starts_with(&prefix));
+        guard.gpu.retain(|key, _| !key.starts_with(&prefix));
+        guard.ram.remove(&prefix);
     }
 }
 
@@ -233,8 +376,28 @@ pub fn cached_model_paths() -> Vec<PathBuf> {
     let Ok(guard) = cache().lock() else {
         return Vec::new();
     };
-    guard
+    let mut paths: Vec<PathBuf> = guard
+        .gpu
         .keys()
         .filter_map(|key| key.split('|').next().map(PathBuf::from))
-        .collect()
+        .collect();
+    paths.extend(guard.ram.keys().map(PathBuf::from));
+    paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_machines_reserve_half_ram() {
+        assert_eq!(ram_reserve_gb(8), 4);
+        assert_eq!(ram_budget_bytes(8), 4 * GIB);
+    }
+
+    #[test]
+    fn typical_laptop_keeps_8gb_free() {
+        assert_eq!(ram_reserve_gb(16), 8);
+        assert_eq!(ram_budget_bytes(16), 8 * GIB);
+    }
 }
