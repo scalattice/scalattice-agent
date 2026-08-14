@@ -1004,6 +1004,7 @@ async fn refresh_disk_inventory(state: &Arc<Mutex<SessionState>>) {
     guard.cached_disk_gb = disk_gb;
     guard.cached_model_disk = model_disk;
     guard.disk_inventory_primed = true;
+    crate::state::set_disk_full(crate::specs::disk_is_full());
     guard.persist_local_state();
 }
 

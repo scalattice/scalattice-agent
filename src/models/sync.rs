@@ -1,7 +1,9 @@
 use crate::compute_pool::VirtualCard;
 use crate::models::capacity::can_host_model;
-use crate::models::download::download_catalog_model;
-use crate::models::storage::{catalog_model_weights_ready, purge_incomplete_model_weights};
+use crate::models::download::{download_catalog_model, is_no_space_error};
+use crate::models::storage::{
+    catalog_model_weights_ready, purge_failed_download, purge_incomplete_model_weights,
+};
 use crate::protocol::CatalogModel;
 use crate::state;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +46,11 @@ pub fn spawn_catalog_sync(
                 purge_incomplete_model_weights(runtime_model);
                 continue;
             }
+            if crate::specs::disk_is_full() {
+                warn!("disk full; pausing remaining model downloads");
+                crate::state::set_disk_full(true);
+                break;
+            }
             if !can_host_model(&model, &card, ram_gb, cpu_ram_headroom_gb) {
                 info!(
                     "skipping {}: needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM, headroom {} GB)",
@@ -67,11 +74,16 @@ pub fn spawn_catalog_sync(
             }
             if let Err(err) = result {
                 let runtime_model = runtime_model_id(&model);
-                purge_incomplete_model_weights(runtime_model);
+                purge_failed_download(runtime_model);
                 warn!(
                     "model download failed for {}: {err:#}",
                     model.model_id
                 );
+                if is_no_space_error(&err) {
+                    crate::state::set_disk_full(true);
+                    warn!("disk full; paused remaining model downloads");
+                    break;
+                }
             }
         }
         state::set_downloading_model(None);

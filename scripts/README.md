@@ -7,6 +7,7 @@ Most day-to-day work is **one command on Linux**. Everything else is setup or tr
 | You want to… | Command | Where |
 |--------------|---------|--------|
 | **Ship a release** (Linux + Windows) | `./scripts/release.sh --dev` | Linux build host |
+| **Reclaim cargo `deps/` agent hashes** | `./scripts/prune-cargo-target.sh` | Linux (safe; keeps llama.cpp) |
 | **Ship all platforms** (+ aarch64 CI) | `./scripts/release.sh` | Linux build host |
 | **First-time Windows build machine** | `scripts\setup-windows-build.cmd` | Windows (Admin) |
 | **Register Windows CI runner** | `scripts\install-windows-runner.cmd` | Windows (Admin) |

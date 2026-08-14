@@ -36,6 +36,8 @@ pub struct AgentRuntime {
     pub models_disk_gb: Option<u32>,
     #[serde(rename = "modelDisk", skip_serializing_if = "HashMap::is_empty")]
     pub model_disk: HashMap<String, SerializedModelDiskStatus>,
+    #[serde(rename = "diskFull")]
+    pub disk_full: bool,
     /// Agent can emit invoke_delta tokens for true SSE streaming.
     #[serde(rename = "supportsStream")]
     pub supports_stream: bool,
@@ -88,7 +90,7 @@ pub fn build_runtime(
     } else {
         JobState::Idle
     };
-    let status_label = status_label(
+    let mut status_label = status_label(
         ready,
         reported_state,
         active_model_id.as_deref(),
@@ -98,6 +100,10 @@ pub fn build_runtime(
         idle_slots,
         slots.len() as u32,
     );
+    let disk_full = crate::state::disk_full();
+    if disk_full && downloading_model.is_none() && reported_state != JobState::Busy {
+        status_label = "Disk full — paused model downloads".to_string();
+    }
 
     AgentRuntime {
         ready,
@@ -121,6 +127,7 @@ pub fn build_runtime(
             None
         },
         model_disk,
+        disk_full,
         supports_stream: true,
         supports_remote_control: true,
         slots,

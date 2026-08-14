@@ -1,9 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::specs::ComputeDevice;
+
+static DISK_FULL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_disk_full(full: bool) {
+    DISK_FULL.store(full, Ordering::Relaxed);
+}
+
+pub fn disk_full() -> bool {
+    DISK_FULL.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLocalState {

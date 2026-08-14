@@ -88,6 +88,16 @@ if (-not (Test-Path $bin)) {
 New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 Copy-Item -LiteralPath $bin -Destination "dist\scalattice-agent.exe" -Force
 
+$targetRoot = Get-CargoTargetRoot
+$pruned = Get-ChildItem -Path $targetRoot -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.DirectoryName -match '[\\/]deps$' -and $_.Name -like 'scalattice_agent-*' }
+if ($pruned) {
+    $bytes = ($pruned | Measure-Object -Property Length -Sum).Sum
+    $pruned | Remove-Item -Force
+    $gib = [math]::Round($bytes / 1GB, 1)
+    Write-Host "==> pruned $($pruned.Count) leftover agent hash(es) from $targetRoot/**/deps (${gib} GB)"
+}
+
 $builtVersion = (& "dist\scalattice-agent.exe" --version 2>&1 | Out-String).Trim()
 Write-Host "==> Built binary reports: $builtVersion"
 if ($syncVersion -and $builtVersion -notmatch [regex]::Escape($syncVersion)) {

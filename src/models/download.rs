@@ -69,20 +69,32 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
-    let mut file = tokio::fs::File::create(&tmp)
-        .await
-        .with_context(|| format!("create {}", tmp.display()))?;
-    let mut stream = response.bytes_stream();
-    let mut written: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("read download chunk")?;
-        written = written.saturating_add(chunk.len() as u64);
-        file.write_all(&chunk)
+    let write_result = async {
+        let mut file = tokio::fs::File::create(&tmp)
             .await
-            .context("write download chunk")?;
+            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut stream = response.bytes_stream();
+        let mut written: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read download chunk")?;
+            written = written.saturating_add(chunk.len() as u64);
+            file.write_all(&chunk)
+                .await
+                .context("write download chunk")?;
+        }
+        file.flush().await.context("flush download")?;
+        drop(file);
+        Ok::<u64, anyhow::Error>(written)
     }
-    file.flush().await.context("flush download")?;
-    drop(file);
+    .await;
+
+    let written = match write_result {
+        Ok(n) => n,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(err);
+        }
+    };
 
     if let Some(expected) = expected_len {
         if written != expected {
@@ -287,6 +299,9 @@ pub async fn download_catalog_model(
         );
         return Ok(());
     }
+    if crate::specs::disk_is_full() {
+        anyhow::bail!("no space left on device");
+    }
     let runtime_model = if model.runtime_model.trim().is_empty() {
         model.model_id.as_str()
     } else {
@@ -297,10 +312,22 @@ pub async fn download_catalog_model(
         match download_mirror_gguf(runtime_model, weights, agent_token).await {
             Ok(()) => return Ok(()),
             Err(err) => {
+                if is_no_space_error(&err) {
+                    warn!("Scalattice mirror download failed (disk full); not trying Hugging Face: {err:#}");
+                    return Err(err);
+                }
                 warn!("Scalattice mirror download failed, trying Hugging Face: {err:#}");
             }
         }
     }
 
     download_hf_gguf(runtime_model, weights, hf_token).await
+}
+
+pub fn is_no_space_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.contains("no space left")
+        || text.contains("os error 28")
+        || text.contains("os error 112")
+        || text.contains("there is not enough space")
 }

@@ -3,6 +3,7 @@ use crate::models::health::{
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use tracing::info;
 
 pub fn models_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SCALATTICE_MODELS_DIR") {
@@ -520,5 +521,22 @@ pub fn purge_incomplete_model_weights(runtime_model: &str) {
         if path.is_file() && !is_manifest_weight_file(runtime_model, &path) {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+/// After a failed download, drop the whole cache dir if weights never became ready.
+pub fn purge_failed_download(runtime_model: &str) {
+    purge_incomplete_model_weights(runtime_model);
+    if model_weights_ready(runtime_model) {
+        return;
+    }
+    let dir = model_cache_dir(runtime_model);
+    if dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&dir);
+        info!(
+            runtime_model,
+            path = %dir.display(),
+            "removed incomplete model weights after failed download"
+        );
     }
 }

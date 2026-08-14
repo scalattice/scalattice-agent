@@ -86,6 +86,8 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+scripts/prune-cargo-target.sh
+
 mkdir -p dist
 cp "$BIN" dist/scalattice-agent
 chmod +x scripts/bundle-release-libs.sh
