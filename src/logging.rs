@@ -279,6 +279,8 @@ pub fn simplify_log_text(raw: &str) -> String {
 }
 
 /// Keep agent/status lines across llama.cpp floods that would otherwise wipe a small tail buffer.
+/// Linux builds have no tray UI; Windows tray and unit tests use this.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn retain_simplified_history(
     lines: &mut Vec<String>,
     chunk: &str,
