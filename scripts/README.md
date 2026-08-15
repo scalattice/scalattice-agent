@@ -32,8 +32,8 @@ Linux build host                       Windows (self-hosted runner)
                                              └─ build-windows-installer.ps1
 ```
 
-**`release.sh --dev`** — Linux x86_64 here + Windows on your runner (skip aarch64).  
-**`release.sh`** — same + aarch64 on GitHub `ubuntu-24.04-arm`.
+**`release.sh --dev`** — Linux x86_64 here + Windows on your runner (skip aarch64 Linux and macOS).  
+**`release.sh`** — same + aarch64 Linux on GitHub `ubuntu-24.04-arm` + macOS Metal on `macos-14`.
 
 Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-hosted-windows`, `--no-push`.
 
@@ -54,7 +54,7 @@ Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-ho
 | Script | Purpose |
 |--------|---------|
 | `build-release.sh` | `cargo build` x86_64/aarch64 + tarball (called by `release.sh` or manually) |
-| `bundle-release-libs.sh` | Copy `.so` dependencies next to the Linux binary |
+| `sign-macos.sh` | Codesign + notarize an arm64 binary (run on macOS; used by CI) |
 
 ### Windows build (CI + local)
 

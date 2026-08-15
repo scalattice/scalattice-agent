@@ -33,6 +33,23 @@ Setup guide: https://scalattice.cloud/install/agent-setup
 
 The agent registers a **boot** scheduled task (runs as SYSTEM before sign-in) plus logon Startup/Task rails. Use the notification area icon for status, token changes, and live logs. Full detail is written to `%LOCALAPPDATA%\Scalattice\logs\agent.log` (rotated at 8 MiB, one backup). The tray Live log can show a Simplified view; the file itself is always verbose.
 
+### macOS (Apple Silicon)
+
+Release builds are **arm64 + Metal only**. Intel Macs are not supported.
+
+The binary is compiled and signed on GitHub’s `macos-14` runners (not on a local Mac). See [docs/macos-signing.md](docs/macos-signing.md).
+
+```bash
+curl -fsSL https://scalattice.cloud/api/v1/agent/release/download/latest/scalattice-agent-aarch64-apple-darwin.tar.gz -o /tmp/scalattice-agent-darwin.tgz
+mkdir -p ~/.local/bin
+tar -xzf /tmp/scalattice-agent-darwin.tgz -C ~/.local/bin
+chmod +x ~/.local/bin/scalattice-agent
+export PATH="$HOME/.local/bin:$PATH"
+scalattice-agent set-token --token slt_provider_YOUR_TOKEN
+```
+
+Background mode uses a LaunchAgent (`~/Library/LaunchAgents/com.scalattice.agent.plist`). Stay signed in (or enable auto-login) so launchd keeps the agent running.
+
 ### Uninstall
 
 ```bash
@@ -45,12 +62,13 @@ Releases are self-contained binaries (plus bundled runtime libraries where allow
 
 ### Hardware support
 
-Release builds include **CUDA** (NVIDIA) and **Vulkan** (AMD/Intel/ARM) on Linux and Windows.
+Release builds include **CUDA** (NVIDIA) and **Vulkan** (AMD/Intel/ARM) on Linux and Windows, and **Metal** on Apple Silicon Macs.
 
 | Hardware | What the host needs |
 |----------|---------------------|
 | NVIDIA GTX/RTX | NVIDIA driver installed (`nvidia-smi` works) |
 | AMD / Intel GPU | Vendor Vulkan ICD (AMD Adrenalin / Intel graphics driver). **ROCm is not required.** Discrete AMD/Intel are detected on Linux (`lspci`) and Windows (Win32 video controllers) and run through Vulkan when enabled in the Providers dashboard. |
+| Apple Silicon | macOS 14+, M1 or later. Unified memory is advertised as GPU VRAM (minus OS headroom). **Intel Macs are not supported.** |
 | CPU only | Nothing extra — the agent connects; inference uses the CPU backend |
 
 When both NVIDIA and AMD/Intel are enabled, the agent prefers **CUDA**. AMD/Intel-only pools use the same load cascade as NVIDIA (`gpu-full` → offload → CPU). Check agent logs for `Vulkan pool: pinning ggml backend device(s)`.

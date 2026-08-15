@@ -36,9 +36,9 @@ pub fn can_host_model(
     // Partial accelerator VRAM: full-GPU may OOM, but offload cascade can still serve.
     let has_accelerator = matches!(
         card.strategy,
-        PoolStrategy::Single | PoolStrategy::TensorParallel | PoolStrategy::Vulkan
+        PoolStrategy::Single | PoolStrategy::TensorParallel | PoolStrategy::Vulkan | PoolStrategy::Metal
     );
-    if has_accelerator && (card.total_vram_gb >= 4 || card.uses_vulkan) {
+    if has_accelerator && (card.total_vram_gb >= 4 || card.uses_vulkan || card.strategy == PoolStrategy::Metal) {
         return ram_gb >= ram_needed;
     }
 

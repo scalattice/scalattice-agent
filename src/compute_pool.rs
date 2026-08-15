@@ -25,6 +25,8 @@ pub enum PoolStrategy {
     TensorParallel,
     /// Enabled AMD/Intel GPUs via llama.cpp Vulkan (no CUDA device pin).
     Vulkan,
+    /// Apple Silicon unified GPU via llama.cpp Metal.
+    Metal,
     CpuOnly,
 }
 
@@ -172,6 +174,7 @@ impl PoolStrategy {
             PoolStrategy::Single => "single",
             PoolStrategy::TensorParallel => "tensor_parallel",
             PoolStrategy::Vulkan => "vulkan",
+            PoolStrategy::Metal => "metal",
             PoolStrategy::CpuOnly => "cpu",
         }
     }
@@ -214,6 +217,7 @@ impl<'de> Deserialize<'de> for VirtualCard {
         let strategy = match raw.strategy.as_str() {
             "tensor_parallel" => PoolStrategy::TensorParallel,
             "vulkan" => PoolStrategy::Vulkan,
+            "metal" => PoolStrategy::Metal,
             "cpu" => PoolStrategy::CpuOnly,
             _ => PoolStrategy::Single,
         };
@@ -316,10 +320,15 @@ pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
 
     let mut cuda: Vec<(&ComputeDevice, u32, u32)> = Vec::new(); // device, index, vram
     let mut vulkan_discrete: Vec<&ComputeDevice> = Vec::new();
+    let mut metal: Vec<&ComputeDevice> = Vec::new();
     let mut integrated: Vec<&ComputeDevice> = Vec::new();
     let mut cpu: Option<&ComputeDevice> = None;
 
     for device in &enabled {
+        if is_metal_accelerator(device) {
+            metal.push(*device);
+            continue;
+        }
         if let Some(idx) = parse_cuda_index(&device.id) {
             if device.kind == "discrete" {
                 cuda.push((*device, idx, effective_vram_gb(device)));
@@ -386,6 +395,36 @@ pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
             cuda_visible: vec![*idx],
             tp_group: tp_group_id.clone(),
         });
+    }
+
+    if metal_runtime_supported() {
+        for (i, device) in metal.iter().enumerate() {
+            let vram = effective_vram_gb(device);
+            let pool_dev = PoolDevice {
+                id: device.id.clone(),
+                kind: device.kind.clone(),
+                name: device.name.clone(),
+                vram_gb: vram,
+                cuda_index: None,
+            };
+            let card = card_for_devices(
+                vec![pool_dev],
+                PoolStrategy::Metal,
+                vram.max(1),
+                device.name.clone(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            );
+            slots.push(ComputeSlot {
+                id: format!("metal-{i}"),
+                kind: "metal".into(),
+                priority: 15,
+                card,
+                cuda_visible: Vec::new(),
+                tp_group: None,
+            });
+        }
     }
 
     if vulkan_runtime_supported() {
@@ -545,6 +584,10 @@ pub fn apply_slot_backend_visibility(strategy: PoolStrategy, cuda_visible: &[u32
             std::env::set_var("CUDA_VISIBLE_DEVICES", "");
             std::env::remove_var("GGML_VK_VISIBLE_DEVICES");
         }
+        PoolStrategy::Metal => {
+            std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+            std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
+        }
         PoolStrategy::CpuOnly => {
             std::env::set_var("CUDA_VISIBLE_DEVICES", "");
             // Empty = no Vulkan devices (same convention as CUDA_VISIBLE_DEVICES).
@@ -579,6 +622,8 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     let mut cuda_names = Vec::new();
     let mut vulkan_vram = Vec::new();
     let mut vulkan_names = Vec::new();
+    let mut metal_vram = Vec::new();
+    let mut metal_names = Vec::new();
 
     for device in &enabled {
         let vram_gb = effective_vram_gb(device);
@@ -588,6 +633,9 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
             cuda_ids.push(cuda_index.unwrap());
             cuda_vram.push(vram_gb);
             cuda_names.push(device.name.clone());
+        } else if is_metal_accelerator(device) {
+            metal_vram.push(vram_gb);
+            metal_names.push(device.name.clone());
         } else if is_vulkan_accelerator(device) {
             vulkan_vram.push(vram_gb);
             vulkan_names.push(device.name.clone());
@@ -652,6 +700,17 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
                 };
                 (strategy, total, name, split, false, cuda_ids)
             }
+        } else if !metal_names.is_empty() && metal_runtime_supported() {
+            let total: u32 = metal_vram.iter().copied().sum::<u32>().max(1);
+            let name = metal_names[0].clone();
+            (
+                PoolStrategy::Metal,
+                total,
+                name,
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
         } else if !vulkan_names.is_empty() && vulkan_runtime_supported() {
             let total: u32 = vulkan_vram.iter().copied().sum::<u32>().max(1);
             let name = match vulkan_names.len() {
@@ -708,6 +767,9 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
 
 /// AMD discrete, Intel Arc, or integrated GPUs — served via Vulkan when CUDA is absent.
 pub fn is_vulkan_accelerator(device: &ComputeDevice) -> bool {
+    if is_metal_accelerator(device) {
+        return false;
+    }
     if device.kind == "cpu" {
         return false;
     }
@@ -734,7 +796,7 @@ fn effective_vram_gb(device: &ComputeDevice) -> u32 {
     match device.kind.as_str() {
         // Soft estimate for shared iGPU memory — cascade + RAM checks are the real gate.
         "integrated" => 2,
-        "discrete" => 1,
+        "discrete" | "metal" => 1,
         _ => 0,
     }
 }
@@ -743,6 +805,14 @@ fn effective_vram_gb(device: &ComputeDevice) -> u32 {
 /// for AMD/Intel until a Windows Vulkan release exists.
 pub fn vulkan_runtime_supported() -> bool {
     cfg!(feature = "vulkan")
+}
+
+pub fn is_metal_accelerator(device: &ComputeDevice) -> bool {
+    device.kind == "metal" || device.id.starts_with("metal:")
+}
+
+pub fn metal_runtime_supported() -> bool {
+    cfg!(feature = "metal")
 }
 
 /// Conservative layer estimate for CPU-offload fallbacks after a full-GPU OOM.
@@ -1183,5 +1253,37 @@ mod tests {
             .collect();
         assert_eq!(cuda.len(), 2);
         assert!(cuda.iter().all(|s| s.tp_group.as_deref() == Some("cuda-tp-0")));
+    }
+
+    #[test]
+    fn apple_silicon_uses_metal_when_feature_enabled() {
+        let card = build_virtual_card(&[
+            ComputeDevice {
+                id: "metal:0".into(),
+                kind: "metal".into(),
+                name: "Apple M4".into(),
+                vram_gb: Some(16),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "Apple M4".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+        if metal_runtime_supported() {
+            assert_eq!(card.strategy, PoolStrategy::Metal);
+            assert_eq!(card.total_vram_gb, 16);
+            assert!(!card.uses_vulkan);
+        } else {
+            assert_eq!(card.strategy, PoolStrategy::CpuOnly);
+        }
     }
 }

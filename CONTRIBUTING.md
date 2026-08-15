@@ -39,6 +39,7 @@ Requirements:
 
 - Rust stable (see [release workflow](.github/workflows/release.yml) for CI targets)
 - Linux (x86_64 or aarch64) for GPU feature builds
+- macOS 14+ on **Apple Silicon** for Metal (`--features metal`)
 - NVIDIA driver and/or Vulkan stack when testing GPU inference locally
 
 ```bash
@@ -48,8 +49,11 @@ cd scalattice-agent
 # x86_64 — CUDA + Vulkan
 cargo build --release --features gpu
 
-# aarch64 — build natively on ARM
+# aarch64 Linux — build natively on ARM
 cargo build --release --no-default-features --features arm-gpu
+
+# macOS Apple Silicon only (fails to compile for Intel)
+cargo build --release --no-default-features --features metal
 ```
 
 Run locally (requires a provider token from [scalattice.cloud/providers](https://scalattice.cloud/providers)):

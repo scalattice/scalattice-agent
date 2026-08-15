@@ -207,11 +207,13 @@ verify_release_assets() {
   local tag="$1"
   local need_aarch64="$2"
   local need_windows="$3"
-  local assets x86 aarch win
+  local need_macos="${4:-false}"
+  local assets x86 aarch darwin win
 
   assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
   x86="$(echo "$assets" | grep -c 'x86_64-unknown-linux-gnu' || true)"
-  aarch="$(echo "$assets" | grep -c 'aarch64' || true)"
+  aarch="$(echo "$assets" | grep -c 'aarch64-unknown-linux-gnu' || true)"
+  darwin="$(echo "$assets" | grep -c 'aarch64-apple-darwin' || true)"
   win="$(echo "$assets" | grep -cE 'pc-windows-msvc|ScalatticeAgentSetup' || true)"
 
   if [[ "$x86" -lt 1 ]]; then
@@ -219,7 +221,11 @@ verify_release_assets() {
     exit 1
   fi
   if [[ "$need_aarch64" == "true" && "$aarch" -lt 1 ]]; then
-    echo "Release ${tag} is missing aarch64 tarball." >&2
+    echo "Release ${tag} is missing aarch64 Linux tarball." >&2
+    exit 1
+  fi
+  if [[ "$need_macos" == "true" && "$darwin" -lt 1 ]]; then
+    echo "Release ${tag} is missing Apple Silicon (aarch64-apple-darwin) tarball." >&2
     exit 1
   fi
   if [[ "$need_windows" == "true" && "$win" -lt 1 ]]; then
@@ -252,9 +258,9 @@ CI_TARGETS="$(resolve_ci_targets)"
 WIN_RUNNER="$(windows_runner_input)"
 
 if [[ "$DEV_RELEASE" == "true" ]]; then
-  echo "==> Release ${TAG} (Linux local + Windows CI; aarch64 skipped)"
+  echo "==> Release ${TAG} (Linux local + Windows CI; aarch64 Linux + macOS skipped)"
 else
-  echo "==> Release ${TAG} (Linux local + Windows + aarch64 CI)"
+  echo "==> Release ${TAG} (Linux local + Windows + aarch64 Linux + macOS CI)"
 fi
 
 if [[ "$LOCAL_WINDOWS" == "true" ]]; then
@@ -312,7 +318,7 @@ if [[ "$LOCAL_WINDOWS" == "true" ]]; then
 elif [[ "$DEV_RELEASE" == "true" ]]; then
   RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; Windows via ${WIN_RUNNER} runner)."
 else
-  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; aarch64 + Windows via CI)."
+  RELEASE_NOTES="Built via scripts/release.sh (x86_64 Linux local; aarch64 Linux + macOS + Windows via CI)."
 fi
 
 echo "==> Creating GitHub release"
@@ -332,9 +338,9 @@ if should_run_windows_ci; then
 fi
 
 if [[ "$DEV_RELEASE" == "true" ]]; then
-  verify_release_assets "$TAG" false true
+  verify_release_assets "$TAG" false true false
 else
-  verify_release_assets "$TAG" true true
+  verify_release_assets "$TAG" true true true
 fi
 
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"

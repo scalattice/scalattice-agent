@@ -1,5 +1,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+compile_error!(
+    "scalattice-agent on macOS requires Apple Silicon (aarch64-apple-darwin). Intel Macs are not supported."
+);
+
 mod agent;
 mod cloud_log;
 mod compute_pool;
@@ -82,7 +87,7 @@ enum Commands {
         /// Only check whether a newer release exists
         #[arg(long)]
         check: bool,
-        /// Enable automatic daily update checks (Linux: systemd user timer)
+        /// Enable automatic daily update checks (Linux: systemd user timer; macOS: LaunchAgent)
         #[arg(long)]
         enable_auto: bool,
         /// Disable automatic daily update checks
@@ -104,6 +109,8 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    refuse_intel_mac()?;
     #[cfg(windows)]
     paths::init_windows_native_search_path();
     init_crypto()?;
@@ -182,6 +189,44 @@ fn prepare_windows_process(cli: &Cli) -> Result<()> {
 #[cfg(windows)]
 fn should_run_tray_ui(cli: &Cli) -> bool {
     matches!(cli.command, None | Some(Commands::Tray { .. }))
+}
+
+#[cfg(target_os = "macos")]
+fn refuse_intel_mac() -> Result<()> {
+    let translated = macos_sysctl_i32("sysctl.proc_translated").unwrap_or(0);
+    if translated == 1 {
+        anyhow::bail!(
+            "scalattice-agent does not support Intel Macs or Rosetta. Use Apple Silicon (M1 or later)."
+        );
+    }
+    let arm64 = macos_sysctl_i32("hw.optional.arm64").unwrap_or(0);
+    if arm64 != 1 {
+        anyhow::bail!(
+            "scalattice-agent requires Apple Silicon. Intel Macs are not supported."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_i32(name: &str) -> Option<i32> {
+    let mut value: i32 = 0;
+    let mut size = std::mem::size_of::<i32>();
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            &mut value as *mut i32 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 fn init_crypto() -> Result<()> {
@@ -392,7 +437,7 @@ fn print_status() -> Result<()> {
         }
     } else {
         #[cfg(unix)]
-        println!("Service  systemd unavailable (use: scalattice-agent foreground)");
+        println!("Service  launchd/systemd unavailable (use: scalattice-agent foreground)");
         #[cfg(windows)]
         println!("Service  task scheduler unavailable (use: scalattice-agent foreground)");
         #[cfg(not(any(unix, windows)))]
@@ -440,7 +485,7 @@ fn print_status() -> Result<()> {
         }
         println!("Control panel: scalattice-agent tray  (or click the notification-area icon)");
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if user_settings.auto_update {
             println!("Update   automatic");

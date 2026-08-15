@@ -84,20 +84,39 @@ fn agent_version_string() -> String {
 }
 
 pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
-    let mut devices = Vec::new();
-    devices.extend(detect_nvidia_devices());
-    devices.extend(detect_amd_devices());
-    devices.extend(detect_pci_vulkan_discrete_devices(&devices));
-    devices.extend(detect_integrated_pci_devices(&devices));
-    devices.extend(detect_cpu_device());
-
-    for device in &mut devices {
-        if device.kind == "discrete" {
-            device.enabled = true;
+    #[cfg(target_os = "macos")]
+    {
+        let mut devices = Vec::new();
+        devices.extend(detect_apple_metal_device());
+        devices.extend(detect_cpu_device());
+        for device in &mut devices {
+            if device.kind == "metal" {
+                device.enabled = true;
+            }
         }
+        return devices;
     }
 
-    devices
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut devices = Vec::new();
+        devices.extend(detect_nvidia_devices());
+        devices.extend(detect_amd_devices());
+        devices.extend(detect_pci_vulkan_discrete_devices(&devices));
+        devices.extend(detect_integrated_pci_devices(&devices));
+        devices.extend(detect_cpu_device());
+
+        for device in &mut devices {
+            if device.kind == "discrete" {
+                device.enabled = true;
+            }
+        }
+
+        return devices;
+    }
+
+    #[allow(unreachable_code)]
+    Vec::new()
 }
 
 pub fn apply_compute_policy(devices: &mut [ComputeDevice], policy: &[(String, bool)]) {
@@ -891,6 +910,120 @@ fn detect_cpu_device() -> Vec<ComputeDevice> {
     }]
 }
 
+#[cfg(target_os = "macos")]
+fn detect_apple_metal_device() -> Vec<ComputeDevice> {
+    let ram_gb = detect_ram_gb().unwrap_or(8);
+    let usable = apple_usable_gpu_gb(ram_gb);
+    let cpu = detect_cpu_model().unwrap_or_else(|| "Apple Silicon".to_string());
+    let name = if cpu.to_ascii_lowercase().contains("apple") {
+        format!("{cpu} GPU")
+    } else {
+        format!("Apple Silicon GPU ({cpu})")
+    };
+    vec![ComputeDevice {
+        id: "metal:0".to_string(),
+        kind: "metal".to_string(),
+        name,
+        vram_gb: Some(usable),
+        vram_used_gb: detect_ram_used_gb().map(|used| used.min(usable)),
+        util_pct: None,
+        enabled: true,
+    }]
+}
+
+/// Unified memory minus OS/UI headroom — advertised as Metal "VRAM" for catalog fit.
+#[cfg(target_os = "macos")]
+fn apple_usable_gpu_gb(ram_gb: u32) -> u32 {
+    let headroom = if ram_gb >= 64 {
+        12
+    } else if ram_gb >= 32 {
+        8
+    } else if ram_gb >= 16 {
+        6
+    } else {
+        4
+    };
+    ram_gb.saturating_sub(headroom).max(1)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let mut size: usize = 0;
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size.saturating_sub(1)); // drop trailing NUL
+    let s = String::from_utf8_lossy(&buf).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            &mut value as *mut u64 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn vm_stat_free_pages() -> Option<u64> {
+    let output = Command::new("vm_stat").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut free = 0u64;
+    for line in stdout.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("pages free") || lower.contains("pages speculative")) {
+            continue;
+        }
+        if let Some(num) = line.split(':').nth(1) {
+            let digits: String = num.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u64>() {
+                free = free.saturating_add(n);
+            }
+        }
+    }
+    (free > 0).then_some(free)
+}
+
 fn detect_amd_vram_gb() -> Option<u32> {
     let output = Command::new("rocm-smi")
         .args(["--showmeminfo", "vram"])
@@ -996,7 +1129,11 @@ pub fn detect_hostname() -> Option<String> {
 }
 
 pub fn detect_cpu_model() -> Option<String> {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        return sysctl_string("machdep.cpu.brand_string");
+    }
+    #[cfg(target_os = "linux")]
     {
         return detect_cpu_model_linux();
     }
@@ -1010,7 +1147,7 @@ pub fn detect_cpu_model() -> Option<String> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn detect_cpu_model_linux() -> Option<String> {
     let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     info.lines()
@@ -1037,7 +1174,11 @@ fn detect_cpu_model_windows() -> Option<String> {
 }
 
 pub fn detect_ram_gb() -> Option<u32> {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        return sysctl_u64("hw.memsize").map(bytes_to_gb);
+    }
+    #[cfg(target_os = "linux")]
     {
         return detect_linux_memtotal_gb();
     }
@@ -1052,7 +1193,16 @@ pub fn detect_ram_gb() -> Option<u32> {
 }
 
 pub fn detect_ram_used_gb() -> Option<u32> {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        let total = sysctl_u64("hw.memsize")?;
+        // hw.memsize is physical RAM; vm_stat pages free is a coarse used estimate.
+        let page = sysctl_u64("hw.pagesize").unwrap_or(16384);
+        let free_pages = vm_stat_free_pages().unwrap_or(0);
+        let used = total.saturating_sub(free_pages.saturating_mul(page));
+        return Some(bytes_to_gb(used).max(1));
+    }
+    #[cfg(target_os = "linux")]
     {
         let total_kb = read_meminfo_kb("MemTotal:")?;
         let available_kb = read_meminfo_kb("MemAvailable:")?;
@@ -1216,7 +1366,7 @@ fn disk_usage_for_path(path: &std::path::Path) -> Option<(Option<u32>, Option<u3
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_meminfo_kb(prefix: &str) -> Option<u64> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
     info.lines()
@@ -1225,7 +1375,7 @@ fn read_meminfo_kb(prefix: &str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn detect_linux_memtotal_gb() -> Option<u32> {
     let kb = read_meminfo_kb("MemTotal:")?;
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)

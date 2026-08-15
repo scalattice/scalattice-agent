@@ -16,6 +16,25 @@ pub fn vulkan_ggml_device_indices() -> Vec<usize> {
         .collect()
 }
 
+/// Indices suitable for [`LlamaModelParams::with_devices`] on a Metal pool.
+pub fn metal_ggml_device_indices() -> Vec<usize> {
+    ggml_devices()
+        .into_iter()
+        .filter(is_metal_gpu_device)
+        .map(|d| d.index)
+        .collect()
+}
+
+fn is_metal_gpu_device(d: &LlamaBackendDevice) -> bool {
+    if !d.backend.eq_ignore_ascii_case("metal") {
+        return false;
+    }
+    matches!(
+        d.device_type,
+        LlamaBackendDeviceType::Gpu | LlamaBackendDeviceType::IntegratedGpu
+    )
+}
+
 fn is_vulkan_gpu_device(d: &LlamaBackendDevice) -> bool {
     if !d.backend.eq_ignore_ascii_case("vulkan") {
         return false;

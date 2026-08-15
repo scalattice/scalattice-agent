@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::{info, warn};
 
-use super::ggml_devices::vulkan_ggml_device_indices;
+use super::ggml_devices::{metal_ggml_device_indices, vulkan_ggml_device_indices};
 use super::prompt::{build_chat_prompt, sanitize_completion};
 
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
@@ -267,6 +267,9 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
         PoolStrategy::Vulkan => {
             model_params = vulkan_full_params()?.with_n_gpu_layers(999);
         }
+        PoolStrategy::Metal => {
+            model_params = metal_full_params()?.with_n_gpu_layers(999);
+        }
         PoolStrategy::CpuOnly => {
             model_params = model_params.with_n_gpu_layers(0);
         }
@@ -298,6 +301,39 @@ fn vulkan_full_params() -> Result<LlamaModelParams> {
             "Vulkan pool: no ggml Vulkan devices enumerated yet; \
              loading with n_gpu_layers only (needs a Vulkan ICD on the host)"
         );
+    }
+    Ok(params)
+}
+
+fn metal_full_params() -> Result<LlamaModelParams> {
+    let indices = metal_ggml_device_indices();
+    let mut params = LlamaModelParams::default().with_use_mmap(true);
+    if !indices.is_empty() {
+        info!(
+            devices = ?indices,
+            "Metal pool: pinning ggml backend device(s)"
+        );
+        params = params
+            .with_devices(&indices)
+            .context("configure Metal ggml devices")?;
+    } else {
+        warn!(
+            "Metal pool: no ggml Metal devices enumerated yet; \
+             loading with n_gpu_layers only"
+        );
+    }
+    Ok(params)
+}
+
+fn metal_offload_params(layers: u32) -> Result<LlamaModelParams> {
+    let indices = metal_ggml_device_indices();
+    let mut params = LlamaModelParams::default()
+        .with_use_mmap(true)
+        .with_n_gpu_layers(layers);
+    if let Some(primary) = indices.first().copied() {
+        params = params
+            .with_devices(std::slice::from_ref(&primary))
+            .context("configure primary Metal device for offload")?;
     }
     Ok(params)
 }
@@ -428,7 +464,7 @@ fn full_placement_vram_gb(pool: &VirtualCard) -> u32 {
         PoolStrategy::Single => primary_cuda_vram_gb(pool).max(pool.total_vram_gb),
         // TP full fit uses pooled VRAM (only when should_attempt_tensor_parallel).
         PoolStrategy::TensorParallel => pool.total_vram_gb,
-        PoolStrategy::Vulkan => pool.total_vram_gb,
+        PoolStrategy::Vulkan | PoolStrategy::Metal => pool.total_vram_gb,
         PoolStrategy::CpuOnly => 0,
     }
 }
@@ -511,11 +547,15 @@ pub(crate) fn should_attempt_gpu_full(pool: &VirtualCard, weight_gb: Option<f64>
                 || should_attempt_tensor_parallel(pool, weight_gb)
         }
         PoolStrategy::Single => should_attempt_single_gpu_full(pool, weight_gb),
-        PoolStrategy::Vulkan => {
+        PoolStrategy::Vulkan | PoolStrategy::Metal => {
             let available = f64::from(full_placement_vram_gb(pool));
-            const HEADROOM_GB: f64 = 2.0;
+            let headroom = if matches!(pool.strategy, PoolStrategy::Metal) {
+                3.0
+            } else {
+                2.0
+            };
             match weight_gb {
-                Some(w) if w > 0.05 => available + 0.05 >= w + HEADROOM_GB,
+                Some(w) if w > 0.05 => available + 0.05 >= w + headroom,
                 _ => false,
             }
         }
@@ -594,7 +634,7 @@ fn load_param_candidates_with_weight(
                 );
             }
         }
-        PoolStrategy::Single | PoolStrategy::Vulkan => {
+        PoolStrategy::Single | PoolStrategy::Vulkan | PoolStrategy::Metal => {
             if should_attempt_gpu_full(pool, weight_gb) {
                 candidates.push(("gpu-full", model_params_for_pool(pool)?));
             } else {
@@ -616,6 +656,13 @@ fn load_param_candidates_with_weight(
                 let reduced = (budget / 2).max(1);
                 if reduced < budget {
                     candidates.push(("gpu-offload-reduced", vulkan_offload_params(reduced)?));
+                }
+            }
+            PoolStrategy::Metal => {
+                candidates.push(("gpu-offload", metal_offload_params(budget)?));
+                let reduced = (budget / 2).max(1);
+                if reduced < budget {
+                    candidates.push(("gpu-offload-reduced", metal_offload_params(reduced)?));
                 }
             }
             PoolStrategy::Single | PoolStrategy::TensorParallel => {

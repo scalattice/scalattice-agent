@@ -33,4 +33,15 @@ fn main() {
             println!("cargo:rustc-link-lib=delayimp");
         }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let plist = manifest.join("installer/macos/Info.plist");
+        println!("cargo:rerun-if-changed={}", plist.display());
+        println!(
+            "cargo:rustc-link-arg=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            plist.display()
+        );
+    }
 }

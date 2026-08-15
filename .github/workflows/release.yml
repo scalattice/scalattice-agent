@@ -2,7 +2,8 @@ name: Release
 
 # Linux x86_64: built locally by scripts/release.sh
 # Windows: self-hosted runner (label scalattice-release). See scripts/install-windows-runner.ps1
-# aarch64: GitHub-hosted ARM runner (full release only)
+# aarch64 Linux: GitHub-hosted ARM runner
+# macOS: GitHub-hosted macos-14 (Apple Silicon only). Metal cannot be built on Linux.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +19,7 @@ on:
         options:
           - aarch64-only
           - windows-only
+          - macos-only
           - full
       windows_runner:
         description: 'Windows build host'
@@ -95,6 +97,83 @@ jobs:
         with:
           name: aarch64
           path: dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz
+
+  build-macos:
+    if: inputs.targets == 'macos-only' || inputs.targets == 'full'
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - name: Require Apple Silicon
+        run: |
+          set -euo pipefail
+          echo "uname=$(uname -sm)"
+          test "$(uname -m)" = "arm64"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-metal
+          cache-targets: true
+          cache-workspace-crates: true
+      - name: Sync Cargo.toml to release tag
+        env:
+          SCALATTICE_VERSION: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ver="${SCALATTICE_VERSION#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"${ver}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+      - name: Build Metal (arm64 only)
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin --no-default-features --features metal
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/scalattice-agent dist/scalattice-agent
+          file dist/scalattice-agent
+          lipo -archs dist/scalattice-agent | grep -qx arm64
+      - name: Sign and notarize
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/sign-macos.sh
+          if [ -z "${APPLE_DEVELOPER_ID_P12_BASE64:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "Apple signing secrets not set; uploading unsigned arm64 binary."
+            echo "See docs/macos-signing.md"
+            exit 0
+          fi
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          KEYCHAIN="${RUNNER_TEMP}/scalattice-signing.keychain-db"
+          P12="${RUNNER_TEMP}/developer-id.p12"
+          echo "${APPLE_DEVELOPER_ID_P12_BASE64}" | base64 -d > "$P12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -P "${APPLE_P12_PASSWORD}" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          ./scripts/sign-macos.sh dist/scalattice-agent
+          security delete-keychain "$KEYCHAIN" || true
+          rm -f "$P12"
+      - name: Package
+        run: |
+          set -euo pipefail
+          tar -czf dist/scalattice-agent-aarch64-apple-darwin.tar.gz -C dist scalattice-agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/scalattice-agent-aarch64-apple-darwin.tar.gz
 
   build-windows-self-hosted:
     if: |
@@ -195,7 +274,7 @@ jobs:
             dist/ScalatticeAgentSetup-x86_64.exe
 
   upload:
-    needs: [build-aarch64, build-windows-self-hosted, build-windows-github-hosted]
+    needs: [build-aarch64, build-macos, build-windows-self-hosted, build-windows-github-hosted]
     if: |
       always() && !cancelled() &&
       (
@@ -204,8 +283,11 @@ jobs:
            needs.build-windows-github-hosted.result == 'success')) ||
         (inputs.targets == 'aarch64-only' &&
           needs.build-aarch64.result == 'success') ||
+        (inputs.targets == 'macos-only' &&
+          needs.build-macos.result == 'success') ||
         (inputs.targets == 'full' &&
           needs.build-aarch64.result == 'success' &&
+          needs.build-macos.result == 'success' &&
           (needs.build-windows-self-hosted.result == 'success' ||
            needs.build-windows-github-hosted.result == 'success'))
       )

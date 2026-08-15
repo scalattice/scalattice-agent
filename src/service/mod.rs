@@ -7,8 +7,10 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 mod uninstall_notify;
@@ -18,8 +20,10 @@ pub fn notify_server_uninstall(reason: &str) {
     uninstall_notify::notify_server_uninstall(reason);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 #[cfg(windows)]
 use windows as platform;
 
@@ -79,11 +83,11 @@ pub fn restart_runtime_from_saved_token() -> Result<()> {
     {
         return platform::restart_runtime_from_saved_token();
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         return platform::restart_background_after_update();
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         bail!("restart is not supported on this platform")
     }
@@ -108,14 +112,19 @@ pub fn save_agent_token(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn stop_background_for_update() -> Result<()> {
     platform::stop_background_for_update()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn restart_background_after_update() -> Result<()> {
     platform::restart_background_after_update()
+}
+
+#[cfg(target_os = "macos")]
+pub fn sync_macos_auto_update(enable: bool) -> Result<()> {
+    platform::sync_update_launch_agent(enable)
 }
 
 #[cfg(windows)]
@@ -267,10 +276,23 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         settings_path()?,
     ];
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         targets.push(config.join("agent.systemd.env"));
         targets.push(platform::systemd_unit_path()?);
+        if let Ok(log) = crate::paths::agent_log_path() {
+            if let Some(logs_dir) = log.parent() {
+                targets.push(logs_dir.to_path_buf());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        targets.push(platform::systemd_unit_path()?);
+        if let Ok(home) = crate::paths::home_dir() {
+            targets.push(home.join("Library/LaunchAgents/com.scalattice.agent.update.plist"));
+        }
         if let Ok(log) = crate::paths::agent_log_path() {
             if let Some(logs_dir) = log.parent() {
                 targets.push(logs_dir.to_path_buf());
@@ -327,7 +349,7 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
     // even when nothing looks "installed" — leftovers cause reboot Script Host errors.
     let _ = platform::remove_background_service();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let _ = crate::update::sync_auto_update(false);
     }

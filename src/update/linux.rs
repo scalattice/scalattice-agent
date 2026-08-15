@@ -9,7 +9,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
 const UPDATE_SERVICE: &str = "scalattice-agent-update.service";
+#[cfg(target_os = "linux")]
 const UPDATE_TIMER: &str = "scalattice-agent-update.timer";
 
 pub async fn check_for_update() -> Result<UpdateCheckOutcome> {
@@ -46,7 +48,7 @@ pub async fn install_latest_update() -> Result<()> {
     println!(
         "Downloading Scalattice Agent v{} ({})...",
         info.latest_version,
-        linux_archive_name()?
+        unix_archive_name()?
     );
     let staging = download_and_extract(&info.latest_tag).await?;
     println!("Installing update...");
@@ -66,42 +68,63 @@ pub async fn install_latest_update() -> Result<()> {
 }
 
 pub fn sync_auto_update_timer(enable: bool) -> Result<()> {
-    if !service::background_service_available() {
-        if enable {
-            bail!("systemd is required to enable automatic updates on Linux");
+    #[cfg(target_os = "macos")]
+    {
+        return crate::service::sync_macos_auto_update(enable);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !service::background_service_available() {
+            if enable {
+                bail!("systemd is required to enable automatic updates on Linux");
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    if enable {
-        write_update_units()?;
-        run_systemctl(&["--user", "daemon-reload"])?;
-        run_systemctl(&["--user", "enable", "--now", UPDATE_TIMER])?;
-        println!("Automatic daily updates enabled (systemd timer).");
-    } else {
-        let _ = run_systemctl(&["--user", "disable", "--now", UPDATE_TIMER]);
-        let _ = remove_update_units();
-        let _ = run_systemctl(&["--user", "daemon-reload"]);
-        println!("Automatic daily updates disabled.");
+        if enable {
+            write_update_units()?;
+            run_systemctl(&["--user", "daemon-reload"])?;
+            run_systemctl(&["--user", "enable", "--now", UPDATE_TIMER])?;
+            println!("Automatic daily updates enabled (systemd timer).");
+        } else {
+            let _ = run_systemctl(&["--user", "disable", "--now", UPDATE_TIMER]);
+            let _ = remove_update_units();
+            let _ = run_systemctl(&["--user", "daemon-reload"]);
+            println!("Automatic daily updates disabled.");
+        }
+        Ok(())
     }
-    Ok(())
 }
 
-fn linux_archive_name() -> Result<String> {
-    Ok(format!("scalattice-agent-{}.tar.gz", linux_release_target()?))
+fn unix_archive_name() -> Result<String> {
+    Ok(format!("scalattice-agent-{}.tar.gz", unix_release_target()?))
 }
 
-fn linux_release_target() -> Result<&'static str> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("x86_64-unknown-linux-gnu"),
-        "aarch64" => Ok("aarch64-unknown-linux-gnu"),
-        other => bail!("automatic updates are not supported on Linux arch: {other}"),
+fn unix_release_target() -> Result<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::consts::ARCH != "aarch64" {
+            bail!("automatic updates support Apple Silicon only");
+        }
+        return Ok("aarch64-apple-darwin");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return match std::env::consts::ARCH {
+            "x86_64" => Ok("x86_64-unknown-linux-gnu"),
+            "aarch64" => Ok("aarch64-unknown-linux-gnu"),
+            other => bail!("automatic updates are not supported on Linux arch: {other}"),
+        };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("automatic updates are not supported on this platform")
     }
 }
 
 async fn download_and_extract(tag: &str) -> Result<PathBuf> {
     let latest = fetch_latest_release().await?;
-    let archive_name = linux_archive_name()?;
+    let archive_name = unix_archive_name()?;
     let expected = latest
         .checksums
         .get(&archive_name)
@@ -311,6 +334,7 @@ fn running_as_live_agent() -> bool {
     std::env::args().any(|arg| arg == "foreground")
 }
 
+#[cfg(target_os = "linux")]
 fn write_update_units() -> Result<()> {
     let home = crate::paths::home_dir()?;
     let unit_dir = home.join(".config/systemd/user");
@@ -348,6 +372,7 @@ WantedBy=timers.target\n";
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn remove_update_units() -> Result<()> {
     let home = crate::paths::home_dir()?;
     let unit_dir = home.join(".config/systemd/user");
@@ -356,6 +381,7 @@ fn remove_update_units() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn run_systemctl(args: &[&str]) -> Result<()> {
     let output = Command::new("systemctl")
         .args(args)

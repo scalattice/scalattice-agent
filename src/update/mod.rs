@@ -1,7 +1,7 @@
 mod cloud;
 mod version;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod linux;
 #[cfg(windows)]
 mod windows;
@@ -35,11 +35,11 @@ pub async fn check_for_update() -> anyhow::Result<UpdateCheckOutcome> {
     {
         return windows::check_for_update().await;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         return linux::check_for_update().await;
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         anyhow::bail!("automatic updates are not supported on this platform");
     }
@@ -50,11 +50,11 @@ pub async fn install_latest_update() -> anyhow::Result<()> {
     {
         return windows::install_latest_update().await;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         return linux::install_latest_update().await;
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         anyhow::bail!("automatic updates are not supported on this platform");
     }
@@ -67,11 +67,11 @@ pub fn sync_auto_update(enabled: bool) -> anyhow::Result<()> {
         let _ = enabled;
         Ok(())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         linux::sync_auto_update_timer(enabled)
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = enabled;
         Ok(())

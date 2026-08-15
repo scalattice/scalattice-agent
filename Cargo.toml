@@ -57,6 +57,7 @@ win-gpu = ["cuda", "vulkan"]
 arm-gpu = ["cuda", "vulkan"]
 cuda = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]
+metal = ["llama-cpp-2/metal"]
 dynamic-backends = ["llama-cpp-2/dynamic-backends"]
 rocm = ["llama-cpp-2/rocm"]
 
