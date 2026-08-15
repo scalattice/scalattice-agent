@@ -71,15 +71,16 @@ pub struct Hypervisor {
 }
 
 /// Give up only when the worker stops sending progress/token lines.
-/// Load/evict/context can stall tens of seconds on a large GGUF CUDA upload
-/// with no llama.cpp callback; prefill/decode hangs are much shorter.
-const WORKER_DECODE_SILENCE: Duration = Duration::from_secs(45);
-const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(180);
+/// Load / evict / context / prefill can sit in CUDA with no llama.cpp callback
+/// (graph compile, weight upload). Only token decode uses the short stall.
+const WORKER_DECODE_SILENCE: Duration = Duration::from_secs(120);
+const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(300);
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
-    match phase {
-        "prefill" | "decode" => WORKER_DECODE_SILENCE,
-        _ => WORKER_LOAD_SILENCE,
+    if phase.eq_ignore_ascii_case("decode") {
+        WORKER_DECODE_SILENCE
+    } else {
+        WORKER_LOAD_SILENCE
     }
 }
 
@@ -786,6 +787,7 @@ async fn worker_rpc_invoke_cancellable(
 
     let mut buf = String::new();
     let mut silence = WORKER_LOAD_SILENCE;
+    let mut last_phase = String::from("start");
     loop {
         buf.clear();
         tokio::select! {
@@ -813,6 +815,7 @@ async fn worker_rpc_invoke_cancellable(
                 };
                 match resp {
                     WorkerResponse::Progress { id, phase, pct } if id == expect_id => {
+                        last_phase = phase.clone();
                         silence = worker_silence_for_phase(&phase);
                         if let Some(cb) = on_delta.as_mut() {
                             cb(format!(
@@ -823,6 +826,7 @@ async fn worker_rpc_invoke_cancellable(
                         }
                     }
                     WorkerResponse::Delta { id, text } if id == expect_id => {
+                        last_phase = "decode".to_string();
                         silence = WORKER_DECODE_SILENCE;
                         if let Some(cb) = on_delta.as_mut() {
                             cb(text);
@@ -855,6 +859,7 @@ async fn worker_rpc_invoke_cancellable(
             _ = tokio::time::sleep(silence) => {
                 warn!(
                     slot = %worker.spec.id,
+                    phase = %last_phase,
                     silence_s = silence.as_secs(),
                     "killing worker; progress comms went silent"
                 );
