@@ -242,6 +242,8 @@ jobs:
           cp target/aarch64-apple-darwin/release/scalattice-agent dist/scalattice-agent
           file dist/scalattice-agent
           lipo -archs dist/scalattice-agent | grep -qx arm64
+          chmod +x scripts/package-macos.sh
+          scripts/package-macos.sh
       - name: Sign and notarize
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -253,33 +255,42 @@ jobs:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           set -euo pipefail
-          chmod +x scripts/sign-macos.sh
+          chmod +x scripts/sign-macos.sh scripts/package-macos.sh
           if [ -z "${APPLE_DEVELOPER_ID_P12_BASE64:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "Apple signing secrets not set; uploading unsigned arm64 binary."
+            echo "Apple signing secrets not set; uploading unsigned arm64 app/dmg."
             echo "See docs/macos-signing.md"
             exit 0
           fi
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           KEYCHAIN="${RUNNER_TEMP}/scalattice-signing.keychain-db"
           P12="${RUNNER_TEMP}/developer-id.p12"
-          echo "${APPLE_DEVELOPER_ID_P12_BASE64}" | base64 -d > "$P12"
+          echo "${APPLE_DEVELOPER_ID_P12_BASE64}" | tr -d '\n\r ' | base64 -d > "$P12"
+          echo "PKCS12 size: $(wc -c < "$P12") bytes"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$P12" -P "${APPLE_P12_PASSWORD}" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          # OpenSSL 3 default .p12 (SHA-256 MAC) fails here with "wrong password?".
+          # Re-export with `openssl pkcs12 -export -legacy` — see docs/macos-signing.md.
+          security import "$P12" -k "$KEYCHAIN" -P "${APPLE_P12_PASSWORD:-}" -A \
+            -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productsign
           security list-keychain -d user -s "$KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          ./scripts/sign-macos.sh dist/scalattice-agent
+          ./scripts/sign-macos.sh "dist/Scalattice Agent.app"
+          ./scripts/package-macos.sh --dmg-from-app
+          ./scripts/sign-macos.sh "dist/Scalattice Agent.app" dist/ScalatticeAgentSetup-aarch64.dmg
           security delete-keychain "$KEYCHAIN" || true
           rm -f "$P12"
       - name: Package
         run: |
           set -euo pipefail
-          tar -czf dist/scalattice-agent-aarch64-apple-darwin.tar.gz -C dist scalattice-agent
+          test -f dist/ScalatticeAgentSetup-aarch64.dmg
+          test -f dist/scalattice-agent-aarch64-apple-darwin.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: dist/scalattice-agent-aarch64-apple-darwin.tar.gz
+          path: |
+            dist/ScalatticeAgentSetup-aarch64.dmg
+            dist/scalattice-agent-aarch64-apple-darwin.tar.gz
 
   build-windows-self-hosted:
     needs: prepare

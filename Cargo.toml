@@ -47,6 +47,11 @@ image = "0.25"
 tauri-winrt-notification = "0.8"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+image = "0.25"
+
 [features]
 default = ["gpu"]
 # x86_64 Linux: NVIDIA CUDA + AMD/Intel Vulkan; release bundles non-driver .so deps

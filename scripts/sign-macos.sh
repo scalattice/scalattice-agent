@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Codesign + notarize an Apple Silicon scalattice-agent binary.
-# Must run on macOS (GitHub macos-14 or a Mac). See docs/macos-signing.md.
+# Codesign + notarize Apple Silicon agent (.app and/or .dmg).
+# Must run on macOS. See docs/macos-signing.md.
 set -euo pipefail
 
-BIN="${1:?usage: sign-macos.sh path/to/scalattice-agent}"
+TARGET="${1:?usage: sign-macos.sh path/to/Scalattice Agent.app [path/to.dmg]}"
+DMG="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENTITLEMENTS="${ROOT}/installer/macos/entitlements.plist"
 IDENTITY="${APPLE_SIGNING_IDENTITY:?Set APPLE_SIGNING_IDENTITY}"
@@ -16,23 +17,42 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   echo "Refusing to sign on Intel ($(uname -m)). Apple Silicon only." >&2
   exit 1
 fi
-if [[ ! -f "$BIN" ]]; then
-  echo "Missing binary: $BIN" >&2
+
+sign_bin() {
+  local bin="$1"
+  if [[ ! -f "$bin" ]]; then
+    echo "Missing binary: $bin" >&2
+    exit 1
+  fi
+  local arch
+  arch="$(lipo -archs "$bin" 2>/dev/null || true)"
+  if [[ -n "$arch" && "$arch" != "arm64" ]]; then
+    echo "Binary is not arm64-only (lipo: ${arch}). Refusing Intel/universal." >&2
+    exit 1
+  fi
+  echo "==> codesign $(basename "$bin")"
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" \
+    --sign "$IDENTITY" \
+    "$bin"
+  codesign --verify --verbose=2 "$bin"
+}
+
+if [[ -d "$TARGET" ]]; then
+  INNER="${TARGET}/Contents/MacOS/scalattice-agent"
+  sign_bin "$INNER"
+  echo "==> codesign $(basename "$TARGET")"
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" \
+    --sign "$IDENTITY" \
+    "$TARGET"
+  codesign --verify --verbose=2 "$TARGET"
+elif [[ -f "$TARGET" ]]; then
+  sign_bin "$TARGET"
+else
+  echo "Missing $TARGET" >&2
   exit 1
 fi
-
-arch="$(lipo -archs "$BIN" 2>/dev/null || true)"
-if [[ -n "$arch" && "$arch" != "arm64" ]]; then
-  echo "Binary is not arm64-only (lipo: ${arch}). Refusing Intel/universal." >&2
-  exit 1
-fi
-
-echo "==> codesign (hardened runtime)"
-codesign --force --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" \
-  --sign "$IDENTITY" \
-  "$BIN"
-codesign --verify --verbose=2 "$BIN"
 
 if [[ -z "${APPLE_API_KEY_ID:-}" || -z "${APPLE_API_ISSUER_ID:-}" ]]; then
   echo "==> Skipping notarization (APPLE_API_KEY_ID / APPLE_API_ISSUER_ID not set)"
@@ -52,19 +72,23 @@ if [[ -z "$KEY_FILE" ]]; then
   trap 'rm -f "$CLEANUP_KEY"' EXIT
 fi
 
-WORKDIR="$(mktemp -d /tmp/scalattice-notary.XXXXXX)"
-ZIP="${WORKDIR}/scalattice-agent.zip"
-(
-  cd "$(dirname "$BIN")"
-  zip -j "$ZIP" "$(basename "$BIN")"
-)
+SUBMIT="$DMG"
+if [[ -z "$SUBMIT" ]]; then
+  echo "==> No .dmg given; skipping notarytool (bare Mach-O cannot be stapled)."
+  exit 0
+fi
+if [[ ! -f "$SUBMIT" ]]; then
+  echo "Missing dmg: $SUBMIT" >&2
+  exit 1
+fi
 
-echo "==> notarytool submit"
-xcrun notarytool submit "$ZIP" \
+echo "==> notarytool submit $(basename "$SUBMIT")"
+xcrun notarytool submit "$SUBMIT" \
   --key "$KEY_FILE" \
   --key-id "$APPLE_API_KEY_ID" \
   --issuer "$APPLE_API_ISSUER_ID" \
   --wait
 
-echo "==> Notarized. Stapling is not supported for a bare Mach-O; Gatekeeper uses the online ticket."
-rm -rf "$WORKDIR"
+echo "==> stapler staple"
+xcrun stapler staple "$SUBMIT"
+echo "==> Notarized and stapled $(basename "$SUBMIT")"

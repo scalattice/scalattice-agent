@@ -37,18 +37,17 @@ The agent registers a **boot** scheduled task (runs as SYSTEM before sign-in) pl
 
 Release builds are **arm64 + Metal only**. Intel Macs are not supported.
 
-The binary is compiled and signed on GitHub’s `macos-14` runners (not on a local Mac). See [docs/macos-signing.md](docs/macos-signing.md).
+Download and open **[ScalatticeAgentSetup-aarch64.dmg](https://github.com/scalattice/scalattice-agent/releases/latest/download/ScalatticeAgentSetup-aarch64.dmg)** (or use **Download macOS installer** on the Providers dashboard).
 
-```bash
-curl -fsSL https://scalattice.cloud/api/v1/agent/release/download/latest/scalattice-agent-aarch64-apple-darwin.tar.gz -o /tmp/scalattice-agent-darwin.tgz
-mkdir -p ~/.local/bin
-tar -xzf /tmp/scalattice-agent-darwin.tgz -C ~/.local/bin
-chmod +x ~/.local/bin/scalattice-agent
-export PATH="$HOME/.local/bin:$PATH"
-scalattice-agent set-token --token slt_provider_YOUR_TOKEN
-```
+1. Open the disk image and run **Scalattice Agent** (approve Gatekeeper if prompted)
+2. Paste your `slt_provider_…` token in the control panel
+3. Finish — the agent stays in the menu bar
 
-Background mode uses a LaunchAgent (`~/Library/LaunchAgents/com.scalattice.agent.plist`). Stay signed in (or enable auto-login) so launchd keeps the agent running.
+Setup guide: https://scalattice.cloud/install/agent-setup?os=macos
+
+The binary is compiled and signed on GitHub’s `macos-14` runners. See [docs/macos-signing.md](docs/macos-signing.md).
+
+Background mode uses a LaunchAgent. Stay signed in (or enable auto-login) so launchd keeps the agent running. The menu bar app is the same control panel as Windows (status, token, logs).
 
 ### Uninstall
 

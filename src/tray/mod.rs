@@ -1,9 +1,9 @@
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod notify;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod ui;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn open_panel(force: bool, open: bool) -> anyhow::Result<()> {
     if !force && ui::tray_window_exists() {
         // Autostart / second launch: never raise the panel unless explicitly requested.

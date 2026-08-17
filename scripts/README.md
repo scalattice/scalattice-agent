@@ -67,7 +67,8 @@ Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-ho
 | `sync-cargo-version.ps1` | Set `Cargo.toml` version to match release tag |
 | `build-release.ps1` | Full Windows release build (exe + zip + installer) |
 | `bundle-release-windows.ps1` | Copy CUDA/runtime DLLs into `dist/lib` |
-| `build-windows-installer.ps1` | Run Inno Setup → `ScalatticeAgentSetup-x86_64.exe` |
+| `package-macos.sh` | Build `Scalattice Agent.app` + `ScalatticeAgentSetup-aarch64.dmg` |
+| `sign-macos.sh` | Codesign + notarize the Mac app/dmg |
 
 ### Windows one-time setup
 
@@ -133,5 +134,5 @@ gh run watch
 |----------|--------|
 | Linux x86_64 | `scalattice-agent-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux aarch64 | `scalattice-agent-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `scalattice-agent-aarch64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `ScalatticeAgentSetup-aarch64.dmg`, `scalattice-agent-aarch64-apple-darwin.tar.gz` |
 | Windows | `ScalatticeAgentSetup-x86_64.exe`, `scalattice-agent-x86_64-pc-windows-msvc.zip` |

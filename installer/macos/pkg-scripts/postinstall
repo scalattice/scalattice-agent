@@ -1,0 +1,10 @@
+#!/bin/sh
+# Run by the macOS .pkg / first-open of Scalattice Agent.app is handled in-app.
+# This postinstall is used if we ship a .pkg; the DMG path opens the app instead.
+set -e
+BIN="/Applications/Scalattice Agent.app/Contents/MacOS/scalattice-agent"
+if [ -x "$BIN" ]; then
+  mkdir -p /usr/local/bin
+  ln -sf "$BIN" /usr/local/bin/scalattice-agent
+fi
+exit 0
