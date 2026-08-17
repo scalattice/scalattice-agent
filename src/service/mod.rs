@@ -127,7 +127,17 @@ pub fn sync_macos_auto_update(enable: bool) -> Result<()> {
     platform::sync_update_launch_agent(enable)
 }
 
+#[cfg(target_os = "macos")]
+pub fn ensure_tray_login_item() -> Result<()> {
+    platform::ensure_tray_login_item()
+}
+
 #[cfg(windows)]
+pub fn in_tray_process() -> bool {
+    platform::in_tray_process()
+}
+
+#[cfg(target_os = "macos")]
 pub fn in_tray_process() -> bool {
     platform::in_tray_process()
 }
@@ -292,6 +302,7 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         targets.push(platform::systemd_unit_path()?);
         if let Ok(home) = crate::paths::home_dir() {
             targets.push(home.join("Library/LaunchAgents/com.scalattice.agent.update.plist"));
+            targets.push(home.join("Library/LaunchAgents/com.scalattice.agent.tray.plist"));
         }
         if let Ok(log) = crate::paths::agent_log_path() {
             if let Some(logs_dir) = log.parent() {

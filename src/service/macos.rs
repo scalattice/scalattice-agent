@@ -8,6 +8,7 @@ use std::process::Command;
 
 const LABEL: &str = "com.scalattice.agent";
 const UPDATE_LABEL: &str = "com.scalattice.agent.update";
+const TRAY_LABEL: &str = "com.scalattice.agent.tray";
 
 pub fn background_status() -> BackgroundStatus {
     if !launch_agent_plist_path_home().map(|p| p.is_file()).unwrap_or(false) {
@@ -102,6 +103,7 @@ pub fn remove_background_service() -> Result<()> {
     let uid = user_id();
     bootout(&format!("gui/{uid}/{LABEL}"));
     bootout(&format!("gui/{uid}/{UPDATE_LABEL}"));
+    bootout(&format!("gui/{uid}/{TRAY_LABEL}"));
     let plist = launch_agent_plist_path()?;
     if plist.is_file() {
         fs::remove_file(&plist)?;
@@ -110,6 +112,10 @@ pub fn remove_background_service() -> Result<()> {
     let update_plist = update_plist_path()?;
     if update_plist.is_file() {
         fs::remove_file(&update_plist)?;
+    }
+    let tray_plist = tray_plist_path()?;
+    if tray_plist.is_file() {
+        fs::remove_file(&tray_plist)?;
     }
     Ok(())
 }
@@ -133,6 +139,20 @@ pub fn restart_background_after_update() -> Result<()> {
 
 pub fn systemd_unit_path() -> Result<PathBuf> {
     launch_agent_plist_path()
+}
+
+pub fn in_tray_process() -> bool {
+    std::env::var("SCALATTICE_TRAY").ok().as_deref() == Some("1")
+}
+
+pub fn ensure_tray_login_item() -> Result<()> {
+    write_tray_plist()?;
+    let uid = user_id();
+    let domain = format!("gui/{uid}/{TRAY_LABEL}");
+    let plist = tray_plist_path()?;
+    bootout(&domain);
+    run_launchctl(&["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])?;
+    Ok(())
 }
 
 pub fn sync_update_launch_agent(enable: bool) -> Result<()> {
@@ -229,6 +249,45 @@ fn write_launch_agent() -> Result<()> {
         stderr = xml_escape(&stderr_log.display().to_string()),
     );
 
+    fs::create_dir_all(plist_path.parent().context("LaunchAgents parent")?)?;
+    fs::write(&plist_path, plist)?;
+    Ok(())
+}
+
+fn write_tray_plist() -> Result<()> {
+    let bin = resolve_agent_binary().unwrap_or_else(|_| {
+        PathBuf::from("/Applications/Scalattice Agent.app/Contents/MacOS/scalattice-agent")
+    });
+    let plist_path = tray_plist_path()?;
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>tray</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SCALATTICE_TRAY</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>
+"#,
+        label = TRAY_LABEL,
+        bin = xml_escape(&bin.display().to_string()),
+    );
     fs::create_dir_all(plist_path.parent().context("LaunchAgents parent")?)?;
     fs::write(&plist_path, plist)?;
     Ok(())
@@ -372,4 +431,10 @@ fn update_plist_path() -> Result<PathBuf> {
     Ok(crate::paths::home_dir()?
         .join("Library/LaunchAgents")
         .join(format!("{UPDATE_LABEL}.plist")))
+}
+
+fn tray_plist_path() -> Result<PathBuf> {
+    Ok(crate::paths::home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{TRAY_LABEL}.plist")))
 }

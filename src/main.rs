@@ -23,7 +23,7 @@ mod specs;
 mod state;
 mod update;
 mod vram_lifecycle;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod tray;
 
 use anyhow::Result;
@@ -72,8 +72,8 @@ enum Commands {
     /// Internal: tell Scalattice Cloud this machine is uninstalling (best-effort)
     #[command(hide = true)]
     NotifyUninstall,
-    /// Windows only: run the notification-area control panel
-    #[cfg(windows)]
+    /// Run the menu-bar / notification-area control panel
+    #[cfg(any(windows, target_os = "macos"))]
     Tray {
         /// Start even if another tray instance appears stuck (kills stale tray PID file)
         #[arg(long, hide = true)]
@@ -134,11 +134,11 @@ fn main() -> Result<()> {
 
     logging::init_logging(verbose);
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if should_run_tray_ui(&cli) {
         let (force, open) = match &cli.command {
             Some(Commands::Tray { force, open }) => (*force, *open),
-            _ => (false, false),
+            _ => (false, crate::config::read_saved_agent_token().is_none()),
         };
         return tray::open_panel(force, open);
     }
@@ -186,7 +186,7 @@ fn prepare_windows_process(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn should_run_tray_ui(cli: &Cli) -> bool {
     matches!(cli.command, None | Some(Commands::Tray { .. }))
 }
@@ -268,7 +268,7 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
                 Err(err) => {
                     println!("Token saved.");
                     eprintln!("Note: {err}");
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "macos"))]
                     spawn_tray_hidden()?;
                 }
             }
@@ -283,7 +283,7 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
         Some(Commands::NotifyUninstall) => {
             service::notify_server_uninstall("uninstall");
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         Some(Commands::Tray { .. }) => unreachable!("tray handled in main"),
         Some(Commands::Update {
             check,
@@ -304,6 +304,17 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_tray_hidden() -> Result<()> {
+    let bin = crate::paths::resolve_agent_binary()?;
+    std::process::Command::new(&bin)
+        .arg("tray")
+        .env("SCALATTICE_TRAY", "1")
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("failed to launch tray: {err}"))
 }
 
 #[cfg(windows)]
@@ -485,7 +496,17 @@ fn print_status() -> Result<()> {
         }
         println!("Control panel: scalattice-agent tray  (or click the notification-area icon)");
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
+    {
+        if user_settings.auto_update {
+            println!("Update   automatic");
+        } else {
+            println!("Update   scalattice-agent update");
+            println!("         scalattice-agent update --enable-auto");
+        }
+        println!("Control panel: menu bar icon, or open -a 'Scalattice Agent'");
+    }
+    #[cfg(target_os = "linux")]
     {
         if user_settings.auto_update {
             println!("Update   automatic");

@@ -230,6 +230,10 @@ verify_release_assets() {
     echo "Release ${tag} is missing Apple Silicon (aarch64-apple-darwin) tarball." >&2
     exit 1
   fi
+  if [[ "$need_macos" == "true" ]] && ! echo "$assets" | grep -q 'ScalatticeAgentSetup-aarch64.dmg'; then
+    echo "Release ${tag} is missing Apple Silicon installer DMG." >&2
+    exit 1
+  fi
   if [[ "$need_windows" == "true" && "$win" -lt 1 ]]; then
     echo "Release ${tag} is missing Windows installer (.exe or zip)." >&2
     exit 1

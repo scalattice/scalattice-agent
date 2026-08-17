@@ -14,14 +14,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::CreateMutexW;
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowW, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
 const DASHBOARD_URL: &str = "https://scalattice.cloud/providers";
 const WINDOW_TITLE: &str = "Scalattice Agent";
+#[cfg(windows)]
 const TRAY_MUTEX: &str = "ScalatticeAgentTray";
 /// How long blue action notices stay visible (save token, open dashboard, etc.).
 const ACTION_MESSAGE_TTL: Duration = Duration::from_secs(8);
@@ -110,10 +114,19 @@ pub fn activate_existing_panel() -> bool {
 
 /// True when a tray panel window already exists (does not show it).
 pub fn tray_window_exists() -> bool {
-    let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        !hwnd.is_null()
+    #[cfg(windows)]
+    {
+        let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
+        unsafe {
+            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+            return !hwnd.is_null();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        tray_pid_from_file()
+            .map(|pid| pid != std::process::id() && process_exists(pid))
+            .unwrap_or(false)
     }
 }
 
@@ -124,6 +137,11 @@ fn run_tray_ui_inner(force: bool, open: bool) -> Result<()> {
         clear_stale_tray_pid()?;
     }
     write_tray_pid()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = crate::service::ensure_tray_login_item();
+    }
 
     // Autostart / reboot must stay tray-icon-only. Panel opens only via menu,
     // `tray --open`, or SCALATTICE_TRAY_OPEN=1.
@@ -869,9 +887,17 @@ impl eframe::App for TrayApp {
             self.kick_update_check();
         }
 
-        let native_visible = native_window_visible();
-        if !native_visible {
-            self.panel_hidden = true;
+        #[cfg(windows)]
+        {
+            let native_visible = native_window_visible();
+            if !native_visible {
+                self.panel_hidden = true;
+                ctx.request_repaint_after(Duration::from_millis(400));
+                return;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if self.panel_hidden {
             ctx.request_repaint_after(Duration::from_millis(400));
             return;
         }
@@ -1236,6 +1262,7 @@ fn render_status_line(ui: &mut egui::Ui, line: &str) {
     ui.add_space(5.0);
 }
 
+#[cfg(windows)]
 fn native_window_visible() -> bool {
     let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
     unsafe {
@@ -1328,22 +1355,46 @@ fn acquire_tray_instance(force: bool) -> Result<bool> {
 }
 
 fn try_acquire_tray_mutex() -> Result<bool> {
-    let name: Vec<u16> = format!("{TRAY_MUTEX}\0").encode_utf16().collect();
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
-        if handle.is_null() {
-            anyhow::bail!("failed to create tray instance lock");
+    #[cfg(windows)]
+    {
+        let name: Vec<u16> = format!("{TRAY_MUTEX}\0").encode_utf16().collect();
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
+            if handle.is_null() {
+                anyhow::bail!("failed to create tray instance lock");
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(handle);
+                return Ok(false);
+            }
         }
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            CloseHandle(handle);
+        return Ok(true);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let path = install_dir()?.join("tray.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
             return Ok(false);
         }
+        std::mem::forget(file);
+        Ok(true)
     }
-    Ok(true)
 }
 
 fn tray_pid_path() -> Result<PathBuf> {
     Ok(install_dir()?.join("tray.pid"))
+}
+
+fn tray_pid_from_file() -> Option<u32> {
+    let raw = std::fs::read_to_string(tray_pid_path().ok()?).ok()?;
+    raw.trim().parse().ok()
 }
 
 fn write_tray_pid() -> Result<()> {
@@ -1369,9 +1420,7 @@ fn clear_stale_tray_pid() -> Result<()> {
     };
     if pid != std::process::id() && process_exists(pid) {
         write_tray_log(&format!("stopping stale tray pid {pid}"));
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .status();
+        stop_pid(pid);
         std::thread::sleep(Duration::from_millis(400));
     }
     let _ = std::fs::remove_file(&path);
@@ -1379,17 +1428,39 @@ fn clear_stale_tray_pid() -> Result<()> {
 }
 
 fn process_exists(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
-        })
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        return std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|o| {
+                o.status.success()
+                    && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false);
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+fn stop_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
 }
 
 fn launched_open() -> bool {
@@ -1399,20 +1470,30 @@ fn launched_open() -> bool {
 }
 
 fn maybe_detach_console() {
-    // Always detach for tray so Start Menu / Startup never leave a console host.
+    #[cfg(windows)]
     detach_console();
 }
 
 fn activate_tray_window() -> bool {
-    let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd.is_null() {
-            return false;
+    #[cfg(windows)]
+    {
+        let title: Vec<u16> = format!("{WINDOW_TITLE}\0").encode_utf16().collect();
+        unsafe {
+            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+            if hwnd.is_null() {
+                return false;
+            }
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+            return true;
         }
-        ShowWindow(hwnd, SW_RESTORE);
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .args(["-a", "Scalattice Agent", "--args", "tray", "--open"])
+            .status();
         true
     }
 }
@@ -1446,6 +1527,7 @@ fn chrono_lite_timestamp() -> String {
     format!("{}", duration.as_secs())
 }
 
+#[cfg(windows)]
 fn detach_console() {
     unsafe {
         windows_sys::Win32::System::Console::FreeConsole();
@@ -1453,26 +1535,40 @@ fn detach_console() {
 }
 
 fn open_dashboard_url(url: &str) -> Result<()> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
-    let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
-    let op: Vec<u16> = "open\0".encode_utf16().collect();
-    unsafe {
-        let rc = ShellExecuteW(
-            std::ptr::null_mut(),
-            op.as_ptr(),
-            url_wide.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOW,
-        );
-        let code = rc as isize;
-        if code <= 32 {
-            anyhow::bail!("ShellExecute failed (code {code})");
+        let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        unsafe {
+            let rc = ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                url_wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOW,
+            );
+            let code = rc as isize;
+            if code <= 32 {
+                anyhow::bail!("ShellExecute failed (code {code})");
+            }
         }
+        return Ok(());
     }
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("open")
+            .arg(url)
+            .status()
+            .context("open")?;
+        if !status.success() {
+            anyhow::bail!("open {url} failed");
+        }
+        Ok(())
+    }
 }
