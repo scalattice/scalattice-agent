@@ -34,7 +34,7 @@ Linux build host                       Windows (self-hosted runner)
 
 **`release.sh --dev`** — Linux x86_64 here + Windows on your runner (skip aarch64 Linux and macOS).  
 **`release.sh`** — same + aarch64 Linux on GitHub `ubuntu-24.04-arm` + macOS Metal on `macos-14`.  
-Preferred: merge private `development` → `production` (see [docs/BRANCHES.md](../docs/BRANCHES.md)); CI builds every platform including Linux x86_64.
+Merging `development` → `production` runs the full Release workflow (including Linux x86_64 in CI).
 
 Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-hosted-windows`, `--no-push`.
 
@@ -47,6 +47,7 @@ Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-ho
 | Script | Purpose |
 |--------|---------|
 | `release.sh` | Main entry: build Linux, create GitHub release, trigger Windows/aarch64 CI, upload assets |
+| `ci-prepare-release.sh` | Used by the Release workflow: tag + GitHub release from `Cargo.toml` |
 | `reset-releases.sh` | Delete all tags/releases and reset `Cargo.toml` to 1.0.0 (destructive; needs `--confirm`) |
 | `check-windows-runner.sh` | Verify an online self-hosted runner with label `scalattice-release` (used by `release.sh`) |
 

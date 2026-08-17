@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # One-command release: x86_64 Linux local + Windows on self-hosted runner + optional aarch64/macOS CI.
 #
-# Preferred: merge private development → production (docs/BRANCHES.md) so CI builds every platform.
-# This script remains for a Linux build host.
+# Preferred: merge development → production so CI builds every platform.
 #
 # Usage:
 #   ./scripts/release.sh --dev      # x86_64 Linux here + Windows on self-hosted runner

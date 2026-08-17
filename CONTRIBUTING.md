@@ -78,7 +78,7 @@ When contributing with maintainer approval:
 ## Pull request process
 
 1. **Discuss first** for anything beyond a typo or doc fix
-2. Fork and branch from `development` on the private repo (see [docs/BRANCHES.md](docs/BRANCHES.md))
+2. Fork and branch from `development`
 3. Keep the diff small and explain *why* in the PR description
 4. Confirm you have built the relevant feature set (`gpu` or `arm-gpu`)
 5. Maintainers review on their schedule; silence is not rejection — we may redirect you to an issue
@@ -87,7 +87,7 @@ We may close PRs that bypass this process without review.
 
 ## Releases
 
-Merging `development` → `production` on the **private** repo squash-publishes to public `production` and runs the full Release workflow.
+Merging `development` → `production` runs the full Release workflow (Linux x86_64, aarch64, Windows, macOS).
 
 Authorized maintainers can still ship from a Linux build host with:
 
@@ -95,7 +95,7 @@ Authorized maintainers can still ship from a Linux build host with:
 ./scripts/release.sh
 ```
 
-See [docs/BRANCHES.md](docs/BRANCHES.md) and [scripts/README.md](scripts/README.md). Do not push tags or publish releases unless you are an authorized maintainer.
+See [scripts/README.md](scripts/README.md). Do not push tags or publish releases unless you are an authorized maintainer.
 
 ## Community standards
 

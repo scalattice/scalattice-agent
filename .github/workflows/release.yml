@@ -1,6 +1,6 @@
 name: Release
 
-# Public production: merge/promote creates a GitHub release and builds every platform.
+# production: merge from development creates a GitHub release and builds every platform.
 # Linux x86_64 CUDA is built here (no local build host required).
 # Windows uses the self-hosted scalattice-release runner by default.
 # macOS is GitHub-hosted macos-14 (Apple Silicon). Unsigned if Apple secrets are missing.
