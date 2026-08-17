@@ -9,7 +9,7 @@ Put them on the repo: **Settings → Secrets and variables → Actions → New r
 | Secret | Where it comes from |
 |--------|---------------------|
 | `APPLE_TEAM_ID` | [developer.apple.com/account](https://developer.apple.com/account) → Membership → Team ID |
-| `APPLE_SIGNING_IDENTITY` | Exact cert name, e.g. `Developer ID Application: Robottik LTD (TEAMID)` |
+| `APPLE_SIGNING_IDENTITY` | Exact cert name, e.g. `Developer ID Application: Robottik LTD (TEAMID)`. CI also accepts the imported Developer ID if this string does not match exactly. |
 | `APPLE_DEVELOPER_ID_P12_BASE64` | Base64 of the Developer ID Application `.p12`. Create it with **`-legacy`** on Linux OpenSSL 3, then `base64 -w0 developer-id.p12 > developer-id.p12.b64` and paste that file (not a terminal dump). |
 | `APPLE_P12_PASSWORD` | Exact export password for that `.p12` (no trailing newline) |
 | `APPLE_API_KEY_P8` | Full text of `AuthKey_XXXXXXXXXX.p8` |

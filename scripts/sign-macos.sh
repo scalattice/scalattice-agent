@@ -7,7 +7,7 @@ TARGET="${1:?usage: sign-macos.sh path/to/Scalattice Agent.app [path/to.dmg]}"
 DMG="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENTITLEMENTS="${ROOT}/installer/macos/entitlements.plist"
-IDENTITY="${APPLE_SIGNING_IDENTITY:?Set APPLE_SIGNING_IDENTITY}"
+KEYCHAIN="${APPLE_KEYCHAIN:-}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "sign-macos.sh must run on macOS (Metal/codesign/notarytool)." >&2
@@ -16,6 +16,37 @@ fi
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "Refusing to sign on Intel ($(uname -m)). Apple Silicon only." >&2
   exit 1
+fi
+
+# codesign matches a valid identity in the keychain, not the secret string.
+# Prefer the SHA-1 hash so a trailing newline / Ltd vs LTD in the secret cannot fail.
+resolve_identity() {
+  local want line
+  want="$(printf '%s' "${APPLE_SIGNING_IDENTITY:-}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [[ -n "$want" ]]; then
+    line="$(security find-identity -v -p codesigning | grep -F "$want" | head -1 || true)"
+  fi
+  if [[ -z "${line:-}" ]]; then
+    line="$(security find-identity -v -p codesigning | grep 'Developer ID Application:' | head -1 || true)"
+  fi
+  if [[ -z "${line:-}" ]]; then
+    echo "No valid Developer ID Application identity in the keychain." >&2
+    security find-identity -p codesigning >&2 || true
+    exit 1
+  fi
+  awk '{print $2}' <<<"$line"
+}
+
+IDENTITY="$(resolve_identity)"
+echo "==> signing identity hash ${IDENTITY}"
+
+CODESIGN_BASE=(
+  --force --options runtime --timestamp
+  --entitlements "$ENTITLEMENTS"
+  --sign "$IDENTITY"
+)
+if [[ -n "$KEYCHAIN" ]]; then
+  CODESIGN_BASE+=(--keychain "$KEYCHAIN")
 fi
 
 sign_bin() {
@@ -31,10 +62,7 @@ sign_bin() {
     exit 1
   fi
   echo "==> codesign $(basename "$bin")"
-  codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" \
-    --sign "$IDENTITY" \
-    "$bin"
+  codesign "${CODESIGN_BASE[@]}" "$bin"
   codesign --verify --verbose=2 "$bin"
 }
 
@@ -42,10 +70,7 @@ if [[ -d "$TARGET" ]]; then
   INNER="${TARGET}/Contents/MacOS/scalattice-agent"
   sign_bin "$INNER"
   echo "==> codesign $(basename "$TARGET")"
-  codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" \
-    --sign "$IDENTITY" \
-    "$TARGET"
+  codesign "${CODESIGN_BASE[@]}" "$TARGET"
   codesign --verify --verbose=2 "$TARGET"
 elif [[ -f "$TARGET" ]]; then
   sign_bin "$TARGET"
