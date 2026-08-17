@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# One-command release: x86_64 Linux local + Windows on self-hosted runner + optional aarch64 CI.
+# One-command release: x86_64 Linux local + Windows on self-hosted runner + optional aarch64/macOS CI.
+#
+# Preferred: merge private development → production (docs/BRANCHES.md) so CI builds every platform.
+# This script remains for a Linux build host.
 #
 # Usage:
 #   ./scripts/release.sh --dev      # x86_64 Linux here + Windows on self-hosted runner
@@ -181,7 +184,7 @@ build_ci_assets() {
   fi
 
   gh workflow run "$WORKFLOW_FILE" \
-    --ref main \
+    --ref production \
     -f "tag=${tag}" \
     -f "targets=${targets}" \
     -f "windows_runner=${win_runner}"
@@ -300,8 +303,8 @@ if [[ "$NO_PUSH" == "true" ]]; then
   exit 0
 fi
 
-echo "==> Pushing main"
-git push "$REMOTE" main
+echo "==> Pushing production"
+git push "$REMOTE" production
 
 if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&1; then
   echo "==> Replacing existing ${TAG}"
@@ -323,7 +326,7 @@ fi
 
 echo "==> Creating GitHub release"
 gh release create "$TAG" "${RELEASE_FILES[@]}" \
-  --target main \
+  --target production \
   --title "$TAG" \
   --notes "$RELEASE_NOTES"
 

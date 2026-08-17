@@ -1,15 +1,15 @@
 name: Release
 
-# Linux x86_64: built locally by scripts/release.sh
-# Windows: self-hosted runner (label scalattice-release). See scripts/install-windows-runner.ps1
-# aarch64 Linux: GitHub-hosted ARM runner
-# macOS: GitHub-hosted macos-14 (Apple Silicon only). Metal cannot be built on Linux.
+# Public production: merge/promote creates a GitHub release and builds every platform.
+# Linux x86_64 CUDA is built here (no local build host required).
+# Windows uses the self-hosted scalattice-release runner by default.
+# macOS is GitHub-hosted macos-14 (Apple Silicon). Unsigned if Apple secrets are missing.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to attach assets to (e.g. v1.0.2)'
-        required: true
+        description: 'Release tag (e.g. v1.1.33). Leave empty to bump from Cargo.toml'
+        required: false
         type: string
       targets:
         description: 'Build targets'
@@ -29,16 +29,135 @@ on:
         options:
           - self-hosted
           - github-hosted
+  push:
+    branches: [production]
+  pull_request:
+    types: [closed]
+    branches: [production]
+
+concurrency:
+  group: release-production
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  build-aarch64:
-    if: inputs.targets == 'aarch64-only' || inputs.targets == 'full'
-    runs-on: ubuntu-24.04-arm
+  prepare:
+    if: |
+      github.repository == 'scalattice/scalattice-agent' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'push' ||
+        (github.event_name == 'pull_request' &&
+          github.event.pull_request.merged == true &&
+          github.event.pull_request.head.ref == 'development')
+      ) &&
+      (
+        github.event_name != 'push' ||
+        (
+          !startsWith(github.event.head_commit.message, 'chore(release):') &&
+          !contains(github.event.head_commit.message, '[skip release]')
+        )
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      targets: ${{ steps.meta.outputs.targets }}
+      windows_runner: ${{ steps.meta.outputs.windows_runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: production
+      - name: Prepare tag and GitHub release
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          chmod +x scripts/ci-prepare-release.sh
+          scripts/ci-prepare-release.sh
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "targets=${{ github.event.inputs.targets }}" >> "$GITHUB_OUTPUT"
+            echo "windows_runner=${{ github.event.inputs.windows_runner }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "targets=full" >> "$GITHUB_OUTPUT"
+            echo "windows_runner=self-hosted" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-linux-x86_64:
+    needs: prepare
+    if: needs.prepare.result == 'success' && (needs.prepare.outputs.targets == 'full')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install build deps (Vulkan)
+        run: |
+          set -euo pipefail
+          apt_retry() {
+            local n=0 max=5 delay=20
+            until sudo "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then
+                echo "apt command failed after ${max} attempts: $*" >&2
+                return 1
+              fi
+              echo "==> apt failed (attempt ${n}/${max}), retrying in ${delay}s: $*"
+              sudo rm -rf /var/lib/apt/lists/*
+              sleep "$delay"
+              delay=$((delay + 15))
+            done
+          }
+          apt_retry apt-get update
+          apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget glslc \
+            libvulkan-dev spirv-headers libshaderc-dev spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
+      - name: Install CUDA
+        id: cuda
+        uses: mjun0812/setup-cuda@v1
+        with:
+          version: '12.6'
+          method: auto
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-x86_64-gpu
+          cache-targets: true
+          cache-workspace-crates: true
+      - name: Build + package
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
+          CMAKE_PREFIX_PATH: /usr
+          Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          export PATH="${CUDA_PATH}/bin:$PATH"
+          chmod +x scripts/build-release.sh scripts/bundle-release-libs.sh scripts/prune-cargo-target.sh
+          ./scripts/build-release.sh x86_64-unknown-linux-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/scalattice-agent-x86_64-unknown-linux-gnu.tar.gz
+
+  build-aarch64:
+    needs: prepare
+    if: needs.prepare.result == 'success' && (needs.prepare.outputs.targets == 'aarch64-only' || needs.prepare.outputs.targets == 'full')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
@@ -99,7 +218,8 @@ jobs:
           path: dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz
 
   build-macos:
-    if: inputs.targets == 'macos-only' || inputs.targets == 'full'
+    needs: prepare
+    if: needs.prepare.result == 'success' && (needs.prepare.outputs.targets == 'macos-only' || needs.prepare.outputs.targets == 'full')
     runs-on: macos-14
     timeout-minutes: 120
     steps:
@@ -109,6 +229,8 @@ jobs:
           echo "uname=$(uname -sm)"
           test "$(uname -m)" = "arm64"
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -117,14 +239,6 @@ jobs:
           shared-key: release-macos-metal
           cache-targets: true
           cache-workspace-crates: true
-      - name: Sync Cargo.toml to release tag
-        env:
-          SCALATTICE_VERSION: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          ver="${SCALATTICE_VERSION#v}"
-          sed -i.bak "s/^version = \".*\"/version = \"${ver}\"/" Cargo.toml
-          rm -f Cargo.toml.bak
       - name: Build Metal (arm64 only)
         env:
           CARGO_INCREMENTAL: "0"
@@ -176,24 +290,28 @@ jobs:
           path: dist/scalattice-agent-aarch64-apple-darwin.tar.gz
 
   build-windows-self-hosted:
+    needs: prepare
     if: |
-      (inputs.targets == 'windows-only' || inputs.targets == 'full') &&
-      inputs.windows_runner == 'self-hosted'
+      needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.targets == 'windows-only' || needs.prepare.outputs.targets == 'full') &&
+      needs.prepare.outputs.windows_runner == 'self-hosted'
     runs-on: [self-hosted, Windows, X64, scalattice-release]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - name: Prepare build environment
         shell: cmd
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-windows-ci.ps1
       - name: Sync Cargo.toml to release tag
         shell: cmd
         env:
-          SCALATTICE_VERSION: ${{ inputs.tag }}
+          SCALATTICE_VERSION: ${{ needs.prepare.outputs.tag }}
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-cargo-version.ps1
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-self-hosted-v5-${{ inputs.tag }}
+          shared-key: release-windows-self-hosted-v5-${{ needs.prepare.outputs.tag }}
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -206,7 +324,7 @@ jobs:
         shell: cmd
         env:
           CARGO_INCREMENTAL: "0"
-          SCALATTICE_VERSION: ${{ inputs.tag }}
+          SCALATTICE_VERSION: ${{ needs.prepare.outputs.tag }}
           AZURE_TENANT_ID: 5d902829-56a2-41e5-812d-a3ec3a502f3d
           AZURE_CLIENT_ID: 0c6c6d06-09c9-4da3-a72c-516eecde1b5e
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -222,18 +340,22 @@ jobs:
             dist/ScalatticeAgentSetup-x86_64.exe
 
   build-windows-github-hosted:
+    needs: prepare
     if: |
-      (inputs.targets == 'windows-only' || inputs.targets == 'full') &&
-      inputs.windows_runner == 'github-hosted'
+      needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.targets == 'windows-only' || needs.prepare.outputs.targets == 'full') &&
+      needs.prepare.outputs.windows_runner == 'github-hosted'
     runs-on: windows-2022
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Sync Cargo.toml to release tag
         shell: cmd
         env:
-          SCALATTICE_VERSION: ${{ inputs.tag }}
+          SCALATTICE_VERSION: ${{ needs.prepare.outputs.tag }}
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-cargo-version.ps1
       - uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda
@@ -244,7 +366,7 @@ jobs:
         run: choco install innosetup -y --no-progress
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-gpu-v5-${{ inputs.tag }}
+          shared-key: release-windows-gpu-v5-${{ needs.prepare.outputs.tag }}
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -259,7 +381,7 @@ jobs:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda_path }}
           CARGO_INCREMENTAL: "0"
           CARGO_BUILD_JOBS: "4"
-          SCALATTICE_VERSION: ${{ inputs.tag }}
+          SCALATTICE_VERSION: ${{ needs.prepare.outputs.tag }}
           AZURE_TENANT_ID: 5d902829-56a2-41e5-812d-a3ec3a502f3d
           AZURE_CLIENT_ID: 0c6c6d06-09c9-4da3-a72c-516eecde1b5e
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -274,18 +396,26 @@ jobs:
             dist/ScalatticeAgentSetup-x86_64.exe
 
   upload:
-    needs: [build-aarch64, build-macos, build-windows-self-hosted, build-windows-github-hosted]
+    needs:
+      - prepare
+      - build-linux-x86_64
+      - build-aarch64
+      - build-macos
+      - build-windows-self-hosted
+      - build-windows-github-hosted
     if: |
       always() && !cancelled() &&
+      needs.prepare.result == 'success' &&
       (
-        (inputs.targets == 'windows-only' &&
+        (needs.prepare.outputs.targets == 'windows-only' &&
           (needs.build-windows-self-hosted.result == 'success' ||
            needs.build-windows-github-hosted.result == 'success')) ||
-        (inputs.targets == 'aarch64-only' &&
+        (needs.prepare.outputs.targets == 'aarch64-only' &&
           needs.build-aarch64.result == 'success') ||
-        (inputs.targets == 'macos-only' &&
+        (needs.prepare.outputs.targets == 'macos-only' &&
           needs.build-macos.result == 'success') ||
-        (inputs.targets == 'full' &&
+        (needs.prepare.outputs.targets == 'full' &&
+          needs.build-linux-x86_64.result == 'success' &&
           needs.build-aarch64.result == 'success' &&
           needs.build-macos.result == 'success' &&
           (needs.build-windows-self-hosted.result == 'success' ||
@@ -294,6 +424,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -303,7 +435,7 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail

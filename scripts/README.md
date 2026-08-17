@@ -33,7 +33,8 @@ Linux build host                       Windows (self-hosted runner)
 ```
 
 **`release.sh --dev`** — Linux x86_64 here + Windows on your runner (skip aarch64 Linux and macOS).  
-**`release.sh`** — same + aarch64 Linux on GitHub `ubuntu-24.04-arm` + macOS Metal on `macos-14`.
+**`release.sh`** — same + aarch64 Linux on GitHub `ubuntu-24.04-arm` + macOS Metal on `macos-14`.  
+Preferred: merge private `development` → `production` (see [docs/BRANCHES.md](../docs/BRANCHES.md)); CI builds every platform including Linux x86_64.
 
 Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-hosted-windows`, `--no-push`.
 
@@ -131,4 +132,5 @@ gh run watch
 |----------|--------|
 | Linux x86_64 | `scalattice-agent-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux aarch64 | `scalattice-agent-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `scalattice-agent-aarch64-apple-darwin.tar.gz` |
 | Windows | `ScalatticeAgentSetup-x86_64.exe`, `scalattice-agent-x86_64-pc-windows-msvc.zip` |
