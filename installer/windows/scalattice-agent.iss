@@ -105,12 +105,15 @@ var
   ShowModelsPage: Boolean;
   ShowDevicesPage: Boolean;
   IsSilentUpdate: Boolean;
+  UninstallPurgeModels: Boolean;
   ResolvedDriverUrl: String;
   ResolvedGpuName: String;
   ResolvedDriverVersion: String;
   DriverLookupDone: Boolean;
   InventoryNvidiaPresent: Boolean;
   InventoryNvidiaSmiOk: Boolean;
+
+procedure ExecAgent(const AppDir, Params: String; var ResultCode: Integer); forward;
 
 
 function GetDirSize(const Dir: string; var Size: Int64): Boolean;
@@ -283,20 +286,53 @@ end;
 
 procedure WipeScalatticeUserData;
 begin
-  { Full wipe: models, cache, config, AppData install tree. }
-  DelTree(ExpandConstant('{%USERPROFILE}\.cache\scalattice'), True, True, True);
+  { Always wipe config, logs, and the AppData install tree. Models only if asked. }
+  if UninstallPurgeModels then
+    DelTree(ExpandConstant('{%USERPROFILE}\.cache\scalattice'), True, True, True);
   DelTree(ExpandConstant('{%USERPROFILE}\.config\scalattice'), True, True, True);
   DelTree(ExpandConstant('{localappdata}\Scalattice'), True, True, True);
   RemoveScalatticeStartupShortcuts;
 end;
 
+function UninstallPurgeModelsCheck: Boolean;
+begin
+  Result := UninstallPurgeModels;
+end;
+
 function InitializeUninstall(): Boolean;
 var
   ResultCode: Integer;
+  Prompt: String;
+  SizeLabel: String;
+  UninstallArgs: String;
 begin
-  { Notify Scalattice Cloud while the token/config still exist, then stop runtime. }
-  Exec(ExpandConstant('{app}\scalattice-agent.exe'), 'notify-uninstall',
-    ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  LibDir := ExpandConstant('{localappdata}\Scalattice\lib');
+  ModelsCacheDir := ExpandConstant('{%USERPROFILE}\.cache\scalattice\models');
+  ModelsCacheBytes := 0;
+  UninstallPurgeModels := False;
+  if DirExists(ModelsCacheDir) then
+    GetDirSize(ModelsCacheDir, ModelsCacheBytes);
+
+  if UninstallSilent then
+    UninstallPurgeModels := ExpandConstant('{param:PURGE|0}') = '1'
+  else if ModelsCacheBytes > 0 then
+  begin
+    SizeLabel := FormatCacheSize(ModelsCacheBytes);
+    Prompt :=
+      'Remove downloaded models from this PC (' + SizeLabel + ')?' + #13#10#13#10 +
+      'Yes - delete the model files. They will download again if you reinstall.' + #13#10 +
+      'No - keep the models. Logs, settings, and the agent are still removed.';
+    UninstallPurgeModels := MsgBox(Prompt, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+  end;
+
+  { Notify Scalattice Cloud while the token/config still exist, then stop runtime.
+    Use ExecAgent so CUDA lib PATH is set; bare .exe often fails to start. }
+  ExecAgent(ExpandConstant('{app}'), 'notify-uninstall', ResultCode);
+  if UninstallPurgeModels then
+    UninstallArgs := 'uninstall --yes --purge'
+  else
+    UninstallArgs := 'uninstall --yes';
+  ExecAgent(ExpandConstant('{app}'), UninstallArgs, ResultCode);
   { Kill agent/tray and clear Startup stubs BEFORE files are deleted, otherwise
     reboot shows "Can not find script file ... launch-*.vbs". }
   StopScalatticeRuntime;
@@ -1021,17 +1057,11 @@ begin
   end;
 end;
 
-[UninstallRun]
-; Prefer the exe directly so CUDA checks in scalattice-run.cmd cannot block cleanup.
-; --purge removes models/cache; Startup/tasks are cleared in InitializeUninstall + agent uninstall.
-Filename: "{app}\scalattice-agent.exe"; Parameters: "uninstall --yes --purge"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "AgentUninstallPurge"
-Filename: "{app}\scalattice-run.cmd"; Parameters: "uninstall --yes --purge"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "AgentUninstallPurgeCmd"
-
 [UninstallDelete]
 Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgent.vbs"
 Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgentTray.vbs"
 Type: filesandordirs; Name: "{localappdata}\Scalattice"
-Type: filesandordirs; Name: "{%USERPROFILE}\.cache\scalattice"
+Type: filesandordirs; Name: "{%USERPROFILE}\.cache\scalattice"; Check: UninstallPurgeModelsCheck
 Type: filesandordirs; Name: "{%USERPROFILE}\.config\scalattice"
 Type: files; Name: "{app}\run-background.cmd"
 Type: files; Name: "{app}\tray.pid"

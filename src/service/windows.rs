@@ -629,6 +629,7 @@ set \"PATH=%INSTALL%;%LIB%;%PATH%\"\r\n\
 cd /d \"%INSTALL%\"\r\n\
 \r\n\
 if /I \"%~1\"==\"uninstall\" goto :RunAgent\r\n\
+if /I \"%~1\"==\"notify-uninstall\" goto :RunAgent\r\n\
 if /I \"%~1\"==\"set-token\" goto :RunAgent\r\n\
 \r\n\
 call :CheckCudaRuntime\r\n\

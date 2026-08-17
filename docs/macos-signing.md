@@ -2,7 +2,7 @@
 
 Metal llama.cpp is built on GitHub-hosted `macos-14` (Apple Silicon). Intel Macs are not supported. CI reads these repository secrets; if they are missing the macOS app/dmg is still uploaded **unsigned**.
 
-CI produces `ScalatticeAgentSetup-aarch64.dmg` (drag the app to Applications) and the `aarch64-apple-darwin` tarball.
+CI produces `ScalatticeAgentSetup-aarch64.dmg` (drag the app to Applications) and the `aarch64-apple-darwin` tarball. The macOS job waits up to 4 hours for Apple notarization (`notarytool --wait`).
 
 Put them on the repo: **Settings → Secrets and variables → Actions → New repository secret**.
 

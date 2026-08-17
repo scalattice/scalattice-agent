@@ -43,7 +43,9 @@ After install, a Scalattice icon stays in the Windows notification area (system 
 - Token change
 - Live log tail from the background agent
 
-Uninstall via Windows Settings → Apps, or:
+Uninstall via Windows Settings → Apps. The wizard asks whether to delete downloaded models; logs and settings are always removed.
+
+From a terminal:
 
 ```text
 scalattice-agent uninstall --yes

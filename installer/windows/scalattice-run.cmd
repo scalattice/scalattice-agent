@@ -8,6 +8,7 @@ cd /d "%INSTALL%"
 
 rem Uninstall / set-token must run even when CUDA DLLs are missing or locked.
 if /I "%~1"=="uninstall" goto :RunAgent
+if /I "%~1"=="notify-uninstall" goto :RunAgent
 if /I "%~1"=="set-token" goto :RunAgent
 
 call :CheckCudaRuntime
