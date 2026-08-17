@@ -5,6 +5,7 @@ use crate::paths::{
 };
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
@@ -268,7 +269,7 @@ fn write_file_replace(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
-pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
+pub fn uninstall_agent(mut opts: UninstallOptions) -> Result<()> {
     let install = install_dir()?;
     let lib = lib_dir()?;
     let config = config_dir()?;
@@ -331,11 +332,6 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         }
     }
 
-    if opts.purge_models {
-        targets.push(models.clone());
-        targets.push(cache_root.clone());
-    }
-
     if !opts.yes {
         println!("This will remove Scalattice agent from this machine:");
         if background_service_available() {
@@ -344,13 +340,39 @@ pub fn uninstall_agent(opts: &UninstallOptions) -> Result<()> {
         for path in &targets {
             println!("  - {}", path.display());
         }
-        if !opts.purge_models {
-            println!(
-                "  (model weights in {} are kept. Add --purge to delete them)",
-                models.display()
-            );
+        if std::io::stdin().is_terminal() {
+            if models.is_dir() && !opts.purge_models {
+                print!(
+                    "Also delete downloaded models in {}? [y/N] ",
+                    models.display()
+                );
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let answer = line.trim().to_ascii_lowercase();
+                opts.purge_models = answer == "y" || answer == "yes";
+            }
+            print!("Type yes to uninstall: ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if !line.trim().eq_ignore_ascii_case("yes") {
+                bail!("Uninstall cancelled.");
+            }
+        } else {
+            if !opts.purge_models {
+                println!(
+                    "  (model weights in {} are kept. Add --purge to delete them)",
+                    models.display()
+                );
+            }
+            bail!("Re-run with --yes to confirm: scalattice-agent uninstall --yes");
         }
-        bail!("Re-run with --yes to confirm: scalattice-agent uninstall --yes");
+    }
+
+    if opts.purge_models {
+        targets.push(models.clone());
+        targets.push(cache_root.clone());
     }
 
     // Tell Scalattice Cloud this machine is going away (best-effort, before wipe).

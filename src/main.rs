@@ -275,7 +275,7 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
             let _ = update::maybe_sync_auto_update_timer();
         }
         Some(Commands::Uninstall { yes, purge }) => {
-            service::uninstall_agent(&service::UninstallOptions {
+            service::uninstall_agent(service::UninstallOptions {
                 yes,
                 purge_models: purge,
             })?;

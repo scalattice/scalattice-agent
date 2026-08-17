@@ -51,11 +51,15 @@ Background mode uses a LaunchAgent. Stay signed in (or enable auto-login) so lau
 
 ### Uninstall
 
+On Windows, use Settings → Apps. The wizard asks whether to delete downloaded models; logs and settings are always removed.
+
+On Linux and macOS:
+
 ```bash
-scalattice-agent uninstall --yes
+scalattice-agent uninstall
 ```
 
-Add `--purge` to also delete cached model weights.
+That prompts to keep or delete model weights, then asks you to type `yes`. Use `--yes` to skip the confirmation (models are kept) and `--purge` to delete models too.
 
 Releases are self-contained binaries (plus bundled runtime libraries where allowed). You can also build from source with Rust/Cargo.
 

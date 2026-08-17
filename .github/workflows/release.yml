@@ -213,7 +213,7 @@ jobs:
     needs: prepare
     if: needs.prepare.result == 'success' && (needs.prepare.outputs.targets == 'macos-only' || needs.prepare.outputs.targets == 'full')
     runs-on: macos-14
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - name: Require Apple Silicon
         run: |
