@@ -7,7 +7,7 @@ Put them on the repo: **Settings → Secrets and variables → Actions → New r
 | Secret | Where it comes from |
 |--------|---------------------|
 | `APPLE_TEAM_ID` | [developer.apple.com/account](https://developer.apple.com/account) → Membership → Team ID |
-| `APPLE_SIGNING_IDENTITY` | Exact cert name, e.g. `Developer ID Application: Robottik Ltd (TEAMID)` |
+| `APPLE_SIGNING_IDENTITY` | Exact cert name, e.g. `Developer ID Application: Robottik LTD (TEAMID)` |
 | `APPLE_DEVELOPER_ID_P12_BASE64` | Base64 of the Developer ID Application `.p12` (`base64 -w0 developer-id.p12`) |
 | `APPLE_P12_PASSWORD` | Password you set when exporting the `.p12` |
 | `APPLE_API_KEY_P8` | Full text of `AuthKey_XXXXXXXXXX.p8` |
