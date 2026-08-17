@@ -1,6 +1,6 @@
 name: Release
 
-# production: merge from development creates a GitHub release and builds every platform.
+# production: a merge (or push) onto this branch tags a release and builds every platform.
 # Linux x86_64 CUDA is built here (no local build host required).
 # Windows uses the self-hosted scalattice-release runner by default.
 # macOS is GitHub-hosted macos-14 (Apple Silicon). Unsigned if Apple secrets are missing.
@@ -29,10 +29,8 @@ on:
         options:
           - self-hosted
           - github-hosted
+  # One event per merge: a GitHub PR into production always produces this push.
   push:
-    branches: [production]
-  pull_request:
-    types: [closed]
     branches: [production]
 
 concurrency:
@@ -46,13 +44,7 @@ jobs:
   prepare:
     if: |
       github.repository == 'scalattice/scalattice-agent' &&
-      (
-        github.event_name == 'workflow_dispatch' ||
-        github.event_name == 'push' ||
-        (github.event_name == 'pull_request' &&
-          github.event.pull_request.merged == true &&
-          github.event.pull_request.head.ref == 'development')
-      ) &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'push') &&
       (
         github.event_name != 'push' ||
         (
