@@ -264,22 +264,34 @@ jobs:
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           KEYCHAIN="${RUNNER_TEMP}/scalattice-signing.keychain-db"
           P12="${RUNNER_TEMP}/developer-id.p12"
+          G2="${RUNNER_TEMP}/DeveloperIDG2CA.cer"
           echo "${APPLE_DEVELOPER_ID_P12_BASE64}" | tr -d '\n\r ' | base64 -d > "$P12"
           echo "PKCS12 size: $(wc -c < "$P12") bytes"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Keep login/System in the search list. Replacing it with only the temp
+          # keychain makes Developer ID identities invalid (missing Apple G2 CA).
+          EXISTING_KEYCHAINS="$(security list-keychain -d user | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | tr '\n' ' ')"
+          # shellcheck disable=SC2086
+          security list-keychain -d user -s "$KEYCHAIN" $EXISTING_KEYCHAINS
+          security default-keychain -d user -s "$KEYCHAIN"
+          # Cert is issued by Developer ID Certification Authority G2.
+          curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "$G2"
+          security import "$G2" -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security || true
           # OpenSSL 3 default .p12 (SHA-256 MAC) fails here with "wrong password?".
           # Re-export with `openssl pkcs12 -export -legacy` — see docs/macos-signing.md.
-          security import "$P12" -k "$KEYCHAIN" -P "${APPLE_P12_PASSWORD:-}" -A \
+          security import "$P12" -k "$KEYCHAIN" -P "${APPLE_P12_PASSWORD:-}" -A -f pkcs12 \
             -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productsign
-          security list-keychain -d user -s "$KEYCHAIN"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "==> codesigning identities:"
+          security find-identity -v -p codesigning
+          export APPLE_KEYCHAIN="$KEYCHAIN"
           ./scripts/sign-macos.sh "dist/Scalattice Agent.app"
           ./scripts/package-macos.sh --dmg-from-app
           ./scripts/sign-macos.sh "dist/Scalattice Agent.app" dist/ScalatticeAgentSetup-aarch64.dmg
           security delete-keychain "$KEYCHAIN" || true
-          rm -f "$P12"
+          rm -f "$P12" "$G2"
       - name: Package
         run: |
           set -euo pipefail
