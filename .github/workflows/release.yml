@@ -458,7 +458,7 @@ jobs:
             echo "Release ${TAG} not found on ${GH_REPO}." >&2
             exit 1
           }
-          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' \))
+          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.dmg' \))
           [[ ${#files[@]} -gt 0 ]] || { echo "No release archives built." >&2; exit 1; }
           for f in "${files[@]}"; do
             echo "Uploading $(basename "$f")"
