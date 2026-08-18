@@ -15,6 +15,6 @@ pub use health::{
 };
 pub use storage::{
     list_cached_runtime_models, list_model_disk_status, models_cache_disk_gb, models_dir,
-    purge_incomplete_model_weights, resolve_model_gguf, ModelDiskStatus,
+    purge_incomplete_model_weights, resolve_mmproj, resolve_model_gguf, ModelDiskStatus,
 };
 pub use sync::spawn_catalog_sync;

@@ -16,6 +16,7 @@ use crate::compute_pool::VirtualCard;
 use crate::specs::{detect_ram_gb, detect_ram_used_gb};
 use anyhow::{Context, Result};
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::mtmd::MtmdContext;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -26,6 +27,7 @@ use super::embedded::{
     backend, load_candidate_count, load_candidate_label, load_cpu_mmap_model, load_model_for_pool,
     load_model_for_pool_starting_at,
 };
+use super::vision::init_mtmd_for_model;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// Do not keep a RAM duplicate of a large offload model that is also on the GPU.
@@ -33,6 +35,7 @@ const DROP_SHELF_WHEN_PROMOTING_BYTES: u64 = 3 * GIB;
 
 struct CachedModel {
     model: LlamaModel,
+    mtmd: Option<MtmdContext>,
     /// Index into [`load_param_candidates`] that produced this resident.
     load_tier: usize,
 }
@@ -240,7 +243,14 @@ fn is_vram_pressure(err: &anyhow::Error) -> bool {
 }
 
 fn insert_loaded(inner: &mut CacheInner, key: String, model: LlamaModel, load_tier: usize) {
-    inner.gpu.insert(key, CachedModel { model, load_tier });
+    inner.gpu.insert(
+        key,
+        CachedModel {
+            model,
+            mtmd: None,
+            load_tier,
+        },
+    );
 }
 
 fn ensure_loaded(
@@ -302,6 +312,16 @@ pub fn with_loaded_model_timed<R>(
     pool: &VirtualCard,
     mut f: impl FnMut(&LlamaModel) -> Result<R>,
 ) -> Result<(R, u64)> {
+    with_loaded_weights(model_path, pool, false, |model, _mtmd| f(model))
+}
+
+/// Same cache lookup as [`with_loaded_model_timed`], optionally initializing mmproj.
+pub fn with_loaded_weights<R>(
+    model_path: &Path,
+    pool: &VirtualCard,
+    need_vision: bool,
+    mut f: impl FnMut(&LlamaModel, Option<&MtmdContext>) -> Result<R>,
+) -> Result<(R, u64)> {
     let backend = backend()?;
     let key = cache_key(model_path, pool);
     let mut guard = cache()
@@ -329,14 +349,17 @@ pub fn with_loaded_model_timed<R>(
         .context("model missing immediately after cache insert")?
         .load_tier;
 
+    if need_vision {
+        ensure_mtmd(&mut guard, model_path, pool, &key)?;
+    }
+
     loop {
         let out = {
-            let model = &guard
+            let cached = guard
                 .gpu
                 .get(&key)
-                .context("model missing immediately after cache insert")?
-                .model;
-            f(model)
+                .context("model missing immediately after cache insert")?;
+            f(&cached.model, cached.mtmd.as_ref())
         };
 
         match out {
@@ -354,10 +377,40 @@ pub fn with_loaded_model_timed<R>(
                     ensure_loaded(&mut guard, backend, model_path, pool, &key, next_tier)?;
                 model_load_ms = model_load_ms.saturating_add(ms);
                 load_tier = new_tier;
+                if need_vision {
+                    ensure_mtmd(&mut guard, model_path, pool, &key)?;
+                }
             }
             Err(err) => return Err(err),
         }
     }
+}
+
+fn ensure_mtmd(
+    inner: &mut CacheInner,
+    model_path: &Path,
+    pool: &VirtualCard,
+    key: &str,
+) -> Result<()> {
+    if inner
+        .gpu
+        .get(key)
+        .map(|c| c.mtmd.is_some())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let mtmd = {
+        let cached = inner
+            .gpu
+            .get(key)
+            .context("model missing while loading mmproj")?;
+        init_mtmd_for_model(&cached.model, model_path, pool)?
+    };
+    if let Some(cached) = inner.gpu.get_mut(key) {
+        cached.mtmd = Some(mtmd);
+    }
+    Ok(())
 }
 
 pub fn evict_all() {

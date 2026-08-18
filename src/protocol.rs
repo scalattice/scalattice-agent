@@ -230,10 +230,121 @@ pub struct InvokeProgressMessage {
     pub pct: Option<f32>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatImage {
+    #[serde(default)]
+    pub mime: String,
+    /// Raw base64 (no `data:` prefix). Router inlines http(s) URLs before invoke.
+    #[serde(default)]
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ChatImage>,
+}
+
+#[derive(Deserialize)]
+struct ChatMessageWire {
+    role: String,
+    #[serde(default)]
+    content: serde_json::Value,
+    #[serde(default)]
+    images: Vec<ChatImage>,
+}
+
+impl From<ChatMessageWire> for ChatMessage {
+    fn from(wire: ChatMessageWire) -> Self {
+        let mut images = wire.images;
+        let content = flatten_message_content(wire.content, &mut images);
+        Self {
+            role: wire.role,
+            content,
+            images,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ChatMessageWire::deserialize(deserializer).map(Self::from)
+    }
+}
+
+fn flatten_message_content(value: serde_json::Value, images: &mut Vec<ChatImage>) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text,
+        serde_json::Value::Array(parts) => {
+            let mut texts = Vec::new();
+            for part in parts {
+                match part.get("type").and_then(|v| v.as_str()).unwrap_or("text") {
+                    "image_url" => {
+                        if let Some(url) = image_url_from_part(&part) {
+                            if let Some(image) = chat_image_from_data_url(&url) {
+                                images.push(image);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                texts.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            texts.join("\n")
+        }
+        other => other.as_str().unwrap_or("").to_string(),
+    }
+}
+
+fn image_url_from_part(part: &serde_json::Value) -> Option<String> {
+    let url = part.get("image_url")?;
+    if let Some(s) = url.as_str() {
+        return Some(s.to_string());
+    }
+    url.get("url")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+pub fn chat_image_from_data_url(url: &str) -> Option<ChatImage> {
+    let trimmed = url.trim();
+    let rest = trimmed.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.to_ascii_lowercase().contains("base64") {
+        return None;
+    }
+    let mime = meta
+        .split(';')
+        .next()
+        .unwrap_or("image/png")
+        .trim()
+        .to_string();
+    Some(ChatImage {
+        mime: if mime.is_empty() {
+            "image/png".into()
+        } else {
+            mime
+        },
+        data: payload.trim().to_string(),
+    })
+}
+
+impl ChatMessage {
+    pub fn has_images(&self) -> bool {
+        self.images.iter().any(|img| !img.data.trim().is_empty())
+    }
+}
+
+pub fn messages_have_images(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(ChatMessage::has_images)
 }
 
 #[derive(Debug, Serialize)]
@@ -368,4 +479,40 @@ pub fn parse_invoke_cancel(data: &[u8]) -> anyhow::Result<InvokeCancelMessage> {
 
 pub fn parse_error(data: &[u8]) -> anyhow::Result<Value> {
     Ok(serde_json::from_slice(data)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_string_content() {
+        let msg: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(msg.content, "hello");
+        assert!(msg.images.is_empty());
+    }
+
+    #[test]
+    fn deserializes_openai_image_parts() {
+        let raw = r#"{
+            "role":"user",
+            "content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aaaa"}}
+            ]
+        }"#;
+        let msg: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.content, "what is this?");
+        assert_eq!(msg.images.len(), 1);
+        assert_eq!(msg.images[0].data, "aaaa");
+        assert_eq!(msg.images[0].mime, "image/png");
+    }
+
+    #[test]
+    fn deserializes_inlined_images_field() {
+        let raw = r#"{"role":"user","content":"look","images":[{"mime":"image/jpeg","data":"bbbb"}]}"#;
+        let msg: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.content, "look");
+        assert_eq!(msg.images[0].data, "bbbb");
+    }
 }

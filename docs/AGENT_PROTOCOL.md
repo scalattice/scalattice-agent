@@ -106,7 +106,14 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
   "id": "request-uuid",
   "modelId": "example-model",
   "runtimeModel": "org/example-runtime",
-  "messages": [{ "role": "user", "content": "Hello" }],
+  "messages": [
+    { "role": "user", "content": "Hello" },
+    {
+      "role": "user",
+      "content": "What is in this picture?",
+      "images": [{ "mime": "image/png", "data": "<base64>" }]
+    }
+  ],
   "stream": true
 }
 ```
