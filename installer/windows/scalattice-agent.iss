@@ -63,6 +63,9 @@ SetupMutex=ScalatticeAgentSetupGlobal
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+ConfirmUninstall=Remove Scalattice Agent from this PC?%n%nThe program, settings, and logs will be removed. Downloaded models are kept unless you already chose to delete them.
+
 [Files]
 ; Extracted to {tmp} at runtime for the Compatible devices wizard page.
 Source: "detect-compute-devices.ps1"; Flags: dontcopy
@@ -106,6 +109,7 @@ var
   ShowDevicesPage: Boolean;
   IsSilentUpdate: Boolean;
   UninstallPurgeModels: Boolean;
+  ModelsShelterDir: String;
   ResolvedDriverUrl: String;
   ResolvedGpuName: String;
   ResolvedDriverVersion: String;
@@ -294,20 +298,48 @@ begin
   RemoveScalatticeStartupShortcuts;
 end;
 
-function UninstallPurgeModelsCheck: Boolean;
+{ Inno records [UninstallDelete] at install time. An older installer baked in
+  "delete .cache\scalattice" with no keep-models check, so ConfirmUninstall
+  would wipe weights even after the user chose No. Move them aside first. }
+procedure ShelterModelsIfKeeping;
+var
+  ResultCode: Integer;
 begin
-  Result := UninstallPurgeModels;
+  if UninstallPurgeModels then
+    Exit;
+  if (ModelsCacheDir = '') or (not DirExists(ModelsCacheDir)) then
+    Exit;
+  ModelsShelterDir := ExpandConstant('{%USERPROFILE}\.cache\scalattice-keep');
+  if DirExists(ModelsShelterDir) then
+    DelTree(ModelsShelterDir, True, True, True);
+  Exec('cmd.exe', '/c move /Y "' + ModelsCacheDir + '" "' + ModelsShelterDir + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure RestoreShelteredModels;
+var
+  ResultCode: Integer;
+  CacheRoot: String;
+begin
+  if UninstallPurgeModels then
+    Exit;
+  if (ModelsShelterDir = '') or (not DirExists(ModelsShelterDir)) then
+    Exit;
+  CacheRoot := ExpandConstant('{%USERPROFILE}\.cache\scalattice');
+  if not DirExists(CacheRoot) then
+    ForceDirectories(CacheRoot);
+  if DirExists(ModelsCacheDir) then
+    Exit;
+  Exec('cmd.exe', '/c move /Y "' + ModelsShelterDir + '" "' + ModelsCacheDir + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 function InitializeUninstall(): Boolean;
 var
-  ResultCode: Integer;
   Prompt: String;
   SizeLabel: String;
-  UninstallArgs: String;
 begin
   LibDir := ExpandConstant('{localappdata}\Scalattice\lib');
   ModelsCacheDir := ExpandConstant('{%USERPROFILE}\.cache\scalattice\models');
+  ModelsShelterDir := '';
   ModelsCacheBytes := 0;
   UninstallPurgeModels := False;
   if DirExists(ModelsCacheDir) then
@@ -320,32 +352,41 @@ begin
     SizeLabel := FormatCacheSize(ModelsCacheBytes);
     Prompt :=
       'Remove downloaded models from this PC (' + SizeLabel + ')?' + #13#10#13#10 +
-      'Yes - delete the model files. They will download again if you reinstall.' + #13#10 +
-      'No - keep the models. Logs, settings, and the agent are still removed.';
+      'Yes - delete the model files.' + #13#10 +
+      'No - keep the models.';
     UninstallPurgeModels := MsgBox(Prompt, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
   end;
 
-  { Notify Scalattice Cloud while the token/config still exist, then stop runtime.
-    Use ExecAgent so CUDA lib PATH is set; bare .exe often fails to start. }
-  ExecAgent(ExpandConstant('{app}'), 'notify-uninstall', ResultCode);
-  if UninstallPurgeModels then
-    UninstallArgs := 'uninstall --yes --purge'
-  else
-    UninstallArgs := 'uninstall --yes';
-  ExecAgent(ExpandConstant('{app}'), UninstallArgs, ResultCode);
-  { Kill agent/tray and clear Startup stubs BEFORE files are deleted, otherwise
-    reboot shows "Can not find script file ... launch-*.vbs". }
-  StopScalatticeRuntime;
-  RemoveScalatticeStartupShortcuts;
+  { Do not wipe yet. Inno still shows ConfirmUninstall; Cancel must leave models and the agent. }
   Result := True;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+  UninstallArgs: String;
 begin
+  if CurUninstallStep = usUninstall then
+  begin
+    ShelterModelsIfKeeping;
+    { Notify Scalattice Cloud while the token/config still exist, then stop runtime.
+      Use ExecAgent so CUDA lib PATH is set; bare .exe often fails to start. }
+    ExecAgent(ExpandConstant('{app}'), 'notify-uninstall', ResultCode);
+    if UninstallPurgeModels then
+      UninstallArgs := 'uninstall --yes --purge'
+    else
+      UninstallArgs := 'uninstall --yes';
+    ExecAgent(ExpandConstant('{app}'), UninstallArgs, ResultCode);
+    { Kill agent/tray and clear Startup stubs BEFORE files are deleted, otherwise
+      reboot shows "Can not find script file ... launch-*.vbs". }
+    StopScalatticeRuntime;
+    RemoveScalatticeStartupShortcuts;
+  end;
   if CurUninstallStep = usPostUninstall then
   begin
     StopScalatticeRuntime;
     WipeScalatticeUserData;
+    RestoreShelteredModels;
   end;
 end;
 
@@ -1061,7 +1102,6 @@ end;
 Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgent.vbs"
 Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\ScalatticeAgentTray.vbs"
 Type: filesandordirs; Name: "{localappdata}\Scalattice"
-Type: filesandordirs; Name: "{%USERPROFILE}\.cache\scalattice"; Check: UninstallPurgeModelsCheck
 Type: filesandordirs; Name: "{%USERPROFILE}\.config\scalattice"
 Type: files; Name: "{app}\run-background.cmd"
 Type: files; Name: "{app}\tray.pid"
