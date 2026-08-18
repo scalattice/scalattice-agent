@@ -244,16 +244,6 @@ impl SessionState {
             return;
         }
         let token = self.effective_hf_token(server_token);
-        let can_mirror = pending.iter().any(|m| {
-            m.weights
-                .as_ref()
-                .and_then(|w| w.mirror_url.as_deref())
-                .is_some_and(|url| !url.trim().is_empty())
-        });
-        if token.is_none() && !can_mirror {
-            warn!("model downloads are not configured on the server yet (contact Scalattice support)");
-            return;
-        }
         self.last_sync_token = token.clone();
         if let Some(token) = token.clone() {
             self.hf_token = Some(token);
