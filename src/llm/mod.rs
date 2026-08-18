@@ -4,6 +4,7 @@ mod model_cache;
 mod progress;
 mod prompt;
 mod split;
+mod vision;
 
 pub use embedded::{generate, generate_with_callback, init_backend, GenerateConfig, GenerateTimings};
 pub use model_cache::{evict_all, evict_all_for_path, preload_model};

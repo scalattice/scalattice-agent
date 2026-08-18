@@ -7,7 +7,7 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 pub fn prepare_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = messages
         .iter()
-        .filter(|m| !m.content.trim().is_empty())
+        .filter(|m| !m.content.trim().is_empty() || m.has_images())
         .cloned()
         .collect();
     let has_system = out.iter().any(|m| m.role == "system");
@@ -17,6 +17,7 @@ pub fn prepare_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             ChatMessage {
                 role: "system".to_string(),
                 content: DEFAULT_SYSTEM_PROMPT.to_string(),
+                images: Vec::new(),
             },
         );
     }
@@ -29,7 +30,8 @@ pub fn build_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result
         .iter()
         .map(|m| {
             let role = normalize_role(&m.role);
-            LlamaChatMessage::new(role, m.content.clone())
+            let content = super::vision::content_with_media_markers(m);
+            LlamaChatMessage::new(role, content)
         })
         .collect::<Result<_, _>>()
         .context("build llama chat messages")?;
@@ -68,7 +70,10 @@ fn messages_to_prompt_fallback(messages: &[ChatMessage]) -> String {
             "assistant" => "Assistant",
             _ => "User",
         };
-        out.push_str(&format!("{role}: {}\n", message.content));
+        out.push_str(&format!(
+            "{role}: {}\n",
+            super::vision::content_with_media_markers(message)
+        ));
     }
     out.push_str("Assistant: ");
     out
@@ -83,6 +88,7 @@ mod tests {
         let prepared = prepare_messages(&[ChatMessage {
             role: "user".into(),
             content: "Hi".into(),
+            images: Vec::new(),
         }]);
         assert_eq!(prepared[0].role, "system");
         assert_eq!(prepared[1].content, "Hi");
@@ -97,5 +103,20 @@ mod tests {
             sanitize_completion("deepseek-r1-7b", &raw),
             format!("{OPEN}reason{CLOSE}\nHello there.")
         );
+    }
+
+    #[test]
+    fn keeps_image_only_user_message() {
+        let prepared = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: String::new(),
+            images: vec![crate::protocol::ChatImage {
+                mime: "image/png".into(),
+                data: "aaaa".into(),
+            }],
+        }]);
+        assert_eq!(prepared[1].role, "user");
+        assert!(prepared[1].has_images());
+        assert!(crate::llm::vision::content_with_media_markers(&prepared[1]).contains("<__media__>"));
     }
 }

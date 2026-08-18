@@ -294,6 +294,39 @@ pub fn resolve_model_gguf(runtime_model: &str) -> Option<PathBuf> {
     Some(target_gguf_path(runtime_model, primary))
 }
 
+/// Projector GGUF next to the language weights (`mmproj*.gguf`).
+pub fn resolve_mmproj(model_path: &Path) -> Option<PathBuf> {
+    let dir = model_path.parent()?;
+    let mut found: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if name.contains("mmproj") && name.ends_with(".gguf") && path.is_file() {
+            found.push(path);
+        }
+    }
+    found.sort_by_key(|path| {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if name.contains("f16") || name.contains("f32") {
+            0u8
+        } else if name.contains("q8") {
+            1
+        } else {
+            2
+        }
+    });
+    found.into_iter().next()
+}
+
 pub fn models_cache_disk_gb() -> u32 {
     dir_size_gb(&models_dir())
 }

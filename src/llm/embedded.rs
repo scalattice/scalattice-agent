@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use super::ggml_devices::{metal_ggml_device_indices, vulkan_ggml_device_indices};
 use super::prompt::{build_chat_prompt, sanitize_completion};
+use super::vision::{prefill_vision, prompt_needs_vision};
 
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
 
@@ -107,11 +108,16 @@ pub fn generate_with_callback(
 ) -> Result<GenerateOutput> {
     let total_start = Instant::now();
     let backend = backend()?;
+    let need_vision = prompt_needs_vision(&config.messages);
 
-    let (output, model_load_ms) =
-        super::model_cache::with_loaded_model_timed(&config.model_path, &config.pool, |model| {
+    let (output, model_load_ms) = super::model_cache::with_loaded_weights(
+        &config.model_path,
+        &config.pool,
+        need_vision,
+        |model, mtmd| {
+            let ctx_tokens = if need_vision { 8192 } else { 4096 };
             let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
-                NonZeroU32::new(4096).context("invalid default context size")?,
+                NonZeroU32::new(ctx_tokens).context("invalid default context size")?,
             ));
             super::progress::report("context", 0.0);
             let context_start = Instant::now();
@@ -120,46 +126,74 @@ pub fn generate_with_callback(
                 .context("create llama context")?;
             tracing::info!(
                 elapsed_ms = context_start.elapsed().as_millis() as u64,
+                vision = need_vision,
                 "llama context ready"
             );
             super::progress::report("context", 1.0);
 
             let prefill_start = Instant::now();
             let prompt = build_chat_prompt(model, &config.messages)?;
-            let prompt_tokens = model
-                .str_to_token(&prompt, AddBos::Never)
-                .context("tokenize prompt")?;
-
             let max_tokens = config.max_tokens.max(1).min(8192) as usize;
-            if prompt_tokens.len() + max_tokens > ctx.n_ctx() as usize {
-                anyhow::bail!(
-                    "prompt too long for context window ({} + {} > {})",
-                    prompt_tokens.len(),
-                    max_tokens,
-                    ctx.n_ctx()
-                );
-            }
 
-            let prompt_token_count = prompt_tokens.len() as u32;
-            let tokens = prompt_tokens;
-            let n = tokens.len();
-            const PREFILL_CHUNK: usize = 64;
-            let mut batch = LlamaBatch::new(PREFILL_CHUNK.max(1), 1);
-            let mut i = 0usize;
-            super::progress::report("prefill", 0.0);
-            while i < n {
-                batch.clear();
-                let end = (i + PREFILL_CHUNK).min(n);
-                for pos in i..end {
-                    let want_logits = pos + 1 == n;
-                    batch
-                        .add(tokens[pos], pos as i32, &[0], want_logits)
-                        .context("add prompt token to batch")?;
+            let (prompt_token_count, mut position, mut sample_idx) = if need_vision {
+                let mtmd = mtmd.ok_or_else(|| {
+                    anyhow!("image input requested but mmproj did not initialize")
+                })?;
+                let used_template = model.chat_template(None).is_ok();
+                let (prompt_tokens, next_pos) = prefill_vision(
+                    model,
+                    mtmd,
+                    &ctx,
+                    &prompt,
+                    &config.messages,
+                    !used_template,
+                )?;
+                if prompt_tokens as usize + max_tokens > ctx.n_ctx() as usize {
+                    anyhow::bail!(
+                        "prompt too long for context window ({} + {} > {})",
+                        prompt_tokens,
+                        max_tokens,
+                        ctx.n_ctx()
+                    );
                 }
-                ctx.decode(&mut batch).context("decode prompt")?;
-                super::progress::report("prefill", end as f32 / n.max(1) as f32);
-                i = end;
-            }
+                (prompt_tokens, next_pos, -1i32)
+            } else {
+                let prompt_tokens = model
+                    .str_to_token(&prompt, AddBos::Never)
+                    .context("tokenize prompt")?;
+
+                if prompt_tokens.len() + max_tokens > ctx.n_ctx() as usize {
+                    anyhow::bail!(
+                        "prompt too long for context window ({} + {} > {})",
+                        prompt_tokens.len(),
+                        max_tokens,
+                        ctx.n_ctx()
+                    );
+                }
+
+                let prompt_token_count = prompt_tokens.len() as u32;
+                let tokens = prompt_tokens;
+                let n = tokens.len();
+                const PREFILL_CHUNK: usize = 64;
+                let mut batch = LlamaBatch::new(PREFILL_CHUNK.max(1), 1);
+                let mut i = 0usize;
+                super::progress::report("prefill", 0.0);
+                while i < n {
+                    batch.clear();
+                    let end = (i + PREFILL_CHUNK).min(n);
+                    for pos in i..end {
+                        let want_logits = pos + 1 == n;
+                        batch
+                            .add(tokens[pos], pos as i32, &[0], want_logits)
+                            .context("add prompt token to batch")?;
+                    }
+                    ctx.decode(&mut batch).context("decode prompt")?;
+                    super::progress::report("prefill", end as f32 / n.max(1) as f32);
+                    i = end;
+                }
+                let sample_idx = batch.n_tokens() - 1;
+                (prompt_token_count, n as i32, sample_idx)
+            };
 
             let mut sampler = LlamaSampler::chain_simple([
                 LlamaSampler::dist(0x5CA1A7CE),
@@ -167,14 +201,14 @@ pub fn generate_with_callback(
             ]);
 
             let mut content = String::new();
-            let mut position = n.saturating_sub(1) as i32;
             let mut generated = 0u32;
             let mut prefill_ms = 0u64;
             let mut decode_ms = 0u64;
             let mut first_token = true;
+            let mut batch = LlamaBatch::new(1, 1);
 
             while generated < max_tokens as u32 {
-                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                let token = sampler.sample(&ctx, sample_idx);
                 sampler.accept(token);
 
                 if model.is_eog_token(token) {
@@ -195,12 +229,13 @@ pub fn generate_with_callback(
                 );
 
                 batch.clear();
-                position += 1;
                 batch
                     .add(token, position, &[0], true)
                     .context("add generated token to batch")?;
                 ctx.decode(&mut batch).context("decode generated token")?;
                 decode_ms += decode_piece_start.elapsed().as_millis() as u64;
+                position += 1;
+                sample_idx = batch.n_tokens() - 1;
                 generated += 1;
             }
 
@@ -219,7 +254,8 @@ pub fn generate_with_callback(
                     total_ms: 0,
                 },
             })
-        })?;
+        },
+    )?;
 
     Ok(GenerateOutput {
         content: output.content,
