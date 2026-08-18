@@ -18,6 +18,8 @@ pub struct ModelWeights {
     pub companion_filenames: Vec<String>,
     #[serde(default)]
     pub revision: String,
+    #[serde(rename = "downloadVia", default)]
+    pub download_via: Option<String>,
     #[serde(rename = "mirrorUrl", default)]
     pub mirror_url: Option<String>,
 }

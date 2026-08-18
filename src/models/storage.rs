@@ -228,6 +228,7 @@ fn write_adopted_manifest(
         // Adopted installs are single-file; companions from a newer catalog may not exist yet.
         "companionFilenames": Vec::<String>::new(),
         "revision": weights.revision,
+        "downloadVia": weights.download_via,
         "mirrorUrl": weights.mirror_url,
     });
     std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&body)?)

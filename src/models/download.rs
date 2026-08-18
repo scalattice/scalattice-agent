@@ -153,6 +153,24 @@ fn mirror_url_for_filename(weights: &ModelWeights, repo_path: &str) -> Option<St
     Some(format!("{prefix}/{basename}"))
 }
 
+fn prefer_scalattice_mirror(weights: &ModelWeights) -> bool {
+    let via = weights
+        .download_via
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let has_mirror = weights
+        .mirror_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty());
+    match via.as_str() {
+        "huggingface" | "hf" => false,
+        "scalattice" | "mirror" | "proxy" => has_mirror,
+        _ => has_mirror,
+    }
+}
+
 fn weights_download_complete(runtime_model: &str, weights: &ModelWeights) -> bool {
     weight_filenames(weights)
         .iter()
@@ -273,6 +291,7 @@ fn write_manifest(runtime_model: &str, weights: &ModelWeights) -> Result<()> {
         "filename": weights.filename,
         "companionFilenames": weights.companion_filenames,
         "revision": weights.revision,
+        "downloadVia": weights.download_via,
         "mirrorUrl": weights.mirror_url,
     });
     let path = dir.join("manifest.json");
@@ -308,7 +327,7 @@ pub async fn download_catalog_model(
         model.runtime_model.as_str()
     };
 
-    if weights.mirror_url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+    if prefer_scalattice_mirror(weights) {
         match download_mirror_gguf(runtime_model, weights, agent_token).await {
             Ok(()) => return Ok(()),
             Err(err) => {
