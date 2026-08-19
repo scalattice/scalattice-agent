@@ -1,5 +1,5 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
-use crate::models::can_host_model;
+use crate::models::{can_host_model, hosting_min_vram_gb};
 use crate::protocol::CatalogModel;
 use tracing::debug;
 
@@ -27,7 +27,7 @@ pub fn pick_placement(
     let idle: std::collections::HashSet<&str> =
         idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
-    let min_vram = crate::models::capacity::hosting_min_vram_gb(model);
+    let min_vram = hosting_min_vram_gb(model);
 
     let mut full_fit: Vec<&ComputeSlot> = plan
         .slots
