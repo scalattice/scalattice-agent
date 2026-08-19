@@ -1,0 +1,50 @@
+name: CI
+
+# Compile gate on PRs — catches Rust errors before production merge / release tagging.
+# Intentionally NOT on the release workflow: cargo check still builds llama.cpp (~15–30m
+# cold) and duplicates the platform build jobs.
+on:
+  pull_request:
+    branches: [production, development]
+  push:
+    branches: [development]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          apt_retry() {
+            local n=0 max=5 delay=20
+            until sudo "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then
+                echo "apt command failed after ${max} attempts: $*" >&2
+                return 1
+              fi
+              echo "==> apt failed (attempt ${n}/${max}), retrying in ${delay}s: $*"
+              sudo rm -rf /var/lib/apt/lists/*
+              sleep "$delay"
+              delay=$((delay + 15))
+            done
+          }
+          apt_retry apt-get update
+          apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-check-gate
+          cache-targets: true
+          cache-workspace-crates: true
+      - name: cargo check
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: cargo check --no-default-features

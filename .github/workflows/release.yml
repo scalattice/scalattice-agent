@@ -35,44 +35,15 @@ on:
 
 concurrency:
   group: release-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  # Compile gate — must pass before prepare creates a tag (avoids orphan v1.1.4x tags on build failure).
-  verify:
-    if: |
-      github.repository == 'scalattice/scalattice-agent' &&
-      (github.event_name == 'workflow_dispatch' || github.event_name == 'push') &&
-      (
-        github.event_name != 'push' ||
-        (
-          !startsWith(github.event.head_commit.message, 'chore(release):') &&
-          !contains(github.event.head_commit.message, '[skip release]')
-        )
-      )
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: production
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install build deps (check only)
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev cmake build-essential pkg-config libvulkan-dev
-      - name: cargo check (Rust compile gate)
-        run: cargo check --no-default-features
-
   prepare:
-    needs: verify
     if: |
       github.repository == 'scalattice/scalattice-agent' &&
-      needs.verify.result == 'success' &&
       (github.event_name == 'workflow_dispatch' || github.event_name == 'push') &&
       (
         github.event_name != 'push' ||
