@@ -40,6 +40,10 @@ pub struct CatalogModel {
     pub weight_size_gb: Option<f64>,
     #[serde(rename = "minVramGb", default)]
     pub min_vram_gb: Option<f64>,
+    #[serde(rename = "minVramGbVision", default)]
+    pub min_vram_gb_vision: Option<f64>,
+    #[serde(rename = "visionModel", default)]
+    pub vision_model: bool,
     #[serde(rename = "minRamGb", default)]
     pub min_ram_gb: Option<f64>,
     #[serde(default)]
@@ -400,6 +404,9 @@ pub struct LogsSubscribeMessage {
     pub kind: String,
     /// subscribe | unsubscribe
     pub action: String,
+    /// When true, include llama.cpp / ggml noise in cloud batches.
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Serialize)]

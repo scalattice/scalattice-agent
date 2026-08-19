@@ -15,6 +15,36 @@ fn gb_ceil(v: Option<f64>) -> u32 {
 /// Default when an older server omits `cpuRamHeadroomGb` on ready.
 pub const DEFAULT_CPU_RAM_HEADROOM_GB: u32 = 2;
 
+const VISION_VRAM_OVERHEAD_GB: u32 = 4;
+
+fn model_is_vision(model: &CatalogModel) -> bool {
+    model.vision_model
+}
+
+pub fn resolve_min_vram_gb_vision(model: &CatalogModel) -> u32 {
+    if !model_is_vision(model) {
+        return gb_ceil(model.min_vram_gb);
+    }
+    if let Some(v) = model.min_vram_gb_vision {
+        if v > 0.0 {
+            return gb_ceil(Some(v));
+        }
+    }
+    let base = gb_ceil(model.min_vram_gb);
+    if base > 0 {
+        return base.saturating_add(VISION_VRAM_OVERHEAD_GB).max(base);
+    }
+    12
+}
+
+/// Minimum accelerator VRAM to host this catalog model on a provider machine.
+pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
+    if model_is_vision(model) {
+        return resolve_min_vram_gb_vision(model);
+    }
+    gb_ceil(model.min_vram_gb)
+}
+
 /// Whether this machine can download and serve a catalog model on its virtual compute card.
 /// `cpu_ram_headroom_gb` comes from the server (`ready.cpuRamHeadroomGb`).
 pub fn can_host_model(
@@ -23,10 +53,18 @@ pub fn can_host_model(
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
 ) -> bool {
-    let min_vram = gb_ceil(model.min_vram_gb);
+    let min_vram = hosting_min_vram_gb(model);
     let min_ram = gb_ceil(model.min_ram_gb);
     let weight_gb = gb_ceil(model.weight_size_gb);
     let ram_needed = weight_gb.saturating_add(cpu_ram_headroom_gb).max(min_ram);
+
+    // Vision catalog rows: require real GPU VRAM (mmproj + image prefill). No CPU-offload loophole.
+    if model_is_vision(model) {
+        if min_vram > 0 && card.total_vram_gb >= min_vram {
+            return ram_gb >= min_ram;
+        }
+        return false;
+    }
 
     // Fits entirely on pooled accelerator VRAM (CUDA and/or Vulkan estimate).
     if min_vram > 0 && card.total_vram_gb >= min_vram {
@@ -117,6 +155,24 @@ mod tests {
             regions: vec![],
             weight_size_gb: Some(weight),
             min_vram_gb: Some(min_vram),
+            min_vram_gb_vision: None,
+            vision_model: false,
+            min_ram_gb: Some(min_ram),
+            weights: None,
+        }
+    }
+
+    fn vl_catalog(min_vram: f64, vision_vram: f64, weight: f64, min_ram: f64) -> CatalogModel {
+        CatalogModel {
+            model_id: "qwen-3-vl-8b".into(),
+            display_name: "Qwen3 VL 8B".into(),
+            runtime_model: "Qwen/Qwen3-VL-8B".into(),
+            max_context_tokens: 8192,
+            regions: vec![],
+            weight_size_gb: Some(weight),
+            min_vram_gb: Some(min_vram),
+            min_vram_gb_vision: Some(vision_vram),
+            vision_model: true,
             min_ram_gb: Some(min_ram),
             weights: None,
         }
@@ -225,6 +281,58 @@ mod tests {
             &catalog(12.0, 11.7, 16.0),
             &devices,
             16,
+            2
+        ));
+    }
+
+    #[test]
+    fn vl_model_rejects_four_gb_offload_loophole() {
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "GTX 1650 SUPER".into(),
+            vram_gb: Some(4),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(!can_host_model(
+            &vl_catalog(8.0, 12.0, 4.7, 8.0),
+            &card,
+            32,
+            2
+        ));
+        let card8 = build_virtual_card(&[ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "RTX 4060".into(),
+            vram_gb: Some(8),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(!can_host_model(
+            &vl_catalog(8.0, 12.0, 4.7, 8.0),
+            &card8,
+            32,
+            2
+        ));
+        let card12 = build_virtual_card(&[ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "RTX 3060".into(),
+            vram_gb: Some(12),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(can_host_model(
+            &vl_catalog(8.0, 12.0, 4.7, 8.0),
+            &card12,
+            32,
             2
         ));
     }

@@ -1192,7 +1192,7 @@ async fn handle_server_message(
                 }
                 "logs_subscribe" => {
                     if let Ok(msg) = serde_json::from_slice::<LogsSubscribeMessage>(data) {
-                        handle_logs_subscribe(&write, &msg.action).await?;
+                        handle_logs_subscribe(&write, &msg.action, msg.verbose).await?;
                     }
                 }
                 "control" => {
@@ -1215,7 +1215,7 @@ async fn handle_server_message(
     Ok(true)
 }
 
-async fn handle_logs_subscribe(write: &SharedWsWrite, action: &str) -> Result<()> {
+async fn handle_logs_subscribe(write: &SharedWsWrite, action: &str, verbose: bool) -> Result<()> {
     let action = action.trim().to_ascii_lowercase();
     if action == "unsubscribe" || action == "stop" || action == "off" {
         crate::cloud_log::set_streaming(false);
@@ -1223,8 +1223,12 @@ async fn handle_logs_subscribe(write: &SharedWsWrite, action: &str) -> Result<()
         return Ok(());
     }
     crate::cloud_log::set_streaming(true);
-    info!("cloud log streaming started");
-    let lines: Vec<LogsLinePayload> = crate::cloud_log::snapshot()
+    crate::cloud_log::set_streaming_verbose(verbose);
+    info!(
+        "cloud log streaming started ({})",
+        if verbose { "verbose" } else { "simplified" }
+    );
+    let lines: Vec<LogsLinePayload> = crate::cloud_log::snapshot(verbose)
         .into_iter()
         .map(|l| LogsLinePayload {
             ts_ms: l.ts_ms,
@@ -1425,6 +1429,8 @@ async fn respond_invoke(
                 regions: vec![],
                 weight_size_gb: None,
                 min_vram_gb: None,
+                min_vram_gb_vision: None,
+                vision_model: false,
                 min_ram_gb: None,
                 weights: None,
             });
