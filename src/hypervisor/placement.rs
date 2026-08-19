@@ -27,14 +27,7 @@ pub fn pick_placement(
     let idle: std::collections::HashSet<&str> =
         idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
-    let min_vram = {
-        let n = model.min_vram_gb.unwrap_or(0.0);
-        if n <= 0.0 {
-            0
-        } else {
-            n.ceil() as u32
-        }
-    };
+    let min_vram = crate::models::capacity::hosting_min_vram_gb(model);
 
     let mut full_fit: Vec<&ComputeSlot> = plan
         .slots
@@ -147,6 +140,8 @@ mod tests {
             regions: vec![],
             weight_size_gb: Some(weight),
             min_vram_gb: Some(min_vram),
+            min_vram_gb_vision: None,
+            vision_model: false,
             min_ram_gb: Some(4.0),
             weights: None,
         }

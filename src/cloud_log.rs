@@ -17,11 +17,16 @@ pub struct CloudLogLine {
 }
 
 struct CloudLogState {
+    /// Simplified ring (no llama-cpp / ggml noise).
     lines: VecDeque<CloudLogLine>,
+    /// Full ring including verbose-only lines (for dashboard verbose mode).
+    lines_verbose: VecDeque<CloudLogLine>,
     /// Monotonic sequence for subscribers.
     next_seq: u64,
     /// True while the cloud asked us to stream.
     streaming: bool,
+    /// When true, pending + snapshot use the verbose ring.
+    streaming_verbose: bool,
     /// Lines queued since last flush (only while streaming).
     pending: VecDeque<CloudLogLine>,
 }
@@ -32,8 +37,10 @@ fn state() -> &'static Mutex<CloudLogState> {
     STATE.get_or_init(|| {
         Mutex::new(CloudLogState {
             lines: VecDeque::with_capacity(LOCAL_RING_CAP),
+            lines_verbose: VecDeque::with_capacity(LOCAL_RING_CAP),
             next_seq: 1,
             streaming: false,
+            streaming_verbose: false,
             pending: VecDeque::new(),
         })
     })
@@ -89,6 +96,17 @@ fn clean_msg(raw: &str) -> String {
     out
 }
 
+fn push_ring(ring: &mut VecDeque<CloudLogLine>, line: CloudLogLine) {
+    if ring.len() >= LOCAL_RING_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(line);
+}
+
+fn forward_to_stream(msg: &str, verbose: bool) -> bool {
+    verbose || !crate::logging::is_verbose_only_log_line(msg)
+}
+
 /// Called from the logging tee for each written chunk (may contain multiple lines).
 pub fn ingest_log_chunk(buf: &[u8]) {
     let Ok(text) = std::str::from_utf8(buf) else {
@@ -102,21 +120,17 @@ pub fn ingest_log_chunk(buf: &[u8]) {
         if msg.is_empty() {
             continue;
         }
-        // Skip ultra-noisy verbose-only lines from the cloud stream.
-        if crate::logging::is_verbose_only_log_line(&msg) {
-            continue;
-        }
         let line = CloudLogLine {
             ts_ms: now_ms(),
             level: guess_level(&msg).to_string(),
-            msg,
+            msg: msg.clone(),
         };
-        if guard.lines.len() >= LOCAL_RING_CAP {
-            guard.lines.pop_front();
+        if forward_to_stream(&msg, false) {
+            push_ring(&mut guard.lines, line.clone());
         }
-        guard.lines.push_back(line.clone());
+        push_ring(&mut guard.lines_verbose, line.clone());
         guard.next_seq = guard.next_seq.saturating_add(1);
-        if guard.streaming {
+        if guard.streaming && forward_to_stream(&msg, guard.streaming_verbose) {
             if guard.pending.len() >= LOCAL_RING_CAP {
                 guard.pending.pop_front();
             }
@@ -130,7 +144,15 @@ pub fn set_streaming(on: bool) {
         guard.streaming = on;
         if !on {
             guard.pending.clear();
+            guard.streaming_verbose = false;
         }
+    }
+}
+
+pub fn set_streaming_verbose(verbose: bool) {
+    if let Ok(mut guard) = state().lock() {
+        guard.streaming_verbose = verbose;
+        guard.pending.clear();
     }
 }
 
@@ -141,11 +163,25 @@ pub fn is_streaming() -> bool {
         .unwrap_or(false)
 }
 
-/// Snapshot of the local ring (oldest → newest).
-pub fn snapshot() -> Vec<CloudLogLine> {
+pub fn streaming_verbose() -> bool {
     state()
         .lock()
-        .map(|g| g.lines.iter().cloned().collect())
+        .map(|g| g.streaming_verbose)
+        .unwrap_or(false)
+}
+
+/// Snapshot of the local ring (oldest → newest).
+pub fn snapshot(verbose: bool) -> Vec<CloudLogLine> {
+    state()
+        .lock()
+        .map(|g| {
+            let ring = if verbose {
+                &g.lines_verbose
+            } else {
+                &g.lines
+            };
+            ring.iter().cloned().collect()
+        })
         .unwrap_or_default()
 }
 
@@ -155,4 +191,21 @@ pub fn drain_pending() -> Vec<CloudLogLine> {
         .lock()
         .map(|mut g| g.pending.drain(..).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbose_snapshot_includes_llama_lines() {
+        let sample = b"agent ready\nllama-cpp-2 module=ggml info\n";
+        ingest_log_chunk(sample);
+        let simple = snapshot(false);
+        let verbose = snapshot(true);
+        assert_eq!(simple.len(), 1);
+        assert!(simple[0].msg.contains("agent ready"));
+        assert_eq!(verbose.len(), 2);
+        assert!(verbose.iter().any(|l| l.msg.contains("llama-cpp-2")));
+    }
 }
