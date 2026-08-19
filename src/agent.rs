@@ -39,6 +39,10 @@ use tracing::{debug, info, warn};
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type SharedWsWrite = Arc<Mutex<WsWrite>>;
 
+/// If no inbound server frame (pong, invoke, etc.) for this long while registered,
+/// treat the WebSocket as zombie and reconnect. ~3 missed heartbeats; cloud Redis TTL is 90s.
+const COMMS_STALE_AFTER: Duration = Duration::from_secs(45);
+
 /// Full Windows specs detection (PowerShell + nvidia-smi) is expensive. Cache it so the
 /// WebSocket loop is not blocked for tens of seconds every heartbeat / invoke.
 const SPECS_CACHE_TTL: Duration = Duration::from_secs(20);
@@ -78,6 +82,8 @@ struct SessionState {
     cached_disk_ready: Vec<String>,
     cached_disk_gb: u32,
     cached_model_disk: Vec<(String, crate::models::ModelDiskStatus)>,
+    /// Last inbound server activity (pong, ready, invoke, …). Used to detect half-open links.
+    last_server_activity: Instant,
 }
 
 impl SessionState {
@@ -112,7 +118,16 @@ impl SessionState {
             cached_disk_ready: Vec::new(),
             cached_disk_gb: 0,
             cached_model_disk: Vec::new(),
+            last_server_activity: Instant::now(),
         }
+    }
+
+    fn touch_server_activity(&mut self) {
+        self.last_server_activity = Instant::now();
+    }
+
+    fn cloud_link_stale(&self) -> bool {
+        self.registered && self.last_server_activity.elapsed() >= COMMS_STALE_AFTER
     }
 
     fn disk_has_runtime(&self, runtime_or_id: &str) -> bool {
@@ -782,6 +797,17 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                     // Keepalive frame FIRST — never await warm/hypervisor work before
                     // putting bytes on the wire (edge proxies idle-close ~100s).
                     send_heartbeat(&state, &write).await?;
+                    {
+                        let mut guard = state.lock().await;
+                        guard.persist_local_state();
+                        if guard.cloud_link_stale() {
+                            warn!(
+                                "no cloud response for {}s; reconnecting",
+                                COMMS_STALE_AFTER.as_secs()
+                            );
+                            bail!("cloud link stale (no server response)");
+                        }
+                    }
                     if maintenance_busy
                         .compare_exchange(
                             false,
@@ -1027,6 +1053,7 @@ async fn handle_server_message(
 ) -> Result<bool> {
     match msg {
         Message::Text(text) => {
+            state.lock().await.touch_server_activity();
             let data = text.as_bytes();
             let env = parse_envelope(data)?;
             match env.kind.as_str() {
@@ -1179,6 +1206,7 @@ async fn handle_server_message(
             }
         }
         Message::Ping(payload) => {
+            state.lock().await.touch_server_activity();
             write.lock().await.send(Message::Pong(payload)).await?;
         }
         Message::Close(_) => return Ok(false),
