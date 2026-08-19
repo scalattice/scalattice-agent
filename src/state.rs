@@ -220,10 +220,7 @@ pub fn cloud_connection_line() -> String {
 
     if !is_recent(state.updated_at_ms) {
         if state.server_registered && service_hint() {
-            if let Some(node) = &state.node_id {
-                return format!("Scalattice Cloud: connected (node {node})");
-            }
-            return "Scalattice Cloud: connected (agent running)".to_string();
+            return "Scalattice Cloud: connected".to_string();
         }
         return "Scalattice Cloud: not connected".to_string();
     }
@@ -262,7 +259,7 @@ pub fn agent_activity_summary() -> Option<AgentActivitySummary> {
                 .status_label
                 .as_deref()
                 .map(normalize_status_label)
-                .unwrap_or_else(|| "registered (agent running)".to_string());
+                .unwrap_or_else(|| "Ready".to_string());
             return Some(AgentActivitySummary {
                 status,
                 node_id: state.node_id,
