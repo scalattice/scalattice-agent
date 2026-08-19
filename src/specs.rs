@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// On Windows, console tools (`nvidia-smi`, `powershell`, `where`) briefly flash a
 /// cmd window unless CREATE_NO_WINDOW is set. Specs are refreshed on every
@@ -75,6 +76,12 @@ pub struct MachineSpecs {
     pub disk_used_gb: Option<u32>,
     #[serde(rename = "diskFreeGb", skip_serializing_if = "Option::is_none")]
     pub disk_free_gb: Option<u32>,
+    #[serde(rename = "os", skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(rename = "osVersion", skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    #[serde(rename = "osPretty", skip_serializing_if = "Option::is_none")]
+    pub os_pretty: Option<String>,
     #[serde(rename = "computeDevices", skip_serializing_if = "Vec::is_empty")]
     pub compute_devices: Vec<ComputeDevice>,
 }
@@ -138,6 +145,7 @@ pub fn detect_machine_specs() -> MachineSpecs {
     let devices = detect_all_compute_devices();
     if devices.is_empty() {
         let disk = disk_usage_gb().unwrap_or((None, None, None));
+        let (os, os_version, os_pretty) = host_os_fields();
         return MachineSpecs {
             agent_version: Some(agent_version_string()),
             hostname,
@@ -147,6 +155,9 @@ pub fn detect_machine_specs() -> MachineSpecs {
             disk_total_gb: disk.0,
             disk_used_gb: disk.1,
             disk_free_gb: disk.2,
+            os,
+            os_version,
+            os_pretty,
             ..MachineSpecs::default()
         };
     }
@@ -203,6 +214,7 @@ pub fn build_specs_from_devices(
     };
 
     let disk = disk_usage_gb().unwrap_or((None, None, None));
+    let (os, os_version, os_pretty) = host_os_fields();
 
     MachineSpecs {
         agent_version: Some(agent_version_string()),
@@ -220,6 +232,9 @@ pub fn build_specs_from_devices(
         disk_total_gb: disk.0,
         disk_used_gb: disk.1,
         disk_free_gb: disk.2,
+        os,
+        os_version,
+        os_pretty,
         compute_devices: devices.to_vec(),
     }
 }
@@ -1106,6 +1121,199 @@ fn clean_pci_gpu_name(raw: &str) -> String {
     name.trim().to_string()
 }
 
+fn host_os_fields() -> (Option<String>, Option<String>, Option<String>) {
+    static CACHED: OnceLock<(Option<String>, Option<String>, Option<String>)> = OnceLock::new();
+    CACHED.get_or_init(detect_host_os).clone()
+}
+
+fn detect_host_os() -> (Option<String>, Option<String>, Option<String>) {
+    let os = std::env::consts::OS.to_string();
+    #[cfg(target_os = "linux")]
+    {
+        if let Some((version, pretty)) = detect_os_linux() {
+            return (Some(os), version, Some(pretty));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some((version, pretty)) = detect_os_windows() {
+            return (Some(os), version, Some(pretty));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some((version, pretty)) = detect_os_macos() {
+            return (Some(os), version, Some(pretty));
+        }
+    }
+    (Some(os.clone()), None, Some(os_family_label(&os).to_string()))
+}
+
+fn os_family_label(os: &str) -> &'static str {
+    match os {
+        "windows" => "Windows",
+        "macos" => "macOS",
+        "linux" => "Linux",
+        _ => "Unknown",
+    }
+}
+
+fn unquote_os_release_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        return trimmed[1..trimmed.len() - 1].trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn parse_os_release(raw: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut name = None;
+    let mut version_id = None;
+    let mut pretty = None;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = unquote_os_release_value(value);
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "NAME" => name = Some(value),
+            "VERSION_ID" => version_id = Some(value),
+            "PRETTY_NAME" => pretty = Some(value),
+            _ => {}
+        }
+    }
+    (name, version_id, pretty)
+}
+
+fn pretty_linux(name: Option<&str>, version_id: Option<&str>, pretty: Option<&str>) -> String {
+    match (name.map(str::trim).filter(|s| !s.is_empty()), version_id.map(str::trim).filter(|s| !s.is_empty())) {
+        (Some(name), Some(version)) => format!("{name} {version}"),
+        _ => pretty
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| name.map(str::to_string))
+            .unwrap_or_else(|| "Linux".to_string()),
+    }
+}
+
+fn pretty_windows(caption: &str, version: &str) -> String {
+    let lower = caption.to_ascii_lowercase();
+    if lower.contains("windows 11") {
+        return "Windows 11".to_string();
+    }
+    if lower.contains("windows 10") {
+        return "Windows 10".to_string();
+    }
+    if let Some(build) = version
+        .split('.')
+        .nth(2)
+        .and_then(|part| part.parse::<u32>().ok())
+    {
+        if build >= 22000 {
+            return "Windows 11".to_string();
+        }
+        if build >= 10240 {
+            return "Windows 10".to_string();
+        }
+    }
+    let stripped = caption
+        .trim()
+        .trim_start_matches("Microsoft ")
+        .trim();
+    if stripped.is_empty() {
+        "Windows".to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn macos_codename(major: u32) -> Option<&'static str> {
+    match major {
+        11 => Some("Big Sur"),
+        12 => Some("Monterey"),
+        13 => Some("Ventura"),
+        14 => Some("Sonoma"),
+        15 => Some("Sequoia"),
+        16 | 26 => Some("Tahoe"),
+        _ => None,
+    }
+}
+
+fn pretty_macos(version: &str) -> String {
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u32>().ok());
+    if let Some(name) = major.and_then(macos_codename) {
+        format!("macOS {name}")
+    } else if version.trim().is_empty() {
+        "macOS".to_string()
+    } else {
+        format!("macOS {version}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_os_linux() -> Option<(Option<String>, String)> {
+    let raw = std::fs::read_to_string("/etc/os-release")
+        .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
+        .ok()?;
+    let (name, version_id, pretty_name) = parse_os_release(&raw);
+    let pretty = pretty_linux(
+        name.as_deref(),
+        version_id.as_deref(),
+        pretty_name.as_deref(),
+    );
+    Some((version_id, pretty))
+}
+
+#[cfg(windows)]
+fn detect_os_windows() -> Option<(Option<String>, String)> {
+    let output = powershell_hidden(&[
+        "-Command",
+        "$o = Get-CimInstance Win32_OperatingSystem | Select-Object -First 1; \"$($o.Caption)|$($o.Version)\"",
+    ])
+    .output()
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let line = line.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (caption, version) = line.split_once('|').unwrap_or((line, ""));
+    let version = version.trim();
+    Some((
+        (!version.is_empty()).then(|| version.to_string()),
+        pretty_windows(caption.trim(), version),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn detect_os_macos() -> Option<(Option<String>, String)> {
+    let output = Command::new("sw_vers").arg("-productVersion").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        return None;
+    }
+    Some((Some(version.clone()), pretty_macos(&version)))
+}
+
 pub fn detect_hostname() -> Option<String> {
     #[cfg(unix)]
     {
@@ -1505,5 +1713,33 @@ mod tests {
         assert_eq!(fields[1], "NVIDIA RTX A6000, v2");
         assert_eq!(parse_util_pct("37"), Some(37));
         assert_eq!(parse_util_pct("[N/A]"), None);
+    }
+
+    #[test]
+    fn linux_os_release_pretty_uses_name_and_version() {
+        let raw = r#"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+PRETTY_NAME="Ubuntu 22.04.5 LTS"
+"#;
+        let (name, version, pretty) = parse_os_release(raw);
+        assert_eq!(name.as_deref(), Some("Ubuntu"));
+        assert_eq!(version.as_deref(), Some("22.04"));
+        assert_eq!(
+            pretty_linux(name.as_deref(), version.as_deref(), pretty.as_deref()),
+            "Ubuntu 22.04"
+        );
+    }
+
+    #[test]
+    fn windows_and_macos_pretty_names() {
+        assert_eq!(
+            pretty_windows("Microsoft Windows 11 Pro", "10.0.22631"),
+            "Windows 11"
+        );
+        assert_eq!(pretty_windows("Windows 10 Home", "10.0.19045"), "Windows 10");
+        assert_eq!(pretty_macos("15.1"), "macOS Sequoia");
+        assert_eq!(pretty_macos("14.6.1"), "macOS Sonoma");
+        assert_eq!(pretty_macos("26.0"), "macOS Tahoe");
     }
 }
