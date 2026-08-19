@@ -174,7 +174,7 @@ pub fn generate_with_callback(
                 let prompt_token_count = prompt_tokens.len() as u32;
                 let tokens = prompt_tokens;
                 let n = tokens.len();
-                const PREFILL_CHUNK: usize = 64;
+                const PREFILL_CHUNK: usize = 256;
                 let mut batch = LlamaBatch::new(PREFILL_CHUNK.max(1), 1);
                 let mut i = 0usize;
                 super::progress::report("prefill", 0.0);
