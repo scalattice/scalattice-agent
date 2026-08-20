@@ -111,6 +111,7 @@ pub struct ReadyMessage {
     #[serde(rename = "maxCompletionTokens", default)]
     pub max_completion_tokens: u32,
     /// Extra system RAM (GB) beyond weight size for CPU / offload fit checks.
+    /// Server always sends this; default matches platform settings.
     #[serde(rename = "cpuRamHeadroomGb", default = "default_cpu_ram_headroom_gb")]
     pub cpu_ram_headroom_gb: u32,
     #[serde(rename = "huggingFaceToken", default)]
@@ -120,7 +121,7 @@ pub struct ReadyMessage {
 }
 
 fn default_cpu_ram_headroom_gb() -> u32 {
-    2
+    crate::models::DEFAULT_CPU_RAM_HEADROOM_GB
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +374,9 @@ pub struct InvokeResultMessage {
     pub completion_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<InvokeTimings>,
+    /// Compute slot that ran the job (`cuda-0`, `tp:cuda-0+cuda-1`, …).
+    #[serde(rename = "slotId", skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,6 +1,6 @@
 use super::demand::DemandTracker;
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
-use super::placement::{pick_placement, Placement};
+use super::placement::{pick_placement, placement_miss_detail, Placement};
 use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot};
 use crate::protocol::{CatalogModel, ChatMessage, InvokeTimings};
 use crate::specs::ComputeDevice;
@@ -145,6 +145,16 @@ impl Hypervisor {
         };
         notify.notify_waiters();
         true
+    }
+
+    /// Signal every registered in-flight job to abort (admin stop-all).
+    pub async fn cancel_all_invokes(&self) -> usize {
+        let cancels: Vec<Arc<Notify>> = self.job_cancels.lock().await.values().cloned().collect();
+        let n = cancels.len();
+        for notify in cancels {
+            notify.notify_waiters();
+        }
+        n
     }
 
     #[allow(dead_code)]
@@ -402,8 +412,11 @@ impl Hypervisor {
             ) {
                 Some(p) => p,
                 None => {
+                    let need_vision = crate::protocol::messages_have_images(messages);
+                    let detail =
+                        placement_miss_detail(&self.plan, &idle, model, need_vision);
                     self.clear_job_cancel(job_id).await;
-                    return Err(anyhow!("agent_busy: no idle compute slot for {model_id}"));
+                    return Err(anyhow!(detail));
                 }
             };
 

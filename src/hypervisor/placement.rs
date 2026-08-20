@@ -136,6 +136,66 @@ pub fn pick_placement(
     None
 }
 
+/// Explain why [`pick_placement`] returned `None`. Vision misses with idle
+/// slots are capacity (insufficient VRAM), not "busy".
+pub fn placement_miss_detail(
+    plan: &ComputePlan,
+    idle_slot_ids: &[String],
+    model: &CatalogModel,
+    need_vision: bool,
+) -> String {
+    let model_id = model.model_id.as_str();
+    let idle: std::collections::HashSet<&str> =
+        idle_slot_ids.iter().map(|s| s.as_str()).collect();
+    let idle_accel: Vec<&ComputeSlot> = plan
+        .slots
+        .iter()
+        .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
+        .collect();
+
+    if idle_accel.is_empty() && idle_slot_ids.is_empty() {
+        return format!("agent_busy: no idle compute slot for {model_id}");
+    }
+    if idle_accel.is_empty() {
+        // Only CPU idle — vision cannot use it; text would have placed CPU.
+        if need_vision {
+            let need = image_job_min_vram_gb(model);
+            return format!(
+                "insufficient_vram: need {need} GB GPU for vision job {model_id}; no idle accelerator"
+            );
+        }
+        return format!("agent_busy: no idle compute slot for {model_id}");
+    }
+
+    if need_vision {
+        let need = image_job_min_vram_gb(model);
+        let max_slot = idle_accel
+            .iter()
+            .map(|s| s.card.total_vram_gb)
+            .max()
+            .unwrap_or(0);
+        let mut max_pool = max_slot;
+        for (group_id, _phys_ids) in &plan.tp_groups {
+            let siblings: Vec<&ComputeSlot> = plan
+                .slots
+                .iter()
+                .filter(|s| s.tp_group.as_deref() == Some(group_id.as_str()))
+                .collect();
+            if siblings.is_empty() || siblings.iter().any(|s| !idle.contains(s.id.as_str())) {
+                continue;
+            }
+            let pooled: u32 = siblings.iter().map(|s| s.card.total_vram_gb).sum();
+            max_pool = max_pool.max(pooled);
+        }
+        return format!(
+            "insufficient_vram: need {need} GB GPU for vision job {model_id}; largest idle {max_pool} GB across {} slot(s)",
+            idle_accel.len()
+        );
+    }
+
+    format!("agent_busy: no placeable idle slot for {model_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
