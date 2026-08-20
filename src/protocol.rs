@@ -44,6 +44,14 @@ pub struct CatalogModel {
     pub min_vram_gb_vision: Option<f64>,
     #[serde(rename = "visionModel", default)]
     pub vision_model: bool,
+    #[serde(rename = "mmprojSizeGb", default)]
+    pub mmproj_size_gb: Option<f64>,
+    #[serde(rename = "visionMaxImages", default)]
+    pub vision_max_images: Option<u32>,
+    #[serde(rename = "visionMaxImageSidePx", default)]
+    pub vision_max_image_side_px: Option<u32>,
+    #[serde(rename = "visionMaxImagePixels", default)]
+    pub vision_max_image_pixels: Option<u32>,
     #[serde(rename = "minRamGb", default)]
     pub min_ram_gb: Option<f64>,
     #[serde(default)]

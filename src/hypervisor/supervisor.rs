@@ -398,6 +398,7 @@ impl Hypervisor {
                 ram_gb,
                 cpu_ram_headroom_gb,
                 &self.devices,
+                crate::protocol::messages_have_images(messages),
             ) {
                 Some(p) => p,
                 None => {
