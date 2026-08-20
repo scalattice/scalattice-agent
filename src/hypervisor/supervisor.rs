@@ -699,7 +699,12 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
                         if !t.is_empty() {
                             // Slot workers own llama.cpp. debug! was dropped by the INFO
                             // filter, so Verbose live logs never saw load dumps.
-                            info!(slot = %slot_log_id, "{t}");
+                            // Strip the worker's own tracing prefix so we don't nest
+                            // timestamps/targets when the supervisor re-logs.
+                            let (_lvl, body) = crate::cloud_log::normalize_tracing_message(t);
+                            if !body.is_empty() {
+                                info!(slot = %slot_log_id, "{body}");
+                            }
                         }
                     }
                     Err(_) => break,

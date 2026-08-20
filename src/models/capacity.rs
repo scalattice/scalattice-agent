@@ -49,6 +49,37 @@ pub fn can_serve_vision_on_card(model: &CatalogModel, card: &VirtualCard) -> boo
         && !matches!(card.strategy, PoolStrategy::CpuOnly)
 }
 
+/// True if any independent slot or homogeneous TP group can run image jobs for this model.
+pub fn can_serve_vision_on_machine(
+    model: &CatalogModel,
+    devices: &[ComputeDevice],
+    _ram_gb: u32,
+) -> bool {
+    if !model_is_vision(model) {
+        return true;
+    }
+    let Ok(plan) = build_compute_slots(devices) else {
+        return build_virtual_card(devices)
+            .map(|card| can_serve_vision_on_card(model, &card))
+            .unwrap_or(false);
+    };
+    if plan
+        .slots
+        .iter()
+        .any(|slot| can_serve_vision_on_card(model, &slot.card))
+    {
+        return true;
+    }
+    for phys in plan.tp_groups.values() {
+        if let Ok(tp) = build_tp_card_for_group(devices, phys) {
+            if can_serve_vision_on_card(model, &tp) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Whether this machine can download and serve a catalog model on its virtual compute card.
 /// `cpu_ram_headroom_gb` comes from the server (`ready.cpuRamHeadroomGb`).
 pub fn can_host_model(
@@ -153,6 +184,7 @@ mod tests {
             min_vram_gb: Some(min_vram),
             min_vram_gb_vision: None,
             vision_model: false,
+            text_sibling_model_id: None,
             min_ram_gb: Some(min_ram),
             mmproj_size_gb: None,
             vision_max_images: None,
@@ -173,6 +205,7 @@ mod tests {
             min_vram_gb: Some(min_vram),
             min_vram_gb_vision: Some(vision_vram),
             vision_model: true,
+            text_sibling_model_id: Some("qwen-3-8b".into()),
             min_ram_gb: Some(min_ram),
             mmproj_size_gb: None,
             vision_max_images: None,
@@ -310,6 +343,19 @@ mod tests {
         assert!(!can_serve_vision_on_card(
             &vl_catalog(8.0, 12.0, 4.7, 8.0),
             &card
+        ));
+        assert!(!can_serve_vision_on_machine(
+            &vl_catalog(8.0, 12.0, 4.7, 8.0),
+            &[ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1650 SUPER".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            }],
+            32
         ));
         let card8 = build_virtual_card(&[ComputeDevice {
             id: "nvidia:0".into(),

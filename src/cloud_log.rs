@@ -67,6 +67,73 @@ fn guess_level(line: &str) -> &'static str {
     }
 }
 
+/// Peel one `tracing` default fmt layer: `2026-…Z  INFO target: rest`.
+fn peel_one_tracing_layer(s: &str) -> Option<(&'static str, &str)> {
+    let s = s.trim();
+    // ISO-8601 timestamp ending in Z (with optional fractional seconds).
+    let z = s.find('Z')?;
+    if z < 19 || z > 40 {
+        return None;
+    }
+    if !s.as_bytes().get(4).is_some_and(|b| *b == b'-') || !s[..z].contains('T') {
+        return None;
+    }
+    let after = s[z + 1..].trim_start();
+    let (level, rest) = if let Some(r) = after.strip_prefix("ERROR ") {
+        ("error", r)
+    } else if let Some(r) = after.strip_prefix("WARN ") {
+        ("warn", r)
+    } else if let Some(r) = after.strip_prefix("INFO ") {
+        ("info", r)
+    } else if let Some(r) = after.strip_prefix("DEBUG ") {
+        ("debug", r)
+    } else if let Some(r) = after.strip_prefix("TRACE ") {
+        ("trace", r)
+    } else {
+        return None;
+    };
+    Some((level, rest.trim_start()))
+}
+
+/// Drop `crate::module::path: ` so live logs show the message body only.
+fn strip_rust_target_prefix(s: &str) -> &str {
+    let Some(idx) = s.find(": ") else {
+        return s;
+    };
+    let target = &s[..idx];
+    // Keep llama-style prefixes like `load_from_file:` (no `::`).
+    if target.contains("::") || target.starts_with("scalattice") {
+        return s[idx + 2..].trim_start();
+    }
+    s
+}
+
+/// Collapse nested worker→supervisor tracing wraps into `(level, message)`.
+pub fn normalize_tracing_message(raw: &str) -> (String, String) {
+    let mut level = guess_level(raw).to_string();
+    let mut rest = raw.trim().to_string();
+    for _ in 0..6 {
+        let Some((lvl, body)) = peel_one_tracing_layer(&rest) else {
+            break;
+        };
+        level = lvl.to_string();
+        let next = strip_rust_target_prefix(body).to_string();
+        if next == rest {
+            break;
+        }
+        rest = next;
+    }
+    // Drop a trailing duplicate `slot=…` when the supervisor re-tagged a worker line.
+    if let Some((a, b)) = rest.rsplit_once(" slot=") {
+        if let Some((_, first_slot)) = a.rsplit_once(" slot=") {
+            if first_slot.split_whitespace().next() == Some(b.split_whitespace().next().unwrap_or("")) {
+                rest = a.to_string();
+            }
+        }
+    }
+    (level, rest)
+}
+
 fn clean_msg(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -117,13 +184,17 @@ pub fn ingest_log_chunk(buf: &[u8]) {
         return;
     };
     for raw in text.split('\n') {
-        let msg = clean_msg(raw);
+        let cleaned = clean_msg(raw);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let (level, msg) = normalize_tracing_message(&cleaned);
         if msg.is_empty() {
             continue;
         }
         let line = CloudLogLine {
             ts_ms: now_ms(),
-            level: guess_level(&msg).to_string(),
+            level,
             msg: msg.clone(),
         };
         if forward_to_stream(&msg, false) {
@@ -210,5 +281,21 @@ mod tests {
         assert!(simple[0].msg.contains("agent ready"));
         assert_eq!(verbose.len(), 2);
         assert!(verbose.iter().any(|l| l.msg.contains("llama-cpp-2")));
+    }
+
+    #[test]
+    fn normalize_strips_nested_worker_supervisor_wrap() {
+        let raw = "2026-08-20T20:26:32.700132Z  INFO scalattice_agent::hypervisor::supervisor: 2026-08-20T20:26:32.699996Z  INFO load_from_file: llama-cpp-2: file size = 4.83 GiB slot=cuda-0";
+        let (level, msg) = normalize_tracing_message(raw);
+        assert_eq!(level, "info");
+        assert_eq!(msg, "load_from_file: llama-cpp-2: file size = 4.83 GiB slot=cuda-0");
+    }
+
+    #[test]
+    fn normalize_strips_agent_target() {
+        let raw = "2026-08-20T20:26:45.868670Z  INFO scalattice_agent::agent: invoke 053e8f25 completed slot=cuda-0";
+        let (level, msg) = normalize_tracing_message(raw);
+        assert_eq!(level, "info");
+        assert_eq!(msg, "invoke 053e8f25 completed slot=cuda-0");
     }
 }

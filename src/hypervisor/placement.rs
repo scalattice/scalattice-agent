@@ -213,6 +213,7 @@ mod tests {
             min_vram_gb: Some(min_vram),
             min_vram_gb_vision: None,
             vision_model: false,
+            text_sibling_model_id: None,
             min_ram_gb: Some(4.0),
             mmproj_size_gb: None,
             vision_max_images: None,
