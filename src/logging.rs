@@ -7,11 +7,15 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::EnvFilter;
 
 /// Soft cap for the active `agent.log`. A single `agent.log.1` backup keeps roughly 2× this.
 pub const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const ROTATE_CHECK_EVERY: u64 = 64 * 1024;
+
+/// Dashboard live-log verbose; combined with process `--verbose` for stderr.
+static DASHBOARD_VERBOSE: AtomicBool = AtomicBool::new(false);
 
 /// True when the process should emit full llama.cpp / GGML detail on the console.
 pub fn verbose_requested(cli_verbose: bool) -> bool {
@@ -22,6 +26,19 @@ pub fn verbose_requested(cli_verbose: bool) -> bool {
         return true;
     }
     agent_env_truthy("SCALATTICE_VERBOSE")
+}
+
+/// Cloud live-log verbose toggle (does not persist; watch session only).
+pub fn set_dashboard_verbose(on: bool) {
+    DASHBOARD_VERBOSE.store(on, Ordering::Relaxed);
+}
+
+pub fn dashboard_verbose() -> bool {
+    DASHBOARD_VERBOSE.load(Ordering::Relaxed)
+}
+
+fn emit_verbose_on_stderr(boot_verbose: bool) -> bool {
+    boot_verbose || dashboard_verbose()
 }
 
 pub fn init_logging(verbose: bool) {
@@ -107,7 +124,7 @@ impl Write for TeeLogWriter {
 
         if self.also_stderr {
             let text = std::str::from_utf8(buf).unwrap_or("");
-            let skip = !self.stderr_verbose
+            let skip = !emit_verbose_on_stderr(self.stderr_verbose)
                 && text
                     .lines()
                     .any(|line| !line.is_empty() && is_verbose_only_log_line(line));
@@ -242,6 +259,13 @@ pub fn is_verbose_only_log_line(line: &str) -> bool {
         || line.contains("module=\"ggml")
         || line.contains(" module=llama.cpp")
         || line.contains(" module=ggml")
+        || line.contains("ggml_")
+        || line.contains("ggml-")
+        || line.contains("llama_model")
+        || line.contains("llama_context")
+        || line.contains("llama_kv")
+        || line.contains("print_info")
+        || line.contains("llama.cpp")
 }
 
 /// Stream lines from a log source to stdout, optionally Simplified.
@@ -353,6 +377,7 @@ mod tests {
         assert!(is_verbose_only_log_line(
             "INFO llama-cpp-2: BOS token = 1 module=\"llama.cpp::print_info\""
         ));
+        assert!(is_verbose_only_log_line("ggml_cuda_init: found 1 CUDA devices"));
         assert!(!is_verbose_only_log_line(
             "INFO scalattice_agent::agent: invoke abc · model qwen-3-8b"
         ));

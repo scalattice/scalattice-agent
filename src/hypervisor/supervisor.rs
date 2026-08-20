@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -684,7 +684,9 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
                     Ok(_) => {
                         let t = line.trim();
                         if !t.is_empty() {
-                            debug!(slot = %slot_log_id, "{t}");
+                            // Slot workers own llama.cpp. debug! was dropped by the INFO
+                            // filter, so Verbose live logs never saw load dumps.
+                            info!(slot = %slot_log_id, "{t}");
                         }
                     }
                     Err(_) => break,
