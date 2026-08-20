@@ -1118,7 +1118,10 @@ async fn handle_server_message(
                         if let Err(err) = respond_invoke(&state, &write, invoke).await {
                             warn!("invoke task failed: {err:#}");
                             let code = invoke_error_code(&err);
-                            if code != "agent_busy" && code != "request_canceled" {
+                            if code != "agent_busy"
+                                && code != "request_canceled"
+                                && code != "insufficient_vram"
+                            {
                                 state::record_inference_failure(code, &format!("{err:#}"));
                             }
                         }
@@ -1197,7 +1200,7 @@ async fn handle_server_message(
                 }
                 "control" => {
                     if let Ok(msg) = serde_json::from_slice::<ControlMessage>(data) {
-                        handle_remote_control(&write, &msg.action).await?;
+                        handle_remote_control(&state, &write, &msg.action).await?;
                     }
                 }
                 other => {
@@ -1236,6 +1239,9 @@ async fn handle_logs_subscribe(write: &SharedWsWrite, action: &str, verbose: boo
             msg: l.msg,
         })
         .collect();
+    // Snapshot already includes the "started" line; drop pending so the next
+    // live flush does not send the same line again (duplicate on the dashboard).
+    let _ = crate::cloud_log::drain_pending();
     let batch = LogsBatchMessage {
         kind: "logs_batch",
         mode: "snapshot",
@@ -1267,9 +1273,29 @@ async fn flush_live_logs(write: &SharedWsWrite) -> Result<()> {
     Ok(())
 }
 
-async fn handle_remote_control(write: &SharedWsWrite, action: &str) -> Result<()> {
+async fn handle_remote_control(
+    state: &Arc<Mutex<SessionState>>,
+    write: &SharedWsWrite,
+    action: &str,
+) -> Result<()> {
     let action = action.trim().to_ascii_lowercase();
     match action.as_str() {
+        "cancel_jobs" | "stop_jobs" => {
+            let hv = state.lock().await.hypervisor.clone();
+            let canceled = if let Some(hv) = hv {
+                hv.cancel_all_invokes().await
+            } else {
+                0
+            };
+            let ack = ControlAckMessage {
+                kind: "control_ack",
+                action: "cancel_jobs".to_string(),
+                ok: true,
+                detail: Some(format!("Canceled {canceled} in-flight job(s)")),
+            };
+            let _ = ws_send_text(write, &serde_json::to_string(&ack)?).await;
+            info!("remote control: cancel_jobs ({canceled})");
+        }
         "restart" => {
             let ack = ControlAckMessage {
                 kind: "control_ack",
@@ -1527,13 +1553,14 @@ async fn respond_invoke(
                     prompt_tokens,
                     completion_tokens,
                     timings: Some(timings),
+                    slot_id: Some(slot_id),
                 };
                 ws_send_text(write, &serde_json::to_string(&result)?).await
             }
             Err(err) => {
                 let code = invoke_error_code(&err);
-                if code == "agent_busy" {
-                    debug!("inference invoke busy: {err:#}");
+                if code == "agent_busy" || code == "insufficient_vram" {
+                    debug!("inference invoke capacity miss: {err:#}");
                 } else if code == "request_canceled" {
                     info!("inference invoke canceled: {err:#}");
                 } else {
@@ -1750,6 +1777,12 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || (detail.contains("gguf") && detail.contains("not found"))
     {
         "model_load_failed"
+    } else if detail.contains("insufficient_vram")
+        || detail.contains("no_vision_capacity")
+        || (detail.contains("need") && detail.contains("vision job") && detail.contains("gb"))
+    {
+        // Idle slots exist but none meet the image-job VRAM floor — not "busy".
+        "insufficient_vram"
     } else if detail.contains("agent_busy")
         || detail.contains("no idle compute slot")
         || detail.contains("not available")
@@ -1812,5 +1845,13 @@ mod invoke_error_code_tests {
     fn corrupt_image_is_invalid_image_not_inference_failed() {
         let err = anyhow::anyhow!("invalid_image: Bitmap creation returned null");
         assert_eq!(invoke_error_code(&err), "invalid_image");
+    }
+
+    #[test]
+    fn vision_vram_miss_is_insufficient_vram_not_busy() {
+        let err = anyhow::anyhow!(
+            "insufficient_vram: need 8 GB GPU for vision job qwen-3-vl-8b; largest idle 4 GB across 2 slot(s)"
+        );
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }
 }

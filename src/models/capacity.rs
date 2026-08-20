@@ -12,10 +12,9 @@ fn gb_ceil(v: Option<f64>) -> u32 {
     n.ceil().min(u32::MAX as f64) as u32
 }
 
-/// Default when an older server omits `cpuRamHeadroomGb` on ready.
+/// Platform default for CPU/offload RAM headroom (GB). Matches server
+/// `DEFAULT_CPU_RAM_HEADROOM_GB`; used only until `ready` sets the live value.
 pub const DEFAULT_CPU_RAM_HEADROOM_GB: u32 = 2;
-
-const VISION_VRAM_OVERHEAD_GB: u32 = 4;
 
 fn model_is_vision(model: &CatalogModel) -> bool {
     model.vision_model
@@ -25,21 +24,16 @@ pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
     gb_ceil(model.min_vram_gb)
 }
 
-/// GPU floor for image jobs. Server publishes computed budget; fallback is min_vram + 4.
+/// GPU floor for image jobs — catalog `minVramGbVision` from the server.
 pub fn image_job_min_vram_gb(model: &CatalogModel) -> u32 {
     if !model_is_vision(model) {
         return hosting_min_vram_gb(model);
     }
-    if let Some(v) = model.min_vram_gb_vision {
-        if v > 0.0 {
-            return gb_ceil(Some(v));
-        }
+    let vision = gb_ceil(model.min_vram_gb_vision);
+    if vision > 0 {
+        return vision;
     }
-    let base = hosting_min_vram_gb(model);
-    if base > 0 {
-        return base.saturating_add(VISION_VRAM_OVERHEAD_GB).max(base);
-    }
-    8
+    hosting_min_vram_gb(model)
 }
 
 pub fn resolve_min_vram_gb_vision(model: &CatalogModel) -> u32 {
@@ -357,5 +351,13 @@ mod tests {
             &vl_catalog(8.0, 12.0, 4.7, 8.0),
             &card12
         ));
+    }
+
+    #[test]
+    fn vision_vram_uses_catalog_then_hosting_floor() {
+        assert_eq!(image_job_min_vram_gb(&vl_catalog(8.0, 12.0, 4.7, 8.0)), 12);
+        let mut model = vl_catalog(8.0, 99.0, 4.7, 8.0);
+        model.min_vram_gb_vision = None;
+        assert_eq!(image_job_min_vram_gb(&model), 8);
     }
 }

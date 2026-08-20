@@ -72,18 +72,21 @@ pub fn init_logging(verbose: bool) {
 }
 
 /// Slot workers speak JSON on stdout — keep tracing off stdout.
-/// Disk `agent.log` always gets full llama.cpp detail (same contract as the supervisor);
-/// stderr stays Simplified unless `--verbose` / `SCALATTICE_VERBOSE`.
-pub fn init_worker_logging(verbose: bool) {
+/// Disk `agent.log` always gets full llama.cpp detail.
+///
+/// Stderr is **piped to the supervisor** (never a GUI console). Always mirror
+/// full detail there so the parent can `info!` lines into cloud Verbose live
+/// logs. When `also_stderr` was gated on `--verbose`, workers wrote llama dumps
+/// only to disk and the dashboard Verbose toggle looked broken.
+pub fn init_worker_logging(_verbose: bool) {
     // Always capture llama-cpp-2 INFO on disk; do not inherit a parent `RUST_LOG=warn`.
     let filter = build_env_filter(true);
     if let Some(file) = open_agent_log_writer() {
         let file = Arc::new(Mutex::new(file));
         let writer = TeeLogWriter {
             file: Some(file),
-            // Disk is the record. Extra stderr can block a GUI-parented worker on Windows.
-            also_stderr: verbose,
-            stderr_verbose: verbose,
+            also_stderr: true,
+            stderr_verbose: true,
         };
         tracing_subscriber::fmt()
             .with_ansi(false)

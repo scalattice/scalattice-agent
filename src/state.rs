@@ -159,7 +159,7 @@ pub fn set_downloading_model(model_id: Option<&str>) {
 
 /// Record a real inference failure for the tray (skips expected capacity/`agent_busy`).
 pub fn record_inference_failure(code: &str, detail: &str) {
-    if code == "agent_busy" {
+    if code == "agent_busy" || code == "insufficient_vram" || code == "request_canceled" {
         return;
     }
     if state_file_path().is_none() {
