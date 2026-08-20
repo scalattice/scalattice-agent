@@ -5,9 +5,10 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Lines retained locally for the next subscribe snapshot (router keeps ~20).
-pub const LOCAL_RING_CAP: usize = 24;
-const MAX_LINE_CHARS: usize = 500;
+/// Lines retained for dashboard subscribe snapshots + live pending flush.
+/// Must stay ahead of a llama.cpp load dump; tiny caps made Verbose useless.
+pub const LOCAL_RING_CAP: usize = 2500;
+const MAX_LINE_CHARS: usize = 2000;
 
 #[derive(Debug, Clone)]
 pub struct CloudLogLine {
