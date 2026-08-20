@@ -145,11 +145,13 @@ pub fn set_streaming(on: bool) {
         if !on {
             guard.pending.clear();
             guard.streaming_verbose = false;
+            crate::logging::set_dashboard_verbose(false);
         }
     }
 }
 
 pub fn set_streaming_verbose(verbose: bool) {
+    crate::logging::set_dashboard_verbose(verbose);
     if let Ok(mut guard) = state().lock() {
         guard.streaming_verbose = verbose;
         guard.pending.clear();
