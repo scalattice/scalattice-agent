@@ -1774,6 +1774,11 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         "model_out_of_memory"
     } else if detail.contains("context window") || detail.contains("too long") {
         "prompt_too_long"
+    } else if detail.contains("invalid_image")
+        || detail.contains("decode image for mmproj")
+        || detail.contains("bitmap creation returned null")
+    {
+        "invalid_image"
     } else {
         "inference_failed"
     }
@@ -1801,5 +1806,11 @@ mod invoke_error_code_tests {
     fn unknown_architecture_is_model_load_failed() {
         let err = anyhow::anyhow!("unknown model architecture: 'qwen35'");
         assert_eq!(invoke_error_code(&err), "model_load_failed");
+    }
+
+    #[test]
+    fn corrupt_image_is_invalid_image_not_inference_failed() {
+        let err = anyhow::anyhow!("invalid_image: Bitmap creation returned null");
+        assert_eq!(invoke_error_code(&err), "invalid_image");
     }
 }

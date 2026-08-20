@@ -102,8 +102,10 @@ pub fn prefill_vision(
         if bytes.len() > 12 * 1024 * 1024 {
             anyhow::bail!("image exceeds 12 MB decoded");
         }
-        let bitmap = MtmdBitmap::from_buffer(mtmd, &bytes, false)
-            .map_err(|err| anyhow!("decode image for mmproj: {err}"))?;
+        let bitmap = MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(|err| {
+            // Stable client-input code — router/backend must not treat as operator fault.
+            anyhow!("invalid_image: {err}")
+        })?;
         bitmaps.push(bitmap);
     }
     let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
