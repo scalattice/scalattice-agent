@@ -1,5 +1,5 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
-use crate::models::{can_host_model, hosting_min_vram_gb};
+use crate::models::{can_host_model, can_serve_vision_on_card, hosting_min_vram_gb, image_job_min_vram_gb};
 use crate::protocol::CatalogModel;
 use tracing::debug;
 
@@ -23,11 +23,16 @@ pub fn pick_placement(
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
     devices: &[crate::specs::ComputeDevice],
+    need_vision: bool,
 ) -> Option<Placement> {
     let idle: std::collections::HashSet<&str> =
         idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
-    let min_vram = hosting_min_vram_gb(model);
+    let min_vram = if need_vision {
+        image_job_min_vram_gb(model)
+    } else {
+        hosting_min_vram_gb(model)
+    };
 
     let mut full_fit: Vec<&ComputeSlot> = plan
         .slots
@@ -35,6 +40,7 @@ pub fn pick_placement(
         .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
         .filter(|s| min_vram > 0 && s.card.total_vram_gb >= min_vram)
         .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
+        .filter(|s| !need_vision || can_serve_vision_on_card(model, &s.card))
         .collect();
     full_fit.sort_by(|a, b| {
         a.card
@@ -69,6 +75,9 @@ pub fn pick_placement(
         if tp_card.strategy != PoolStrategy::TensorParallel {
             continue;
         }
+        if need_vision && !can_serve_vision_on_card(model, &tp_card) {
+            continue;
+        }
         if min_vram > 0 && tp_card.total_vram_gb < min_vram {
             continue;
         }
@@ -84,7 +93,8 @@ pub fn pick_placement(
         });
     }
 
-    // Offload on the largest idle accelerator.
+    // Offload on the largest idle accelerator (text only — image jobs need full vision VRAM).
+    if !need_vision {
     let mut offload: Vec<&ComputeSlot> = plan
         .slots
         .iter()
@@ -121,6 +131,7 @@ pub fn pick_placement(
             use_tp_worker: false,
         });
     }
+    }
 
     None
 }
@@ -143,6 +154,10 @@ mod tests {
             min_vram_gb_vision: None,
             vision_model: false,
             min_ram_gb: Some(4.0),
+            mmproj_size_gb: None,
+            vision_max_images: None,
+            vision_max_image_side_px: None,
+            vision_max_image_pixels: None,
             weights: None,
         }
     }
@@ -180,7 +195,7 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let placement = pick_placement(&plan, &idle, &model(8.0, 5.0), 64, 2, &devices).unwrap();
+        let placement = pick_placement(&plan, &idle, &model(8.0, 5.0), 64, 2, &devices, false).unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
         assert!(!placement.use_tp_worker);
     }
@@ -219,7 +234,7 @@ mod tests {
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
         let placement =
-            pick_placement(&plan, &idle, &model(40.0, 30.0), 64, 2, &devices).unwrap();
+            pick_placement(&plan, &idle, &model(40.0, 30.0), 64, 2, &devices, false).unwrap();
         assert!(placement.use_tp_worker);
         assert_eq!(placement.slot_ids.len(), 2);
     }

@@ -1432,6 +1432,10 @@ async fn respond_invoke(
                 min_vram_gb_vision: None,
                 vision_model: false,
                 min_ram_gb: None,
+                mmproj_size_gb: None,
+                vision_max_images: None,
+                vision_max_image_side_px: None,
+                vision_max_image_pixels: None,
                 weights: None,
             });
         let specs = guard.enabled_devices();

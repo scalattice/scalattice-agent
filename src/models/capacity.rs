@@ -21,28 +21,38 @@ fn model_is_vision(model: &CatalogModel) -> bool {
     model.vision_model
 }
 
-pub fn resolve_min_vram_gb_vision(model: &CatalogModel) -> u32 {
+pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
+    gb_ceil(model.min_vram_gb)
+}
+
+/// GPU floor for image jobs. Server publishes computed budget; fallback is min_vram + 4.
+pub fn image_job_min_vram_gb(model: &CatalogModel) -> u32 {
     if !model_is_vision(model) {
-        return gb_ceil(model.min_vram_gb);
+        return hosting_min_vram_gb(model);
     }
     if let Some(v) = model.min_vram_gb_vision {
         if v > 0.0 {
             return gb_ceil(Some(v));
         }
     }
-    let base = gb_ceil(model.min_vram_gb);
+    let base = hosting_min_vram_gb(model);
     if base > 0 {
         return base.saturating_add(VISION_VRAM_OVERHEAD_GB).max(base);
     }
-    12
+    8
 }
 
-/// Minimum accelerator VRAM to host this catalog model on a provider machine.
-pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
-    if model_is_vision(model) {
-        return resolve_min_vram_gb_vision(model);
+pub fn resolve_min_vram_gb_vision(model: &CatalogModel) -> u32 {
+    image_job_min_vram_gb(model)
+}
+
+pub fn can_serve_vision_on_card(model: &CatalogModel, card: &VirtualCard) -> bool {
+    let need = image_job_min_vram_gb(model);
+    if need == 0 {
+        return true;
     }
-    gb_ceil(model.min_vram_gb)
+    card.total_vram_gb >= need
+        && !matches!(card.strategy, PoolStrategy::CpuOnly)
 }
 
 /// Whether this machine can download and serve a catalog model on its virtual compute card.
@@ -57,14 +67,6 @@ pub fn can_host_model(
     let min_ram = gb_ceil(model.min_ram_gb);
     let weight_gb = gb_ceil(model.weight_size_gb);
     let ram_needed = weight_gb.saturating_add(cpu_ram_headroom_gb).max(min_ram);
-
-    // Vision catalog rows: require real GPU VRAM (mmproj + image prefill). No CPU-offload loophole.
-    if model_is_vision(model) {
-        if min_vram > 0 && card.total_vram_gb >= min_vram {
-            return ram_gb >= min_ram;
-        }
-        return false;
-    }
 
     // Fits entirely on pooled accelerator VRAM (CUDA and/or Vulkan estimate).
     if min_vram > 0 && card.total_vram_gb >= min_vram {
@@ -158,6 +160,10 @@ mod tests {
             min_vram_gb_vision: None,
             vision_model: false,
             min_ram_gb: Some(min_ram),
+            mmproj_size_gb: None,
+            vision_max_images: None,
+            vision_max_image_side_px: None,
+            vision_max_image_pixels: None,
             weights: None,
         }
     }
@@ -174,6 +180,10 @@ mod tests {
             min_vram_gb_vision: Some(vision_vram),
             vision_model: true,
             min_ram_gb: Some(min_ram),
+            mmproj_size_gb: None,
+            vision_max_images: None,
+            vision_max_image_side_px: None,
+            vision_max_image_pixels: None,
             weights: None,
         }
     }
@@ -286,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn vl_model_rejects_four_gb_offload_loophole() {
+    fn vl_text_can_offload_but_images_need_vision_vram() {
         let card = build_virtual_card(&[ComputeDevice {
             id: "nvidia:0".into(),
             kind: "discrete".into(),
@@ -297,11 +307,15 @@ mod tests {
             enabled: true,
         }])
         .unwrap();
-        assert!(!can_host_model(
+        assert!(can_host_model(
             &vl_catalog(8.0, 12.0, 4.7, 8.0),
             &card,
             32,
             2
+        ));
+        assert!(!can_serve_vision_on_card(
+            &vl_catalog(8.0, 12.0, 4.7, 8.0),
+            &card
         ));
         let card8 = build_virtual_card(&[ComputeDevice {
             id: "nvidia:0".into(),
@@ -313,11 +327,15 @@ mod tests {
             enabled: true,
         }])
         .unwrap();
-        assert!(!can_host_model(
+        assert!(can_host_model(
             &vl_catalog(8.0, 12.0, 4.7, 8.0),
             &card8,
             32,
             2
+        ));
+        assert!(!can_serve_vision_on_card(
+            &vl_catalog(8.0, 12.0, 4.7, 8.0),
+            &card8
         ));
         let card12 = build_virtual_card(&[ComputeDevice {
             id: "nvidia:0".into(),
@@ -334,6 +352,10 @@ mod tests {
             &card12,
             32,
             2
+        ));
+        assert!(can_serve_vision_on_card(
+            &vl_catalog(8.0, 12.0, 4.7, 8.0),
+            &card12
         ));
     }
 }
