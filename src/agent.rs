@@ -9,7 +9,7 @@ use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecyc
 use crate::hypervisor::{Hypervisor, SlotStatus};
 use crate::inference::InferenceEngine;
 use crate::models::{
-    can_host_on_machine, handle_weight_load_failure,
+    can_host_on_machine, can_serve_vision_on_machine, handle_weight_load_failure,
     preferred_download_card, purge_incomplete_model_weights,
     should_skip_preload, spawn_delete_staged_dirs, stage_purge_model_weights,
     sweep_staged_purge_dirs, spawn_catalog_sync,
@@ -206,20 +206,16 @@ impl SessionState {
             .register_model_ids()
             .into_iter()
             .filter_map(|model_id| {
-                self.catalog.iter().find_map(|model| {
-                    if model.model_id != model_id {
-                        return None;
-                    }
-                    let runtime = if model.runtime_model.trim().is_empty() {
-                        model.model_id.clone()
-                    } else {
-                        model.runtime_model.clone()
-                    };
-                    if should_skip_preload(&runtime) {
-                        return None;
-                    }
-                    Some(runtime)
-                })
+                let model = self.catalog_for_advertised_id(&model_id)?;
+                let runtime = if model.runtime_model.trim().is_empty() {
+                    model.model_id.clone()
+                } else {
+                    model.runtime_model.clone()
+                };
+                if should_skip_preload(&runtime) {
+                    return None;
+                }
+                Some(runtime)
             })
             .collect::<Vec<_>>();
         // Demand ordering + one-resident-per-small-slot happens in warm_models.
@@ -372,9 +368,7 @@ impl SessionState {
     }
 
     fn runtime_for_model_id(&self, model_id: &str) -> String {
-        self.catalog
-            .iter()
-            .find(|model| model.model_id == model_id)
+        self.catalog_for_advertised_id(model_id)
             .map(|model| {
                 if model.runtime_model.trim().is_empty() {
                     model.model_id.clone()
@@ -383,6 +377,122 @@ impl SessionState {
                 }
             })
             .unwrap_or_else(|| model_id.replace("__", "/"))
+    }
+
+    /// Catalog row that backs an advertised id (exact SKU, or VL row for a text sibling).
+    fn catalog_for_advertised_id(&self, model_id: &str) -> Option<&CatalogModel> {
+        let id = model_id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        if let Some(exact) = self.catalog.iter().find(|m| m.model_id == id) {
+            return Some(exact);
+        }
+        self.catalog.iter().find(|m| {
+            m.vision_model
+                && m.text_sibling_model_id
+                    .as_deref()
+                    .map(|s| s.trim() == id)
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Resolve catalog + runtime for an invoke. Text jobs may run on VL weights when
+    /// the text GGUF is missing but a ready VL sibling declares this text id.
+    fn resolve_invoke_catalog(
+        &self,
+        model_id: &str,
+        runtime_hint: &str,
+    ) -> (CatalogModel, String) {
+        let fallback = CatalogModel {
+            model_id: model_id.to_string(),
+            display_name: model_id.to_string(),
+            runtime_model: runtime_hint.to_string(),
+            max_context_tokens: 4096,
+            regions: vec![],
+            weight_size_gb: None,
+            min_vram_gb: None,
+            min_vram_gb_vision: None,
+            vision_model: false,
+            text_sibling_model_id: None,
+            min_ram_gb: None,
+            mmproj_size_gb: None,
+            vision_max_images: None,
+            vision_max_image_side_px: None,
+            vision_max_image_pixels: None,
+            weights: None,
+        };
+
+        let exact = self.catalog.iter().find(|m| m.model_id == model_id);
+        if let Some(m) = exact {
+            if self.catalog_ready_on_disk(m) {
+                let runtime = if m.runtime_model.trim().is_empty() {
+                    m.model_id.clone()
+                } else {
+                    m.runtime_model.clone()
+                };
+                return (m.clone(), runtime);
+            }
+            if !m.vision_model {
+                if let Some(vl) = self.catalog.iter().find(|cand| {
+                    cand.vision_model
+                        && cand
+                            .text_sibling_model_id
+                            .as_deref()
+                            .map(|s| s.trim() == model_id)
+                            .unwrap_or(false)
+                        && self.catalog_ready_on_disk(cand)
+                }) {
+                    let runtime = if vl.runtime_model.trim().is_empty() {
+                        vl.model_id.clone()
+                    } else {
+                        vl.runtime_model.clone()
+                    };
+                    info!(
+                        "invoke remap {} → {} (text sibling uses VL weights)",
+                        model_id, vl.model_id
+                    );
+                    return (vl.clone(), runtime);
+                }
+            }
+            let runtime = if !runtime_hint.trim().is_empty() {
+                runtime_hint.to_string()
+            } else if m.runtime_model.trim().is_empty() {
+                m.model_id.clone()
+            } else {
+                m.runtime_model.clone()
+            };
+            return (m.clone(), runtime);
+        }
+
+        // Advertised text sibling with no text catalog row — only VL present.
+        if let Some(vl) = self.catalog.iter().find(|cand| {
+            cand.vision_model
+                && cand
+                    .text_sibling_model_id
+                    .as_deref()
+                    .map(|s| s.trim() == model_id)
+                    .unwrap_or(false)
+                && self.catalog_ready_on_disk(cand)
+        }) {
+            let runtime = if vl.runtime_model.trim().is_empty() {
+                vl.model_id.clone()
+            } else {
+                vl.runtime_model.clone()
+            };
+            info!(
+                "invoke remap {} → {} (VL-only host for text sibling)",
+                model_id, vl.model_id
+            );
+            return (vl.clone(), runtime);
+        }
+
+        let runtime = if runtime_hint.trim().is_empty() {
+            model_id.replace("__", "/")
+        } else {
+            runtime_hint.to_string()
+        };
+        (fallback, runtime)
     }
 
     fn apply_purge_models(&mut self, model_ids: &[String]) -> Vec<std::path::PathBuf> {
@@ -436,11 +546,36 @@ impl SessionState {
     }
 
     fn register_model_ids(&self) -> Vec<String> {
-        self.eligible_catalog_models()
-            .iter()
-            .filter(|model| self.catalog_ready_on_disk(model))
-            .map(|m| m.model_id.clone())
-            .collect()
+        let specs = self.enabled_devices();
+        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
+        let mut out: Vec<String> = Vec::new();
+        for model in self.eligible_catalog_models() {
+            if !self.catalog_ready_on_disk(&model) {
+                continue;
+            }
+            if model.vision_model {
+                // Only advertise the VL id when this machine can actually run image jobs.
+                if can_serve_vision_on_machine(&model, &specs.compute_devices, ram_gb) {
+                    out.push(model.model_id.clone());
+                }
+                // VL weights still serve text via the sibling SKU (bill/route as text).
+                if let Some(sib) = model
+                    .text_sibling_model_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if !out.iter().any(|id| id == sib) {
+                        out.push(sib.to_string());
+                    }
+                }
+            } else {
+                out.push(model.model_id.clone());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn apply_compute_devices(&mut self, devices: &[ComputeDevicePolicy]) {
@@ -1416,7 +1551,7 @@ async fn respond_invoke(
     // Push the invoke line to live cloud logs immediately (don't wait for the 1s ticker).
     let _ = flush_live_logs(write).await;
 
-    let (hv, catalog_model, ram_gb, headroom, max_tokens) = {
+    let (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens) = {
         let mut guard = state.lock().await;
         let max_jobs = guard.cached_max_jobs.max(1);
         if guard.active_job_count >= max_jobs {
@@ -1442,39 +1577,18 @@ async fn respond_invoke(
             .hypervisor
             .clone()
             .context("compute hypervisor not started")?;
-        let catalog_model = guard
-            .catalog
-            .iter()
-            .find(|m| m.model_id == invoke.model_id)
-            .cloned()
-            .unwrap_or(CatalogModel {
-                model_id: invoke.model_id.clone(),
-                display_name: invoke.model_id.clone(),
-                runtime_model: invoke.runtime_model.clone(),
-                max_context_tokens: 4096,
-                regions: vec![],
-                weight_size_gb: None,
-                min_vram_gb: None,
-                min_vram_gb_vision: None,
-                vision_model: false,
-                min_ram_gb: None,
-                mmproj_size_gb: None,
-                vision_max_images: None,
-                vision_max_image_side_px: None,
-                vision_max_image_pixels: None,
-                weights: None,
-            });
+        let (catalog_model, runtime_model) =
+            guard.resolve_invoke_catalog(&invoke.model_id, &invoke.runtime_model);
         let specs = guard.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let headroom = guard.cpu_ram_headroom_gb;
         let max_tokens = guard.effective_max_tokens(invoke.max_tokens);
-        (hv, catalog_model, ram_gb, headroom, max_tokens)
+        (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens)
     };
     // Do not heartbeat per-invoke — under concurrency that floods the WS with
     // heartbeat/pong/policy traffic and resets the provider connection.
 
     let invoke_id = invoke.id.clone();
-    let runtime_model = invoke.runtime_model.clone();
     let stream = invoke.stream;
 
     let result = async {
@@ -1560,7 +1674,9 @@ async fn respond_invoke(
             Err(err) => {
                 let code = invoke_error_code(&err);
                 if code == "agent_busy" || code == "insufficient_vram" {
-                    debug!("inference invoke capacity miss: {err:#}");
+                    // INFO so live/cloud logs show why an invoke vanished after the
+                    // start line (placement miss never claims a slot / runs llama).
+                    info!("invoke {} capacity miss · {code}: {err:#}", invoke_id);
                 } else if code == "request_canceled" {
                     info!("inference invoke canceled: {err:#}");
                 } else {
@@ -1622,6 +1738,12 @@ async fn respond_invoke_split(
     }
 
     let specs = state.lock().await.enabled_devices();
+    let runtime_model = {
+        let guard = state.lock().await;
+        guard
+            .resolve_invoke_catalog(&invoke.model_id, &invoke.runtime_model)
+            .1
+    };
     let engine = InferenceEngine::new(&specs.compute_devices)
         .context("no enabled compute devices for split inference")?;
 
@@ -1629,7 +1751,7 @@ async fn respond_invoke_split(
     let result = async {
         match segment.as_str() {
             "lower" => match engine
-                .invoke_split_lower(&invoke.runtime_model, &invoke.prompt_token_ids)
+                .invoke_split_lower(&runtime_model, &invoke.prompt_token_ids)
                 .await
             {
                 Ok(output) => {
@@ -1656,7 +1778,7 @@ async fn respond_invoke_split(
                     guard.effective_max_tokens(invoke.max_tokens)
                 };
                 match engine
-                    .invoke_split_upper(&invoke.runtime_model, &invoke.state_b64, max_tokens)
+                    .invoke_split_upper(&runtime_model, &invoke.state_b64, max_tokens)
                     .await
                 {
                     Ok(output) => {
@@ -1678,7 +1800,7 @@ async fn respond_invoke_split(
                     Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
                 }
             }
-            "warm" => match engine.invoke_split_warm(&invoke.runtime_model).await {
+            "warm" => match engine.invoke_split_warm(&runtime_model).await {
                 Ok(()) => {
                     let result = crate::protocol::InvokeSplitResultMessage {
                         kind: "invoke_split_result",

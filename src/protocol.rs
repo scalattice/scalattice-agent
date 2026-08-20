@@ -44,6 +44,9 @@ pub struct CatalogModel {
     pub min_vram_gb_vision: Option<f64>,
     #[serde(rename = "visionModel", default)]
     pub vision_model: bool,
+    /// Non-VL catalog id this vision SKU may serve for text-only jobs.
+    #[serde(rename = "textSiblingModelId", default)]
+    pub text_sibling_model_id: Option<String>,
     #[serde(rename = "mmprojSizeGb", default)]
     pub mmproj_size_gb: Option<f64>,
     #[serde(rename = "visionMaxImages", default)]
