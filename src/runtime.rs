@@ -84,8 +84,15 @@ pub fn build_runtime(
     // Report real busyness for dashboards. Routing uses claim slots / idleSlots,
     // not this flag — forcing Idle whenever any slot (often cpu-0) was free hid
     // active GPU jobs as "in the inference pool".
-    let reported_state = if job_state == JobState::Busy || (idle_slots == 0 && max_concurrent_jobs > 0)
-    {
+    // idle_slots==0 alone used to mark Busy forever when a worker was checked out
+    // by an abandoned invoke; prefer the session job flag, and only use empty
+    // idle as a secondary signal when we also have an active job id.
+    let reported_state = if job_state == JobState::Busy {
+        JobState::Busy
+    } else if idle_slots == 0 && max_concurrent_jobs > 0 && active_job_id.is_some() {
+        JobState::Busy
+    } else if idle_slots == 0 && max_concurrent_jobs > 0 {
+        // Transient: slot map empty/busy during checkout. Heartbeat reconcile heals lies.
         JobState::Busy
     } else {
         JobState::Idle

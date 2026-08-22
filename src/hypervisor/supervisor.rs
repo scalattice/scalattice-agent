@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
@@ -29,6 +29,24 @@ fn warm_model_weight_mb(runtime_model: &str) -> u64 {
     std::fs::metadata(path)
         .map(|m| m.len() / (1024 * 1024))
         .unwrap_or(u64::MAX / 4)
+}
+
+fn force_kill_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +78,13 @@ struct SlotWorker {
     loaded_models: Vec<String>,
 }
 
+/// Worker removed from the map for an in-flight invoke (or warm).
+struct SlotCheckout {
+    job_id: String,
+    since: Instant,
+    pid: Option<u32>,
+}
+
 pub struct Hypervisor {
     plan: ComputePlan,
     devices: Vec<ComputeDevice>,
@@ -68,6 +93,8 @@ pub struct Hypervisor {
     changed: Notify,
     /// In-flight job_id → cancel signal (kill worker when router abandons).
     job_cancels: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Slots whose worker is currently owned by an invoke/warm stack frame.
+    checkouts: Mutex<HashMap<String, SlotCheckout>>,
 }
 
 /// Give up only when the worker stops sending progress/token lines.
@@ -75,6 +102,11 @@ pub struct Hypervisor {
 /// (graph compile, weight upload). Only token decode uses the short stall.
 const WORKER_DECODE_SILENCE: Duration = Duration::from_secs(120);
 const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(300);
+/// Hard ceiling for any single invoke, even if the worker keeps dripping tokens.
+/// Prevents abandoned streams from holding a GPU forever under network load.
+const WORKER_INVOKE_WALL_CLOCK: Duration = Duration::from_secs(12 * 60);
+/// Checked-out slot with no progress path for this long → force reclaim.
+const STUCK_CHECKOUT: Duration = Duration::from_secs(13 * 60);
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
     if phase.eq_ignore_ascii_case("decode") {
@@ -114,6 +146,7 @@ impl Hypervisor {
             demand: Mutex::new(DemandTracker::default()),
             changed: Notify::new(),
             job_cancels: Mutex::new(HashMap::new()),
+            checkouts: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -147,7 +180,7 @@ impl Hypervisor {
         true
     }
 
-    /// Signal every registered in-flight job to abort (admin stop-all).
+    /// Signal every registered in-flight job to abort (admin stop-all / session reconnect).
     pub async fn cancel_all_invokes(&self) -> usize {
         let cancels: Vec<Arc<Notify>> = self.job_cancels.lock().await.values().cloned().collect();
         let n = cancels.len();
@@ -155,6 +188,156 @@ impl Hypervisor {
             notify.notify_waiters();
         }
         n
+    }
+
+    /// How many slots are currently checked out to an invoke/warm stack.
+    pub async fn checked_out_count(&self) -> u32 {
+        self.checkouts.lock().await.len() as u32
+    }
+
+    /// True when the hypervisor has real in-flight work (checked-out slots or cancel waiters).
+    pub async fn has_in_flight_work(&self) -> bool {
+        !self.checkouts.lock().await.is_empty() || !self.job_cancels.lock().await.is_empty()
+    }
+
+    async fn mark_checkout(&self, slot_id: &str, job_id: &str, pid: Option<u32>) {
+        self.checkouts.lock().await.insert(
+            slot_id.to_string(),
+            SlotCheckout {
+                job_id: job_id.to_string(),
+                since: Instant::now(),
+                pid,
+            },
+        );
+    }
+
+    async fn clear_checkout(&self, slot_id: &str) {
+        self.checkouts.lock().await.remove(slot_id);
+    }
+
+    /// Put a worker back after invoke/warm. If reconcile already respawned a healthy
+    /// idle worker into this slot, kill the returning process instead of clobbering it.
+    async fn return_worker(&self, slot_id: String, mut worker: SlotWorker) {
+        worker.busy = false;
+        self.clear_checkout(&slot_id).await;
+        let mut workers = self.workers.lock().await;
+        if let Some(existing) = workers.get(&slot_id) {
+            if existing.healthy && !existing.busy {
+                warn!(
+                    slot = %slot_id,
+                    "discarding returning worker; slot already reclaimed"
+                );
+                let _ = worker.child.kill().await;
+                let _ = worker.child.wait().await;
+                return;
+            }
+        }
+        workers.insert(slot_id, worker);
+        drop(workers);
+        self.changed.notify_waiters();
+    }
+
+    /// Detect lied-about busy: orphan `busy` flags, stale checkouts, missing workers.
+    /// Safe to call from the heartbeat path under load.
+    pub async fn reconcile_slots(&self) -> u32 {
+        let mut recovered = 0u32;
+
+        // Clear busy flags on workers that are still in the map but not checked out
+        // (warm/invoke crash left busy=true while the process is idle).
+        {
+            let checkouts = self.checkouts.lock().await;
+            let mut workers = self.workers.lock().await;
+            for (id, worker) in workers.iter_mut() {
+                if worker.busy && !checkouts.contains_key(id) {
+                    warn!(slot = %id, "clearing orphan busy flag (worker idle in map)");
+                    worker.busy = false;
+                    recovered += 1;
+                }
+            }
+        }
+
+        // Stale checkouts: cancel the job, kill the orphaned PID, respawn into the map.
+        let stale: Vec<(String, SlotCheckout)> = {
+            let checkouts = self.checkouts.lock().await;
+            checkouts
+                .iter()
+                .filter(|(_, c)| c.since.elapsed() >= STUCK_CHECKOUT)
+                .map(|(id, c)| {
+                    (
+                        id.clone(),
+                        SlotCheckout {
+                            job_id: c.job_id.clone(),
+                            since: c.since,
+                            pid: c.pid,
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        for (slot_id, checkout) in stale {
+            warn!(
+                slot = %slot_id,
+                job_id = %checkout.job_id,
+                age_s = checkout.since.elapsed().as_secs(),
+                "reclaiming stuck checked-out slot"
+            );
+            let _ = self.cancel_invoke(&checkout.job_id).await;
+            if let Some(pid) = checkout.pid {
+                force_kill_pid(pid);
+            }
+            self.clear_checkout(&slot_id).await;
+            self.clear_job_cancel(&checkout.job_id).await;
+
+            let mut workers = self.workers.lock().await;
+            if workers.get(&slot_id).map(|w| w.healthy && !w.busy).unwrap_or(false) {
+                continue;
+            }
+            workers.remove(&slot_id);
+            drop(workers);
+
+            if let Some(spec) = self.plan.slots.iter().find(|s| s.id == slot_id) {
+                match spawn_worker(spec).await {
+                    Ok(mut w) => {
+                        w.busy = false;
+                        self.workers.lock().await.insert(slot_id.clone(), w);
+                        recovered += 1;
+                        info!(slot = %slot_id, "respawned worker after stuck checkout");
+                    }
+                    Err(err) => {
+                        warn!(slot = %slot_id, error = %err, "failed to respawn after stuck checkout")
+                    }
+                }
+            }
+        }
+
+        // Plan slots that exist in neither map nor checkouts (lost after panic).
+        let missing: Vec<ComputeSlot> = {
+            let workers = self.workers.lock().await;
+            let checkouts = self.checkouts.lock().await;
+            self.plan
+                .slots
+                .iter()
+                .filter(|s| !workers.contains_key(&s.id) && !checkouts.contains_key(&s.id))
+                .cloned()
+                .collect()
+        };
+        for spec in missing {
+            warn!(slot = %spec.id, "slot worker missing; respawning");
+            match spawn_worker(&spec).await {
+                Ok(mut w) => {
+                    w.busy = false;
+                    self.workers.lock().await.insert(spec.id.clone(), w);
+                    recovered += 1;
+                }
+                Err(err) => warn!(slot = %spec.id, error = %err, "failed to respawn missing slot"),
+            }
+        }
+
+        if recovered > 0 {
+            self.changed.notify_waiters();
+        }
+        recovered
     }
 
     #[allow(dead_code)]
@@ -339,6 +522,9 @@ impl Hypervisor {
                     None => continue,
                 }
             };
+            let pid = worker.child.id();
+            self.mark_checkout(&slot_id, &format!("warm:{slot_id}"), pid)
+                .await;
             let req_id = next_req_id();
             let outcome = worker_rpc(
                 &mut worker,
@@ -348,24 +534,20 @@ impl Hypervisor {
                 },
             )
             .await;
-            {
-                let mut workers = self.workers.lock().await;
-                match &outcome {
-                    Ok(WorkerResponse::Ok { .. }) => {
-                        if !worker.loaded_models.iter().any(|m| m == &model) {
-                            worker.loaded_models.push(model.clone());
-                        }
-                        info!(slot = %slot_id, model = %model, "warmed model on slot");
+            match &outcome {
+                Ok(WorkerResponse::Ok { .. }) => {
+                    if !worker.loaded_models.iter().any(|m| m == &model) {
+                        worker.loaded_models.push(model.clone());
                     }
-                    Ok(WorkerResponse::Error { error, .. }) => {
-                        warn!(slot = %slot_id, model = %model, error = %error, "warm failed");
-                    }
-                    Ok(_) => {}
-                    Err(err) => warn!(slot = %slot_id, error = %err, "warm rpc failed"),
+                    info!(slot = %slot_id, model = %model, "warmed model on slot");
                 }
-                worker.busy = false;
-                workers.insert(slot_id, worker);
+                Ok(WorkerResponse::Error { error, .. }) => {
+                    warn!(slot = %slot_id, model = %model, error = %error, "warm failed");
+                }
+                Ok(_) => {}
+                Err(err) => warn!(slot = %slot_id, error = %err, "warm rpc failed"),
             }
+            self.return_worker(slot_id, worker).await;
         }
         Ok(())
     }
@@ -506,6 +688,8 @@ impl Hypervisor {
                 .remove(&slot_id)
                 .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?
         };
+        let pid = worker.child.id();
+        self.mark_checkout(&slot_id, job_id, pid).await;
 
         let req_id = next_req_id();
         let stream = on_delta.is_some();
@@ -525,7 +709,6 @@ impl Hypervisor {
         )
         .await;
 
-        worker.busy = false;
         if let Ok((_, _, _, _, loaded)) = &outcome {
             worker.loaded_models = loaded.clone();
         }
@@ -541,11 +724,7 @@ impl Hypervisor {
             }
         }
 
-        {
-            let mut workers = self.workers.lock().await;
-            workers.insert(slot_id.clone(), worker);
-        }
-        self.changed.notify_waiters();
+        self.return_worker(slot_id.clone(), worker).await;
         outcome.map(|(c, p, t, timings, _)| (c, p, t, timings, slot_id))
     }
 
@@ -561,16 +740,23 @@ impl Hypervisor {
         cancel: &Notify,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         // Slots already claimed busy by invoke(). Pause siblings, run TP, restore.
-        {
+        let sibling_pids: Vec<(String, Option<u32>)> = {
             let mut workers = self.workers.lock().await;
+            let mut out = Vec::new();
             for sid in &placement.slot_ids {
                 let Some(w) = workers.get_mut(sid) else {
                     bail!("missing sibling slot {sid}");
                 };
+                let pid = w.child.id();
                 // Stop the process so CVD can be reused by TP worker.
                 let _ = w.child.kill().await;
                 w.healthy = false;
+                out.push((sid.clone(), pid));
             }
+            out
+        };
+        for (sid, pid) in &sibling_pids {
+            self.mark_checkout(sid, job_id, *pid).await;
         }
 
         let tp_key = placement.slot_ids.join("+");
@@ -609,6 +795,9 @@ impl Hypervisor {
                     }
                 }
                 drop(workers);
+                for sid in &placement.slot_ids {
+                    self.clear_checkout(sid).await;
+                }
                 self.changed.notify_waiters();
                 return Err(err).context("spawn tensor-parallel worker");
             }
@@ -649,6 +838,9 @@ impl Hypervisor {
             }
         }
         drop(workers);
+        for sid in &placement.slot_ids {
+            self.clear_checkout(sid).await;
+        }
         self.changed.notify_waiters();
 
         let tp_label = format!("tp:{}", placement.slot_ids.join("+"));
@@ -809,8 +1001,31 @@ async fn worker_rpc_invoke_cancellable(
     let mut buf = String::new();
     let mut silence = WORKER_LOAD_SILENCE;
     let mut last_phase = String::from("start");
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
     loop {
+        if started.elapsed() >= WORKER_INVOKE_WALL_CLOCK {
+            warn!(
+                slot = %worker.spec.id,
+                phase = %last_phase,
+                wall_s = started.elapsed().as_secs(),
+                "killing worker; invoke exceeded wall-clock limit"
+            );
+            let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            worker.healthy = false;
+            bail!("invoke_timeout: exceeded wall-clock limit");
+        }
         buf.clear();
+        let silence_left = silence
+            .checked_sub(last_progress.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let wall_left = WORKER_INVOKE_WALL_CLOCK
+            .checked_sub(started.elapsed())
+            .unwrap_or(Duration::from_millis(1));
+        let wait = silence_left
+            .min(wall_left)
+            .max(Duration::from_millis(50));
         tokio::select! {
             biased;
             _ = cancel.notified() => {
@@ -838,6 +1053,7 @@ async fn worker_rpc_invoke_cancellable(
                     WorkerResponse::Progress { id, phase, pct } if id == expect_id => {
                         last_phase = phase.clone();
                         silence = worker_silence_for_phase(&phase);
+                        last_progress = Instant::now();
                         if let Some(cb) = on_delta.as_mut() {
                             cb(format!(
                                 "\u{1e}{}\u{1e}{}",
@@ -849,6 +1065,7 @@ async fn worker_rpc_invoke_cancellable(
                     WorkerResponse::Delta { id, text } if id == expect_id => {
                         last_phase = "decode".to_string();
                         silence = WORKER_DECODE_SILENCE;
+                        last_progress = Instant::now();
                         if let Some(cb) = on_delta.as_mut() {
                             cb(text);
                         }
@@ -877,7 +1094,10 @@ async fn worker_rpc_invoke_cancellable(
                     }
                 }
             }
-            _ = tokio::time::sleep(silence) => {
+            _ = tokio::time::sleep(wait) => {
+                if last_progress.elapsed() < silence {
+                    continue;
+                }
                 warn!(
                     slot = %worker.spec.id,
                     phase = %last_phase,
