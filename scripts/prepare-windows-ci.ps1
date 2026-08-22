@@ -57,3 +57,4 @@ Write-Host "==> LIBCLANG_PATH=$clang"
 
 Set-ShortCargoTargetDir -ExportForCi
 Set-WindowsBuildParallelism -Jobs 4
+Clear-LlamaCmakeCache

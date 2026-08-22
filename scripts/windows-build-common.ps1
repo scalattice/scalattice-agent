@@ -798,18 +798,32 @@ function Set-WindowsBuildParallelism {
 }
 
 function Clear-LlamaCmakeCache {
+    # Persistent C:\ar\t on the self-hosted runner can leave llama.cpp CMake trees where
+    # cmake-rs skips configure ("already configured") but build.ninja is gone after a
+    # cancelled/failed job. Always wipe those out\build dirs before cargo build.
     $targetRoot = Get-CargoTargetRoot
-    foreach ($profile in @("release\build", "x86_64-pc-windows-msvc\release\build")) {
+    $cleared = 0
+    foreach ($profile in @("release\build", "debug\build", "x86_64-pc-windows-msvc\release\build", "x86_64-pc-windows-msvc\debug\build")) {
         $root = Join-Path $targetRoot $profile
         if (-not (Test-Path $root)) { continue }
         Get-ChildItem $root -Directory -Filter "llama-cpp-sys-*" -ErrorAction SilentlyContinue |
             ForEach-Object {
-                $cmakeDir = Join-Path $_.FullName "out\build"
-                if (Test-Path $cmakeDir) {
+                $outDir = Join-Path $_.FullName "out"
+                $cmakeDir = Join-Path $outDir "build"
+                $ninja = Join-Path $cmakeDir "build.ninja"
+                if ((Test-Path $cmakeDir) -and -not (Test-Path $ninja)) {
+                    Write-Host "==> Clearing broken CMake tree (missing build.ninja): $cmakeDir"
+                    Remove-Item $cmakeDir -Recurse -Force -ErrorAction SilentlyContinue
+                    $cleared++
+                } elseif (Test-Path $cmakeDir) {
                     Write-Host "==> Clearing stale CMake cache: $cmakeDir"
-                    Remove-Item $cmakeDir -Recurse -Force
+                    Remove-Item $cmakeDir -Recurse -Force -ErrorAction SilentlyContinue
+                    $cleared++
                 }
             }
+    }
+    if ($cleared -eq 0) {
+        Write-Host "==> No stale llama-cpp CMake cache under $targetRoot"
     }
 }
 
