@@ -39,6 +39,45 @@ use tracing::{debug, info, warn};
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type SharedWsWrite = Arc<Mutex<WsWrite>>;
 
+/// Ensures `active_job_count` is decremented if an invoke task is aborted/panics.
+struct ActiveJobLease {
+    state: Arc<Mutex<SessionState>>,
+    armed: bool,
+}
+
+impl ActiveJobLease {
+    fn new(state: Arc<Mutex<SessionState>>) -> Self {
+        Self { state, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveJobLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let mut guard = state.lock().await;
+            if guard.active_job_count == 0 {
+                return;
+            }
+            guard.active_job_count = guard.active_job_count.saturating_sub(1);
+            if guard.active_job_count == 0 {
+                guard.job_state = JobState::Idle;
+                guard.active_job_id = None;
+                guard.active_model_id = None;
+                guard.vram_lifecycle.on_job_finished();
+            }
+        });
+    }
+}
+
 /// If no inbound server frame (pong, invoke, etc.) for this long while registered,
 /// treat the WebSocket as zombie and reconnect. ~3 missed heartbeats; cloud Redis TTL is 90s.
 const COMMS_STALE_AFTER: Duration = Duration::from_secs(45);
@@ -844,6 +883,18 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     }
     let _streaming_guard = StreamingGuard;
 
+    // Prior WS sessions share this hypervisor; abort orphan invokes so slots are
+    // not left checked-out forever (UI stuck Busy / serving_job).
+    let canceled = hypervisor.cancel_all_invokes().await;
+    if canceled > 0 {
+        info!(canceled, "canceled orphan invoke(s) from prior session");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+    let recovered = hypervisor.reconcile_slots().await;
+    if recovered > 0 {
+        info!(recovered, "reclaimed slot(s) at session start");
+    }
+
     info!(
         "connecting with provider token {}",
         token_snippet(&config.token)
@@ -1034,15 +1085,33 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
     let Some(hv) = hv else {
         return;
     };
+    let recovered = hv.reconcile_slots().await;
+    if recovered > 0 {
+        info!(recovered, "hypervisor reclaimed stuck compute slot(s)");
+    }
     let slots = hv.slot_statuses().await;
     let idle = hv.idle_slot_count().await;
     let max = hv.max_concurrent_jobs().await;
     let loaded = hv.loaded_models_union().await;
+    let in_flight = hv.has_in_flight_work().await;
     let mut guard = state.lock().await;
     guard.cached_slots = slots;
     guard.cached_idle_slots = idle;
     guard.cached_max_jobs = max;
     guard.cached_loaded_models = loaded;
+    // Heal lied-about busy: counter says jobs remain but hypervisor has nothing
+    // checked out and no cancel waiters (WS reconnect / panicked invoke task).
+    if guard.active_job_count > 0 && !in_flight && idle > 0 {
+        warn!(
+            stale = guard.active_job_count,
+            idle,
+            "clearing stale active_job_count; hypervisor has no in-flight work"
+        );
+        guard.active_job_count = 0;
+        guard.job_state = JobState::Idle;
+        guard.active_job_id = None;
+        guard.active_model_id = None;
+    }
 }
 
 async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
@@ -1417,11 +1486,29 @@ async fn handle_remote_control(
     match action.as_str() {
         "cancel_jobs" | "stop_jobs" => {
             let hv = state.lock().await.hypervisor.clone();
-            let canceled = if let Some(hv) = hv {
-                hv.cancel_all_invokes().await
+            let canceled = if let Some(ref hv) = hv {
+                let n = hv.cancel_all_invokes().await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let recovered = hv.reconcile_slots().await;
+                if recovered > 0 {
+                    info!(recovered, "reclaimed slot(s) after cancel_jobs");
+                }
+                n
             } else {
                 0
             };
+            // Drop lied session counters if hypervisor is idle.
+            let clear_counter = match &hv {
+                Some(hv) => !hv.has_in_flight_work().await,
+                None => true,
+            };
+            if clear_counter {
+                let mut guard = state.lock().await;
+                guard.active_job_count = 0;
+                guard.job_state = JobState::Idle;
+                guard.active_job_id = None;
+                guard.active_model_id = None;
+            }
             let ack = ControlAckMessage {
                 kind: "control_ack",
                 action: "cancel_jobs".to_string(),
@@ -1551,7 +1638,7 @@ async fn respond_invoke(
     // Push the invoke line to live cloud logs immediately (don't wait for the 1s ticker).
     let _ = flush_live_logs(write).await;
 
-    let (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens) = {
+    let (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens, mut job_lease) = {
         let mut guard = state.lock().await;
         let max_jobs = guard.cached_max_jobs.max(1);
         if guard.active_job_count >= max_jobs {
@@ -1573,6 +1660,7 @@ async fn respond_invoke(
             guard.cached_idle_slots = guard.cached_idle_slots.saturating_sub(1);
         }
         guard.vram_lifecycle.on_job_started();
+        let lease = ActiveJobLease::new(state.clone());
         let hv = guard
             .hypervisor
             .clone()
@@ -1583,7 +1671,7 @@ async fn respond_invoke(
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let headroom = guard.cpu_ram_headroom_gb;
         let max_tokens = guard.effective_max_tokens(invoke.max_tokens);
-        (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens)
+        (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens, lease)
     };
     // Do not heartbeat per-invoke — under concurrency that floods the WS with
     // heartbeat/pong/policy traffic and resets the provider connection.
@@ -1710,6 +1798,7 @@ async fn respond_invoke(
             guard.vram_lifecycle.on_job_finished();
         }
     }
+    job_lease.disarm();
     result
 }
 
