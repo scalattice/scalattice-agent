@@ -119,7 +119,7 @@ if ($syncVersion) {
     if ($builtVersion -and ($builtVersion -match [regex]::Escape($syncVersion))) {
         $versionOk = $true
     } elseif (Test-ExeContainsAscii "dist\scalattice-agent.exe" $syncVersion) {
-        Write-Host "==> --version empty (GUI subsystem); PE contains '$syncVersion' — OK"
+        Write-Host "==> --version empty (GUI subsystem); PE contains $syncVersion - OK"
         $versionOk = $true
     }
     if (-not $versionOk) {
