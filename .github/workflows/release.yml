@@ -377,6 +377,11 @@ jobs:
         with:
           cuda: '12.6.3'
           method: 'network'
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
       - uses: Swatinem/rust-cache@v2
