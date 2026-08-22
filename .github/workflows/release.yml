@@ -2,7 +2,8 @@ name: Release
 
 # production: a merge (or push) onto this branch tags a release and builds every platform.
 # Linux x86_64 CUDA is built here (no local build host required).
-# Windows uses the self-hosted scalattice-release runner by default.
+# Windows ALWAYS defaults to the self-hosted scalattice-release runner on production pushes.
+# workflow_dispatch may override to github-hosted only as an explicit fallback.
 # macOS is GitHub-hosted macos-14 (Apple Silicon). Unsigned if Apple secrets are missing.
 on:
   workflow_dispatch:

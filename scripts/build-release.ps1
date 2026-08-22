@@ -98,10 +98,33 @@ if ($pruned) {
     Write-Host "==> pruned $($pruned.Count) leftover agent hash(es) from $targetRoot/**/deps (${gib} GB)"
 }
 
-$builtVersion = (& "dist\scalattice-agent.exe" --version 2>&1 | Out-String).Trim()
+# windows_subsystem=windows: --version often prints nothing (no console). Confirm the
+# synced Cargo version is embedded in the PE instead of trusting empty stdout.
+function Test-ExeContainsAscii([string]$ExePath, [string]$Needle) {
+    if (-not $Needle) { return $false }
+    $bytes = [System.IO.File]::ReadAllBytes($ExePath)
+    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+    return $ascii.IndexOf($Needle, [StringComparison]::Ordinal) -ge 0
+}
+
+$builtVersion = ""
+try {
+    $builtVersion = (& "dist\scalattice-agent.exe" --version 2>&1 | Out-String).Trim()
+} catch {
+    $builtVersion = ""
+}
 Write-Host "==> Built binary reports: $builtVersion"
-if ($syncVersion -and $builtVersion -notmatch [regex]::Escape($syncVersion)) {
-    Write-Error "Version mismatch: binary is '$builtVersion' but release tag is $syncVersion. Clear rust-cache and rebuild."
+if ($syncVersion) {
+    $versionOk = $false
+    if ($builtVersion -and ($builtVersion -match [regex]::Escape($syncVersion))) {
+        $versionOk = $true
+    } elseif (Test-ExeContainsAscii "dist\scalattice-agent.exe" $syncVersion) {
+        Write-Host "==> --version empty (GUI subsystem); PE contains '$syncVersion' — OK"
+        $versionOk = $true
+    }
+    if (-not $versionOk) {
+        Write-Error "Version mismatch: binary is '$builtVersion' but release tag is $syncVersion. Clear rust-cache and rebuild."
+    }
 }
 
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\installer\windows\scalattice-run.cmd") -Destination "dist\scalattice-run.cmd" -Force
