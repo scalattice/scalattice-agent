@@ -399,6 +399,8 @@ jobs:
         shell: cmd
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda_path }}
+          # ggml find_package(SPIRV-Headers) on Windows needs the SDK prefix
+          CMAKE_PREFIX_PATH: ${{ env.VULKAN_SDK }}
           CARGO_INCREMENTAL: "0"
           CARGO_BUILD_JOBS: "4"
           SCALATTICE_VERSION: ${{ needs.prepare.outputs.tag }}

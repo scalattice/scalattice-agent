@@ -865,8 +865,91 @@ Then open a new PowerShell and re-run the build.
     $env:PATH = "$bin;$env:PATH"
     $glslc = Join-Path $bin "glslc.exe"
     $env:Vulkan_GLSLC_EXECUTABLE = $glslc
-    Write-Host "==> Vulkan SDK: $sdk"
-    Write-Host "    glslc: $glslc"
+
+    # Older llama.cpp/ggml Vulkan CMake does find_package(SPIRV-Headers) without
+    # appending VULKAN_SDK; CMAKE_PREFIX_PATH (env) is required on Windows CI.
+    $prefixes = @()
+    if ($env:CMAKE_PREFIX_PATH) {
+        $prefixes += @($env:CMAKE_PREFIX_PATH -split ';' | Where-Object { $_ -and $_.Trim() })
+    }
+    if ($prefixes -notcontains $sdk) {
+        $prefixes = @($sdk) + $prefixes
+    }
+    $env:CMAKE_PREFIX_PATH = ($prefixes -join ';')
+
+    $spirvDir = $null
+    foreach ($candidate in @(
+            (Join-Path $sdk "share\cmake\SPIRV-Headers"),
+            (Join-Path $sdk "Share\cmake\SPIRV-Headers"),
+            (Join-Path $sdk "cmake\SPIRV-Headers")
+        )) {
+        if (Test-Path (Join-Path $candidate "SPIRV-HeadersConfig.cmake")) {
+            $spirvDir = $candidate
+            break
+        }
+    }
+    if (-not $spirvDir) {
+        $found = Get-ChildItem -Path $sdk -Recurse -Filter "SPIRV-HeadersConfig.cmake" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($found) {
+            $spirvDir = $found.Directory.FullName
+        }
+    }
+    if ($spirvDir) {
+        [Environment]::SetEnvironmentVariable("SPIRV-Headers_DIR", $spirvDir, "Process")
+        Write-Host "==> Vulkan SDK: $sdk"
+        Write-Host "    glslc: $glslc"
+        Write-Host "    CMAKE_PREFIX_PATH: $($env:CMAKE_PREFIX_PATH)"
+        Write-Host "    SPIRV-Headers_DIR: $spirvDir"
+    } else {
+        Write-Host "==> Vulkan SDK: $sdk"
+        Write-Host "    glslc: $glslc"
+        Write-Host "    CMAKE_PREFIX_PATH: $($env:CMAKE_PREFIX_PATH)"
+        Write-Warning "SPIRV-HeadersConfig.cmake not found under Vulkan SDK; ensuring a local install"
+        Ensure-SpirvHeadersForCmake
+    }
+}
+
+# Install Khronos SPIRV-Headers so find_package(SPIRV-Headers CONFIG) works when the
+# LunarG SDK layout (or a stripped CI SDK) omits the CMake package config.
+function Ensure-SpirvHeadersForCmake {
+    $prefix = Join-Path ([IO.Path]::GetTempPath()) "scalattice-spirv-headers"
+    $cfg = Join-Path $prefix "share\cmake\SPIRV-Headers\SPIRV-HeadersConfig.cmake"
+    if (-not (Test-Path $cfg)) {
+        $src = Join-Path ([IO.Path]::GetTempPath()) "SPIRV-Headers-src"
+        if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+        if (Test-Path $prefix) { Remove-Item -Recurse -Force $prefix }
+        Write-Host "==> Cloning KhronosGroup/SPIRV-Headers (cmake package for ggml-vulkan)"
+        git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git $src
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "git clone SPIRV-Headers failed with exit code $LASTEXITCODE"
+        }
+        $build = Join-Path $src "build"
+        New-Item -ItemType Directory -Force -Path $build | Out-Null
+        cmake -S $src -B $build -DCMAKE_INSTALL_PREFIX="$prefix" -DSPIRV_HEADERS_ENABLE_TESTS=OFF
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "cmake configure SPIRV-Headers failed with exit code $LASTEXITCODE"
+        }
+        cmake --build $build --target install --config Release
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "cmake install SPIRV-Headers failed with exit code $LASTEXITCODE"
+        }
+    }
+    if (-not (Test-Path $cfg)) {
+        Write-Error "SPIRV-HeadersConfig.cmake missing after install: $cfg"
+    }
+    $prefixes = @()
+    if ($env:CMAKE_PREFIX_PATH) {
+        $prefixes += @($env:CMAKE_PREFIX_PATH -split ';' | Where-Object { $_ -and $_.Trim() })
+    }
+    if ($prefixes -notcontains $prefix) {
+        $prefixes = @($prefix) + $prefixes
+    }
+    $env:CMAKE_PREFIX_PATH = ($prefixes -join ';')
+    $spirvDir = Join-Path $prefix "share\cmake\SPIRV-Headers"
+    [Environment]::SetEnvironmentVariable("SPIRV-Headers_DIR", $spirvDir, "Process")
+    Write-Host "    SPIRV-Headers_DIR: $spirvDir"
+    Write-Host "    CMAKE_PREFIX_PATH: $($env:CMAKE_PREFIX_PATH)"
 }
 
 function Install-CudaToolkit {
