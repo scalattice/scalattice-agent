@@ -63,6 +63,7 @@ $env:LIBCLANG_PATH = $clang
 Set-CmakeNinjaMsvcEnv
 Set-ShortCargoTargetDir
 Set-WindowsBuildParallelism -Jobs 4
+Clear-LlamaCmakeCache
 
 # win-gpu = CUDA + Vulkan (replaces default Linux `gpu` feature set on Windows CI)
 # Delay-load nvcuda.dll so the agent can start without an NVIDIA driver (CPU-only).
