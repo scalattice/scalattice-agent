@@ -5,10 +5,15 @@ use crate::models::storage::{
 use crate::protocol::{CatalogModel, ModelWeights};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
+use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::StatusCode;
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use url::Url;
+
+const DOWNLOAD_RETRIES: u32 = 8;
 
 /// Only accept platform model-mirror URLs under Scalattice Cloud API hosts.
 fn assert_allowed_mirror_url(raw: &str) -> Result<()> {
@@ -34,86 +39,61 @@ fn assert_allowed_mirror_url(raw: &str) -> Result<()> {
     Ok(())
 }
 
-async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Option<&str>) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .user_agent("scalattice-agent")
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .context("build HTTP client")?;
-
-    let mut request = client.get(url);
-    if let Some(token) = auth_token.filter(|t| !t.trim().is_empty()) {
-        request = request.header("Authorization", format!("Bearer {}", token.trim()));
+fn content_range_total(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    let raw = value?.to_str().ok()?.trim();
+    let total = raw.split('/').nth(1)?.trim();
+    if total == "*" {
+        return None;
     }
+    total.parse().ok()
+}
 
-    let response = request
-        .send()
+pub fn is_retryable_transfer_error(err: &anyhow::Error) -> bool {
+    if is_no_space_error(err) {
+        return false;
+    }
+    let text = format!("{err:#}").to_ascii_lowercase();
+    if text.contains("404") || text.contains("401") || text.contains("403") || text.contains("410")
+    {
+        return false;
+    }
+    text.contains("end of file")
+        || text.contains("error decoding response body")
+        || text.contains("error reading a body")
+        || text.contains("error sending request")
+        || text.contains("connection")
+        || text.contains("timed out")
+        || text.contains("timeout")
+        || text.contains("reset")
+        || text.contains("broken pipe")
+        || text.contains("unexpected eof")
+        || text.contains("temporarily")
+        || text.contains("network is unreachable")
+        || text.contains("502")
+        || text.contains("503")
+        || text.contains("504")
+        || text.contains("429")
+        || text.contains("truncated download")
+}
+
+async fn part_len(path: &Path) -> u64 {
+    tokio::fs::metadata(path)
         .await
-        .with_context(|| format!("request {url}"))?
-        .error_for_status()
-        .with_context(|| format!("download failed for {url}"))?;
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
 
-    let expected_len = response.content_length();
-
-    // After redirects, final URL must still be an allowed mirror when this was a mirror fetch.
-    // (HF downloads use huggingface.co and skip this helper's mirror check.)
-
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-
-    let tmp = dest.with_extension("part");
-    if tmp.exists() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-
-    let write_result = async {
-        let mut file = tokio::fs::File::create(&tmp)
-            .await
-            .with_context(|| format!("create {}", tmp.display()))?;
-        let mut stream = response.bytes_stream();
-        let mut written: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read download chunk")?;
-            written = written.saturating_add(chunk.len() as u64);
-            file.write_all(&chunk)
-                .await
-                .context("write download chunk")?;
-        }
-        file.flush().await.context("flush download")?;
-        drop(file);
-        Ok::<u64, anyhow::Error>(written)
-    }
-    .await;
-
-    let written = match write_result {
-        Ok(n) => n,
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err);
-        }
-    };
-
-    if let Some(expected) = expected_len {
-        if written != expected {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            bail!(
-                "truncated download for {}: got {written} of {expected} bytes",
-                dest.display()
-            );
-        }
-    }
+async fn finalize_download(tmp: &Path, dest: &Path) -> Result<()> {
+    let written = part_len(tmp).await;
     if written == 0 {
-        let _ = tokio::fs::remove_file(&tmp).await;
+        let _ = tokio::fs::remove_file(tmp).await;
         bail!("empty download for {}", dest.display());
     }
+    tokio::fs::rename(tmp, dest)
+        .await
+        .with_context(|| format!("finalize {}", dest.display()))?;
 
-    std::fs::rename(&tmp, dest).with_context(|| format!("finalize {}", dest.display()))?;
-
-    // HF/CDN streams often omit Content-Length; reject truncated GGUFs that
-    // would otherwise look "complete" (non-empty file) and fail at load time.
     if dest
         .extension()
         .and_then(|ext| ext.to_str())
@@ -137,8 +117,132 @@ async fn stream_url_to_file(url: &str, dest: &std::path::Path, auth_token: Optio
             }
         }
     }
-
     Ok(())
+}
+
+async fn stream_url_once(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    tmp: &Path,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    let existing = part_len(tmp).await;
+    let mut request = client.get(url);
+    if let Some(token) = auth_token.filter(|t| !t.trim().is_empty()) {
+        request = request.header("Authorization", format!("Bearer {}", token.trim()));
+    }
+    if existing > 0 {
+        request = request.header(RANGE, format!("bytes={existing}-"));
+        info!("resuming {} from {existing} bytes", dest.display());
+    }
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("request {url}"))?;
+    let status = response.status();
+
+    if status == StatusCode::RANGE_NOT_SATISFIABLE && existing > 0 {
+        return finalize_download(tmp, dest).await;
+    }
+    if !status.is_success() {
+        let code = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(180).collect();
+        bail!("download failed for {url} (HTTP {code}) {snippet}");
+    }
+
+    let resume = existing > 0 && status == StatusCode::PARTIAL_CONTENT;
+    if existing > 0 && !resume {
+        warn!(
+            "server ignored resume for {}; restarting from byte 0",
+            dest.display()
+        );
+        let _ = tokio::fs::remove_file(tmp).await;
+    }
+    let start_at = if resume { existing } else { 0 };
+    let expected_total = if resume {
+        content_range_total(response.headers().get(CONTENT_RANGE))
+            .or_else(|| response.content_length().map(|n| start_at.saturating_add(n)))
+    } else {
+        response.content_length()
+    };
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resume)
+        .truncate(!resume)
+        .open(tmp)
+        .await
+        .with_context(|| format!("open {}", tmp.display()))?;
+    let mut stream = response.bytes_stream();
+    let mut written = start_at;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read download chunk")?;
+        written = written.saturating_add(chunk.len() as u64);
+        file.write_all(&chunk)
+            .await
+            .context("write download chunk")?;
+    }
+    file.flush().await.context("flush download")?;
+    drop(file);
+
+    if let Some(expected) = expected_total {
+        if written < expected {
+            bail!(
+                "truncated download for {}: got {written} of {expected} bytes",
+                dest.display()
+            );
+        }
+        if written > expected {
+            let _ = tokio::fs::remove_file(tmp).await;
+            bail!(
+                "download larger than expected for {}: got {written} of {expected} bytes",
+                dest.display()
+            );
+        }
+    }
+    finalize_download(tmp, dest).await
+}
+
+async fn stream_url_to_file(url: &str, dest: &Path, auth_token: Option<&str>) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent("scalattice-agent")
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .context("build HTTP client")?;
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    let tmp = dest.with_extension("part");
+    let mut last_err = None;
+    for attempt in 1..=DOWNLOAD_RETRIES {
+        match stream_url_once(&client, url, dest, &tmp, auth_token).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if !is_retryable_transfer_error(&err) || attempt == DOWNLOAD_RETRIES {
+                    return Err(err);
+                }
+                let have = part_len(&tmp).await;
+                let wait = Duration::from_secs(2u64.saturating_pow(attempt.min(4)));
+                warn!(
+                    "download interrupted at {have} bytes (attempt {attempt}/{DOWNLOAD_RETRIES}): {err:#}; retrying in {}s",
+                    wait.as_secs()
+                );
+                last_err = Some(err);
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("download failed")))
 }
 
 fn mirror_url_for_filename(weights: &ModelWeights, repo_path: &str) -> Option<String> {
@@ -336,6 +440,11 @@ pub async fn download_catalog_model(
                     return Err(err);
                 }
                 warn!("Scalattice mirror download failed, trying Hugging Face: {err:#}");
+                for repo_path in weight_filenames(weights) {
+                    let dest = target_gguf_path(runtime_model, repo_path);
+                    let tmp = dest.with_extension("part");
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                }
             }
         }
     }
