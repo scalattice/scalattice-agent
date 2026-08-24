@@ -652,6 +652,19 @@ def dump_logs(home: Path, localappdata: Optional[Path]) -> None:
         for line in lines[-80:]:
             print(line)
 
+    if sys.platform.startswith("linux"):
+        for cmd in (
+            ["systemctl", "--user", "status", "scalattice-agent.service", "--no-pager", "-l", "-n", "30"],
+            ["journalctl", "--user", "-u", "scalattice-agent.service", "-n", "40", "--no-pager"],
+        ):
+            print(f"==> {' '.join(cmd)}")
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+                sys.stdout.write(out.stdout or "")
+                sys.stderr.write(out.stderr or "")
+            except Exception as err:  # noqa: BLE001
+                print(f"  ({err})")
+
 
 def ensure_linux_user_systemd() -> None:
     if not sys.platform.startswith("linux"):

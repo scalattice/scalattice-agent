@@ -808,9 +808,13 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     info!("{}", crate::specs::status_line(&specs));
     sweep_staged_purge_dirs();
 
-    let hypervisor = Hypervisor::start(&specs.compute_devices)
-        .await
-        .context("start compute hypervisor")?;
+    let hypervisor = match Hypervisor::start(&specs.compute_devices).await {
+        Ok(hv) => hv,
+        Err(err) => {
+            warn!("start compute hypervisor failed: {err:#}");
+            return Err(err).context("start compute hypervisor");
+        }
+    };
     info!(
         slots = hypervisor.plan().slots.len(),
         "compute hypervisor online"
