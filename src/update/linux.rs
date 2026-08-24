@@ -2,7 +2,7 @@ use super::cloud::{download_release_asset, fetch_latest_release};
 use super::{compare_versions, current_version, UpdateCheckOutcome, UpdateInfo};
 use crate::paths::{lib_dir, unix_agent_install_targets};
 use crate::service;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::cmp::Ordering;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -312,9 +312,10 @@ fn apply_update(staging: &Path) -> Result<()> {
         }
     }
     if replaced == 0 {
-        return Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("failed to replace scalattice-agent at any install location")
-        }));
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        bail!("failed to replace scalattice-agent at any install location");
     }
 
     let source_lib = staging.join("lib");
