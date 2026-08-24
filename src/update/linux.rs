@@ -97,7 +97,10 @@ pub fn sync_auto_update_timer(enable: bool) -> Result<()> {
 }
 
 fn unix_archive_name() -> Result<String> {
-    Ok(format!("scalattice-agent-{}.tar.gz", unix_release_target()?))
+    Ok(format!(
+        "scalattice-agent-{}.tar.gz",
+        unix_release_target()?
+    ))
 }
 
 fn unix_release_target() -> Result<&'static str> {
@@ -286,9 +289,7 @@ fn apply_update(staging: &Path) -> Result<()> {
     // should still stop the service first.
     let self_replace = running_as_live_agent();
     if self_replace {
-        eprintln!(
-            "self-update: replacing binary in place (not stopping this process)"
-        );
+        eprintln!("self-update: replacing binary in place (not stopping this process)");
     } else {
         service::stop_background_for_update()?;
     }
@@ -328,8 +329,9 @@ fn apply_update(staging: &Path) -> Result<()> {
                 continue;
             }
             let name = entry.file_name();
-            fs::copy(entry.path(), dest_lib.join(&name))
-                .with_context(|| format!("copy library {}", name.to_string_lossy()))?;
+            let dest = dest_lib.join(&name);
+            replace_unix_file(&entry.path(), &dest)
+                .with_context(|| format!("replace library {}", name.to_string_lossy()))?;
         }
     }
 
@@ -349,36 +351,51 @@ fn running_as_live_agent() -> bool {
 }
 
 fn replace_unix_binary(source: &Path, dest: &Path) -> Result<()> {
-    let parent = dest.parent().context("agent binary parent directory")?;
+    replace_unix_file_with_mode(source, dest, Some(0o755))
+}
+
+/// Replace `dest` without truncating an inode a running process still has mapped.
+///
+/// `fs::copy` onto an existing file truncates that inode. The CLI updater is the
+/// same CUDA-linked binary as the agent, with `$ORIGIN/../lib/scalattice` already
+/// mapped, so overwriting those `.so` files in place SIGSEGVs after "success"
+/// (`returncode -11`). Rename keeps the old inode alive until this process exits.
+fn replace_unix_file(source: &Path, dest: &Path) -> Result<()> {
+    replace_unix_file_with_mode(source, dest, None)
+}
+
+fn replace_unix_file_with_mode(source: &Path, dest: &Path, mode: Option<u32>) -> Result<()> {
+    let parent = dest.parent().context("install parent directory")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("create install directory {}", parent.display()))?;
-    let tmp_bin = parent.join(format!(
+    let tmp = parent.join(format!(
         "{}.update.{}",
         dest.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("scalattice-agent"),
+            .unwrap_or("scalattice-file"),
         std::process::id()
     ));
-    // Atomic replace via rename is safe while this process is still mapped to the
-    // old inode; Linux keeps the running image until exit. macOS usually allows
-    // rename-over of a running Mach-O; if it does not, unlink then copy.
-    fs::copy(source, &tmp_bin)
-        .with_context(|| format!("copy new agent binary to {}", tmp_bin.display()))?;
-    fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755))
-        .context("set executable bit on new agent binary")?;
-    match fs::rename(&tmp_bin, dest) {
+    fs::copy(source, &tmp).with_context(|| format!("copy new file to {}", tmp.display()))?;
+    if let Some(mode) = mode {
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))
+            .context("set permissions on new file")?;
+    }
+    match fs::rename(&tmp, dest) {
         Ok(()) => Ok(()),
         Err(rename_err) => {
+            // Unlink first so a fallback never writes through a mapped inode.
             let _ = fs::remove_file(dest);
-            let copied = fs::copy(&tmp_bin, dest).and_then(|_| {
-                fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
+            let replaced = fs::rename(&tmp, dest).or_else(|_| {
+                fs::copy(&tmp, dest).and_then(|_| {
+                    if let Some(mode) = mode {
+                        fs::set_permissions(dest, fs::Permissions::from_mode(mode))?;
+                    }
+                    let _ = fs::remove_file(&tmp);
+                    Ok(())
+                })
             });
-            let _ = fs::remove_file(&tmp_bin);
-            copied.with_context(|| {
-                format!(
-                    "replace {} (rename failed: {rename_err})",
-                    dest.display()
-                )
+            replaced.with_context(|| {
+                format!("replace {} (rename failed: {rename_err})", dest.display())
             })?;
             Ok(())
         }

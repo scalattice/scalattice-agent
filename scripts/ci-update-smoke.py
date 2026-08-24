@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -48,6 +49,15 @@ WIN_APP_ID = "A4E8B2C1-9F3D-4A6E-8B1C-2D5E7F9A0B3C"
 
 class Fail(Exception):
     pass
+
+
+def describe_returncode(code: int) -> str:
+    if code >= 0:
+        return str(code)
+    try:
+        return f"{code} ({signal.Signals(-code).name})"
+    except ValueError:
+        return f"{code} (signal {-code})"
 
 
 class MockState:
@@ -948,7 +958,7 @@ def main() -> int:
         print_cmd(result)
         # Windows CLI exits 0 immediately after spawning Inno; Unix waits for replace+restart.
         if sys.platform not in ("win32", "cygwin") and result.returncode != 0:
-            raise Fail(f"CLI update failed ({result.returncode})")
+            raise Fail(f"CLI update failed ({describe_returncode(result.returncode)})")
         wait_download(state, args.timeout, downloads_before)
         wait_until(
             "agent re-registered after CLI update",
