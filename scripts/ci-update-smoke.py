@@ -452,6 +452,66 @@ def extract_zip(archive: Path, dest: Path) -> None:
         zf.extractall(dest)
 
 
+def find_cuda_stub() -> Optional[Path]:
+    """NVIDIA driver (`libcuda.so.1`) is not in the release tarball and is not
+    present on GitHub-hosted runners. The CUDA *toolkit* ships a link stub that
+    is enough for the process to start (inference will not use a GPU here)."""
+    names = ("libcuda.so.1", "libcuda.so")
+    roots: list[Path] = []
+    for key in ("CUDA_PATH", "CUDA_HOME"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            roots.append(Path(raw))
+    if Path("/usr/local").is_dir():
+        roots.extend(sorted(Path("/usr/local").glob("cuda*")))
+    subdirs = (
+        Path("lib64/stubs"),
+        Path("lib/stubs"),
+        Path("targets/aarch64-linux/lib/stubs"),
+        Path("targets/sbsa-linux/lib/stubs"),
+        Path("targets/x86_64-linux/lib/stubs"),
+        Path("lib64"),
+        Path("lib"),
+    )
+    dirs: list[Path] = []
+    for root in roots:
+        dirs.extend(root / sub for sub in subdirs)
+    dirs.extend(
+        [
+            Path("/usr/lib/wsl/lib"),
+            Path("/usr/lib/aarch64-linux-gnu"),
+            Path("/usr/lib/x86_64-linux-gnu"),
+        ]
+    )
+    for directory in dirs:
+        for name in names:
+            path = directory / name
+            if path.is_file():
+                return path.resolve()
+    return None
+
+
+def install_cuda_driver_stub(lib_dir: Path) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    dest = lib_dir / "libcuda.so.1"
+    if dest.is_file():
+        return
+    stub = find_cuda_stub()
+    if stub is None:
+        raise Fail(
+            "GPU-linked agent needs libcuda.so.1 to start, and this runner has "
+            "no NVIDIA driver. Expected a CUDA toolkit stub at "
+            "$CUDA_PATH/lib64/stubs or /usr/local/cuda*/targets/*/lib/stubs."
+        )
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        dest.symlink_to(stub)
+    except OSError:
+        shutil.copy2(stub, dest)
+    print(f"==> CUDA driver stub {stub} -> {dest} (CPU-only runner)")
+
+
 def seed_unix(staging: Path, home: Path) -> Path:
     src = staging / "scalattice-agent"
     if not src.is_file():
@@ -461,13 +521,14 @@ def seed_unix(staging: Path, home: Path) -> Path:
     dest = bindir / "scalattice-agent"
     shutil.copy2(src, dest)
     dest.chmod(0o755)
+    lib_dest = home / ".local" / "lib" / "scalattice"
+    lib_dest.mkdir(parents=True, exist_ok=True)
     lib_src = staging / "lib"
     if lib_src.is_dir():
-        lib_dest = home / ".local" / "lib" / "scalattice"
-        lib_dest.mkdir(parents=True, exist_ok=True)
         for item in lib_src.iterdir():
             if item.is_file():
                 shutil.copy2(item, lib_dest / item.name)
+    install_cuda_driver_stub(lib_dest)
     return dest
 
 
@@ -680,6 +741,11 @@ def isolate_env(home: Path, localappdata: Optional[Path], bin_path: Path, http: 
     path_sep = ";" if sys.platform in ("win32", "cygwin") else ":"
     env["PATH"] = str(bin_path.parent) + path_sep + env.get("PATH", "")
     env["SCALATTICE_INSTALL_DIR"] = str(bin_path.parent)
+    if sys.platform.startswith("linux"):
+        lib_dest = home / ".local" / "lib" / "scalattice"
+        if lib_dest.is_dir():
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = str(lib_dest) + ((":" + existing) if existing else "")
     if localappdata is not None:
         lib = localappdata / "Scalattice" / "lib"
         env["SCALATTICE_LIB_DIR"] = str(lib)
@@ -741,6 +807,10 @@ def main() -> int:
     # Version from the seeded binary (this release), not from Cargo.toml on disk.
     probe_env = os.environ.copy()
     probe_env["SCALATTICE_UPDATE_SMOKE"] = "1"
+    if sys.platform.startswith("linux"):
+        lib_dest = home / ".local" / "lib" / "scalattice"
+        existing = probe_env.get("LD_LIBRARY_PATH", "")
+        probe_env["LD_LIBRARY_PATH"] = str(lib_dest) + ((":" + existing) if existing else "")
     real_version = agent_version(bin_path, probe_env)
     print(f"==> real version {real_version}; advertising {FAKE_VERSION} until first download")
 
@@ -768,6 +838,14 @@ def main() -> int:
             "SCALATTICE_VERBOSE": "1",
         },
     )
+    if sys.platform.startswith("linux"):
+        lib_dest = home / ".local" / "lib" / "scalattice"
+        ld = env.get("LD_LIBRARY_PATH", str(lib_dest))
+        env_path = home / ".config" / "scalattice" / "agent.env"
+        env_path.write_text(
+            env_path.read_text(encoding="utf-8") + f"LD_LIBRARY_PATH={ld}\n",
+            encoding="utf-8",
+        )
     if localappdata is not None:
         env_path = home / ".config" / "scalattice" / "agent.env"
         env_path.write_text(

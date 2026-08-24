@@ -138,6 +138,8 @@ jobs:
           chmod +x scripts/build-release.sh scripts/bundle-release-libs.sh scripts/prune-cargo-target.sh
           ./scripts/build-release.sh x86_64-unknown-linux-gnu
       - name: Vet auto-update and remote restart
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
         run: |
           set -euo pipefail
           python3 scripts/ci-update-smoke.py --dist dist
@@ -210,6 +212,8 @@ jobs:
             tar -czf dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz -C dist scalattice-agent
           fi
       - name: Vet auto-update and remote restart
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
         run: |
           set -euo pipefail
           python3 scripts/ci-update-smoke.py --dist dist
