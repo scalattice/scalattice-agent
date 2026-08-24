@@ -121,6 +121,10 @@ pub fn remove_background_service() -> Result<()> {
 }
 
 pub fn stop_background_for_update() -> Result<()> {
+    if invoked_by_background_service() {
+        // bootout of this job unloads it; the live updater would never come back.
+        return Ok(());
+    }
     if !service_active() {
         return Ok(());
     }
@@ -256,7 +260,7 @@ fn write_launch_agent() -> Result<()> {
 
 fn write_tray_plist() -> Result<()> {
     let bin = resolve_agent_binary().unwrap_or_else(|_| {
-        PathBuf::from("/Applications/Scalattice Agent.app/Contents/MacOS/scalattice-agent")
+        crate::paths::bundled_macos_agent_binary()
     });
     let plist_path = tray_plist_path()?;
     let plist = format!(
@@ -330,6 +334,18 @@ fn write_update_plist() -> Result<()> {
 fn reload_launch_agent() -> Result<()> {
     let uid = user_id();
     let domain = format!("gui/{uid}/{LABEL}");
+    if invoked_by_background_service() {
+        // NEVER bootout our own LaunchAgent. bootout unloads the job, launchd
+        // kills this process, and bootstrap/kickstart never run. KeepAlive does
+        // not apply to a booted-out job, so the agent stays dead until the next
+        // GUI login. Linux `systemctl restart` is one atomic call; this is not.
+        //
+        // kickstart -k is a single launchd operation: replace this instance
+        // while leaving the job loaded. If that fails, the caller still exits
+        // and KeepAlive re-execs the (already loaded) ProgramArguments.
+        let _ = run_launchctl(&["kickstart", "-k", &domain]);
+        return Ok(());
+    }
     let plist = launch_agent_plist_path()?;
     bootout(&domain);
     run_launchctl(&["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])?;

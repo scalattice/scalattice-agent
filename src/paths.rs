@@ -107,11 +107,82 @@ pub fn agent_binary_name() -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn bundled_macos_agent_binary() -> PathBuf {
+    PathBuf::from("/Applications/Scalattice Agent.app/Contents/MacOS/scalattice-agent")
+}
+
+#[cfg(target_os = "macos")]
+fn looks_like_agent_binary(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n == agent_binary_name() || n == "scalattice-agent")
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn paths_eq(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Locations that a Unix self-update should replace.
+///
+/// macOS ships as an .app bundle; `install_dir()` is `~/.local/bin`. Replacing
+/// only the latter leaves launchd running the old bundle binary.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn unix_agent_install_targets() -> Result<Vec<PathBuf>> {
+    let mut targets = Vec::new();
+    let mut push = |path: PathBuf| {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        if targets.iter().any(|existing| paths_eq(existing, &path)) {
+            return;
+        }
+        targets.push(path);
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if looks_like_agent_binary(&exe) {
+                push(exe);
+            }
+        }
+        let app = bundled_macos_agent_binary();
+        if app.is_file() {
+            push(app);
+        }
+    }
+
+    push(install_dir()?.join(agent_binary_name()));
+    Ok(targets)
+}
+
 pub fn resolve_agent_binary() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("SCALATTICE_AGENT_BIN") {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Ok(path);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if exe.is_file() && looks_like_agent_binary(&exe) {
+                return Ok(exe);
+            }
+        }
+        let app = bundled_macos_agent_binary();
+        if app.is_file() {
+            return Ok(app);
         }
     }
 
@@ -217,5 +288,23 @@ pub fn remove_path_quiet(path: &Path) {
         Ok(()) => println!("Removed {}", path.display()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => eprintln!("Warning: could not remove {}: {err}", path.display()),
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_install_targets_include_local_bin() {
+        let targets = unix_agent_install_targets().expect("targets");
+        let expected = install_dir().expect("install dir").join(agent_binary_name());
+        assert!(
+            targets
+                .iter()
+                .any(|path| path == &expected || paths_eq(path, &expected)),
+            "expected {} in {targets:?}",
+            expected.display()
+        );
     }
 }

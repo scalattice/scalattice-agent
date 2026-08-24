@@ -1,8 +1,8 @@
 use super::cloud::{download_release_asset, fetch_latest_release};
 use super::{compare_versions, current_version, UpdateCheckOutcome, UpdateInfo};
-use crate::paths::{install_dir, lib_dir};
+use crate::paths::{lib_dir, unix_agent_install_targets};
 use crate::service;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::cmp::Ordering;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -293,16 +293,29 @@ fn apply_update(staging: &Path) -> Result<()> {
         service::stop_background_for_update()?;
     }
 
-    let install_bin = install_dir().context("resolve install directory")?;
-    fs::create_dir_all(&install_bin).context("create install directory")?;
-    let dest_bin = install_bin.join("scalattice-agent");
-    let tmp_bin = install_bin.join("scalattice-agent.update");
-    // Atomic replace via rename is safe while this process is still mapped to the
-    // old inode; Linux keeps the running image until exit.
-    fs::copy(&source_bin, &tmp_bin).context("copy new agent binary")?;
-    fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755))
-        .context("set executable bit on new agent binary")?;
-    fs::rename(&tmp_bin, &dest_bin).context("replace installed agent binary")?;
+    // Linux: rename over ~/.local/bin is enough (systemd unit points there).
+    // macOS: launchd often execs the .app bundle binary, not ~/.local/bin —
+    // replacing only install_dir left KeepAlive restarting the old image.
+    let targets = unix_agent_install_targets().context("resolve install targets")?;
+    let mut replaced = 0usize;
+    let mut last_err: Option<anyhow::Error> = None;
+    for dest_bin in &targets {
+        match replace_unix_binary(&source_bin, dest_bin) {
+            Ok(()) => replaced += 1,
+            Err(err) => {
+                eprintln!(
+                    "self-update: could not replace {}: {err:#}",
+                    dest_bin.display()
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    if replaced == 0 {
+        return Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("failed to replace scalattice-agent at any install location")
+        }));
+    }
 
     let source_lib = staging.join("lib");
     if source_lib.is_dir() {
@@ -334,6 +347,43 @@ fn running_as_live_agent() -> bool {
     std::env::args().any(|arg| arg == "foreground")
 }
 
+fn replace_unix_binary(source: &Path, dest: &Path) -> Result<()> {
+    let parent = dest.parent().context("agent binary parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create install directory {}", parent.display()))?;
+    let tmp_bin = parent.join(format!(
+        "{}.update.{}",
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("scalattice-agent"),
+        std::process::id()
+    ));
+    // Atomic replace via rename is safe while this process is still mapped to the
+    // old inode; Linux keeps the running image until exit. macOS usually allows
+    // rename-over of a running Mach-O; if it does not, unlink then copy.
+    fs::copy(source, &tmp_bin)
+        .with_context(|| format!("copy new agent binary to {}", tmp_bin.display()))?;
+    fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755))
+        .context("set executable bit on new agent binary")?;
+    match fs::rename(&tmp_bin, dest) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            let _ = fs::remove_file(dest);
+            let copied = fs::copy(&tmp_bin, dest).and_then(|_| {
+                fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
+            });
+            let _ = fs::remove_file(&tmp_bin);
+            copied.with_context(|| {
+                format!(
+                    "replace {} (rename failed: {rename_err})",
+                    dest.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn write_update_units() -> Result<()> {
     let home = crate::paths::home_dir()?;
@@ -341,7 +391,7 @@ fn write_update_units() -> Result<()> {
     fs::create_dir_all(&unit_dir).context("create systemd user unit directory")?;
 
     let bin = crate::paths::resolve_agent_binary().unwrap_or_else(|_| {
-        install_dir()
+        crate::paths::install_dir()
             .map(|d| d.join("scalattice-agent"))
             .unwrap_or_else(|_| PathBuf::from("scalattice-agent"))
     });
