@@ -15,8 +15,9 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::ggml_devices::{metal_ggml_device_indices, vulkan_ggml_device_indices};
@@ -24,6 +25,33 @@ use super::prompt::{build_chat_prompt, sanitize_completion};
 use super::vision::{prefill_vision, prompt_needs_vision};
 
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
+
+enum BackendInit {
+    Idle,
+    Waiting(mpsc::Receiver<Result<LlamaBackend, String>>),
+}
+
+static BACKEND_INIT: Mutex<BackendInit> = Mutex::new(BackendInit::Idle);
+
+fn backend_init_timeout() -> Duration {
+    // CUDA driver mismatches can stall forever inside ggml_cuda_init (12s is a
+    // hang detector). Metal's first ggml init compiles shaders and routinely
+    // exceeds 12s; poisoning the OnceLock after that made every later warm
+    // fail with a bogus NVIDIA-driver message.
+    if cfg!(target_os = "macos") {
+        Duration::from_secs(90)
+    } else {
+        Duration::from_secs(12)
+    }
+}
+
+fn backend_timeout_message() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "timed out initializing llama.cpp Metal — first GPU setup can take a while; will keep trying"
+    } else {
+        "timed out initializing llama.cpp — update the NVIDIA driver or use CPU-only models"
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GenerateConfig {
@@ -53,34 +81,70 @@ pub struct GenerateOutput {
 pub fn init_backend() -> Result<()> {
     llama_cpp_2::send_logs_to_tracing(LogOptions::default());
     if BACKEND.get().is_some() {
-        return backend().map(|_| ());
+        return backend_ready();
     }
 
-    // CUDA driver mismatches can stall inside ggml_cuda_init. Bound the wait so the
-    // agent can still connect and run CPU-compatible work (or report no compute).
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("llama-backend-init".into())
-        .spawn(move || {
-            let result = LlamaBackend::init().map_err(|err| err.to_string());
-            let _ = tx.send(result);
-        })
-        .context("spawn llama.cpp backend init thread")?;
+    let mut slot = BACKEND_INIT.lock().unwrap_or_else(|err| err.into_inner());
+    if BACKEND.get().is_some() {
+        drop(slot);
+        return backend_ready();
+    }
 
-    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+    if matches!(*slot, BackendInit::Idle) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("llama-backend-init".into())
+            .spawn(move || {
+                let result = LlamaBackend::init().map_err(|err| err.to_string());
+                let _ = tx.send(result);
+            })
+            .context("spawn llama.cpp backend init thread")?;
+        *slot = BackendInit::Waiting(rx);
+        info!(
+            timeout_secs = backend_init_timeout().as_secs(),
+            "initializing llama.cpp backend"
+        );
+    }
+
+    let BackendInit::Waiting(rx) = &mut *slot else {
+        drop(slot);
+        return backend_ready();
+    };
+
+    match rx.recv_timeout(backend_init_timeout()) {
         Ok(result) => {
+            match &result {
+                Ok(_) => info!("llama.cpp backend ready"),
+                Err(err) => warn!(error = %err, "llama.cpp backend init failed"),
+            }
             let _ = BACKEND.set(result);
+            *slot = BackendInit::Idle;
         }
-        Err(_) => {
+        Err(RecvTimeoutError::Timeout) => {
             warn!(
-                "llama.cpp backend init timed out after 12s (often an outdated NVIDIA driver); continuing without GPU backend"
+                timeout_secs = backend_init_timeout().as_secs(),
+                "{}",
+                backend_timeout_message()
             );
-            let _ = BACKEND.set(Err(
-                "timed out initializing llama.cpp — update the NVIDIA driver or use CPU-only models"
-                    .into(),
-            ));
+            if !cfg!(target_os = "macos") {
+                // CUDA hang almost never recovers; cache the failure so warm
+                // does not block 12s on every heartbeat.
+                let _ = BACKEND.set(Err(backend_timeout_message().into()));
+                *slot = BackendInit::Idle;
+            }
+            anyhow::bail!("{}", backend_timeout_message());
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let msg = "llama.cpp backend init thread exited without a result";
+            let _ = BACKEND.set(Err(msg.into()));
+            *slot = BackendInit::Idle;
         }
     }
+    drop(slot);
+    backend_ready()
+}
+
+fn backend_ready() -> Result<()> {
     backend().map(|_| ())
 }
 
@@ -92,8 +156,12 @@ pub(crate) fn decode_token(model: &LlamaModel, token: LlamaToken) -> Result<Stri
 }
 
 pub(crate) fn backend() -> Result<&'static LlamaBackend> {
+    if BACKEND.get().is_none() {
+        init_backend()?;
+    }
     BACKEND
-        .get_or_init(|| LlamaBackend::init().map_err(|err| err.to_string()))
+        .get()
+        .ok_or_else(|| anyhow::anyhow!(backend_timeout_message()))?
         .as_ref()
         .map_err(|err| anyhow::anyhow!(err.clone()))
 }
