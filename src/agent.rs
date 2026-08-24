@@ -1582,8 +1582,10 @@ async fn handle_remote_control(
                         let _ = ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default()).await;
                         if will_restart {
                             tokio::time::sleep(Duration::from_millis(800)).await;
-                            // Linux: binary already replaced in place; restart the unit
-                            // (or exit and let Restart=always respawn the new image).
+                            // Linux: systemctl restart is atomic (systemd respawns).
+                            // macOS: must not launchctl bootout from inside the job —
+                            // that unloads it and the agent never comes back. The
+                            // macOS helper kickstarts in-place (or KeepAlive after exit).
                             match tokio::task::spawn_blocking(|| {
                                 crate::service::restart_runtime_from_saved_token()
                             })
