@@ -274,7 +274,7 @@ fn uninstall_user_service() -> Result<()> {
 fn sync_systemd_env_file(home: &Path) -> Result<()> {
     let env_file = crate::paths::agent_env_path()?;
     let systemd_env = systemd_env_path(home);
-    let raw = fs::read_to_string(&env_file)
+    let raw = crate::config::read_text_file_lossy(&env_file)
         .with_context(|| format!("read {}", env_file.display()))?;
 
     let mut lines = Vec::new();

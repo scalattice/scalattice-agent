@@ -390,7 +390,8 @@ fn parse_agent_env() -> Result<Vec<(String, String)>> {
     if !env_file.is_file() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(&env_file).with_context(|| format!("read {}", env_file.display()))?;
+    let raw = crate::config::read_text_file_lossy(&env_file)
+        .with_context(|| format!("read {}", env_file.display()))?;
     let mut pairs = Vec::new();
     for line in raw.lines() {
         let trimmed = line.trim();
