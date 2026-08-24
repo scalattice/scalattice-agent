@@ -984,7 +984,7 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                     // putting bytes on the wire (edge proxies idle-close ~100s).
                     send_heartbeat(&state, &write).await?;
                     {
-                        let mut guard = state.lock().await;
+                        let guard = state.lock().await;
                         guard.persist_local_state();
                         if guard.cloud_link_stale() {
                             warn!(

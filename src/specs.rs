@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "macos"))]
 use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
@@ -292,6 +293,7 @@ fn sum_option(values: impl Iterator<Item = u32>) -> Option<u32> {
     if total > 0 { Some(total) } else { None }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn detect_nvidia_devices() -> Vec<ComputeDevice> {
     for bin in nvidia_smi_bins() {
         let devices = detect_nvidia_devices_from(&bin);
@@ -406,6 +408,7 @@ fn configure_nvidia_smi_command(bin: &str) -> Command {
     cmd
 }
 
+#[cfg(not(target_os = "macos"))]
 fn detect_nvidia_devices_from_procfs() -> Vec<ComputeDevice> {
     #[cfg(not(unix))]
     {
@@ -449,6 +452,7 @@ fn detect_nvidia_devices_from_procfs() -> Vec<ComputeDevice> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
     let Ok(output) = configure_nvidia_smi_command(bin)
         .args([
@@ -487,6 +491,7 @@ fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
     devices
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn parse_csv_fields(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
@@ -507,6 +512,7 @@ fn parse_csv_fields(line: &str) -> Vec<String> {
     fields
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_nvidia_number(raw: &str) -> Option<f32> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("[N/A]") {
@@ -515,6 +521,7 @@ fn parse_nvidia_number(raw: &str) -> Option<f32> {
     trimmed.parse::<f32>().ok()
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn parse_util_pct(raw: &str) -> Option<u8> {
     let trimmed = raw.trim().trim_end_matches('%').trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("[N/A]") {
@@ -526,6 +533,7 @@ fn parse_util_pct(raw: &str) -> Option<u8> {
         .map(|v| v.round().clamp(0.0, 100.0) as u8)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn detect_amd_devices() -> Vec<ComputeDevice> {
     let Ok(output) = Command::new("rocm-smi")
         .args(["--showproductname"])
@@ -567,6 +575,7 @@ fn detect_amd_devices() -> Vec<ComputeDevice> {
         .collect()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn detect_amd_util_by_index() -> std::collections::HashMap<usize, u8> {
     let Ok(output) = Command::new("rocm-smi").args(["--showuse"]).output() else {
         return std::collections::HashMap::new();
@@ -601,6 +610,7 @@ fn detect_amd_util_by_index() -> std::collections::HashMap<usize, u8> {
     out
 }
 
+#[cfg(not(target_os = "macos"))]
 fn detect_integrated_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
     #[cfg(windows)]
     {
@@ -617,6 +627,7 @@ fn detect_integrated_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevic
 }
 
 /// Discrete AMD / Intel Arc when vendor tools are absent (Linux lspci / Windows CIM).
+#[cfg(not(target_os = "macos"))]
 fn detect_pci_vulkan_discrete_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
     #[cfg(unix)]
     {
@@ -690,7 +701,7 @@ fn detect_pci_vulkan_discrete_windows(existing: &[ComputeDevice]) -> Vec<Compute
         .collect()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn detect_pci_vulkan_discrete_linux(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
     let output = match Command::new("lspci").output() {
         Ok(output) if output.status.success() => output,
@@ -760,6 +771,7 @@ fn detect_pci_vulkan_discrete_linux(existing: &[ComputeDevice]) -> Vec<ComputeDe
         .collect()
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn is_discrete_vulkan_pci_name(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("nvidia")
@@ -775,7 +787,7 @@ fn is_discrete_vulkan_pci_name(raw: &str) -> bool {
         || lower.contains("arc")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn detect_integrated_linux_pci_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
     let output = match Command::new("lspci").output() {
         Ok(output) if output.status.success() => output,
@@ -880,6 +892,7 @@ fn detect_integrated_windows_devices(existing: &[ComputeDevice]) -> Vec<ComputeD
         .collect()
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn is_integrated_pci_name(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("nvidia")
@@ -1039,6 +1052,7 @@ fn vm_stat_free_pages() -> Option<u64> {
     (free > 0).then_some(free)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn detect_amd_vram_gb() -> Option<u32> {
     let output = Command::new("rocm-smi")
         .args(["--showmeminfo", "vram"])
@@ -1066,6 +1080,7 @@ fn detect_amd_vram_gb() -> Option<u32> {
     mb_to_gb(best_mb)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn dedupe_pci_gpu_names(raw_names: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -1078,6 +1093,7 @@ fn dedupe_pci_gpu_names(raw_names: Vec<String>) -> Vec<String> {
     out
 }
 
+#[cfg(not(target_os = "macos"))]
 fn pci_gpu_dedupe_key(raw: &str) -> String {
     if let Some(start) = raw.find('[') {
         if let Some(end) = raw[start + 1..].find(']') {
@@ -1091,6 +1107,7 @@ fn pci_gpu_dedupe_key(raw: &str) -> String {
         .to_ascii_lowercase()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn clean_pci_gpu_name(raw: &str) -> String {
     if let Some(start) = raw.find('[') {
         if let Some(end) = raw[start + 1..].find(']') {
@@ -1158,6 +1175,7 @@ fn os_family_label(os: &str) -> &'static str {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn unquote_os_release_value(raw: &str) -> String {
     let trimmed = raw.trim();
     if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
@@ -1168,6 +1186,7 @@ fn unquote_os_release_value(raw: &str) -> String {
     trimmed.to_string()
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn parse_os_release(raw: &str) -> (Option<String>, Option<String>, Option<String>) {
     let mut name = None;
     let mut version_id = None;
@@ -1194,6 +1213,7 @@ fn parse_os_release(raw: &str) -> (Option<String>, Option<String>, Option<String
     (name, version_id, pretty)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn pretty_linux(name: Option<&str>, version_id: Option<&str>, pretty: Option<&str>) -> String {
     match (name.map(str::trim).filter(|s| !s.is_empty()), version_id.map(str::trim).filter(|s| !s.is_empty())) {
         (Some(name), Some(version)) => format!("{name} {version}"),
@@ -1206,6 +1226,7 @@ fn pretty_linux(name: Option<&str>, version_id: Option<&str>, pretty: Option<&st
     }
 }
 
+#[cfg(any(test, windows))]
 fn pretty_windows(caption: &str, version: &str) -> String {
     let lower = caption.to_ascii_lowercase();
     if lower.contains("windows 11") {
@@ -1660,6 +1681,7 @@ pub fn detect_driver_version() -> Option<String> {
     None
 }
 
+#[cfg(not(target_os = "macos"))]
 fn mb_to_gb(mb: f32) -> Option<u32> {
     if mb <= 0.0 {
         return None;
