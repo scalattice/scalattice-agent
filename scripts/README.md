@@ -49,6 +49,7 @@ Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-ho
 | `release.sh` | Main entry: build Linux, create GitHub release, trigger Windows/aarch64 CI, upload assets |
 | `ci-prepare-release.sh` | Used by the Release workflow: tag + GitHub release from `Cargo.toml` |
 | `ci-update-smoke.py` | Release-gate: mock Cloud + fake newer version, prove live/remote and CLI update come back running (Linux/macOS/Windows) |
+| `run-ci-update-smoke.ps1` | Windows wrapper: use PATH Python or the embeddable zip (no admin installer) |
 | `reset-releases.sh` | Delete all tags/releases and reset `Cargo.toml` to 1.0.0 (destructive; needs `--confirm`) |
 | `check-windows-runner.sh` | Verify an online self-hosted runner with label `scalattice-release` (used by `release.sh`) |
 

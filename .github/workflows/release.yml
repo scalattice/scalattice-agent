@@ -364,14 +364,9 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=amd64 -host_arch=amd64
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Vet auto-update and remote restart
         shell: powershell
-        run: |
-          python scripts/ci-update-smoke.py --dist dist
-          if ($LASTEXITCODE -ne 0) { throw "update smoke failed" }
+        run: .\scripts\run-ci-update-smoke.ps1 -Dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -435,14 +430,9 @@ jobs:
         run: |
           set "PATH=%CUDA_PATH%\bin;%PATH%"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Vet auto-update and remote restart
         shell: powershell
-        run: |
-          python scripts/ci-update-smoke.py --dist dist
-          if ($LASTEXITCODE -ne 0) { throw "update smoke failed" }
+        run: .\scripts\run-ci-update-smoke.ps1 -Dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: windows
