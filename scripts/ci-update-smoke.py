@@ -488,7 +488,44 @@ def find_cuda_stub() -> Optional[Path]:
             path = directory / name
             if path.is_file():
                 return path.resolve()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in ("**/stubs/libcuda.so.1", "**/stubs/libcuda.so"):
+            hit = next((p for p in root.glob(pattern) if p.is_file()), None)
+            if hit is not None:
+                return hit.resolve()
     return None
+
+
+def compile_dummy_libcuda(lib_dir: Path) -> Path:
+    """Satisfy DT_NEEDED libcuda.so.1 so --version / foreground can start."""
+    dest = lib_dir / "libcuda.so.1"
+    cc = shutil.which("gcc") or shutil.which("cc")
+    if cc is None:
+        raise Fail(
+            "GPU-linked agent needs libcuda.so.1 to start, and this runner has "
+            "neither an NVIDIA driver, a CUDA toolkit stub, nor gcc to build a dummy."
+        )
+    src = lib_dir / ".scalattice_libcuda_stub.c"
+    src.write_text(
+        "/* CI-only loader stub; not a real NVIDIA driver. */\n"
+        "void scalattice_cuda_ci_stub(void) {}\n",
+        encoding="utf-8",
+    )
+    try:
+        compiled = subprocess.run(
+            [cc, "-shared", "-fPIC", "-Wl,-soname,libcuda.so.1", "-o", str(dest), str(src)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if compiled.returncode != 0 or not dest.is_file():
+            detail = (compiled.stderr or compiled.stdout or "").strip()
+            raise Fail(f"failed to compile dummy libcuda.so.1: {detail or compiled.returncode}")
+    finally:
+        src.unlink(missing_ok=True)
+    return dest
 
 
 def install_cuda_driver_stub(lib_dir: Path) -> None:
@@ -497,19 +534,17 @@ def install_cuda_driver_stub(lib_dir: Path) -> None:
     dest = lib_dir / "libcuda.so.1"
     if dest.is_file():
         return
-    stub = find_cuda_stub()
-    if stub is None:
-        raise Fail(
-            "GPU-linked agent needs libcuda.so.1 to start, and this runner has "
-            "no NVIDIA driver. Expected a CUDA toolkit stub at "
-            "$CUDA_PATH/lib64/stubs or /usr/local/cuda*/targets/*/lib/stubs."
-        )
     lib_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        dest.symlink_to(stub)
-    except OSError:
-        shutil.copy2(stub, dest)
-    print(f"==> CUDA driver stub {stub} -> {dest} (CPU-only runner)")
+    stub = find_cuda_stub()
+    if stub is not None:
+        try:
+            dest.symlink_to(stub)
+        except OSError:
+            shutil.copy2(stub, dest)
+        print(f"==> CUDA driver stub {stub} -> {dest} (CPU-only runner)")
+        return
+    compiled = compile_dummy_libcuda(lib_dir)
+    print(f"==> compiled dummy {compiled} (no NVIDIA driver or CUDA stub on this runner)")
 
 
 def seed_unix(staging: Path, home: Path) -> Path:
