@@ -183,22 +183,26 @@ pub fn persist_agent_token(token: &str) -> Result<bool> {
     let env_file = agent_env_path()?;
     fs::create_dir_all(env_file.parent().context("agent env parent")?)?;
 
-    let mut lines: Vec<String> = if env_file.is_file() {
-        fs::read_to_string(&env_file)?
-            .lines()
-            .map(str::to_string)
-            .collect()
+    // Windows Notepad/PowerShell often save this file as UTF-16. `read_to_string`
+    // then fails with "stream did not contain valid UTF-8" and the tray cannot save.
+    let (mut lines, mut changed) = if env_file.is_file() {
+        let bytes = fs::read(&env_file).with_context(|| format!("read {}", env_file.display()))?;
+        let raw = crate::config::decode_text_bytes(&bytes);
+        let rewrite = crate::config::text_file_needs_utf8_rewrite(&bytes, &raw);
+        (
+            raw.lines().map(str::to_string).collect::<Vec<_>>(),
+            rewrite,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
 
     let key = "SCALATTICE_AGENT_TOKEN";
     let assignment = format!("{key}={token}");
-    let mut changed = false;
     let mut found = false;
 
     for line in &mut lines {
-        let trimmed = line.trim();
+        let trimmed = line.trim().trim_start_matches('\u{feff}').trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }

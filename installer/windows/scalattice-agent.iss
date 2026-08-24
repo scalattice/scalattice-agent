@@ -189,11 +189,13 @@ begin
   TokenPath := ExpandConstant('{%USERPROFILE}\.config\scalattice\agent.env');
   if not FileExists(TokenPath) then
     Exit;
-  if LoadStringsFromFile(TokenPath, Lines) then
+  if LoadStringsFromUTF8File(TokenPath, Lines) or LoadStringsFromFile(TokenPath, Lines) then
   begin
     for I := 0 to GetArrayLength(Lines) - 1 do
     begin
       Line := Trim(Lines[I]);
+      if (Length(Line) > 0) and (Line[1] = #$FEFF) then
+        Line := Copy(Line, 2, MaxInt);
       if Copy(Line, 1, 23) = 'SCALATTICE_AGENT_TOKEN=' then
       begin
         Value := Trim(Copy(Line, 24, MaxInt));
@@ -992,6 +994,7 @@ end;
 procedure PersistProviderToken(const Token: String);
 var
   Dir, Path: String;
+  Lines: TArrayOfString;
 begin
   if not TokenLooksValid(Token) then
     Exit;
@@ -999,7 +1002,10 @@ begin
   if not DirExists(Dir) then
     ForceDirectories(Dir);
   Path := Dir + '\agent.env';
-  SaveStringToFile(Path, 'SCALATTICE_AGENT_TOKEN=' + Token + #13#10, False);
+  { UTF-8 so the agent can read the file. SaveStringToFile writes ANSI. }
+  SetArrayLength(Lines, 1);
+  Lines[0] := 'SCALATTICE_AGENT_TOKEN=' + Token;
+  SaveStringsToUTF8File(Path, Lines, False);
 end;
 
 procedure StartScalatticeAfterInstall(const AppDir: String);

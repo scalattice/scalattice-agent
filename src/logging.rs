@@ -347,7 +347,7 @@ fn agent_env_truthy(key: &str) -> bool {
     let Ok(path) = agent_env_path() else {
         return false;
     };
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Ok(raw) = crate::config::read_text_file_lossy(&path) else {
         return false;
     };
     for line in raw.lines() {
