@@ -102,6 +102,7 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
                 device.enabled = true;
             }
         }
+        enable_cpu_if_no_accelerator(&mut devices);
         return devices;
     }
 
@@ -119,12 +120,25 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
                 device.enabled = true;
             }
         }
+        enable_cpu_if_no_accelerator(&mut devices);
 
         return devices;
     }
 
     #[allow(unreachable_code)]
     Vec::new()
+}
+
+/// CPU is off by default when a GPU exists. With no accelerator (typical GitHub
+/// runner, CPU-only provider), leave it off and the hypervisor exits immediately
+/// — systemd Restart=always then crash-loops and the agent never reaches Cloud.
+fn enable_cpu_if_no_accelerator(devices: &mut [ComputeDevice]) {
+    if devices.iter().any(|d| d.enabled) {
+        return;
+    }
+    if let Some(cpu) = devices.iter_mut().find(|d| d.kind == "cpu") {
+        cpu.enabled = true;
+    }
 }
 
 pub fn apply_compute_policy(devices: &mut [ComputeDevice], policy: &[(String, bool)]) {
