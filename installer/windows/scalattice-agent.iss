@@ -189,7 +189,7 @@ begin
   TokenPath := ExpandConstant('{%USERPROFILE}\.config\scalattice\agent.env');
   if not FileExists(TokenPath) then
     Exit;
-  if LoadStringsFromUTF8File(TokenPath, Lines) or LoadStringsFromFile(TokenPath, Lines) then
+  if LoadStringsFromFile(TokenPath, Lines) then
   begin
     for I := 0 to GetArrayLength(Lines) - 1 do
     begin
