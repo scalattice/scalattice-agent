@@ -26,8 +26,9 @@ pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
         .build()
         .context("build HTTP client")?;
 
+    let base = release_base();
     let response = client
-        .get(format!("{CLOUD_RELEASE_BASE}/latest"))
+        .get(format!("{base}/latest"))
         .header("Accept", "application/json")
         .send()
         .await
@@ -71,9 +72,15 @@ pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
     })
 }
 
+pub(crate) fn release_base() -> String {
+    crate::config::loopback_http_override("SCALATTICE_UPDATE_BASE")
+        .unwrap_or_else(|| CLOUD_RELEASE_BASE.to_string())
+}
+
 pub(crate) fn release_download_url(tag: &str, asset_name: &str) -> String {
     format!(
-        "{CLOUD_RELEASE_BASE}/download/{}/{}",
+        "{}/download/{}/{}",
+        release_base(),
         urlencoding_path(tag),
         urlencoding_path(asset_name)
     )

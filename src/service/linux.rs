@@ -12,7 +12,7 @@ pub fn background_status() -> BackgroundStatus {
     if !background_service_available() {
         return BackgroundStatus::NotInstalled;
     }
-    let home = match crate::paths::home_dir() {
+    let home = match crate::paths::os_user_home() {
         Ok(h) => h,
         Err(_) => return BackgroundStatus::NotInstalled,
     };
@@ -41,11 +41,12 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
         return ensure_service_running(config);
     }
 
-    let home = crate::paths::home_dir()?;
-    let unit_path = systemd_user_unit_path(&home);
+    let os_home = crate::paths::os_user_home()?;
+    let data_home = crate::paths::home_dir()?;
+    let unit_path = systemd_user_unit_path(&os_home);
     let _ = crate::service::persist_agent_token(&config.token)?;
-    let _ = write_user_unit(&home)?;
-    sync_systemd_env_file(&home)?;
+    let _ = write_user_unit(&os_home, &data_home)?;
+    sync_systemd_env_file(&data_home)?;
     run_systemctl(&["--user", "daemon-reload"])?;
 
     if unit_path.is_file() {
@@ -164,8 +165,8 @@ pub fn restart_background_after_update() -> Result<()> {
     if !background_service_available() {
         return Ok(());
     }
-    let home = crate::paths::home_dir()?;
-    if !systemd_user_unit_path(&home).is_file() {
+    let os_home = crate::paths::os_user_home()?;
+    if !systemd_user_unit_path(&os_home).is_file() {
         return Ok(());
     }
     run_systemctl(&["--user", "restart", UNIT_NAME])?;
@@ -173,7 +174,7 @@ pub fn restart_background_after_update() -> Result<()> {
 }
 
 pub fn systemd_unit_path() -> Result<PathBuf> {
-    Ok(systemd_user_unit_path(&crate::paths::home_dir()?))
+    Ok(systemd_user_unit_path(&crate::paths::os_user_home()?))
 }
 
 fn ensure_service_running(config: &AgentConfig) -> Result<()> {
@@ -181,16 +182,17 @@ fn ensure_service_running(config: &AgentConfig) -> Result<()> {
         bail!("systemd is required for background mode - use: scalattice-agent foreground");
     }
 
-    let home = crate::paths::home_dir()?;
-    let unit_path = systemd_user_unit_path(&home);
+    let os_home = crate::paths::os_user_home()?;
+    let data_home = crate::paths::home_dir()?;
+    let unit_path = systemd_user_unit_path(&os_home);
     let token_changed = crate::service::persist_agent_token(&config.token)?;
-    let unit_changed = write_user_unit(&home)?;
+    let unit_changed = write_user_unit(&os_home, &data_home)?;
 
     if !unit_path.is_file() {
         bail!("failed to write {}", unit_path.display());
     }
 
-    sync_systemd_env_file(&home)?;
+    sync_systemd_env_file(&data_home)?;
     run_systemctl(&["--user", "daemon-reload"])?;
 
     let was_active = run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok();
@@ -209,19 +211,24 @@ fn ensure_service_running(config: &AgentConfig) -> Result<()> {
 
     verify_service_active()?;
     if unit_changed {
-        try_enable_linger(&home);
+        try_enable_linger(&os_home);
     }
     Ok(())
 }
 
-fn write_user_unit(home: &Path) -> Result<bool> {
-    let unit_path = systemd_user_unit_path(home);
+fn write_user_unit(os_home: &Path, data_home: &Path) -> Result<bool> {
+    let unit_path = systemd_user_unit_path(os_home);
     let bin = resolve_agent_binary()?;
-    let systemd_env = systemd_env_path(home);
+    let systemd_env = systemd_env_path(data_home);
     let path_prefix = format!(
         "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         bin.parent().unwrap_or(Path::new("/usr/local/bin")).display()
     );
+    let home_override = if os_home != data_home {
+        format!("Environment=SCALATTICE_HOME={}\n", data_home.display())
+    } else {
+        String::new()
+    };
 
     let unit = format!(
         r#"[Unit]
@@ -232,7 +239,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=PATH={path}
-EnvironmentFile={env}
+{home_override}EnvironmentFile={env}
 ExecStart={bin} foreground
 Restart=always
 RestartSec=2
@@ -242,6 +249,7 @@ StartLimitIntervalSec=0
 WantedBy=default.target
 "#,
         path = path_prefix,
+        home_override = home_override,
         env = systemd_env.display(),
         bin = bin.display(),
     );
@@ -259,7 +267,7 @@ WantedBy=default.target
 }
 
 fn uninstall_user_service() -> Result<()> {
-    let home = crate::paths::home_dir()?;
+    let home = crate::paths::os_user_home()?;
     let unit_path = systemd_user_unit_path(&home);
 
     let _ = run_systemctl(&["--user", "disable", "--now", UNIT_NAME]);

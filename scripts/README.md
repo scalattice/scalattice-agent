@@ -34,7 +34,7 @@ Linux build host                       Windows (self-hosted runner)
 
 **`release.sh --dev`** — Linux x86_64 here + Windows on your runner (skip aarch64 Linux and macOS).  
 **`release.sh`** — same + aarch64 Linux on GitHub `ubuntu-24.04-arm` + macOS Metal on `macos-14`.  
-Merging `development` → `production` runs the full Release workflow (including Linux x86_64 in CI).
+Merging `development` → `production` runs the full Release workflow (including Linux x86_64 in CI). Each platform job vets auto-update **before** the asset is uploaded: a loopback mock serves the just-built package as v99.0.0, then the agent must download, replace itself, and come back running (remote `control/update` and CLI `update`). There is never a future GitHub release to update to while cutting this one.
 
 Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-hosted-windows`, `--no-push`.
 
@@ -48,6 +48,7 @@ Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-ho
 |--------|---------|
 | `release.sh` | Main entry: build Linux, create GitHub release, trigger Windows/aarch64 CI, upload assets |
 | `ci-prepare-release.sh` | Used by the Release workflow: tag + GitHub release from `Cargo.toml` |
+| `ci-update-smoke.py` | Release-gate: mock Cloud + fake newer version, prove live/remote and CLI update come back running (Linux/macOS/Windows) |
 | `reset-releases.sh` | Delete all tags/releases and reset `Cargo.toml` to 1.0.0 (destructive; needs `--confirm`) |
 | `check-windows-runner.sh` | Verify an online self-hosted runner with label `scalattice-release` (used by `release.sh`) |
 

@@ -91,6 +91,11 @@ pub fn spawn_silent_setup_and_exit(installer: &Path) -> Result<()> {
         "/CLOSEAPPLICATIONS".to_string(),
         "/UPDATE=1".to_string(),
     ];
+    // Pin the existing install dir so UsePreviousAppDir cannot redirect a
+    // silent update onto another copy (CI isolate, or a leftover AppId).
+    if let Ok(dir) = crate::paths::install_dir() {
+        args.push(format!("/DIR={}", dir.display()));
+    }
     if let Some(token) = crate::config::read_saved_agent_token() {
         let token = token.trim();
         if !token.is_empty() {
@@ -98,9 +103,15 @@ pub fn spawn_silent_setup_and_exit(installer: &Path) -> Result<()> {
         }
     }
 
-    Command::new(installer)
-        .args(&args)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+    let mut cmd = Command::new(installer);
+    cmd.args(&args);
+    if let Ok(dir) = crate::paths::install_dir() {
+        cmd.env("SCALATTICE_INSTALL_DIR", &dir);
+    }
+    if let Ok(dir) = crate::paths::lib_dir() {
+        cmd.env("SCALATTICE_LIB_DIR", dir);
+    }
+    cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

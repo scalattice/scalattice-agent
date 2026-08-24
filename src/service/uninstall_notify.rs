@@ -3,6 +3,9 @@ use std::time::Duration;
 
 /// Best-effort HTTPS notify before local wipe. Never fails uninstall.
 pub fn notify_server_uninstall(reason: &str) {
+    if crate::config::update_smoke_test() {
+        return;
+    }
     let Some(token) = read_saved_agent_token() else {
         return;
     };

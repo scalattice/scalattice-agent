@@ -2,6 +2,18 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 pub fn home_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("SCALATTICE_HOME") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    os_user_home()
+}
+
+/// Login-session home used for systemd user units (Linux). Independent of
+/// `SCALATTICE_HOME`, which isolates agent data for the CI update smoke.
+pub fn os_user_home() -> Result<PathBuf> {
     #[cfg(unix)]
     {
         return std::env::var("HOME")

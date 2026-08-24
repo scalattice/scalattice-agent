@@ -69,7 +69,7 @@ fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()>
     stop_background_for_token_restart()?;
     spawn_background_detached()?;
 
-    if !skip_tray && !in_tray_process() {
+    if !skip_tray && !in_tray_process() && !crate::config::update_smoke_test() {
         ensure_tray_autostart_registered()?;
         launch_tray_if_needed()?;
     }
@@ -267,7 +267,7 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
         start_background_with_retry()?;
     }
 
-    if !skip_tray && !in_tray_process() {
+    if !skip_tray && !in_tray_process() && !crate::config::update_smoke_test() {
         ensure_tray_autostart_registered()?;
         launch_tray_if_needed()?;
     }
@@ -1088,6 +1088,9 @@ pub fn install_boot_start_elevated() -> Result<()> {
 
 /// Interactive path only: if the boot task is missing, ask for admin once.
 pub fn ensure_boot_start_interactive() -> Result<()> {
+    if crate::config::update_smoke_test() {
+        return Ok(());
+    }
     let _ = write_boot_runner_script()?;
     if boot_task_exists() {
         return Ok(());
