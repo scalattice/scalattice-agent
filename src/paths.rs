@@ -137,7 +137,7 @@ fn paths_eq(a: &Path, b: &Path) -> bool {
 /// only the latter leaves launchd running the old bundle binary.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn unix_agent_install_targets() -> Result<Vec<PathBuf>> {
-    let mut targets = Vec::new();
+    let mut targets: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if path.as_os_str().is_empty() {
             return;
