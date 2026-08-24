@@ -1080,7 +1080,7 @@ fn detect_amd_vram_gb() -> Option<u32> {
     mb_to_gb(best_mb)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn dedupe_pci_gpu_names(raw_names: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -1093,7 +1093,7 @@ fn dedupe_pci_gpu_names(raw_names: Vec<String>) -> Vec<String> {
     out
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn pci_gpu_dedupe_key(raw: &str) -> String {
     if let Some(start) = raw.find('[') {
         if let Some(end) = raw[start + 1..].find(']') {
@@ -1107,7 +1107,7 @@ fn pci_gpu_dedupe_key(raw: &str) -> String {
         .to_ascii_lowercase()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn clean_pci_gpu_name(raw: &str) -> String {
     if let Some(start) = raw.find('[') {
         if let Some(end) = raw[start + 1..].find(']') {
@@ -1258,6 +1258,7 @@ fn pretty_windows(caption: &str, version: &str) -> String {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn macos_codename(major: u32) -> Option<&'static str> {
     match major {
         11 => Some("Big Sur"),
@@ -1270,6 +1271,7 @@ fn macos_codename(major: u32) -> Option<&'static str> {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn pretty_macos(version: &str) -> String {
     let major = version
         .split('.')

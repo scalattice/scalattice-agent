@@ -134,11 +134,13 @@ pub fn ensure_tray_login_item() -> Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn in_tray_process() -> bool {
     platform::in_tray_process()
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub fn in_tray_process() -> bool {
     platform::in_tray_process()
 }

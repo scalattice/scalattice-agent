@@ -36,6 +36,7 @@ pub fn image_job_min_vram_gb(model: &CatalogModel) -> u32 {
     hosting_min_vram_gb(model)
 }
 
+#[allow(dead_code)]
 pub fn resolve_min_vram_gb_vision(model: &CatalogModel) -> u32 {
     image_job_min_vram_gb(model)
 }

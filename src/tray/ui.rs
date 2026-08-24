@@ -1392,6 +1392,7 @@ fn tray_pid_path() -> Result<PathBuf> {
     Ok(install_dir()?.join("tray.pid"))
 }
 
+#[cfg(target_os = "macos")]
 fn tray_pid_from_file() -> Option<u32> {
     let raw = std::fs::read_to_string(tray_pid_path().ok()?).ok()?;
     raw.trim().parse().ok()

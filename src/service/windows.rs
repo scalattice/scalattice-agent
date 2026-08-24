@@ -213,6 +213,7 @@ pub fn background_runner_path() -> Result<PathBuf> {
     Ok(install_dir()?.join("run-background.cmd"))
 }
 
+#[allow(dead_code)]
 pub fn systemd_unit_path() -> Result<PathBuf> {
     background_runner_path()
 }
@@ -346,7 +347,7 @@ pub fn try_acquire_background_instance_mutex() -> Result<bool> {
             &mut sd,
             std::ptr::null_mut(),
         );
-        let mut sa = SECURITY_ATTRIBUTES {
+        let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd,
             bInheritHandle: 0,
@@ -371,7 +372,8 @@ pub fn try_acquire_background_instance_mutex() -> Result<bool> {
             CloseHandle(handle);
             return Ok(false);
         }
-        std::mem::forget(handle);
+        // Intentionally do not CloseHandle: the mutex must outlive this function.
+        let _ = handle;
         Ok(true)
     }
 }
@@ -1325,6 +1327,7 @@ fn remove_startup_shortcuts() {
     }
 }
 
+#[allow(dead_code)]
 fn run_scheduled_task_now() -> Result<()> {
     let output = Command::new("schtasks")
         .args(["/Run", "/TN", TASK_NAME])
@@ -1344,6 +1347,7 @@ fn run_scheduled_task_now() -> Result<()> {
     spawn_background_detached()
 }
 
+#[allow(dead_code)]
 fn run_tray_task_now() -> Result<()> {
     if !tray_task_exists() {
         return launch_tray_if_needed();
