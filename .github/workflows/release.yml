@@ -137,6 +137,10 @@ jobs:
           export PATH="${CUDA_PATH}/bin:$PATH"
           chmod +x scripts/build-release.sh scripts/bundle-release-libs.sh scripts/prune-cargo-target.sh
           ./scripts/build-release.sh x86_64-unknown-linux-gnu
+      - name: Vet auto-update and remote restart
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-update-smoke.py --dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
@@ -205,6 +209,10 @@ jobs:
           else
             tar -czf dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz -C dist scalattice-agent
           fi
+      - name: Vet auto-update and remote restart
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-update-smoke.py --dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: aarch64
@@ -298,6 +306,10 @@ jobs:
           set -euo pipefail
           test -f dist/ScalatticeAgentSetup-aarch64.dmg
           test -f dist/scalattice-agent-aarch64-apple-darwin.tar.gz
+      - name: Vet auto-update and remote restart
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-update-smoke.py --dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -348,6 +360,17 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=amd64 -host_arch=amd64
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+      - name: Vet auto-update and remote restart
+        shell: powershell
+        run: |
+          $py = @(Get-Command python, python3, py -ErrorAction SilentlyContinue) | Select-Object -First 1
+          if (-not $py) { throw "Python is required to vet Windows auto-update before shipping" }
+          if ($py.Name -eq "py.exe") {
+            & py -3 scripts/ci-update-smoke.py --dist dist
+          } else {
+            & $py.Source scripts/ci-update-smoke.py --dist dist
+          }
+          if ($LASTEXITCODE -ne 0) { throw "update smoke failed" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -411,6 +434,17 @@ jobs:
         run: |
           set "PATH=%CUDA_PATH%\bin;%PATH%"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+      - name: Vet auto-update and remote restart
+        shell: powershell
+        run: |
+          $py = @(Get-Command python, python3, py -ErrorAction SilentlyContinue) | Select-Object -First 1
+          if (-not $py) { throw "Python is required to vet Windows auto-update before shipping" }
+          if ($py.Name -eq "py.exe") {
+            & py -3 scripts/ci-update-smoke.py --dist dist
+          } else {
+            & $py.Source scripts/ci-update-smoke.py --dist dist
+          }
+          if ($LASTEXITCODE -ne 0) { throw "update smoke failed" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows

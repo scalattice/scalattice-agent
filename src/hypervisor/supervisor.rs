@@ -191,6 +191,7 @@ impl Hypervisor {
     }
 
     /// How many slots are currently checked out to an invoke/warm stack.
+    #[allow(dead_code)]
     pub async fn checked_out_count(&self) -> u32 {
         self.checkouts.lock().await.len() as u32
     }

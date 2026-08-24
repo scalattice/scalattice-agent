@@ -982,9 +982,13 @@ begin
   if NeedsCuda and (not CudaRuntimePresent(LibDir)) then
     Exit;
   RunCmd := AppDir + '\scalattice-run.cmd';
+  { Pin install/lib so a silent update cannot restart a different copy
+    (UsePreviousAppDir / leftover AppId / CI isolated LOCALAPPDATA). }
   if FileExists(RunCmd) then
   begin
-    CmdLine := '/c ""' + RunCmd + '" ' + Params + '"';
+    CmdLine := '/c set "SCALATTICE_INSTALL_DIR=' + AppDir +
+      '"& set "SCALATTICE_LIB_DIR=' + LibDir +
+      '"& call "' + RunCmd + '" ' + Params;
     Exec('cmd.exe', CmdLine, AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end
   else

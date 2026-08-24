@@ -9,6 +9,57 @@ pub const SCALATTICE_WS_URL: &str = "wss://api.scalattice.cloud/v1/operators/age
 /// Hard-coded Scalattice Cloud HTTPS API base for agent control calls.
 pub const SCALATTICE_API_BASE: &str = "https://api.scalattice.cloud/v1/operators/agent";
 
+/// Loopback-only release HTTP base (`SCALATTICE_UPDATE_BASE`). Production stays
+/// on Scalattice Cloud; CI update smoke points this at a local mock.
+pub fn loopback_http_override(key: &str) -> Option<String> {
+    loopback_override(key, &["http"])
+}
+
+/// Loopback-only WebSocket URL (`SCALATTICE_WS_URL`). Rejects anything that is
+/// not `ws://127.0.0.1|localhost|::1` so a compromised env cannot redirect the
+/// fleet to an attacker.
+pub fn agent_ws_url() -> String {
+    loopback_override("SCALATTICE_WS_URL", &["ws"])
+        .unwrap_or_else(|| SCALATTICE_WS_URL.to_string())
+}
+
+/// True when this process is the CI update smoke (isolated HOME, mock Cloud).
+pub fn update_smoke_test() -> bool {
+    matches!(
+        env_or_agent_file("SCALATTICE_UPDATE_SMOKE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+fn loopback_override(key: &str, schemes: &[&str]) -> Option<String> {
+    let raw = env_or_agent_file(key)?;
+    is_loopback_url(&raw, schemes).then(|| raw.trim().trim_end_matches('/').to_string())
+}
+
+fn env_or_agent_file(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| read_key_from_config_files(key))
+}
+
+fn is_loopback_url(url: &str, schemes: &[&str]) -> bool {
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return false;
+    };
+    if !schemes.iter().any(|s| parsed.scheme().eq_ignore_ascii_case(s)) {
+        return false;
+    }
+    matches!(
+        parsed.host_str(),
+        Some("127.0.0.1") | Some("localhost") | Some("::1")
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub token: String,
@@ -19,24 +70,7 @@ fn trim_env_line(line: &str) -> &str {
 }
 
 fn parse_token_from_env_file(raw: &str) -> Option<String> {
-    for line in raw.lines() {
-        let trimmed = trim_env_line(line);
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-        let Some((key, value)) = assignment.split_once('=') else {
-            continue;
-        };
-        if trim_env_line(key) != "SCALATTICE_AGENT_TOKEN" {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
+    parse_env_key(raw, "SCALATTICE_AGENT_TOKEN")
 }
 
 /// Decode a config/env file that may be UTF-8, UTF-8 BOM, or Windows UTF-16
@@ -117,6 +151,10 @@ pub fn resolve_agent_token(cli: Option<String>) -> Option<String> {
 }
 
 fn read_token_from_config_files() -> Option<String> {
+    read_key_from_config_files("SCALATTICE_AGENT_TOKEN")
+}
+
+fn read_key_from_config_files(key: &str) -> Option<String> {
     let mut paths = Vec::new();
     if let Ok(config) = config_dir() {
         paths.push(config.join("agent.env"));
@@ -132,11 +170,32 @@ fn read_token_from_config_files() -> Option<String> {
         let Ok(raw) = read_text_file_lossy(&path) else {
             continue;
         };
-        if let Some(token) = parse_token_from_env_file(&raw) {
-            return Some(token);
+        if let Some(value) = parse_env_key(&raw, key) {
+            return Some(value);
         }
     }
 
+    None
+}
+
+fn parse_env_key(raw: &str, want_key: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = trim_env_line(line);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let Some((key, value)) = assignment.split_once('=') else {
+            continue;
+        };
+        if trim_env_line(key) != want_key {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
     None
 }
 
@@ -220,5 +279,33 @@ mod tests {
         let decoded = decode_text_bytes(raw);
         assert_eq!(decoded, "SCALATTICE_AGENT_TOKEN=slt_provider_plain\n");
         assert!(!text_file_needs_utf8_rewrite(raw, &decoded));
+    }
+
+    #[test]
+    fn loopback_http_allows_ipv4() {
+        assert!(is_loopback_url("http://127.0.0.1:9/api", &["http"]));
+        assert!(is_loopback_url("ws://localhost:9/v1", &["ws"]));
+        assert!(is_loopback_url("ws://[::1]:9/v1", &["ws"]));
+    }
+
+    #[test]
+    fn loopback_rejects_non_loopback_and_tls() {
+        assert!(!is_loopback_url(
+            "https://127.0.0.1/api",
+            &["http"]
+        ));
+        assert!(!is_loopback_url(
+            "wss://127.0.0.1/ws",
+            &["ws"]
+        ));
+        assert!(!is_loopback_url(
+            "http://scalattice.cloud/api",
+            &["http"]
+        ));
+        assert!(!is_loopback_url(
+            "http://127.0.0.1.attacker.example/x",
+            &["http"]
+        ));
+        assert!(!is_loopback_url("not-a-url", &["http"]));
     }
 }

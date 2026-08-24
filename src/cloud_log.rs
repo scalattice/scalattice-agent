@@ -237,6 +237,7 @@ pub fn is_streaming() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub fn streaming_verbose() -> bool {
     state()
         .lock()

@@ -387,7 +387,7 @@ fn replace_unix_binary(source: &Path, dest: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn write_update_units() -> Result<()> {
-    let home = crate::paths::home_dir()?;
+    let home = crate::paths::os_user_home()?;
     let unit_dir = home.join(".config/systemd/user");
     fs::create_dir_all(&unit_dir).context("create systemd user unit directory")?;
 
@@ -425,7 +425,7 @@ WantedBy=timers.target\n";
 
 #[cfg(target_os = "linux")]
 fn remove_update_units() -> Result<()> {
-    let home = crate::paths::home_dir()?;
+    let home = crate::paths::os_user_home()?;
     let unit_dir = home.join(".config/systemd/user");
     let _ = fs::remove_file(unit_dir.join(UPDATE_SERVICE));
     let _ = fs::remove_file(unit_dir.join(UPDATE_TIMER));

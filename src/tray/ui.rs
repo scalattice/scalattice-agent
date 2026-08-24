@@ -947,7 +947,7 @@ impl eframe::App for TrayApp {
 
                 egui::Frame::group(ui.style())
                     .fill(panel_fill)
-                    .stroke(egui::Stroke::new(1.0, border))
+                    .stroke(egui::Stroke::new(1.0_f32, border))
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.label(
@@ -1086,7 +1086,7 @@ impl eframe::App for TrayApp {
 
                 egui::Frame::group(ui.style())
                     .fill(panel_fill)
-                    .stroke(egui::Stroke::new(1.0, border))
+                    .stroke(egui::Stroke::new(1.0_f32, border))
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -1112,7 +1112,7 @@ impl eframe::App for TrayApp {
                             )
                             .fill(egui::Color32::from_rgb(40, 44, 52))
                             .stroke(egui::Stroke::new(
-                                1.0,
+                                1.0_f32,
                                 if self.log_verbose {
                                     egui::Color32::from_rgb(180, 140, 80)
                                 } else {
@@ -1392,6 +1392,7 @@ fn tray_pid_path() -> Result<PathBuf> {
     Ok(install_dir()?.join("tray.pid"))
 }
 
+#[cfg(target_os = "macos")]
 fn tray_pid_from_file() -> Option<u32> {
     let raw = std::fs::read_to_string(tray_pid_path().ok()?).ok()?;
     raw.trim().parse().ok()

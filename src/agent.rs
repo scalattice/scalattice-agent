@@ -1,4 +1,4 @@
-use crate::config::{read_saved_agent_token, token_snippet, AgentConfig, SCALATTICE_WS_URL};
+use crate::config::{read_saved_agent_token, token_snippet, AgentConfig};
 use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_cancel, parse_invoke_split, parse_pong, parse_ready, parse_registered,
     AgentSchedule, CatalogModel, ComputeDevicePolicy, ControlAckMessage, ControlMessage, HeartbeatMessage,
@@ -906,7 +906,9 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     }
     refresh_slot_cache(&state).await;
 
-    let mut request = SCALATTICE_WS_URL
+    let ws_url = crate::config::agent_ws_url();
+    let mut request = ws_url
+        .as_str()
         .into_client_request()
         .context("invalid WebSocket URL")?;
     request
@@ -984,7 +986,7 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                     // putting bytes on the wire (edge proxies idle-close ~100s).
                     send_heartbeat(&state, &write).await?;
                     {
-                        let mut guard = state.lock().await;
+                        let guard = state.lock().await;
                         guard.persist_local_state();
                         if guard.cloud_link_stale() {
                             warn!(
