@@ -53,8 +53,17 @@ class Fail(Exception):
     pass
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def start_deadline_watchdog(seconds: float) -> None:
+    def boom() -> None:
+        time.sleep(seconds)
+        print(
+            f"==> update smoke FAILED: wall-clock deadline ({int(seconds)}s)",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(1)
+
+    threading.Thread(target=boom, name="smoke-deadline", daemon=True).start()
 
 
 def describe_returncode(code: int) -> str:
@@ -438,18 +447,26 @@ def run_agent(bin_path: Path, args: list[str], env: dict, timeout: int = 180, qu
     if sys.platform in ("win32", "cygwin"):
         kwargs["creationflags"] = CREATE_NO_WINDOW
     proc = subprocess.Popen(**kwargs)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_process_tree(proc.pid)
+    box: dict = {}
+
+    def wait() -> None:
         try:
-            stdout, stderr = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
+            box["out"] = proc.communicate()
+        except Exception as err:  # noqa: BLE001
+            box["err"] = err
+
+    waiter = threading.Thread(target=wait, daemon=True)
+    waiter.start()
+    waiter.join(timeout)
+    if waiter.is_alive():
+        kill_process_tree(proc.pid)
+        waiter.join(5)
         if quiet:
-            return subprocess.CompletedProcess(cmdline, -1, stdout or "", stderr or "")
+            return subprocess.CompletedProcess(cmdline, -1, "", f"timed out after {timeout}s")
         raise Fail(f"{' '.join(args)} timed out after {timeout}s")
+    if "err" in box:
+        raise box["err"]
+    stdout, stderr = box.get("out", ("", ""))
     return subprocess.CompletedProcess(cmdline, proc.returncode, stdout or "", stderr or "")
 
 
@@ -647,14 +664,37 @@ def seed_windows(staging: Path, localappdata: Path) -> Path:
 
 
 def agent_version(bin_path: Path, env: dict) -> str:
+    if sys.platform in ("win32", "cygwin"):
+        pe = windows_pe_product_version(bin_path)
+        if pe:
+            log(f"==> {bin_path} ProductVersion {pe}")
+            return pe.lstrip("v")
     result = run_agent(bin_path, ["--version"], env, timeout=30)
     print_cmd(result)
     if result.returncode != 0:
-        raise Fail(f"--version failed ({result.returncode})")
+        raise Fail(f"--version failed ({describe_returncode(result.returncode)})")
     text = (result.stdout or result.stderr or "").strip().split()
     if not text:
         raise Fail("empty --version output")
     return text[-1].lstrip("v")
+
+
+def windows_pe_product_version(bin_path: Path) -> Optional[str]:
+    literal = str(bin_path).replace("'", "''")
+    ps = f"(Get-Item -LiteralPath '{literal}').VersionInfo.ProductVersion"
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 30,
+        "check": False,
+    }
+    if sys.platform in ("win32", "cygwin"):
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    result = subprocess.run(["powershell", "-NoProfile", "-Command", ps], **kwargs)
+    ver = (result.stdout or "").strip()
+    if result.returncode != 0 or not ver:
+        return None
+    return ver.split()[0].strip()
 
 
 def write_agent_env(home: Path, extra: dict[str, str]) -> Path:
@@ -951,6 +991,8 @@ def main() -> int:
     parser.add_argument("--dist", type=Path, default=Path("dist"))
     parser.add_argument("--timeout", type=float, default=600.0)
     args = parser.parse_args()
+    if sys.platform in ("win32", "cygwin"):
+        start_deadline_watchdog(min(args.timeout * 3, 12 * 60))
     dist = args.dist.resolve()
     asset, seed_zip = detect_assets(dist)
     log(f"==> asset {asset} ({asset.stat().st_size} bytes)")

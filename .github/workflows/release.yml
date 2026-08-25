@@ -364,10 +364,6 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=amd64 -host_arch=amd64
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
-      - name: Vet auto-update and remote restart
-        timeout-minutes: 25
-        shell: powershell
-        run: .\scripts\run-ci-update-smoke.ps1 -Dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -431,16 +427,40 @@ jobs:
         run: |
           set "PATH=%CUDA_PATH%\bin;%PATH%"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
-      - name: Vet auto-update and remote restart
-        timeout-minutes: 25
-        shell: powershell
-        run: .\scripts\run-ci-update-smoke.ps1 -Dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
             dist/scalattice-agent-x86_64-pc-windows-msvc.zip
             dist/ScalatticeAgentSetup-x86_64.exe
+
+  # CUDA-linked --version/status on the self-hosted GPU box deadlocks in nvcuda.dll
+  # (production agent already holds the driver). Prove update on a clean hosted VM.
+  windows-update-smoke:
+    needs:
+      - prepare
+      - build-windows-self-hosted
+      - build-windows-github-hosted
+    if: |
+      always() && !cancelled() &&
+      needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.targets == 'windows-only' || needs.prepare.outputs.targets == 'full') &&
+      (needs.build-windows-self-hosted.result == 'success' ||
+       needs.build-windows-github-hosted.result == 'success')
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: .
+      - name: Vet auto-update and remote restart
+        timeout-minutes: 25
+        shell: powershell
+        run: .\scripts\run-ci-update-smoke.ps1 -Dist dist
 
   upload:
     needs:
@@ -450,13 +470,13 @@ jobs:
       - build-macos
       - build-windows-self-hosted
       - build-windows-github-hosted
+      - windows-update-smoke
     if: |
       always() && !cancelled() &&
       needs.prepare.result == 'success' &&
       (
         (needs.prepare.outputs.targets == 'windows-only' &&
-          (needs.build-windows-self-hosted.result == 'success' ||
-           needs.build-windows-github-hosted.result == 'success')) ||
+          needs.windows-update-smoke.result == 'success') ||
         (needs.prepare.outputs.targets == 'aarch64-only' &&
           needs.build-aarch64.result == 'success') ||
         (needs.prepare.outputs.targets == 'macos-only' &&
@@ -465,8 +485,7 @@ jobs:
           needs.build-linux-x86_64.result == 'success' &&
           needs.build-aarch64.result == 'success' &&
           needs.build-macos.result == 'success' &&
-          (needs.build-windows-self-hosted.result == 'success' ||
-           needs.build-windows-github-hosted.result == 'success'))
+          needs.windows-update-smoke.result == 'success')
       )
     runs-on: ubuntu-latest
     steps:
