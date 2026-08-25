@@ -9,9 +9,6 @@ use std::process::{Command, Stdio};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
-/// Leave the GitHub Actions / Python job so waiting on set-token stdio cannot
-/// pin the background agent, and taskkill /T on the CLI cannot kill it.
-const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const TASK_NAME: &str = "ScalatticeAgent";
 const TASK_NAME_RETRY: &str = "ScalatticeAgentRetry";
 /// Starts the agent at machine boot (before interactive login), as SYSTEM.
@@ -1441,7 +1438,9 @@ fn spawn_detached(cmd: &mut Command) -> Result<std::process::Child> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
+        // Do not use CREATE_BREAKAWAY_FROM_JOB: GitHub Actions job objects
+        // reject it with ERROR_ACCESS_DENIED (5).
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .context("failed to spawn detached process")
 }
