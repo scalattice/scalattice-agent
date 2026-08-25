@@ -320,6 +320,7 @@ fn spawn_tray_hidden() -> Result<()> {
 #[cfg(windows)]
 fn spawn_tray_hidden() -> Result<()> {
     use std::os::windows::process::CommandExt;
+    crate::service::prevent_stdio_handle_inheritance();
     let bin = crate::paths::resolve_agent_binary()?;
     std::process::Command::new(&bin)
         .arg("tray")
@@ -329,7 +330,6 @@ fn spawn_tray_hidden() -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0100_0000)
-        .inherit_handles(false)
         .spawn()
         .context("failed to launch tray")?;
     Ok(())

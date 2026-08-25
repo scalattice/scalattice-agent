@@ -150,6 +150,11 @@ pub fn install_boot_start_elevated() -> Result<()> {
     platform::install_boot_start_elevated()
 }
 
+#[cfg(windows)]
+pub(crate) fn prevent_stdio_handle_inheritance() {
+    platform::prevent_stdio_handle_inheritance();
+}
+
 /// Background single-instance lock. `Ok(false)` = another instance already owns it.
 #[cfg(windows)]
 pub fn try_acquire_background_instance_mutex() -> Result<bool> {
