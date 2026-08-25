@@ -675,6 +675,45 @@ def dump_logs(home: Path, localappdata: Optional[Path]) -> None:
             except Exception as err:  # noqa: BLE001
                 print(f"  ({err})")
 
+    if sys.platform in ("win32", "cygwin"):
+        if localappdata is not None:
+            exe = localappdata / "Scalattice" / "bin" / "scalattice-agent.exe"
+            if exe.is_file():
+                print(f"==> {exe} status")
+                try:
+                    out = subprocess.run(
+                        [str(exe), "status"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                        env={
+                            **os.environ,
+                            "SCALATTICE_UPDATE_SMOKE": "1",
+                            "SCALATTICE_HOME": str(home),
+                            "USERPROFILE": str(home),
+                            "LOCALAPPDATA": str(localappdata),
+                            "SCALATTICE_INSTALL_DIR": str(localappdata / "Scalattice" / "bin"),
+                        },
+                    )
+                    sys.stdout.write(out.stdout or "")
+                    sys.stderr.write(out.stderr or "")
+                except Exception as err:  # noqa: BLE001
+                    print(f"  ({err})")
+        print("==> tasklist scalattice-agent.exe")
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq scalattice-agent.exe", "/V"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            sys.stdout.write(out.stdout or "")
+            sys.stderr.write(out.stderr or "")
+        except Exception as err:  # noqa: BLE001
+            print(f"  ({err})")
+
 
 def ensure_linux_user_systemd() -> None:
     if not sys.platform.startswith("linux"):

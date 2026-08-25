@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 #[cfg(not(target_os = "macos"))]
 use std::collections::HashSet;
-use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -103,6 +103,7 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
             }
         }
         enable_cpu_if_no_accelerator(&mut devices);
+        prefer_cpu_only_for_update_smoke(&mut devices);
         return devices;
     }
 
@@ -121,6 +122,7 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
             }
         }
         enable_cpu_if_no_accelerator(&mut devices);
+        prefer_cpu_only_for_update_smoke(&mut devices);
 
         return devices;
     }
@@ -132,12 +134,28 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
 /// CPU is off by default when a GPU exists. With no accelerator (typical GitHub
 /// runner, CPU-only provider), leave it off and the hypervisor exits immediately
 /// — systemd Restart=always then crash-loops and the agent never reaches Cloud.
-fn enable_cpu_if_no_accelerator(devices: &mut [ComputeDevice]) {
+fn enable_cpu_if_no_accelerator(devices: &mut Vec<ComputeDevice>) {
     if devices.iter().any(|d| d.enabled) {
         return;
     }
     if let Some(cpu) = devices.iter_mut().find(|d| d.kind == "cpu") {
         cpu.enabled = true;
+        return;
+    }
+    let mut cpu = fallback_cpu_device();
+    cpu.enabled = true;
+    devices.push(cpu);
+}
+
+/// Update smoke only needs a live Cloud session. Pin to CPU so CI does not
+/// initialize Metal/CUDA (slow, and on Windows it would fight the host agent).
+fn prefer_cpu_only_for_update_smoke(devices: &mut Vec<ComputeDevice>) {
+    if !crate::config::update_smoke_test() {
+        return;
+    }
+    enable_cpu_if_no_accelerator(devices);
+    for device in devices.iter_mut() {
+        device.enabled = device.kind == "cpu";
     }
 }
 
@@ -189,10 +207,7 @@ pub fn build_specs_from_devices(
     cuda_version: Option<String>,
 ) -> MachineSpecs {
     let enabled: Vec<&ComputeDevice> = devices.iter().filter(|d| d.enabled).collect();
-    let discrete_count = enabled
-        .iter()
-        .filter(|d| d.kind == "discrete")
-        .count();
+    let discrete_count = enabled.iter().filter(|d| d.kind == "discrete").count();
 
     let gpu_name = if enabled.len() == 1 {
         Some(enabled[0].name.clone())
@@ -215,10 +230,7 @@ pub fn build_specs_from_devices(
             .filter_map(|d| d.vram_gb),
     );
     let vram_used_gb = sum_option(enabled.iter().filter_map(|d| d.vram_used_gb));
-    let gpu_util_pct = enabled
-        .iter()
-        .filter_map(|d| d.util_pct)
-        .max();
+    let gpu_util_pct = enabled.iter().filter_map(|d| d.util_pct).max();
 
     let gpu_count = if discrete_count > 0 {
         Some(discrete_count.min(255) as u8)
@@ -255,11 +267,7 @@ pub fn build_specs_from_devices(
 }
 
 pub fn status_line(specs: &MachineSpecs) -> String {
-    let enabled: Vec<_> = specs
-        .compute_devices
-        .iter()
-        .filter(|d| d.enabled)
-        .collect();
+    let enabled: Vec<_> = specs.compute_devices.iter().filter(|d| d.enabled).collect();
 
     if !enabled.is_empty() {
         let names: Vec<_> = enabled.iter().map(|d| d.name.as_str()).collect();
@@ -304,7 +312,11 @@ pub fn status_line(specs: &MachineSpecs) -> String {
 
 fn sum_option(values: impl Iterator<Item = u32>) -> Option<u32> {
     let total: u32 = values.sum();
-    if total > 0 { Some(total) } else { None }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -378,16 +390,10 @@ fn nvidia_smi_bins() -> Vec<String> {
 #[allow(dead_code)]
 pub fn resolve_nvidia_smi() -> Option<String> {
     for bin in nvidia_smi_bins() {
-        if bin != "nvidia-smi"
-            && bin != "nvidia-smi.exe"
-            && !std::path::Path::new(&bin).is_file()
-        {
+        if bin != "nvidia-smi" && bin != "nvidia-smi.exe" && !std::path::Path::new(&bin).is_file() {
             continue;
         }
-        let Ok(output) = configure_nvidia_smi_command(&bin)
-            .args(["-L"])
-            .output()
-        else {
+        let Ok(output) = configure_nvidia_smi_command(&bin).args(["-L"]).output() else {
             continue;
         };
         if output.status.success() {
@@ -485,7 +491,11 @@ fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut devices = Vec::new();
 
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let parts = parse_csv_fields(line);
         if parts.len() < 5 {
             continue;
@@ -567,7 +577,12 @@ fn detect_amd_devices() -> Vec<ComputeDevice> {
         if !(lower.contains("card series") || lower.contains("card model")) {
             continue;
         }
-        if let Some(name) = line.rsplit(':').next().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(name) = line
+            .rsplit(':')
+            .next()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             names.push(name.to_string());
         }
     }
@@ -612,10 +627,7 @@ fn detect_amd_util_by_index() -> std::collections::HashMap<usize, u8> {
             .nth(1)
             .and_then(|rest| rest.split(']').next())
             .and_then(|value| value.trim().parse::<usize>().ok());
-        let pct = line
-            .split(':')
-            .last()
-            .and_then(parse_util_pct);
+        let pct = line.split(':').last().and_then(parse_util_pct);
         if let (Some(index), Some(pct)) = (index, pct) {
             out.insert(index, pct);
         }
@@ -912,7 +924,8 @@ fn is_integrated_pci_name(raw: &str) -> bool {
     if lower.contains("nvidia")
         || lower.contains("geforce")
         || lower.contains("quadro")
-        || lower.contains("arc") // discrete Intel Arc — not iGPU
+        || lower.contains("arc")
+    // discrete Intel Arc — not iGPU
     {
         return false;
     }
@@ -938,18 +951,19 @@ fn is_integrated_pci_name(raw: &str) -> bool {
 }
 
 fn detect_cpu_device() -> Vec<ComputeDevice> {
-    let Some(cpu_model) = detect_cpu_model() else {
-        return Vec::new();
-    };
-    vec![ComputeDevice {
+    vec![fallback_cpu_device()]
+}
+
+fn fallback_cpu_device() -> ComputeDevice {
+    ComputeDevice {
         id: "cpu:0".to_string(),
         kind: "cpu".to_string(),
-        name: cpu_model,
+        name: detect_cpu_model().unwrap_or_else(|| "CPU".to_string()),
         vram_gb: None,
         vram_used_gb: None,
         util_pct: None,
         enabled: false,
-    }]
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1177,7 +1191,11 @@ fn detect_host_os() -> (Option<String>, Option<String>, Option<String>) {
             return (Some(os), version, Some(pretty));
         }
     }
-    (Some(os.clone()), None, Some(os_family_label(&os).to_string()))
+    (
+        Some(os.clone()),
+        None,
+        Some(os_family_label(&os).to_string()),
+    )
 }
 
 fn os_family_label(os: &str) -> &'static str {
@@ -1229,7 +1247,10 @@ fn parse_os_release(raw: &str) -> (Option<String>, Option<String>, Option<String
 
 #[cfg(any(test, target_os = "linux"))]
 fn pretty_linux(name: Option<&str>, version_id: Option<&str>, pretty: Option<&str>) -> String {
-    match (name.map(str::trim).filter(|s| !s.is_empty()), version_id.map(str::trim).filter(|s| !s.is_empty())) {
+    match (
+        name.map(str::trim).filter(|s| !s.is_empty()),
+        version_id.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
         (Some(name), Some(version)) => format!("{name} {version}"),
         _ => pretty
             .map(str::trim)
@@ -1261,10 +1282,7 @@ fn pretty_windows(caption: &str, version: &str) -> String {
             return "Windows 10".to_string();
         }
     }
-    let stripped = caption
-        .trim()
-        .trim_start_matches("Microsoft ")
-        .trim();
+    let stripped = caption.trim().trim_start_matches("Microsoft ").trim();
     if stripped.is_empty() {
         "Windows".to_string()
     } else {
@@ -1340,7 +1358,10 @@ fn detect_os_windows() -> Option<(Option<String>, String)> {
 
 #[cfg(target_os = "macos")]
 fn detect_os_macos() -> Option<(Option<String>, String)> {
-    let output = Command::new("sw_vers").arg("-productVersion").output().ok()?;
+    let output = Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1394,28 +1415,78 @@ pub fn detect_cpu_model() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn detect_cpu_model_linux() -> Option<String> {
-    let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-    info.lines()
-        .find(|line| line.starts_with("model name"))
-        .and_then(|line| line.split(':').nth(1))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+        if let Some(name) = cpu_model_from_linux_cpuinfo(&info) {
+            return Some(name);
+        }
+    }
+    for path in [
+        "/sys/firmware/devicetree/base/model",
+        "/proc/device-tree/model",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            let model = raw.trim_matches('\0').trim();
+            if !model.is_empty() {
+                return Some(model.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cpu_model_from_linux_cpuinfo(info: &str) -> Option<String> {
+    for key in ["model name", "Hardware"] {
+        if let Some(value) = cpuinfo_field(info, key) {
+            return Some(value);
+        }
+    }
+    let implementer = cpuinfo_field(info, "CPU implementer");
+    let part = cpuinfo_field(info, "CPU part");
+    match (implementer, part) {
+        (Some(imp), Some(part)) => Some(format!("ARM CPU ({imp} {part})")),
+        (_, Some(part)) => Some(format!("ARM CPU ({part})")),
+        (Some(imp), _) => Some(format!("ARM CPU ({imp})")),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cpuinfo_field(info: &str, key: &str) -> Option<String> {
+    for line in info.lines() {
+        let Some((left, right)) = line.split_once(':') else {
+            continue;
+        };
+        if !left.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let value = right.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(windows)]
 fn detect_cpu_model_windows() -> Option<String> {
-    let output = powershell_hidden(&[
+    if let Ok(output) = powershell_hidden(&[
         "-Command",
         "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
     ])
     .output()
-    .ok()?;
-    if !output.status.success() {
-        return None;
+    {
+        if output.status.success() {
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
     }
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!name.is_empty()).then_some(name)
+    std::env::var("PROCESSOR_IDENTIFIER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn detect_ram_gb() -> Option<u32> {
@@ -1465,7 +1536,10 @@ pub fn detect_ram_used_gb() -> Option<u32> {
         if !output.status.success() {
             return None;
         }
-        let used = String::from_utf8_lossy(&output.stdout).trim().parse::<u32>().ok()?;
+        let used = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()?;
         return Some(used.max(1));
     }
     #[cfg(not(any(unix, windows)))]
@@ -1566,7 +1640,11 @@ fn disk_usage_for_path(path: &std::path::Path) -> Option<(Option<u32>, Option<u3
         } else {
             bytes_to_gb(used_bytes).min(total)
         };
-        return Some((Some(total), Some(used), Some(bytes_to_gb_floor(avail_bytes))));
+        return Some((
+            Some(total),
+            Some(used),
+            Some(bytes_to_gb_floor(avail_bytes)),
+        ));
     }
 
     #[cfg(windows)]
@@ -1597,11 +1675,7 @@ fn disk_usage_for_path(path: &std::path::Path) -> Option<(Option<u32>, Option<u3
         } else {
             bytes_to_gb(used_bytes).min(total_gb)
         };
-        return Some((
-            Some(total_gb),
-            Some(used_gb),
-            Some(bytes_to_gb_floor(free)),
-        ));
+        return Some((Some(total_gb), Some(used_gb), Some(bytes_to_gb_floor(free))));
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1637,7 +1711,10 @@ fn detect_windows_memtotal_gb() -> Option<u32> {
     if !output.status.success() {
         return None;
     }
-    let gb = String::from_utf8_lossy(&output.stdout).trim().parse::<u32>().ok()?;
+    let gb = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()?;
     Some(gb.max(1))
 }
 
@@ -1723,9 +1800,7 @@ mod tests {
         assert!(!is_integrated_pci_name(
             "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800]"
         ));
-        assert!(!is_integrated_pci_name(
-            "Intel Corporation DG2 [Arc A770]"
-        ));
+        assert!(!is_integrated_pci_name("Intel Corporation DG2 [Arc A770]"));
     }
 
     #[test]
@@ -1733,7 +1808,9 @@ mod tests {
         assert!(is_discrete_vulkan_pci_name(
             "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800]"
         ));
-        assert!(is_discrete_vulkan_pci_name("Intel Corporation DG2 [Arc A770]"));
+        assert!(is_discrete_vulkan_pci_name(
+            "Intel Corporation DG2 [Arc A770]"
+        ));
         assert!(!is_discrete_vulkan_pci_name(
             "Intel Corporation UHD Graphics 620"
         ));
@@ -1741,7 +1818,9 @@ mod tests {
             "NVIDIA Corporation GP107 [GeForce GTX 1650 SUPER]"
         ));
         assert!(is_discrete_vulkan_pci_name("AMD Radeon RX 6800 XT"));
-        assert!(is_discrete_vulkan_pci_name("Intel(R) Arc(TM) A770 Graphics"));
+        assert!(is_discrete_vulkan_pci_name(
+            "Intel(R) Arc(TM) A770 Graphics"
+        ));
     }
 
     #[test]
@@ -1770,12 +1849,42 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
     }
 
     #[test]
+    fn arm_cpuinfo_without_model_name_still_names_the_cpu() {
+        let info = r#"
+processor	: 0
+BogoMIPS	: 50.00
+Features	: fp asimd evtstrm aes
+CPU implementer	: 0x41
+CPU architecture: 8
+CPU variant	: 0x3
+CPU part	: 0xd0c
+CPU revision	: 1
+"#;
+        assert_eq!(
+            cpu_model_from_linux_cpuinfo(info).as_deref(),
+            Some("ARM CPU (0x41 0xd0c)")
+        );
+    }
+
+    #[test]
+    fn cpu_is_enabled_when_nothing_else_is_present() {
+        let mut devices = Vec::new();
+        enable_cpu_if_no_accelerator(&mut devices);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].kind, "cpu");
+        assert!(devices[0].enabled);
+    }
+
+    #[test]
     fn windows_and_macos_pretty_names() {
         assert_eq!(
             pretty_windows("Microsoft Windows 11 Pro", "10.0.22631"),
             "Windows 11"
         );
-        assert_eq!(pretty_windows("Windows 10 Home", "10.0.19045"), "Windows 10");
+        assert_eq!(
+            pretty_windows("Windows 10 Home", "10.0.19045"),
+            "Windows 10"
+        );
         assert_eq!(pretty_macos("15.1"), "macOS Sequoia");
         assert_eq!(pretty_macos("14.6.1"), "macOS Sonoma");
         assert_eq!(pretty_macos("26.0"), "macOS Tahoe");
