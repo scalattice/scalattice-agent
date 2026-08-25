@@ -920,31 +920,43 @@ def compile_windows_nvcuda_stub(bindir: Path, libdir: Path) -> Path:
             def_lines.append(f"    {name}={ident}")
     src.write_text("\n".join(c_lines) + "\n", encoding="utf-8")
     defn.write_text("\n".join(def_lines) + "\n", encoding="utf-8")
-    dest = bindir / "nvcuda.dll"
-    cmdline = (
-        f'cl /nologo /LD /O1 /Fe"{dest}" "{src}" '
-        f'/link /DLL /DEF:"{defn}" /OUT:"{dest}"'
+    # Python's list2cmdline escapes inner quotes, so `cmd /c call "C:\Program
+    # Files\...\vcvars64.bat"` becomes a command name that cmd cannot find.
+    # Drive vcvars + cl from a .bat in this folder instead.
+    built = work / "nvcuda.dll"
+    script = work / "build.bat"
+    script.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                "setlocal",
+                f'call "{vcvars}"',
+                "if errorlevel 1 exit /b 1",
+                "cl /nologo /LD /O1 /Fe:nvcuda.dll nvcuda_stub.c /link /DLL /DEF:nvcuda.def /OUT:nvcuda.dll",
+                "exit /b %ERRORLEVEL%",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
+    log(f"==> compiling nvcuda stub via {vcvars}")
     kwargs: dict = {
         "capture_output": True,
         "text": True,
-        "timeout": 120,
+        "timeout": 180,
         "check": False,
         "cwd": str(work),
     }
     if sys.platform in ("win32", "cygwin"):
         kwargs["creationflags"] = CREATE_NO_WINDOW
-    compiled = subprocess.run(
-        ["cmd.exe", "/c", f'call "{vcvars}" >nul && {cmdline}'],
-        **kwargs,
-    )
-    if compiled.returncode != 0 or not dest.is_file():
+    compiled = subprocess.run(["cmd.exe", "/c", str(script)], **kwargs)
+    if compiled.returncode != 0 or not built.is_file():
         detail = (compiled.stderr or compiled.stdout or "").strip()
         raise Fail(f"failed to compile nvcuda.dll stub: {detail or compiled.returncode}")
-    shutil.copy2(dest, libdir / "nvcuda.dll")
+    dest = bindir / "nvcuda.dll"
+    shutil.copy2(built, dest)
+    shutil.copy2(built, libdir / "nvcuda.dll")
     shutil.rmtree(work, ignore_errors=True)
-    for leftover in ("nvcuda.exp", "nvcuda.lib", "nvcuda.obj", "nvcuda.ilk"):
-        (bindir / leftover).unlink(missing_ok=True)
     return dest
 
 
