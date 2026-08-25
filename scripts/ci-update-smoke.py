@@ -45,10 +45,16 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WIN_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WIN_RUN_VALUES = ("ScalatticeAgent", "ScalatticeAgentTray")
 WIN_APP_ID = "A4E8B2C1-9F3D-4A6E-8B1C-2D5E7F9A0B3C"
+# GUI-subsystem agent + piped stdio can hang on Windows; hide the window.
+CREATE_NO_WINDOW = 0x08000000
 
 
 class Fail(Exception):
     pass
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def describe_returncode(code: int) -> str:
@@ -391,7 +397,7 @@ def wait_until(desc: str, timeout: float, fn) -> None:
     while time.time() < deadline:
         try:
             if fn():
-                print(f"==> ok: {desc}")
+                log(f"==> ok: {desc}")
                 return
         except Exception as err:  # noqa: BLE001
             last = err
@@ -400,17 +406,51 @@ def wait_until(desc: str, timeout: float, fn) -> None:
     raise Fail(f"timeout waiting for {desc}{extra}")
 
 
+def kill_process_tree(pid: int) -> None:
+    if sys.platform in ("win32", "cygwin"):
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        return
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+
+
 def run_agent(bin_path: Path, args: list[str], env: dict, timeout: int = 180, quiet: bool = False) -> subprocess.CompletedProcess:
+    cmdline = [str(bin_path), *args]
     if not quiet:
-        print(f"==> {' '.join([str(bin_path), *args])}")
-    return subprocess.run(
-        [str(bin_path), *args],
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
+        log(f"==> {' '.join(cmdline)}")
+    kwargs: dict = {
+        "args": cmdline,
+        "env": env,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+    }
+    if sys.platform in ("win32", "cygwin"):
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    proc = subprocess.Popen(**kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        if quiet:
+            return subprocess.CompletedProcess(cmdline, -1, stdout or "", stderr or "")
+        raise Fail(f"{' '.join(args)} timed out after {timeout}s")
+    return subprocess.CompletedProcess(cmdline, proc.returncode, stdout or "", stderr or "")
 
 
 def print_cmd(result: subprocess.CompletedProcess) -> None:
@@ -418,10 +458,12 @@ def print_cmd(result: subprocess.CompletedProcess) -> None:
         sys.stdout.write(result.stdout)
         if not result.stdout.endswith("\n"):
             sys.stdout.write("\n")
+        sys.stdout.flush()
     if result.stderr:
         sys.stderr.write(result.stderr)
         if not result.stderr.endswith("\n"):
             sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 def detect_assets(dist: Path) -> tuple[Path, Optional[Path]]:
@@ -625,6 +667,15 @@ def write_agent_env(home: Path, extra: dict[str, str]) -> Path:
 
 
 def status_running(bin_path: Path, env: dict) -> bool:
+    if sys.platform in ("win32", "cygwin"):
+        pid_path = bin_path.parent / "background.pid"
+        if pid_path.is_file():
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8", errors="replace").strip())
+            except ValueError:
+                pid = 0
+            if pid and windows_pid_alive(pid):
+                return True
     result = run_agent(bin_path, ["status"], env, timeout=30, quiet=True)
     text = f"{result.stdout}\n{result.stderr}"
     for line in text.splitlines():
@@ -634,6 +685,23 @@ def status_running(bin_path: Path, env: dict) -> bool:
         if stripped.startswith("Agent") and stripped.endswith("running"):
             return True
     return False
+
+
+def windows_pid_alive(pid: int) -> bool:
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 15,
+        "check": False,
+    }
+    if sys.platform in ("win32", "cygwin"):
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    result = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        **kwargs,
+    )
+    out = result.stdout or ""
+    return str(pid) in out and "scalattice" in out.lower()
 
 
 def log_paths(home: Path, localappdata: Optional[Path]) -> list[Path]:
@@ -838,6 +906,8 @@ def isolate_env(home: Path, localappdata: Optional[Path], bin_path: Path, http: 
     path_sep = ";" if sys.platform in ("win32", "cygwin") else ":"
     env["PATH"] = str(bin_path.parent) + path_sep + env.get("PATH", "")
     env["SCALATTICE_INSTALL_DIR"] = str(bin_path.parent)
+    # Isolated smoke must not initialize the host GPU (self-hosted Windows runner).
+    env.setdefault("CUDA_VISIBLE_DEVICES", "")
     if sys.platform.startswith("linux"):
         lib_dest = home / ".local" / "lib" / "scalattice"
         if lib_dest.is_dir():
@@ -872,13 +942,18 @@ def wait_download(state: MockState, timeout: float, before: int) -> None:
 
 
 def main() -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", type=Path, default=Path("dist"))
     parser.add_argument("--timeout", type=float, default=600.0)
     args = parser.parse_args()
     dist = args.dist.resolve()
     asset, seed_zip = detect_assets(dist)
-    print(f"==> asset {asset} ({asset.stat().st_size} bytes)")
+    log(f"==> asset {asset} ({asset.stat().st_size} bytes)")
 
     tmp = Path(tempfile.mkdtemp(prefix="scalattice-update-smoke-"))
     home = tmp / "home"
@@ -890,20 +965,25 @@ def main() -> int:
     staging.mkdir()
 
     if seed_zip is not None:
+        log(f"==> extracting {seed_zip.name}")
         extract_zip(seed_zip, staging)
+        log("==> seeding Windows install dir")
         bin_path = seed_windows(staging, localappdata)  # type: ignore[arg-type]
         update_asset = asset
         update_name = asset.name
     else:
+        log(f"==> extracting {asset.name}")
         extract_unix(asset, staging)
         bin_path = seed_unix(staging, home)
         update_asset = asset
         update_name = asset.name
 
+    log(f"==> hashing {update_asset.name}")
     digest = sha256_file(update_asset)
     # Version from the seeded binary (this release), not from Cargo.toml on disk.
     probe_env = os.environ.copy()
     probe_env["SCALATTICE_UPDATE_SMOKE"] = "1"
+    probe_env.setdefault("CUDA_VISIBLE_DEVICES", "")
     if sys.platform.startswith("linux"):
         lib_dest = home / ".local" / "lib" / "scalattice"
         existing = probe_env.get("LD_LIBRARY_PATH", "")

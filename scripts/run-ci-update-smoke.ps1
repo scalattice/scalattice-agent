@@ -92,5 +92,7 @@ $distPath = $Dist
 if (-not [System.IO.Path]::IsPathRooted($distPath)) {
     $distPath = Join-Path (Get-Location) $Dist
 }
-& $python $smoke --dist $distPath
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONIOENCODING = "utf-8"
+& $python -u $smoke --dist $distPath
 exit $LASTEXITCODE

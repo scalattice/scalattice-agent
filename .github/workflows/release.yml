@@ -142,7 +142,7 @@ jobs:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
         run: |
           set -euo pipefail
-          python3 scripts/ci-update-smoke.py --dist dist
+          python3 -u scripts/ci-update-smoke.py --dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
@@ -216,7 +216,7 @@ jobs:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
         run: |
           set -euo pipefail
-          python3 scripts/ci-update-smoke.py --dist dist
+          python3 -u scripts/ci-update-smoke.py --dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: aarch64
@@ -313,7 +313,7 @@ jobs:
       - name: Vet auto-update and remote restart
         run: |
           set -euo pipefail
-          python3 scripts/ci-update-smoke.py --dist dist
+          python3 -u scripts/ci-update-smoke.py --dist dist
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -365,6 +365,7 @@ jobs:
           call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=amd64 -host_arch=amd64
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
       - name: Vet auto-update and remote restart
+        timeout-minutes: 25
         shell: powershell
         run: .\scripts\run-ci-update-smoke.ps1 -Dist dist
       - uses: actions/upload-artifact@v4
@@ -424,6 +425,7 @@ jobs:
           set "PATH=%CUDA_PATH%\bin;%PATH%"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
       - name: Vet auto-update and remote restart
+        timeout-minutes: 25
         shell: powershell
         run: .\scripts\run-ci-update-smoke.ps1 -Dist dist
       - uses: actions/upload-artifact@v4
