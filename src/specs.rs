@@ -559,7 +559,7 @@ fn parse_util_pct(raw: &str) -> Option<u8> {
 
 #[cfg(not(target_os = "macos"))]
 fn detect_amd_devices() -> Vec<ComputeDevice> {
-    let Ok(output) = Command::new("rocm-smi")
+    let Ok(output) = hide_console(&mut Command::new("rocm-smi"))
         .args(["--showproductname"])
         .output()
     else {
@@ -570,43 +570,122 @@ fn detect_amd_devices() -> Vec<ComputeDevice> {
         return Vec::new();
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut names = Vec::new();
-    for line in stdout.lines() {
-        let lower = line.to_ascii_lowercase();
-        if !(lower.contains("card series") || lower.contains("card model")) {
+    parse_amd_devices_from_rocm(
+        &String::from_utf8_lossy(&output.stdout),
+        &detect_amd_vram_by_index(),
+        &detect_amd_util_by_index(),
+    )
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+#[derive(Default)]
+struct AmdGpuDraft {
+    series: Option<String>,
+    model: Option<String>,
+}
+
+/// Group rocm-smi `--showproductname` by GPU[N]. Card series and card model are
+/// two lines for the same device — treating each line as a GPU duplicated the
+/// 7900 XTX as both "RX 7900 XTX" and "0x744c".
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_amd_devices_from_rocm(
+    product_stdout: &str,
+    vram_by_index: &std::collections::HashMap<usize, u32>,
+    util_by_index: &std::collections::HashMap<usize, u8>,
+) -> Vec<ComputeDevice> {
+    use std::collections::BTreeMap;
+
+    let mut by_index: BTreeMap<usize, AmdGpuDraft> = BTreeMap::new();
+    for line in product_stdout.lines() {
+        let Some(index) = parse_rocm_gpu_index(line) else {
             continue;
-        }
-        if let Some(name) = line
-            .rsplit(':')
-            .next()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            names.push(name.to_string());
+        };
+        let lower = line.to_ascii_lowercase();
+        let value = parse_rocm_field_value(line);
+        let entry = by_index.entry(index).or_default();
+        if lower.contains("card series") || lower.contains("device name") {
+            if let Some(value) = value {
+                entry.series = Some(value);
+            }
+        } else if lower.contains("card model") {
+            if let Some(value) = value {
+                entry.model = Some(value);
+            }
         }
     }
 
-    let util_by_index = detect_amd_util_by_index();
-
-    names
+    by_index
         .into_iter()
-        .enumerate()
-        .map(|(index, name)| ComputeDevice {
-            id: format!("amd:{index}"),
-            kind: "discrete".to_string(),
-            name: format!("AMD {name}"),
-            vram_gb: detect_amd_vram_gb(),
-            vram_used_gb: None,
-            util_pct: util_by_index.get(&index).copied(),
-            enabled: true,
+        .map(|(index, draft)| {
+            let raw_name = amd_display_name(draft.series.as_deref(), draft.model.as_deref())
+                .unwrap_or_else(|| format!("GPU {index}"));
+            let name = if raw_name.to_ascii_lowercase().starts_with("amd") {
+                raw_name
+            } else {
+                format!("AMD {raw_name}")
+            };
+            let integrated = is_integrated_pci_name(&name);
+            ComputeDevice {
+                id: format!("amd:{index}"),
+                kind: if integrated {
+                    "integrated".to_string()
+                } else {
+                    "discrete".to_string()
+                },
+                name,
+                vram_gb: vram_by_index.get(&index).copied(),
+                vram_used_gb: None,
+                util_pct: util_by_index.get(&index).copied(),
+                enabled: !integrated,
+            }
         })
         .collect()
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
+fn amd_display_name(series: Option<&str>, model: Option<&str>) -> Option<String> {
+    let series = series.map(str::trim).filter(|v| !v.is_empty());
+    let model = model.map(str::trim).filter(|v| !v.is_empty());
+    match (series, model) {
+        (Some(series), _) if !looks_like_pci_id(series) => Some(series.to_string()),
+        (_, Some(model)) if !looks_like_pci_id(model) => Some(model.to_string()),
+        (Some(series), _) => Some(series.to_string()),
+        (_, Some(model)) => Some(model.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn looks_like_pci_id(raw: &str) -> bool {
+    let hex = raw
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| raw.trim().strip_prefix("0X"))
+        .unwrap_or(raw.trim());
+    (4..=6).contains(&hex.len()) && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_rocm_gpu_index(line: &str) -> Option<usize> {
+    let start = line.find("GPU[")?;
+    let rest = &line[start + 4..];
+    let end = rest.find(']')?;
+    rest[..end].trim().parse().ok()
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_rocm_field_value(line: &str) -> Option<String> {
+    line.rsplit_once(':')
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn detect_amd_util_by_index() -> std::collections::HashMap<usize, u8> {
-    let Ok(output) = Command::new("rocm-smi").args(["--showuse"]).output() else {
+    let Ok(output) = hide_console(&mut Command::new("rocm-smi"))
+        .args(["--showuse"])
+        .output()
+    else {
         return std::collections::HashMap::new();
     };
 
@@ -622,11 +701,7 @@ fn detect_amd_util_by_index() -> std::collections::HashMap<usize, u8> {
         if !(lower.contains("gpu use") || lower.contains("gpu utilization")) {
             continue;
         }
-        let index = line
-            .split('[')
-            .nth(1)
-            .and_then(|rest| rest.split(']').next())
-            .and_then(|value| value.trim().parse::<usize>().ok());
+        let index = parse_rocm_gpu_index(line);
         let pct = line.split(':').last().and_then(parse_util_pct);
         if let (Some(index), Some(pct)) = (index, pct) {
             out.insert(index, pct);
@@ -738,6 +813,7 @@ fn detect_pci_vulkan_discrete_linux(existing: &[ComputeDevice]) -> Vec<ComputeDe
         .iter()
         .map(|d| d.name.to_ascii_lowercase())
         .collect();
+    let has_rocm_amd = existing.iter().any(|d| d.id.starts_with("amd:"));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw_names: Vec<String> = stdout
@@ -780,6 +856,10 @@ fn detect_pci_vulkan_discrete_linux(existing: &[ComputeDevice]) -> Vec<ComputeDe
                 intel_i += 1;
                 (id, name)
             } else {
+                // rocm-smi already enumerated AMD GPUs — skip lspci duplicates.
+                if has_rocm_amd {
+                    return None;
+                }
                 let id = format!("pci-amd:{amd_i}");
                 amd_i += 1;
                 (id, name)
@@ -824,6 +904,7 @@ fn detect_integrated_linux_pci_devices(existing: &[ComputeDevice]) -> Vec<Comput
         .iter()
         .map(|d| d.name.to_ascii_lowercase())
         .collect();
+    let has_rocm_amd = existing.iter().any(|d| d.id.starts_with("amd:"));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw_names: Vec<String> = stdout
@@ -857,6 +938,14 @@ fn detect_integrated_linux_pci_devices(existing: &[ComputeDevice]) -> Vec<Comput
                 return None;
             }
             if !is_integrated_pci_name(&raw) {
+                return None;
+            }
+            let lower = raw.to_ascii_lowercase();
+            if has_rocm_amd
+                && (lower.contains("amd")
+                    || lower.contains("radeon")
+                    || lower.contains("advanced micro devices"))
+            {
                 return None;
             }
             Some(ComputeDevice {
@@ -938,6 +1027,13 @@ fn is_integrated_pci_name(raw: &str) -> bool {
             || lower.contains("xt ")
             || lower.contains("w ")
             || lower.contains("instinct"))
+        && !lower.contains("radeon graphics")
+        && !lower.contains("890m")
+        && !lower.contains("780m")
+        && !lower.contains("760m")
+        && !lower.contains("740m")
+        && !lower.contains("680m")
+        && !lower.contains("660m")
     {
         return false;
     }
@@ -946,6 +1042,12 @@ fn is_integrated_pci_name(raw: &str) -> bool {
         || lower.contains("iris")
         || lower.contains("hd graphics")
         || lower.contains("radeon graphics")
+        || lower.contains("890m")
+        || lower.contains("780m")
+        || lower.contains("760m")
+        || lower.contains("740m")
+        || lower.contains("680m")
+        || lower.contains("660m")
         || lower.contains("vega")
         || lower.contains("mali")
 }
@@ -1081,31 +1183,61 @@ fn vm_stat_free_pages() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn detect_amd_vram_gb() -> Option<u32> {
-    let output = Command::new("rocm-smi")
+fn detect_amd_vram_by_index() -> std::collections::HashMap<usize, u32> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(output) = hide_console(&mut Command::new("rocm-smi"))
         .args(["--showmeminfo", "vram"])
         .output()
-        .ok()?;
-
+    else {
+        return out;
+    };
     if !output.status.success() {
-        return None;
+        return out;
     }
+    parse_amd_vram_by_index(&String::from_utf8_lossy(&output.stdout), &mut out);
+    out
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut best_mb = 0.0_f32;
+/// Current rocm-smi prints VRAM in bytes (`(B): 25753026560`). Older builds
+/// used megabytes. Treating bytes as MB advertised ~25 million GB per card.
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_amd_vram_by_index(stdout: &str, out: &mut std::collections::HashMap<usize, u32>) {
     for line in stdout.lines() {
         let lower = line.to_ascii_lowercase();
-        if !lower.contains("total") {
+        if lower.contains("used") || !lower.contains("total") {
             continue;
         }
-        for token in line.split_whitespace() {
-            if let Ok(value) = token.parse::<f32>() {
-                best_mb = best_mb.max(value);
-            }
+        let Some(index) = parse_rocm_gpu_index(line) else {
+            continue;
+        };
+        if let Some(gb) = parse_rocm_mem_line_gb(line) {
+            out.insert(index, gb);
         }
     }
+}
 
-    mb_to_gb(best_mb)
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_rocm_mem_line_gb(line: &str) -> Option<u32> {
+    let lower = line.to_ascii_lowercase();
+    let mut value: Option<f64> = None;
+    for token in line.split_whitespace() {
+        let token = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if token.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = token.parse::<f64>() {
+            value = Some(parsed);
+        }
+    }
+    let value = value.filter(|v| *v > 0.0)?;
+    if lower.contains("(b)") || lower.contains("bytes") || (value >= 1_000_000.0 && !lower.contains("(mb)") && !lower.contains("(gb)"))
+    {
+        return Some(bytes_to_gb(value as u64));
+    }
+    if lower.contains("(gb)") {
+        return Some(value.round().max(1.0) as u32);
+    }
+    mb_to_gb(value as f32)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -1888,5 +2020,61 @@ CPU revision	: 1
         assert_eq!(pretty_macos("15.1"), "macOS Sequoia");
         assert_eq!(pretty_macos("14.6.1"), "macOS Sonoma");
         assert_eq!(pretty_macos("26.0"), "macOS Tahoe");
+    }
+
+    #[test]
+    fn amd_rocm_groups_series_and_model_per_gpu() {
+        let product = r#"
+======================= ROCm System Management Interface =======================
+GPU[0]		: Card series: 	 Radeon RX 7900 XTX
+GPU[0]		: Card model: 	 0x744c
+GPU[1]		: Card series: 	 AMD Radeon Graphics
+GPU[1]		: Card model: 	 0x150e
+================================================================================
+"#;
+        let mut vram = std::collections::HashMap::new();
+        vram.insert(0, 24);
+        vram.insert(1, 2);
+        let util = std::collections::HashMap::new();
+        let devices = parse_amd_devices_from_rocm(product, &vram, &util);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].id, "amd:0");
+        assert_eq!(devices[0].name, "AMD Radeon RX 7900 XTX");
+        assert_eq!(devices[0].kind, "discrete");
+        assert_eq!(devices[0].vram_gb, Some(24));
+        assert!(devices[0].enabled);
+        assert_eq!(devices[1].id, "amd:1");
+        assert_eq!(devices[1].name, "AMD Radeon Graphics");
+        assert_eq!(devices[1].kind, "integrated");
+        assert_eq!(devices[1].vram_gb, Some(2));
+        assert!(!devices[1].enabled);
+    }
+
+    #[test]
+    fn amd_vram_bytes_are_not_treated_as_megabytes() {
+        let stdout = r#"
+GPU[0]		: VRAM Total Memory (B): 25753026560
+GPU[0]		: VRAM Total Used Memory (B): 123456
+GPU[1]		: VRAM Total Memory (B): 2147483648
+"#;
+        let mut out = std::collections::HashMap::new();
+        parse_amd_vram_by_index(stdout, &mut out);
+        assert_eq!(out.get(&0).copied(), Some(24));
+        assert_eq!(out.get(&1).copied(), Some(2));
+    }
+
+    #[test]
+    fn amd_vram_legacy_megabytes_still_parse() {
+        let stdout = "GPU[0]\t: Total Memory (MB): 24576\n";
+        let mut out = std::collections::HashMap::new();
+        parse_amd_vram_by_index(stdout, &mut out);
+        assert_eq!(out.get(&0).copied(), Some(24));
+    }
+
+    #[test]
+    fn amd_igpu_names_are_integrated() {
+        assert!(is_integrated_pci_name("AMD Radeon Graphics"));
+        assert!(is_integrated_pci_name("AMD Ryzen AI 9 HX PRO 370 w/ Radeon 890M"));
+        assert!(!is_integrated_pci_name("AMD Radeon RX 7900 XTX"));
     }
 }
