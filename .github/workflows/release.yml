@@ -456,7 +456,25 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows
-          path: .
+          path: dist
+      - name: Place Windows assets in dist/
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          foreach ($name in @(
+            "ScalatticeAgentSetup-x86_64.exe",
+            "scalattice-agent-x86_64-pc-windows-msvc.zip"
+          )) {
+            $dest = Join-Path "dist" $name
+            if (Test-Path -LiteralPath $dest) { continue }
+            $hit = Get-ChildItem -Path . -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $hit) { throw "$name not found after artifact download" }
+            Write-Host "==> moving $($hit.FullName) -> $dest"
+            Copy-Item -Force $hit.FullName $dest
+          }
+          Get-ChildItem dist | Format-Table Name, Length
       - name: Vet auto-update and remote restart
         timeout-minutes: 25
         shell: powershell
