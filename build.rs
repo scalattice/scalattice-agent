@@ -25,11 +25,18 @@ fn main() {
             eprintln!("winres: {err}");
         }
 
-        // CUDA-linked builds import nvcuda.dll from the NVIDIA driver (never bundled).
-        // Delay-load so the process can start on CPU-only PCs / missing drivers;
-        // llama.cpp init then fails soft and the agent stays on CPU-compatible models.
+        // CUDA/Vulkan runtimes and the NVIDIA driver are not present on CPU-only
+        // PCs (or GitHub-hosted Windows). Delay-load so set-token / foreground
+        // can start; llama.cpp then fails soft if the backend is actually used.
         if std::env::var("CARGO_FEATURE_CUDA").is_ok() {
             println!("cargo:rustc-link-arg=/DELAYLOAD:nvcuda.dll");
+            println!("cargo:rustc-link-arg=/DELAYLOAD:cudart64_12.dll");
+            println!("cargo:rustc-link-arg=/DELAYLOAD:cublas64_12.dll");
+            println!("cargo:rustc-link-arg=/DELAYLOAD:cublasLt64_12.dll");
+            println!("cargo:rustc-link-lib=delayimp");
+        }
+        if std::env::var("CARGO_FEATURE_VULKAN").is_ok() {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:vulkan-1.dll");
             println!("cargo:rustc-link-lib=delayimp");
         }
     }
