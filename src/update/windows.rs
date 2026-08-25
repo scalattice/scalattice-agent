@@ -37,10 +37,7 @@ pub async fn install_latest_update() -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "Downloading Scalattice setup v{}...",
-        info.latest_version
-    );
+    println!("Downloading Scalattice setup v{}...", info.latest_version);
     let installer = download_setup(&info.latest_tag).await?;
     println!("Installing update silently in the background…");
     spawn_silent_setup_and_exit(&installer)?;
@@ -88,9 +85,15 @@ pub fn spawn_silent_setup_and_exit(installer: &Path) -> Result<()> {
         "/VERYSILENT".to_string(),
         "/SUPPRESSMSGBOXES".to_string(),
         "/NORESTART".to_string(),
-        "/CLOSEAPPLICATIONS".to_string(),
         "/UPDATE=1".to_string(),
     ];
+    // Never /CLOSEAPPLICATIONS during CI: that taskkills the host runner's
+    // production agent (same ImageName). Isolated /DIR= is enough.
+    if crate::config::update_smoke_test() {
+        args.push("/NOCLOSEAPPLICATIONS".to_string());
+    } else {
+        args.push("/CLOSEAPPLICATIONS".to_string());
+    }
     // Pin the existing install dir so UsePreviousAppDir cannot redirect a
     // silent update onto another copy (CI isolate, or a leftover AppId).
     if let Ok(dir) = crate::paths::install_dir() {
