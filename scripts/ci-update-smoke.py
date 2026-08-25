@@ -53,6 +53,10 @@ class Fail(Exception):
     pass
 
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def start_deadline_watchdog(seconds: float) -> None:
     def boom() -> None:
         time.sleep(seconds)
