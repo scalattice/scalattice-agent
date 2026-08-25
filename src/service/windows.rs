@@ -9,6 +9,9 @@ use std::process::{Command, Stdio};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
+/// Leave the GitHub Actions / Python job so waiting on set-token stdio cannot
+/// pin the background agent, and taskkill /T on the CLI cannot kill it.
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const TASK_NAME: &str = "ScalatticeAgent";
 const TASK_NAME_RETRY: &str = "ScalatticeAgentRetry";
 /// Starts the agent at machine boot (before interactive login), as SYSTEM.
@@ -1412,20 +1415,25 @@ fn run_tray_task_now() -> Result<()> {
     launch_tray_if_needed()
 }
 
+fn spawn_detached(cmd: &mut Command) -> Result<std::process::Child> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
+        .inherit_handles(false)
+        .spawn()
+        .context("failed to spawn detached process")
+}
+
 fn spawn_background_detached() -> Result<()> {
     if crate::config::update_smoke_test() {
         return spawn_foreground_exe();
     }
     let vbs = install_dir()?.join("launch-background.vbs");
     if vbs.is_file() {
-        Command::new("wscript.exe")
-            .args(["//nologo", &vbs.display().to_string()])
-            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to start background agent")?;
+        spawn_detached(
+            Command::new("wscript.exe").args(["//nologo", &vbs.display().to_string()]),
+        )?;
         return Ok(());
     }
 
@@ -1450,17 +1458,13 @@ fn spawn_foreground_exe() -> Result<()> {
         lib.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    Command::new(&bin)
-        .arg("foreground")
-        .env("SCALATTICE_BACKGROUND", "1")
-        .env("PATH", path)
-        .current_dir(&install)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start background agent")?;
+    spawn_detached(
+        Command::new(&bin)
+            .arg("foreground")
+            .env("SCALATTICE_BACKGROUND", "1")
+            .env("PATH", path)
+            .current_dir(&install),
+    )?;
     Ok(())
 }
 

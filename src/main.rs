@@ -325,7 +325,11 @@ fn spawn_tray_hidden() -> Result<()> {
         .arg("tray")
         .env("SCALATTICE_TRAY_HIDDEN", "1")
         .env("SCALATTICE_TRAY", "1")
-        .creation_flags(0x0800_0000)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0100_0000)
+        .inherit_handles(false)
         .spawn()
         .context("failed to launch tray")?;
     Ok(())

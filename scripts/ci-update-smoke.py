@@ -459,27 +459,28 @@ def run_agent(bin_path: Path, args: list[str], env: dict, timeout: int = 180, qu
     if sys.platform in ("win32", "cygwin"):
         kwargs["creationflags"] = CREATE_NO_WINDOW
     proc = subprocess.Popen(**kwargs)
-    box: dict = {}
-
-    def wait() -> None:
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
         try:
-            box["out"] = proc.communicate()
-        except Exception as err:  # noqa: BLE001
-            box["err"] = err
-
-    waiter = threading.Thread(target=wait, daemon=True)
-    waiter.start()
-    waiter.join(timeout)
-    if waiter.is_alive():
-        kill_process_tree(proc.pid)
-        waiter.join(5)
-        if quiet:
-            return subprocess.CompletedProcess(cmdline, -1, "", f"timed out after {timeout}s")
-        raise Fail(f"{' '.join(args)} timed out after {timeout}s")
-    if "err" in box:
-        raise box["err"]
-    stdout, stderr = box.get("out", ("", ""))
-    return subprocess.CompletedProcess(cmdline, proc.returncode, stdout or "", stderr or "")
+            stdout, stderr = proc.communicate(timeout=min(remaining, 0.5))
+            return subprocess.CompletedProcess(
+                cmdline, proc.returncode, stdout or "", stderr or ""
+            )
+        except subprocess.TimeoutExpired:
+            # Windows: the CLI can exit while a detached `foreground` child still
+            # holds inherited stdout/stderr, so communicate() never sees EOF.
+            if proc.poll() is not None:
+                log("==> CLI exited; background agent still holds inherited stdio")
+                return subprocess.CompletedProcess(
+                    cmdline, proc.returncode, "", ""
+                )
+    kill_process_tree(proc.pid)
+    if quiet:
+        return subprocess.CompletedProcess(cmdline, -1, "", f"timed out after {timeout}s")
+    raise Fail(f"{' '.join(args)} timed out after {timeout}s")
 
 
 def print_cmd(result: subprocess.CompletedProcess) -> None:
@@ -756,6 +757,9 @@ def windows_has_nvcuda() -> bool:
 
 def windows_dll_present(name: str, search: list[Path]) -> bool:
     key = name.lower()
+    # API-set names are resolved by the OS; they are not files on disk.
+    if key.startswith("api-ms-win-") or key.startswith("ext-ms-win-"):
+        return True
     for directory in search:
         if not directory.is_dir():
             continue
