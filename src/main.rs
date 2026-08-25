@@ -267,9 +267,14 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
                 }
                 Err(err) => {
                     println!("Token saved.");
-                    eprintln!("Note: {err}");
+                    eprintln!("Note: {err:#}");
                     #[cfg(any(windows, target_os = "macos"))]
-                    spawn_tray_hidden()?;
+                    {
+                        if crate::config::update_smoke_test() {
+                            return Err(err);
+                        }
+                        spawn_tray_hidden()?;
+                    }
                 }
             }
             let _ = update::maybe_sync_auto_update_timer();
@@ -329,7 +334,7 @@ fn spawn_tray_hidden() -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0100_0000)
+        .creation_flags(0x0800_0000 | 0x0000_0008)
         .spawn()
         .context("failed to launch tray")?;
     Ok(())
