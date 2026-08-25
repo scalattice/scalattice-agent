@@ -71,12 +71,20 @@ def start_deadline_watchdog(seconds: float) -> None:
 
 
 def describe_returncode(code: int) -> str:
-    if code >= 0:
-        return str(code)
-    try:
-        return f"{code} ({signal.Signals(-code).name})"
-    except ValueError:
-        return f"{code} (signal {-code})"
+    if code < 0:
+        try:
+            return f"{code} ({signal.Signals(-code).name})"
+        except ValueError:
+            return f"{code} (signal {-code})"
+    nt = {
+        0xC0000005: "STATUS_ACCESS_VIOLATION",
+        0xC0000135: "STATUS_DLL_NOT_FOUND",
+        0xC0000139: "STATUS_ENTRYPOINT_NOT_FOUND",
+        0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",
+    }
+    if code in nt:
+        return f"{code} (0x{code:08X} {nt[code]})"
+    return str(code)
 
 
 class MockState:
@@ -638,6 +646,346 @@ def install_cuda_driver_stub(lib_dir: Path) -> None:
     print(f"==> compiled dummy {compiled} (no NVIDIA driver or CUDA stub on this runner)")
 
 
+def _u16(data: bytes, off: int) -> int:
+    return int.from_bytes(data[off : off + 2], "little")
+
+
+def _u32(data: bytes, off: int) -> int:
+    return int.from_bytes(data[off : off + 4], "little")
+
+
+def _pe_rva_to_off(sections: list[tuple[int, int, int, int]], rva: int) -> Optional[int]:
+    for vaddr, vsize, rawptr, rawsize in sections:
+        span = max(vsize, rawsize)
+        if vaddr <= rva < vaddr + span:
+            return rawptr + (rva - vaddr)
+    return None
+
+
+def _pe_cstring(data: bytes, off: int, limit: int = 512) -> str:
+    end = data.find(b"\x00", off, min(len(data), off + limit))
+    if end < 0:
+        return ""
+    return data[off:end].decode("ascii", "ignore")
+
+
+def pe_imported_dlls(path: Path) -> dict[str, list[str]]:
+    """PE import table: dll-name lower -> imported symbol names (or #ordinal)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return {}
+    e_lfanew = _u32(data, 0x3C)
+    if e_lfanew + 24 > len(data) or data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+        return {}
+    coff = e_lfanew + 4
+    nsec = _u16(data, coff + 2)
+    opt_size = _u16(data, coff + 16)
+    opt = coff + 20
+    magic = _u16(data, opt)
+    pe32plus = magic == 0x20B
+    if magic not in (0x10B, 0x20B):
+        return {}
+    num_rva_off = 108 if pe32plus else 92
+    dd = opt + (112 if pe32plus else 96)
+    num_rva = _u32(data, opt + num_rva_off)
+    if num_rva < 2 or dd + 16 > len(data):
+        return {}
+    import_rva = _u32(data, dd + 8)
+    if import_rva == 0:
+        return {}
+    sec0 = opt + opt_size
+    sections: list[tuple[int, int, int, int]] = []
+    for i in range(nsec):
+        o = sec0 + i * 40
+        if o + 40 > len(data):
+            break
+        sections.append((_u32(data, o + 12), _u32(data, o + 8), _u32(data, o + 20), _u32(data, o + 16)))
+    thunk_size = 8 if pe32plus else 4
+    ordinal_bit = 1 << (63 if pe32plus else 31)
+
+    def rva_off(rva: int) -> Optional[int]:
+        return _pe_rva_to_off(sections, rva)
+
+    out: dict[str, list[str]] = {}
+    desc = rva_off(import_rva)
+    if desc is None:
+        return {}
+    while desc + 20 <= len(data):
+        orig = _u32(data, desc)
+        name_rva = _u32(data, desc + 12)
+        first = _u32(data, desc + 16)
+        if orig == 0 and name_rva == 0 and first == 0:
+            break
+        name_off = rva_off(name_rva) if name_rva else None
+        dll = _pe_cstring(data, name_off).lower() if name_off is not None else ""
+        names: list[str] = []
+        thunk_rva = orig or first
+        thunk_off = rva_off(thunk_rva) if thunk_rva else None
+        if thunk_off is not None:
+            cur = thunk_off
+            while cur + thunk_size <= len(data):
+                raw = int.from_bytes(data[cur : cur + thunk_size], "little")
+                if raw == 0:
+                    break
+                if raw & ordinal_bit:
+                    names.append(f"#{raw & 0xFFFF}")
+                else:
+                    ibn = rva_off(raw)
+                    if ibn is not None and ibn + 2 < len(data):
+                        names.append(_pe_cstring(data, ibn + 2))
+                cur += thunk_size
+        if dll:
+            out.setdefault(dll, []).extend(n for n in names if n)
+        desc += 20
+    return out
+
+
+def windows_system32() -> Path:
+    root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    return Path(root) / "System32"
+
+
+def windows_has_nvcuda() -> bool:
+    sys32 = windows_system32()
+    wow = sys32.parent / "SysWOW64"
+    return (sys32 / "nvcuda.dll").is_file() or (wow / "nvcuda.dll").is_file()
+
+
+def windows_dll_present(name: str, search: list[Path]) -> bool:
+    key = name.lower()
+    for directory in search:
+        if not directory.is_dir():
+            continue
+        if (directory / name).is_file() or (directory / key).is_file():
+            return True
+        try:
+            if any(p.name.lower() == key for p in directory.iterdir() if p.is_file()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def windows_unresolved_imports(bindir: Path, libdir: Path) -> list[str]:
+    search = [bindir, libdir, windows_system32()]
+    missing: list[str] = []
+    seen: set[str] = set()
+    pes = [bindir / "scalattice-agent.exe"]
+    for folder in (bindir, libdir):
+        if folder.is_dir():
+            pes.extend(p for p in folder.glob("*.dll") if p.is_file())
+    for pe in pes:
+        if not pe.is_file():
+            continue
+        for dll in pe_imported_dlls(pe):
+            if dll in seen:
+                continue
+            seen.add(dll)
+            if not windows_dll_present(dll, search):
+                missing.append(dll)
+    return missing
+
+
+def windows_nvcuda_exports(bindir: Path, libdir: Path) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    pes = [bindir / "scalattice-agent.exe"]
+    for folder in (bindir, libdir):
+        if folder.is_dir():
+            pes.extend(p for p in folder.glob("*.dll") if p.is_file())
+    for pe in pes:
+        if not pe.is_file():
+            continue
+        for symbol in pe_imported_dlls(pe).get("nvcuda.dll", []):
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                names.append(symbol)
+    fallback = (
+        "cuInit",
+        "cuDriverGetVersion",
+        "cuDeviceGet",
+        "cuDeviceGetCount",
+        "cuDeviceGetName",
+        "cuDeviceGetAttribute",
+        "cuDeviceGetUuid",
+        "cuDeviceGetUuid_v2",
+        "cuDeviceTotalMem_v2",
+        "cuCtxCreate_v2",
+        "cuCtxDestroy_v2",
+        "cuCtxPushCurrent_v2",
+        "cuCtxPopCurrent_v2",
+        "cuCtxSetCurrent",
+        "cuCtxGetCurrent",
+        "cuCtxGetDevice",
+        "cuCtxSynchronize",
+        "cuMemAlloc_v2",
+        "cuMemFree_v2",
+        "cuMemGetInfo_v2",
+        "cuMemcpyHtoD_v2",
+        "cuMemcpyDtoH_v2",
+        "cuMemcpyDtoD_v2",
+        "cuMemcpyHtoDAsync_v2",
+        "cuMemcpyDtoHAsync_v2",
+        "cuLaunchKernel",
+        "cuModuleLoadData",
+        "cuModuleLoadDataEx",
+        "cuModuleGetFunction",
+        "cuModuleUnload",
+        "cuGetErrorString",
+        "cuGetErrorName",
+        "cuStreamCreate",
+        "cuStreamDestroy_v2",
+        "cuStreamSynchronize",
+        "cuEventCreate",
+        "cuEventDestroy_v2",
+        "cuEventRecord",
+        "cuEventSynchronize",
+    )
+    for symbol in fallback:
+        if symbol not in seen:
+            names.append(symbol)
+    return names
+
+
+def windows_vcvars64() -> Optional[Path]:
+    vswhere = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")
+    if not vswhere.is_file():
+        return None
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 30,
+        "check": False,
+    }
+    if sys.platform in ("win32", "cygwin"):
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    result = subprocess.run(
+        [
+            str(vswhere),
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ],
+        **kwargs,
+    )
+    line = (result.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    bat = Path(line[0].strip()) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    return bat if bat.is_file() else None
+
+
+def _c_ident(name: str, idx: int) -> str:
+    if name.isidentifier() and not name.startswith("#"):
+        return name
+    return f"scalattice_nvcuda_stub_{idx}"
+
+
+def compile_windows_nvcuda_stub(bindir: Path, libdir: Path) -> Path:
+    vcvars = windows_vcvars64()
+    if vcvars is None:
+        raise Fail(
+            "hosted Windows has no nvcuda.dll (NVIDIA driver) and vswhere/vcvars64.bat "
+            "was not found to compile a CI load stub"
+        )
+    exports = windows_nvcuda_exports(bindir, libdir)
+    work = bindir / ".nvcuda_stub"
+    work.mkdir(parents=True, exist_ok=True)
+    src = work / "nvcuda_stub.c"
+    defn = work / "nvcuda.def"
+    c_lines = [
+        "/* CI-only loader stub; not a real NVIDIA driver. */",
+        "int scalattice_nvcuda_ci_stub(void) { return 999; }",
+    ]
+    def_lines = ["LIBRARY nvcuda", "EXPORTS"]
+    for idx, name in enumerate(exports):
+        ident = _c_ident(name, idx)
+        c_lines.append(f"int {ident}(void) {{ return 999; }}")
+        if name.startswith("#"):
+            try:
+                ordinal = int(name[1:])
+            except ValueError:
+                continue
+            def_lines.append(f"    {ident} @{ordinal} NONAME")
+        elif ident == name:
+            def_lines.append(f"    {name}")
+        else:
+            def_lines.append(f"    {name}={ident}")
+    src.write_text("\n".join(c_lines) + "\n", encoding="utf-8")
+    defn.write_text("\n".join(def_lines) + "\n", encoding="utf-8")
+    dest = bindir / "nvcuda.dll"
+    cmdline = (
+        f'cl /nologo /LD /O1 /Fe"{dest}" "{src}" '
+        f'/link /DLL /DEF:"{defn}" /OUT:"{dest}"'
+    )
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 120,
+        "check": False,
+        "cwd": str(work),
+    }
+    if sys.platform in ("win32", "cygwin"):
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    compiled = subprocess.run(
+        ["cmd.exe", "/c", f'call "{vcvars}" >nul && {cmdline}'],
+        **kwargs,
+    )
+    if compiled.returncode != 0 or not dest.is_file():
+        detail = (compiled.stderr or compiled.stdout or "").strip()
+        raise Fail(f"failed to compile nvcuda.dll stub: {detail or compiled.returncode}")
+    shutil.copy2(dest, libdir / "nvcuda.dll")
+    shutil.rmtree(work, ignore_errors=True)
+    for leftover in ("nvcuda.exp", "nvcuda.lib", "nvcuda.obj", "nvcuda.ilk"):
+        (bindir / leftover).unlink(missing_ok=True)
+    return dest
+
+
+def install_windows_nvcuda_stub(bindir: Path, libdir: Path) -> None:
+    if windows_has_nvcuda():
+        log("==> system nvcuda.dll present")
+        return
+    if (bindir / "nvcuda.dll").is_file() or (libdir / "nvcuda.dll").is_file():
+        return
+    compiled = compile_windows_nvcuda_stub(bindir, libdir)
+    log(f"==> compiled {compiled.name} stub (hosted Windows has no NVIDIA driver)")
+    missing = windows_unresolved_imports(bindir, libdir)
+    if missing:
+        log(f"==> still unresolved after nvcuda stub: {', '.join(missing)}")
+
+
+def dump_windows_install_layout(localappdata: Optional[Path]) -> None:
+    if localappdata is None:
+        return
+    for sub in ("bin", "lib"):
+        folder = localappdata / "Scalattice" / sub
+        print(f"==> {folder}")
+        if not folder.is_dir():
+            print("    (missing)")
+            continue
+        for item in sorted(folder.iterdir(), key=lambda p: p.name.lower()):
+            if item.is_file():
+                print(f"    {item.name} {item.stat().st_size}")
+    exe = localappdata / "Scalattice" / "bin" / "scalattice-agent.exe"
+    if exe.is_file():
+        imports = pe_imported_dlls(exe)
+        if imports:
+            print("==> scalattice-agent.exe imports " + ", ".join(sorted(imports)))
+        missing = windows_unresolved_imports(
+            localappdata / "Scalattice" / "bin",
+            localappdata / "Scalattice" / "lib",
+        )
+        if missing:
+            print("==> unresolved DLL imports: " + ", ".join(missing))
+
+
 def seed_unix(staging: Path, home: Path) -> Path:
     src = staging / "scalattice-agent"
     if not src.is_file():
@@ -668,20 +1016,20 @@ def seed_windows(staging: Path, localappdata: Path) -> Path:
     bindir = localappdata / "Scalattice" / "bin"
     libdir = localappdata / "Scalattice" / "lib"
     bindir.mkdir(parents=True, exist_ok=True)
+    libdir.mkdir(parents=True, exist_ok=True)
     dest = bindir / "scalattice-agent.exe"
     shutil.copy2(exe, dest)
-    lib_src = exe.parent / "lib"
-    if not lib_src.is_dir():
-        lib_src = staging / "lib"
-    if lib_src.is_dir():
-        libdir.mkdir(parents=True, exist_ok=True)
-        for item in lib_src.iterdir():
-            if item.is_file():
-                shutil.copy2(item, libdir / item.name)
+    dlls = [p for p in staging.rglob("*.dll") if p.is_file()]
+    log(f"==> seeding {len(dlls)} DLL(s) next to the exe and into lib/")
+    for dll in dlls:
+        log(f"    {dll.relative_to(staging)}")
+        shutil.copy2(dll, bindir / dll.name)
+        shutil.copy2(dll, libdir / dll.name)
     for helper in ("scalattice-run.cmd", "launch-background.vbs", "launch-tray.vbs"):
         src = exe.parent / helper
         if src.is_file():
             shutil.copy2(src, bindir / helper)
+    install_windows_nvcuda_stub(bindir, libdir)
     return dest
 
 
@@ -806,6 +1154,7 @@ def dump_logs(home: Path, localappdata: Optional[Path]) -> None:
                 print(f"  ({err})")
 
     if sys.platform in ("win32", "cygwin"):
+        dump_windows_install_layout(localappdata)
         if localappdata is not None:
             exe = localappdata / "Scalattice" / "bin" / "scalattice-agent.exe"
             if exe.is_file():
@@ -824,6 +1173,13 @@ def dump_logs(home: Path, localappdata: Optional[Path]) -> None:
                             "USERPROFILE": str(home),
                             "LOCALAPPDATA": str(localappdata),
                             "SCALATTICE_INSTALL_DIR": str(localappdata / "Scalattice" / "bin"),
+                            "PATH": (
+                                str(localappdata / "Scalattice" / "bin")
+                                + ";"
+                                + str(localappdata / "Scalattice" / "lib")
+                                + ";"
+                                + os.environ.get("PATH", "")
+                            ),
                         },
                     )
                     sys.stdout.write(out.stdout or "")
@@ -1110,7 +1466,7 @@ def main() -> int:
         )
         print_cmd(result)
         if result.returncode != 0:
-            raise Fail(f"set-token failed ({result.returncode})")
+            raise Fail(f"set-token failed ({describe_returncode(result.returncode)})")
         wait_service(bin_path, env, min(args.timeout, 240))
         wait_registered(state, args.timeout, registers_before)
 

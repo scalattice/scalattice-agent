@@ -131,6 +131,28 @@ Expected under: $(Join-Path $cudaRoot 'bin')
 "@
 }
 
+# Khronos loader is redistributable; the ICD comes from the GPU driver at runtime.
+$vulkanCandidates = @()
+if ($env:VULKAN_SDK) {
+    $vulkanCandidates += Join-Path $env:VULKAN_SDK "Bin\vulkan-1.dll"
+}
+$vulkanSdkRoot = "C:\VulkanSDK"
+if (Test-Path $vulkanSdkRoot) {
+    Get-ChildItem -Path $vulkanSdkRoot -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        ForEach-Object { $vulkanCandidates += Join-Path $_.FullName "Bin\vulkan-1.dll" }
+}
+$vulkanLoader = $vulkanCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($vulkanLoader) {
+    Copy-Item -LiteralPath $vulkanLoader -Destination (Join-Path $LibDir "vulkan-1.dll") -Force
+    if ($OutDir) {
+        Copy-Item -LiteralPath $vulkanLoader -Destination (Join-Path $OutDir "vulkan-1.dll") -Force
+    }
+    Write-Host "    bundled vulkan-1.dll"
+} else {
+    Write-Warning "vulkan-1.dll not found (set VULKAN_SDK). CPU-only hosts may fail to start without a delay-loaded Vulkan import."
+}
+
 if (-not (Get-ChildItem -Path $LibDir -ErrorAction SilentlyContinue)) {
     Remove-Item -Path $LibDir -Force -ErrorAction SilentlyContinue
 }

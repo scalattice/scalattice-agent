@@ -66,13 +66,25 @@ Set-WindowsBuildParallelism -Jobs 4
 Clear-LlamaCmakeCache
 
 # win-gpu = CUDA + Vulkan (replaces default Linux `gpu` feature set on Windows CI)
-# Delay-load nvcuda.dll so the agent can start without an NVIDIA driver (CPU-only).
-# build.rs also sets this when CARGO_FEATURE_CUDA is on; keep RUSTFLAGS as a belt-and-suspenders.
-$delayLoad = "/DELAYLOAD:nvcuda.dll"
-$existingRustflags = [string]$env:RUSTFLAGS
-if ($existingRustflags -notmatch 'DELAYLOAD:nvcuda') {
-    $env:RUSTFLAGS = ("{0} -C link-arg={1} -C link-arg=delayimp.lib" -f $existingRustflags.Trim(), $delayLoad).Trim()
+# Delay-load NVIDIA/Vulkan so the agent can start on CPU-only PCs / GitHub-hosted VMs.
+# build.rs also sets these when the matching Cargo features are on.
+$delayLoads = @(
+    "/DELAYLOAD:nvcuda.dll",
+    "/DELAYLOAD:cudart64_12.dll",
+    "/DELAYLOAD:cublas64_12.dll",
+    "/DELAYLOAD:cublasLt64_12.dll",
+    "/DELAYLOAD:vulkan-1.dll"
+)
+$rustflags = [string]$env:RUSTFLAGS
+foreach ($dll in $delayLoads) {
+    if ($rustflags -notmatch [regex]::Escape($dll)) {
+        $rustflags = ("{0} -C link-arg={1}" -f $rustflags.Trim(), $dll).Trim()
+    }
 }
+if ($rustflags -notmatch 'delayimp') {
+    $rustflags = ("{0} -C link-arg=delayimp.lib" -f $rustflags.Trim()).Trim()
+}
+$env:RUSTFLAGS = $rustflags
 Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
 Write-Host "    RUSTFLAGS=$($env:RUSTFLAGS)"
 cargo build --release --target $Target --no-default-features --features $Features
@@ -153,11 +165,16 @@ if (-not $PackageVersion -and $env:SCALATTICE_VERSION) {
 $archive = "dist\scalattice-agent-$Target.zip"
 if (Test-Path $archive) { Remove-Item $archive -Force }
 
-if (Test-Path "dist\lib") {
-    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd", "dist\launch-tray.vbs", "dist\launch-background.vbs", "dist\lib" -DestinationPath $archive -Force
-} else {
-    Compress-Archive -Path "dist\scalattice-agent.exe", "dist\scalattice-run.cmd", "dist\launch-tray.vbs", "dist\launch-background.vbs" -DestinationPath $archive -Force
-}
+$zipItems = @(
+    "dist\scalattice-agent.exe",
+    "dist\scalattice-run.cmd",
+    "dist\launch-tray.vbs",
+    "dist\launch-background.vbs"
+)
+if (Test-Path "dist\lib") { $zipItems += "dist\lib" }
+Get-ChildItem -Path "dist" -Filter "*.dll" -File -ErrorAction SilentlyContinue |
+    ForEach-Object { $zipItems += $_.FullName }
+Compress-Archive -Path $zipItems -DestinationPath $archive -Force
 
 Write-Host ""
 Write-Host "==> Built $archive"
