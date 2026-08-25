@@ -1415,12 +1415,33 @@ fn run_tray_task_now() -> Result<()> {
     launch_tray_if_needed()
 }
 
+/// `CommandExt::inherit_handles` is still unstable (rustc 1.98). Clearing
+/// HANDLE_FLAG_INHERIT on this process's stdio is the stable equivalent: a
+/// piped parent (CI `communicate()`, shells) then gets EOF when we exit,
+/// instead of waiting for the detached agent to die.
+pub(crate) fn prevent_stdio_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = GetStdHandle(id);
+            if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+                let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 fn spawn_detached(cmd: &mut Command) -> Result<std::process::Child> {
+    prevent_stdio_handle_inheritance();
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
-        .inherit_handles(false)
         .spawn()
         .context("failed to spawn detached process")
 }
