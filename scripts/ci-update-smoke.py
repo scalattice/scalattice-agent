@@ -503,14 +503,32 @@ def detect_assets(dist: Path) -> tuple[Path, Optional[Path]]:
             raise Fail(f"missing {asset}")
         return asset, None
     if system in ("win32", "cygwin"):
-        setup = dist / "ScalatticeAgentSetup-x86_64.exe"
-        zipped = dist / "scalattice-agent-x86_64-pc-windows-msvc.zip"
-        if not setup.is_file():
-            raise Fail(f"missing {setup}")
-        if not zipped.is_file():
-            raise Fail(f"missing {zipped} (used to seed the install before the installer-based update)")
+        setup = find_dist_file(
+            dist,
+            "ScalatticeAgentSetup-x86_64.exe",
+        )
+        zipped = find_dist_file(
+            dist,
+            "scalattice-agent-x86_64-pc-windows-msvc.zip",
+        )
         return setup, zipped
     raise Fail(f"unsupported platform {system}/{machine}")
+
+
+def find_dist_file(dist: Path, name: str) -> Path:
+    roots = [dist, dist.parent, Path.cwd(), Path.cwd() / "dist"]
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            candidate = (root / name).resolve()
+        except OSError:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate
+    raise Fail(f"missing {name} (looked in {dist} and {Path.cwd()})")
 
 
 def extract_unix(archive: Path, dest: Path) -> None:
