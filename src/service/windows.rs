@@ -131,10 +131,7 @@ pub fn follow_service_logs(verbose: bool) -> Result<()> {
         .spawn()
         .context("failed to run powershell log tail")?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .context("powershell stdout missing")?;
+    let stdout = child.stdout.take().context("powershell stdout missing")?;
     crate::logging::pipe_log_lines(stdout, verbose)?;
 
     match child.wait().context("wait for log tail")?.code() {
@@ -153,6 +150,13 @@ pub fn sync_background_env() -> Result<()> {
 }
 
 pub fn remove_background_service() -> Result<()> {
+    if crate::config::update_smoke_test() {
+        // Isolated CI install: never delete the host machine's scheduled tasks
+        // or taskkill every scalattice-agent.exe (the self-hosted runner has a
+        // real agent).
+        stop_smoke_background_only();
+        return Ok(());
+    }
     let _ = Command::new("schtasks")
         .args(["/End", "/TN", TASK_NAME_BOOT])
         .creation_flags(CREATE_NO_WINDOW)
@@ -196,6 +200,10 @@ pub fn remove_background_service() -> Result<()> {
 }
 
 fn force_kill_all_agent_processes() {
+    if crate::config::update_smoke_test() {
+        stop_smoke_background_only();
+        return;
+    }
     for _ in 0..8 {
         let _ = Command::new("taskkill")
             .args(["/IM", "scalattice-agent.exe", "/F", "/T"])
@@ -299,6 +307,11 @@ fn wait_for_background_start_gentle() {
 /// True when the background single-instance mutex is held.
 /// Prefer this over WMI/`Get-CimInstance` — that path can hang while CUDA/driver init is wedged.
 fn background_agent_running() -> bool {
+    if crate::config::update_smoke_test() {
+        // The self-hosted Windows runner already has a production agent. Global
+        // mutex / IMAGENAME listing would report *that* process as "our" agent.
+        return smoke_mutex_held() || background_pid_alive();
+    }
     background_mutex_held() || background_pid_alive() || background_agent_process_listed()
 }
 
@@ -321,6 +334,33 @@ fn background_mutex_held() -> bool {
     mutex_openable(BACKGROUND_MUTEX) || mutex_openable("Local\\ScalatticeAgentBackground")
 }
 
+fn smoke_mutex_name() -> String {
+    let key = std::env::var("SCALATTICE_HOME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| install_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "smoke".to_string());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&key, &mut hasher);
+    format!(
+        "Local\\ScalatticeAgentSmoke-{:x}",
+        std::hash::Hasher::finish(&hasher)
+    )
+}
+
+fn smoke_mutex_held() -> bool {
+    mutex_openable(&smoke_mutex_name())
+}
+
+fn instance_mutex_name() -> String {
+    if crate::config::update_smoke_test() {
+        smoke_mutex_name()
+    } else {
+        BACKGROUND_MUTEX.to_string()
+    }
+}
+
 /// Create the cross-session background mutex with a DACL the user tray can query.
 /// SYSTEM boot agents used to create a default-ACL Global mutex → tray OpenMutex
 /// failed and the UI showed "stopped · auto-restarting…" while the agent was live.
@@ -337,7 +377,9 @@ pub fn try_acquire_background_instance_mutex() -> Result<bool> {
     let sddl: Vec<u16> = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100001;;;WD)\0"
         .encode_utf16()
         .collect();
-    let name: Vec<u16> = format!("{BACKGROUND_MUTEX}\0").encode_utf16().collect();
+    let name: Vec<u16> = format!("{}\0", instance_mutex_name())
+        .encode_utf16()
+        .collect();
 
     unsafe {
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -501,7 +543,22 @@ fn background_agent_process_listed() -> bool {
     }
 }
 
+fn stop_smoke_background_only() {
+    if let Some(path) = background_pid_path() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(pid) = raw.trim().parse::<u32>() {
+                let _ = taskkill_pid(pid);
+            }
+        }
+        let _ = fs::remove_file(&path);
+    }
+}
+
 fn stop_background_agent_only() {
+    if crate::config::update_smoke_test() {
+        stop_smoke_background_only();
+        return;
+    }
     let mut killed = false;
     if let Some(path) = background_pid_path() {
         if let Ok(raw) = fs::read_to_string(&path) {
@@ -709,7 +766,10 @@ exit /b 0\r\n";
         ("launch-tray.vbs", LAUNCH_TRAY_VBS),
         ("launch-tray-interactive.vbs", LAUNCH_TRAY_INTERACTIVE_VBS),
         ("launch-background.vbs", LAUNCH_BACKGROUND_VBS),
-        ("launch-background-delayed.vbs", LAUNCH_BACKGROUND_DELAYED_VBS),
+        (
+            "launch-background-delayed.vbs",
+            LAUNCH_BACKGROUND_DELAYED_VBS,
+        ),
     ] {
         fs::write(install.join(name), content)?;
     }
@@ -909,10 +969,7 @@ fn startup_dir() -> Result<PathBuf> {
 }
 
 fn autostart_configured() -> bool {
-    startup_agent_shortcut_exists()
-        || task_exists()
-        || run_key_agent_exists()
-        || boot_task_exists()
+    startup_agent_shortcut_exists() || task_exists() || run_key_agent_exists() || boot_task_exists()
 }
 
 fn task_exists() -> bool {
@@ -955,6 +1012,10 @@ fn startup_tray_shortcut_exists() -> bool {
 }
 
 fn ensure_agent_autostart_registered() -> Result<()> {
+    if crate::config::update_smoke_test() {
+        // Do not overwrite the host runner's Startup / schtasks / Run key.
+        return Ok(());
+    }
     // Triple rail + delayed retry + boot-before-login. Global\ScalatticeAgentBackground
     // mutex prevents double-start across Session 0 (boot) and interactive logon.
     sync_launch_scripts()?;
@@ -965,7 +1026,10 @@ fn ensure_agent_autostart_registered() -> Result<()> {
     let _ = try_create_retry_task();
     let _ = ensure_boot_start_registered();
 
-    if startup_agent_shortcut_exists() || task_exists() || run_key_agent_exists() || boot_task_exists()
+    if startup_agent_shortcut_exists()
+        || task_exists()
+        || run_key_agent_exists()
+        || boot_task_exists()
     {
         Ok(())
     } else {
@@ -979,19 +1043,14 @@ fn write_boot_runner_script() -> Result<PathBuf> {
     let install = install_dir()?;
     fs::create_dir_all(&install)?;
     let userprofile = std::env::var("USERPROFILE").context("USERPROFILE is not set")?;
-    let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
-        format!("{}\\AppData\\Local", userprofile.trim_end_matches('\\'))
-    });
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| {
-        format!("{}\\AppData\\Roaming", userprofile.trim_end_matches('\\'))
-    });
+    let localappdata = std::env::var("LOCALAPPDATA")
+        .unwrap_or_else(|_| format!("{}\\AppData\\Local", userprofile.trim_end_matches('\\')));
+    let appdata = std::env::var("APPDATA")
+        .unwrap_or_else(|_| format!("{}\\AppData\\Roaming", userprofile.trim_end_matches('\\')));
     let lib = lib_dir().unwrap_or_else(|_| install.join("lib"));
     let exe = install.join("scalattice-agent.exe");
 
-    let homedrive = userprofile
-        .chars()
-        .take(2)
-        .collect::<String>();
+    let homedrive = userprofile.chars().take(2).collect::<String>();
     let homepath = if userprofile.len() > 2 {
         userprofile[2..].to_string()
     } else {
@@ -1143,16 +1202,7 @@ fn try_create_scheduled_task() -> Result<()> {
     let tr = format!("wscript.exe //nologo \"{}\"", vbs.display());
     let output = Command::new("schtasks")
         .args([
-            "/Create",
-            "/TN",
-            TASK_NAME,
-            "/TR",
-            &tr,
-            "/SC",
-            "ONLOGON",
-            "/RL",
-            "LIMITED",
-            "/F",
+            "/Create", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -1363,6 +1413,9 @@ fn run_tray_task_now() -> Result<()> {
 }
 
 fn spawn_background_detached() -> Result<()> {
+    if crate::config::update_smoke_test() {
+        return spawn_foreground_exe();
+    }
     let vbs = install_dir()?.join("launch-background.vbs");
     if vbs.is_file() {
         Command::new("wscript.exe")
@@ -1376,11 +1429,27 @@ fn spawn_background_detached() -> Result<()> {
         return Ok(());
     }
 
-    // Fallback: spawn the exe directly (never host under a visible cmd window).
+    spawn_foreground_exe()
+}
+
+fn spawn_foreground_exe() -> Result<()> {
     let bin = resolve_agent_binary()?;
-    let lib = lib_dir().unwrap_or_else(|_| bin.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
-    let install = install_dir().unwrap_or_else(|_| bin.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
-    let path = format!("{};{};{}", install.display(), lib.display(), std::env::var("PATH").unwrap_or_default());
+    let lib = lib_dir().unwrap_or_else(|_| {
+        bin.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    });
+    let install = install_dir().unwrap_or_else(|_| {
+        bin.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    });
+    let path = format!(
+        "{};{};{}",
+        install.display(),
+        lib.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     Command::new(&bin)
         .arg("foreground")
         .env("SCALATTICE_BACKGROUND", "1")
