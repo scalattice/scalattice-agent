@@ -507,6 +507,8 @@ def detect_assets(dist: Path) -> tuple[Path, Optional[Path]]:
             raise Fail(f"missing {asset}")
         return asset, None
     if system == "darwin":
+        # Seed from the tarball; the update asset must be the DMG (agent installs
+        # that now). Prefer a CI-built DMG when present, else pack one later.
         asset = dist / "scalattice-agent-aarch64-apple-darwin.tar.gz"
         if not asset.is_file():
             raise Fail(f"missing {asset}")
@@ -522,6 +524,70 @@ def detect_assets(dist: Path) -> tuple[Path, Optional[Path]]:
         )
         return setup, zipped
     raise Fail(f"unsupported platform {system}/{machine}")
+
+
+def package_macos_smoke_dmg(agent_bin: Path, dest_dmg: Path) -> Path:
+    """Build a minimal Scalattice Agent.app DMG for the update smoke.
+
+    Production releases ship a notarized DMG; the agent installs that whole
+    bundle. The smoke must advertise/serve the same asset name or the live
+    update never downloads (checksum miss → downloads stay at 0).
+    """
+    if dest_dmg.is_file():
+        return dest_dmg
+    stage = dest_dmg.parent / "dmg-stage"
+    if stage.exists():
+        shutil.rmtree(stage)
+    app = stage / "Scalattice Agent.app"
+    macos_dir = app / "Contents" / "MacOS"
+    macos_dir.mkdir(parents=True)
+    target = macos_dir / "scalattice-agent"
+    shutil.copy2(agent_bin, target)
+    target.chmod(0o755)
+    (app / "Contents" / "Info.plist").write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>scalattice-agent</string>
+  <key>CFBundleIdentifier</key>
+  <string>cloud.scalattice.agent.smoke</string>
+  <key>CFBundleName</key>
+  <string>Scalattice Agent</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+</dict>
+</plist>
+""",
+        encoding="utf-8",
+    )
+    dest_dmg.parent.mkdir(parents=True, exist_ok=True)
+    if dest_dmg.exists():
+        dest_dmg.unlink()
+    result = subprocess.run(
+        [
+            "hdiutil",
+            "create",
+            "-volname",
+            "Scalattice Agent",
+            "-srcfolder",
+            str(stage),
+            "-ov",
+            "-format",
+            "UDZO",
+            str(dest_dmg),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not dest_dmg.is_file():
+        detail = (result.stderr or result.stdout or "").strip()
+        raise Fail(f"hdiutil create failed for smoke DMG: {detail or result.returncode}")
+    shutil.rmtree(stage, ignore_errors=True)
+    log(f"==> packed smoke DMG {dest_dmg.name} ({dest_dmg.stat().st_size} bytes)")
+    return dest_dmg
 
 
 def find_dist_file(dist: Path, name: str) -> Path:
@@ -1342,6 +1408,11 @@ def isolate_env(home: Path, localappdata: Optional[Path], bin_path: Path, http: 
     env["SCALATTICE_INSTALL_DIR"] = str(bin_path.parent)
     # Isolated smoke must not initialize the host GPU (self-hosted Windows runner).
     env.setdefault("CUDA_VISIBLE_DEVICES", "")
+    if sys.platform == "darwin":
+        # Keep DMG installs out of the real /Applications on the runner.
+        app_root = home / "Applications"
+        app_root.mkdir(parents=True, exist_ok=True)
+        env["SCALATTICE_MACOS_APP_ROOT"] = str(app_root)
     if sys.platform.startswith("linux"):
         lib_dest = home / ".local" / "lib" / "scalattice"
         if lib_dest.is_dir():
@@ -1411,8 +1482,20 @@ def main() -> int:
         log(f"==> extracting {asset.name}")
         extract_unix(asset, staging)
         bin_path = seed_unix(staging, home)
-        update_asset = asset
-        update_name = asset.name
+        if sys.platform == "darwin":
+            # Agent now downloads ScalatticeAgentSetup-aarch64.dmg, not the tar.gz.
+            dist_dmg = dist / "ScalatticeAgentSetup-aarch64.dmg"
+            if dist_dmg.is_file():
+                update_asset = dist_dmg
+                log(f"==> using CI DMG {update_asset.name}")
+            else:
+                update_asset = package_macos_smoke_dmg(
+                    bin_path, tmp / "ScalatticeAgentSetup-aarch64.dmg"
+                )
+            update_name = update_asset.name
+        else:
+            update_asset = asset
+            update_name = asset.name
 
     log(f"==> hashing {update_asset.name}")
     digest = sha256_file(update_asset)
@@ -1449,6 +1532,11 @@ def main() -> int:
             "SCALATTICE_AGENT_BIN": str(bin_path),
             "SCALATTICE_INSTALL_DIR": str(bin_path.parent),
             "SCALATTICE_VERBOSE": "1",
+            **(
+                {"SCALATTICE_MACOS_APP_ROOT": str(home / "Applications")}
+                if sys.platform == "darwin"
+                else {}
+            ),
         },
     )
     if sys.platform.startswith("linux"):

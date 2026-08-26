@@ -157,8 +157,20 @@ fn macos_app_name() -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_app_install_root() -> PathBuf {
+    // CI update smoke installs under an isolated HOME; production uses /Applications.
+    if let Ok(root) = std::env::var("SCALATTICE_MACOS_APP_ROOT") {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from("/Applications")
+}
+
+#[cfg(target_os = "macos")]
 fn macos_applications_app() -> PathBuf {
-    PathBuf::from("/Applications").join(macos_app_name())
+    macos_app_install_root().join(macos_app_name())
 }
 
 #[cfg(target_os = "macos")]
