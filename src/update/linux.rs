@@ -43,14 +43,32 @@ pub async fn install_latest_update() -> Result<()> {
     // download finishes. Doing that on macOS made the machine look frozen as
     // soon as a newer release was detected, and it also raced KeepAlive /
     // tray watchdog restarts while the archive was still downloading.
-    println!(
-        "Downloading Scalattice Agent v{} ({})...",
-        info.latest_version,
-        unix_archive_name()?
-    );
-    let staging = download_and_extract(&info.latest_tag).await?;
-    println!("Installing update...");
-    apply_update(&staging)?;
+    #[cfg(target_os = "macos")]
+    {
+        // Replacing only the Mach-O inside a notarized .app invalidates the
+        // bundle signature — Gatekeeper then shows "Unable to open the
+        // application". Install the whole signed DMG instead (same artifact as
+        // a manual download).
+        println!(
+            "Downloading Scalattice Agent v{} ({})...",
+            info.latest_version,
+            macos_dmg_name()
+        );
+        let dmg = download_macos_dmg(&info.latest_tag).await?;
+        println!("Installing update from signed DMG...");
+        apply_macos_dmg_update(&dmg)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        println!(
+            "Downloading Scalattice Agent v{} ({})...",
+            info.latest_version,
+            unix_archive_name()?
+        );
+        let staging = download_and_extract(&info.latest_tag).await?;
+        println!("Installing update...");
+        apply_update(&staging)?;
+    }
     if running_as_live_agent() {
         println!(
             "Updated to v{}. Live agent will restart onto the new binary.",
@@ -126,6 +144,165 @@ fn unix_release_target() -> Result<&'static str> {
     {
         bail!("automatic updates are not supported on this platform")
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dmg_name() -> &'static str {
+    "ScalatticeAgentSetup-aarch64.dmg"
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_name() -> &'static str {
+    "Scalattice Agent.app"
+}
+
+#[cfg(target_os = "macos")]
+fn macos_applications_app() -> PathBuf {
+    PathBuf::from("/Applications").join(macos_app_name())
+}
+
+#[cfg(target_os = "macos")]
+async fn download_macos_dmg(tag: &str) -> Result<PathBuf> {
+    let latest = fetch_latest_release().await?;
+    let dmg_name = macos_dmg_name();
+    let expected = latest
+        .checksums
+        .get(dmg_name)
+        .cloned()
+        .with_context(|| {
+            format!(
+                "Cloud release {tag} has no SHA-256 checksum for {dmg_name}; refusing to update"
+            )
+        })?;
+    let work = update_work_dir(tag)?;
+    fs::create_dir_all(&work).context("create update work directory")?;
+    let dmg_path = work.join(dmg_name);
+    download_release_asset(tag, dmg_name, &dmg_path, &expected).await?;
+    Ok(dmg_path)
+}
+
+/// Mount the notarized DMG and replace the whole `/Applications` bundle.
+///
+/// Swapping only `Contents/MacOS/scalattice-agent` breaks the Developer ID /
+/// notarization seal; Gatekeeper then refuses to open the app ("Unable to open
+/// the application").
+#[cfg(target_os = "macos")]
+fn apply_macos_dmg_update(dmg: &Path) -> Result<()> {
+    let self_replace = running_as_live_agent();
+    let tray_update = crate::service::in_tray_process();
+    if !self_replace && !tray_update {
+        service::stop_background_for_update()?;
+    }
+
+    let mount = dmg
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join(format!("scalattice-dmg-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&mount);
+    fs::create_dir_all(&mount).context("create DMG mount point")?;
+
+    let attach = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-nobrowse",
+            "-readonly",
+            "-mountpoint",
+        ])
+        .arg(&mount)
+        .arg(dmg)
+        .output()
+        .context("run hdiutil attach")?;
+    if !attach.status.success() {
+        let stderr = String::from_utf8_lossy(&attach.stderr);
+        let _ = fs::remove_dir_all(&mount);
+        bail!("hdiutil attach failed: {}", stderr.trim());
+    }
+
+    let install_result = (|| -> Result<()> {
+        let bundled = mount.join(macos_app_name());
+        if !bundled.is_dir() {
+            bail!(
+                "DMG does not contain {} at {}",
+                macos_app_name(),
+                bundled.display()
+            );
+        }
+        let dest = macos_applications_app();
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).context("create /Applications")?;
+        }
+        // Stage next to /Applications then swap so a half-copied tree is never left
+        // as the live bundle name.
+        let staged = dest.with_extension(format!("app.updating.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&staged);
+        let status = Command::new("ditto")
+            .arg(&bundled)
+            .arg(&staged)
+            .status()
+            .context("run ditto to stage updated .app")?;
+        if !status.success() {
+            let _ = fs::remove_dir_all(&staged);
+            bail!("ditto failed copying {}", bundled.display());
+        }
+        // Drop quarantine if the download path stamped one (Gatekeeper still
+        // validates Developer ID + notarization on the staged bundle).
+        let _ = Command::new("xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(&staged)
+            .status();
+
+        let backup = dest.with_extension(format!("app.bak.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&backup);
+        if dest.exists() {
+            fs::rename(&dest, &backup)
+                .with_context(|| format!("move aside {}", dest.display()))?;
+        }
+        if let Err(err) = fs::rename(&staged, &dest) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &dest);
+            }
+            let _ = fs::remove_dir_all(&staged);
+            return Err(err).with_context(|| format!("activate {}", dest.display()));
+        }
+        let _ = fs::remove_dir_all(&backup);
+
+        // Keep ~/.local/bin in sync for CLI / LaunchAgent paths that still point there.
+        let app_bin = dest.join("Contents/MacOS/scalattice-agent");
+        if app_bin.is_file() {
+            if let Ok(local) = crate::paths::install_dir().map(|d| d.join("scalattice-agent")) {
+                if let Err(err) = replace_unix_binary(&app_bin, &local) {
+                    eprintln!(
+                        "self-update: could not refresh {}: {err:#}",
+                        local.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = Command::new("hdiutil")
+        .args(["detach", "-quiet"])
+        .arg(&mount)
+        .status();
+    let _ = fs::remove_dir_all(&mount);
+    // Best-effort: DMG file can go after install.
+    if let Some(parent) = dmg.parent() {
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    install_result?;
+
+    if self_replace {
+        // Remote control acks then restarts/exits.
+    } else if tray_update {
+        let _ = service::restart_background_after_update();
+        relaunch_macos_tray_after_update();
+        std::process::exit(0);
+    } else {
+        service::restart_background_after_update()?;
+    }
+    Ok(())
 }
 
 async fn download_and_extract(tag: &str) -> Result<PathBuf> {
