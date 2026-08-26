@@ -54,12 +54,37 @@ trap 'rm -rf "$STAGE"' EXIT
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
-rm -f "$DMG"
-hdiutil create \
-  -volname "Scalattice Agent" \
-  -srcfolder "$STAGE" \
-  -ov -format UDZO \
-  "$DMG" >/dev/null
+# GHA macOS runners occasionally leave diskimages-helper wedged ("Resource busy").
+hdiutil_create() {
+  local dest="$1" attempt=1 max=6
+  while true; do
+    rm -f "$dest"
+    # Best-effort cleanup of leftover Scalattice attaches from prior steps/jobs.
+    while IFS= read -r dev; do
+      [[ -n "$dev" ]] || continue
+      hdiutil detach -force "$dev" >/dev/null 2>&1 || true
+    done < <(hdiutil info 2>/dev/null | awk '
+      /^\/dev\// { dev=$1 }
+      /[Ss]calattice/ { if (dev != "") print dev; dev="" }
+    ' | sort -u)
+    if hdiutil create \
+      -volname "Scalattice Agent" \
+      -srcfolder "$STAGE" \
+      -ov -format UDZO \
+      "$dest" >/dev/null; then
+      return 0
+    fi
+    if (( attempt >= max )); then
+      echo "hdiutil create failed after ${max} attempts" >&2
+      return 1
+    fi
+    echo "==> hdiutil create busy/failed (attempt ${attempt}/${max}); retrying…" >&2
+    sleep $((attempt * 2))
+    attempt=$((attempt + 1))
+  done
+}
+
+hdiutil_create "$DMG"
 
 tar -czf "${DIST}/scalattice-agent-aarch64-apple-darwin.tar.gz" -C "$DIST" scalattice-agent
 

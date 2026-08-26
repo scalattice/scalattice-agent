@@ -563,28 +563,58 @@ def package_macos_smoke_dmg(agent_bin: Path, dest_dmg: Path) -> Path:
         encoding="utf-8",
     )
     dest_dmg.parent.mkdir(parents=True, exist_ok=True)
-    if dest_dmg.exists():
-        dest_dmg.unlink()
-    result = subprocess.run(
-        [
-            "hdiutil",
-            "create",
-            "-volname",
-            "Scalattice Agent",
-            "-srcfolder",
-            str(stage),
-            "-ov",
-            "-format",
-            "UDZO",
-            str(dest_dmg),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 or not dest_dmg.is_file():
-        detail = (result.stderr or result.stdout or "").strip()
-        raise Fail(f"hdiutil create failed for smoke DMG: {detail or result.returncode}")
+    last_detail = ""
+    for attempt in range(1, 7):
+        if dest_dmg.exists():
+            dest_dmg.unlink()
+        # Drop leftover Scalattice attaches — GHA runners sometimes leave
+        # diskimages-helper wedged ("Resource busy").
+        info = subprocess.run(
+            ["hdiutil", "info"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        current_dev = ""
+        busy_devs: set[str] = set()
+        for line in (info.stdout or "").splitlines():
+            if line.startswith("/dev/"):
+                current_dev = line.split()[0]
+            elif "calattice" in line.lower() and current_dev:
+                busy_devs.add(current_dev)
+                current_dev = ""
+        for dev in sorted(busy_devs):
+            subprocess.run(
+                ["hdiutil", "detach", "-force", dev],
+                capture_output=True,
+                check=False,
+            )
+        result = subprocess.run(
+            [
+                "hdiutil",
+                "create",
+                "-volname",
+                "Scalattice Agent",
+                "-srcfolder",
+                str(stage),
+                "-ov",
+                "-format",
+                "UDZO",
+                str(dest_dmg),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and dest_dmg.is_file():
+            break
+        last_detail = (result.stderr or result.stdout or "").strip() or str(
+            result.returncode
+        )
+        log(f"==> hdiutil create busy/failed (attempt {attempt}/6); retrying…")
+        time.sleep(attempt * 2)
+    else:
+        raise Fail(f"hdiutil create failed for smoke DMG: {last_detail}")
     shutil.rmtree(stage, ignore_errors=True)
     log(f"==> packed smoke DMG {dest_dmg.name} ({dest_dmg.stat().st_size} bytes)")
     return dest_dmg
