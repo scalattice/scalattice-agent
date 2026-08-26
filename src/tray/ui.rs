@@ -454,7 +454,10 @@ impl TrayApp {
             return;
         }
         self.next_agent_watchdog = Instant::now() + Duration::from_secs(5);
-        if self.watchdog_inflight.load(Ordering::SeqCst) || self.token_save_inflight {
+        if self.watchdog_inflight.load(Ordering::SeqCst)
+            || self.token_save_inflight
+            || self.update_busy
+        {
             ctx.request_repaint_after(Duration::from_secs(5));
             return;
         }
@@ -516,11 +519,13 @@ impl TrayApp {
                             write_tray_log(&format!("auto-update: installing v{latest}"));
                             self.settings.mark_auto_update_attempt(&latest);
                             let _ = self.settings.save();
+                            // Queue the download before the toast so a stuck
+                            // notification helper cannot block auto-install.
+                            self.start_update_install();
                             self.notify_desktop(
                                 "Installing update",
                                 &format!("Scalattice Agent v{latest} is downloading."),
                             );
-                            self.start_update_install();
                         } else {
                             write_tray_log(&format!(
                                 "auto-update: skipping repeat install for v{latest}"
