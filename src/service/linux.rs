@@ -153,6 +153,10 @@ pub fn remove_background_service() -> Result<()> {
     uninstall_user_service()
 }
 
+pub fn in_tray_process() -> bool {
+    false
+}
+
 pub fn stop_background_for_update() -> Result<()> {
     if !background_service_available() || !service_active() {
         return Ok(());

@@ -139,8 +139,7 @@ pub fn in_tray_process() -> bool {
     platform::in_tray_process()
 }
 
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn in_tray_process() -> bool {
     platform::in_tray_process()
 }

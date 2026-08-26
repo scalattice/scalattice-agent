@@ -49,17 +49,63 @@ pub use windows_impl::{set_process_app_id, show};
 #[cfg(target_os = "macos")]
 pub fn set_process_app_id() {}
 
+/// macOS notifications go through `osascript`. That must never run on the UI
+/// thread: Apple Events / TCC can block `osascript` indefinitely, which froze
+/// the tray as soon as an update was detected.
 #[cfg(target_os = "macos")]
 pub fn show(title: &str, body: &str) {
-    let title = applescript_escape(title);
-    let body = applescript_escape(body);
-    let script = format!("display notification \"{body}\" with title \"{title}\"");
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .status();
+    let title = title.to_string();
+    let body = body.to_string();
+    let _ = std::thread::Builder::new()
+        .name("scalattice-notify".into())
+        .spawn(move || show_macos_notification(&title, &body));
 }
 
 #[cfg(target_os = "macos")]
+fn show_macos_notification(title: &str, body: &str) {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let title = applescript_escape(title);
+    let body = applescript_escape(body);
+    let script = format!("display notification \"{body}\" with title \"{title}\"");
+    let mut child = match Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return,
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::applescript_escape;
+
+    #[test]
+    fn applescript_escape_quotes_and_backslashes() {
+        assert_eq!(applescript_escape(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(applescript_escape(r"a\b"), r"a\\b");
+    }
 }

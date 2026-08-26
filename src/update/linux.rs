@@ -39,12 +39,10 @@ pub async fn install_latest_update() -> Result<()> {
         return Ok(());
     }
 
-    if !running_as_live_agent() {
-        // Stop the live agent before the (long) download so a dashboard remote
-        // update cannot clobber the same /tmp archive while this CLI runs.
-        service::stop_background_for_update()?;
-    }
-
+    // Never stop the live agent (or the CLI's background service) before the
+    // download finishes. Doing that on macOS made the machine look frozen as
+    // soon as a newer release was detected, and it also raced KeepAlive /
+    // tray watchdog restarts while the archive was still downloading.
     println!(
         "Downloading Scalattice Agent v{} ({})...",
         info.latest_version,
@@ -56,6 +54,11 @@ pub async fn install_latest_update() -> Result<()> {
     if running_as_live_agent() {
         println!(
             "Updated to v{}. Live agent will restart onto the new binary.",
+            info.latest_version
+        );
+    } else if crate::service::in_tray_process() {
+        println!(
+            "Updated to v{}. Restarting Scalattice Agent onto the new binary…",
             info.latest_version
         );
     } else {
@@ -283,14 +286,14 @@ fn apply_update(staging: &Path) -> Result<()> {
     }
 
     // Remote/website update runs inside `foreground` (the live agent). Stopping the
-    // systemd unit here kills this process before the binary is replaced — that is
-    // why Linux force-update from the dashboard failed while Windows (detached
-    // installer) worked. CLI `scalattice-agent update` is a separate process and
-    // should still stop the service first.
+    // systemd/launchd unit here kills this process before the binary is replaced —
+    // that is why Linux force-update from the dashboard failed while Windows
+    // (detached installer) worked. CLI `scalattice-agent update` is a separate
+    // process and should still stop the service first — but only once we are
+    // ready to replace files (download already finished above).
     let self_replace = running_as_live_agent();
-    if self_replace {
-        eprintln!("self-update: replacing binary in place (not stopping this process)");
-    } else {
+    let tray_update = crate::service::in_tray_process();
+    if !self_replace && !tray_update {
         service::stop_background_for_update()?;
     }
 
@@ -338,12 +341,50 @@ fn apply_update(staging: &Path) -> Result<()> {
     if self_replace {
         // Caller (remote control) acks then restarts/exits so systemd picks up the
         // new binary. Restarting here would race the websocket ack.
+    } else if tray_update {
+        // Tray already mapped the old binary. Restart the worker onto the new
+        // image, then exit this tray process (Windows does the same via the
+        // detached Inno setup). Relaunch the panel so the menu-bar icon returns.
+        let _ = service::restart_background_after_update();
+        fs::remove_dir_all(staging.parent().unwrap_or(staging)).ok();
+        relaunch_macos_tray_after_update();
+        std::process::exit(0);
     } else {
         service::restart_background_after_update()?;
     }
     fs::remove_dir_all(staging.parent().unwrap_or(staging)).ok();
     Ok(())
 }
+
+/// Best-effort: reopen the macOS tray app a moment after this process exits.
+#[cfg(target_os = "macos")]
+fn relaunch_macos_tray_after_update() {
+    use std::os::unix::process::CommandExt;
+    let app = PathBuf::from("/Applications/Scalattice Agent.app");
+    if !app.is_dir() {
+        return;
+    }
+    let mut cmd = Command::new("/bin/sh");
+    // `open <path.app>` relaunches the bundle; `-a` expects a display name.
+    cmd.arg("-c").arg(format!(
+        "sleep 1; open {}",
+        shell_single_quote(&app.display().to_string())
+    ));
+    let _ = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
+}
+
+#[cfg(target_os = "macos")]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn relaunch_macos_tray_after_update() {}
 
 /// True when this process is the long-lived agent (`foreground`), not the CLI updater.
 fn running_as_live_agent() -> bool {

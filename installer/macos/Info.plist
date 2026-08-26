@@ -26,6 +26,8 @@
 	<array>
 		<string>arm64</string>
 	</array>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Scalattice Agent uses Apple Events to show desktop notifications.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright (C) Robottik Ltd</string>
 </dict>
