@@ -1659,20 +1659,7 @@ pub fn detect_ram_used_gb() -> Option<u32> {
     }
     #[cfg(windows)]
     {
-        let output = powershell_hidden(&[
-            "-Command",
-            "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 0)",
-        ])
-        .output()
-        .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let used = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u32>()
-            .ok()?;
-        return Some(used.max(1));
+        return detect_windows_memused_gb();
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1832,8 +1819,30 @@ fn detect_linux_memtotal_gb() -> Option<u32> {
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
 }
 
+/// Prefer Win32 `GlobalMemoryStatusEx` — PowerShell/WMI often fails for the
+/// Windows service account (no interactive session / CIM blocked), which made
+/// capacity checks see 0 GB RAM and reject every model.
+#[cfg(windows)]
+fn windows_memory_status() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.ullTotalPhys == 0 {
+        return None;
+    }
+    Some((status.ullTotalPhys, status.ullAvailPhys))
+}
+
 #[cfg(windows)]
 fn detect_windows_memtotal_gb() -> Option<u32> {
+    if let Some((total, _)) = windows_memory_status() {
+        return Some(bytes_to_gb(total));
+    }
+    // Fallback when the Win32 call is unavailable (rare).
     let output = powershell_hidden(&[
         "-Command",
         "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)",
@@ -1848,6 +1857,28 @@ fn detect_windows_memtotal_gb() -> Option<u32> {
         .parse::<u32>()
         .ok()?;
     Some(gb.max(1))
+}
+
+#[cfg(windows)]
+fn detect_windows_memused_gb() -> Option<u32> {
+    if let Some((total, avail)) = windows_memory_status() {
+        let used = total.saturating_sub(avail);
+        return Some(bytes_to_gb(used).max(1).min(bytes_to_gb(total)));
+    }
+    let output = powershell_hidden(&[
+        "-Command",
+        "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 0)",
+    ])
+    .output()
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let used = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    Some(used.max(1))
 }
 
 pub fn detect_cuda_version() -> Option<String> {
