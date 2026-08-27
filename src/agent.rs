@@ -406,6 +406,32 @@ impl SessionState {
         }
     }
 
+    /// Replace the in-memory catalog from a live policy/catalog push (no reconnect).
+    fn apply_catalog(&mut self, catalog: Vec<CatalogModel>, cpu_ram_headroom_gb: Option<u32>) {
+        if let Some(headroom) = cpu_ram_headroom_gb {
+            if headroom > 0 {
+                self.cpu_ram_headroom_gb = headroom;
+            }
+        }
+        let same_ids = self.catalog.len() == catalog.len()
+            && self
+                .catalog
+                .iter()
+                .zip(catalog.iter())
+                .all(|(a, b)| a.model_id == b.model_id && a.runtime_model == b.runtime_model);
+        // Always adopt the payload so weight/VRAM floor edits land without a reconnect.
+        self.catalog = catalog;
+        self.logged_download_blockers = false;
+        self.last_sync_token = None;
+        self.prune_disabled_model_weights();
+        if !same_ids {
+            info!(
+                catalog_models = self.catalog.len(),
+                "applied live catalog update"
+            );
+        }
+    }
+
     fn runtime_for_model_id(&self, model_id: &str) -> String {
         self.catalog_for_advertised_id(model_id)
             .map(|model| {
@@ -1366,11 +1392,15 @@ async fn handle_server_message(
                 "pong" | "policy" => {
                     if let Ok(pong) = parse_pong(data) {
                         let purge_requested = !pong.purge_models.is_empty();
+                        let catalog_updated = pong.catalog.is_some();
                         let (transition, trash) = {
                             let mut guard = state.lock().await;
                             guard.apply_compute_devices(&pong.compute_devices);
                             guard.apply_model_policy(&pong.enabled_models);
                             guard.apply_max_completion_tokens(pong.max_completion_tokens);
+                            if let Some(catalog) = pong.catalog.clone() {
+                                guard.apply_catalog(catalog, pong.cpu_ram_headroom_gb);
+                            }
                             let trash = guard.apply_purge_models(&pong.purge_models);
                             let transition = guard.apply_schedule(pong.schedule.clone());
                             guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
@@ -1384,7 +1414,7 @@ async fn handle_server_message(
                         }
                         if state.lock().await.needs_reregister() {
                             send_register_message(state, write).await?;
-                        } else if purge_requested {
+                        } else if purge_requested || catalog_updated {
                             send_heartbeat(state, write).await?;
                         }
                     }

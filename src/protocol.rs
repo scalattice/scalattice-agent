@@ -139,6 +139,11 @@ pub struct PongMessage {
     pub purge_models: Vec<String>,
     #[serde(rename = "maxCompletionTokens", default)]
     pub max_completion_tokens: u32,
+    /// Live catalog refresh (omit on ordinary heartbeats). Same shape as `ready.catalog`.
+    #[serde(default)]
+    pub catalog: Option<Vec<CatalogModel>>,
+    #[serde(rename = "cpuRamHeadroomGb", default)]
+    pub cpu_ram_headroom_gb: Option<u32>,
     #[serde(default)]
     pub schedule: AgentSchedule,
 }
