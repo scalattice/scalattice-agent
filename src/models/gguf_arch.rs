@@ -111,9 +111,15 @@ fn gguf_shape_uncached(path: &Path) -> std::io::Result<Option<GgufShape>> {
     if arch.is_empty() {
         arch = "llama".into();
     }
-    let n_layer = scalar(&scalars, &arch, "block_count")?;
-    let n_embd = scalar(&scalars, &arch, "embedding_length")?;
-    let n_head = scalar(&scalars, &arch, "attention.head_count")?;
+    let Some(n_layer) = scalar(&scalars, &arch, "block_count") else {
+        return Ok(None);
+    };
+    let Some(n_embd) = scalar(&scalars, &arch, "embedding_length") else {
+        return Ok(None);
+    };
+    let Some(n_head) = scalar(&scalars, &arch, "attention.head_count") else {
+        return Ok(None);
+    };
     let n_head_kv = scalar(&scalars, &arch, "attention.head_count_kv").unwrap_or(n_head);
     let shape = GgufShape {
         n_layer: n_layer as u32,

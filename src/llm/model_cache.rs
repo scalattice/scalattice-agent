@@ -198,7 +198,7 @@ fn incoming_vram_need_gb(inner: &CacheInner, model_path: &Path) -> f64 {
             return measured.max(weight);
         }
     }
-    let shape = crate::models::gguf_arch::gguf_shape(model_path);
+    let shape = crate::models::gguf_shape(model_path);
     crate::models::full_host_need_gb(weight, shape, 4096)
 }
 
@@ -239,13 +239,17 @@ fn fallback_occupancy_gb(model_path: &Path, pool: &VirtualCard, load_tier: usize
         .flatten()
     {
         Some("cpu-only") => 0.0,
-        Some("gpu-offload-reduced") => (weight * 0.45 + 1.0).min(weight + GPU_KV_HEADROOM_GB),
-        Some("gpu-offload") => (weight * 0.7 + 1.0).min(weight + GPU_KV_HEADROOM_GB),
+        Some("gpu-offload-reduced") => {
+            (weight * 0.45 + 1.0).min(crate::models::full_host_need_from_weight(weight, 4096))
+        }
+        Some("gpu-offload") => {
+            (weight * 0.7 + 1.0).min(crate::models::full_host_need_from_weight(weight, 4096))
+        }
         _ => {
             if weight <= 0.05 {
                 0.0
             } else {
-                weight + GPU_KV_HEADROOM_GB
+                crate::models::full_host_need_from_weight(weight, 4096)
             }
         }
     }
