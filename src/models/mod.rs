@@ -6,9 +6,9 @@ mod storage;
 mod sync;
 
 pub use capacity::{
-    can_host_model, can_host_on_machine, can_serve_vision_on_card, can_serve_vision_on_machine,
-    hosting_min_vram_gb, image_job_min_vram_gb, preferred_download_card,
-    DEFAULT_CPU_RAM_HEADROOM_GB,
+    advertised_vram_can_gpu_full, can_host_model, can_host_on_machine, can_serve_vision_on_card,
+    can_serve_vision_on_machine, gpu_full_host_need_gb, hosting_min_vram_gb, image_job_min_vram_gb,
+    preferred_download_card, DEFAULT_CPU_RAM_HEADROOM_GB,
 };
 pub use gguf_check::gguf_payload_in_bounds;
 pub use health::{
