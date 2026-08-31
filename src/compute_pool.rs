@@ -80,6 +80,7 @@ pub fn restrict_heterogeneous_cuda_visibility(devices: &[ComputeDevice]) {
     );
     let (physical, name, vram) = &cuda[primary_pos];
     // SAFETY: must be set before the first CUDA / llama.cpp backend init in this process.
+    pin_cuda_indices_to_pci_bus();
     std::env::set_var("CUDA_VISIBLE_DEVICES", physical.to_string());
     WARNED.call_once(|| {
         warn!(
@@ -594,6 +595,7 @@ pub fn apply_slot_backend_visibility(strategy: PoolStrategy, cuda_visible: &[u32
             std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
         }
         PoolStrategy::Single | PoolStrategy::TensorParallel => {
+            pin_cuda_indices_to_pci_bus();
             if cuda_visible.is_empty() {
                 std::env::set_var("CUDA_VISIBLE_DEVICES", "");
             } else {
@@ -883,6 +885,13 @@ pub fn format_vram(gb: u32) -> String {
 fn parse_cuda_index(id: &str) -> Option<u32> {
     let rest = id.strip_prefix("nvidia:")?;
     rest.parse().ok()
+}
+
+/// nvidia-smi (and our `nvidia:N` ids) use PCI bus order. CUDA defaults to
+/// FASTEST_FIRST, so `CUDA_VISIBLE_DEVICES=1` on a 1660+3080 box selects the
+/// 1660. Set this before any CUDA init so worker CVD matches slot ids.
+fn pin_cuda_indices_to_pci_bus() {
+    std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
 }
 
 fn vram_proportions(vram_gb: &[u32]) -> Vec<f32> {
@@ -1285,5 +1294,12 @@ mod tests {
         } else {
             assert_eq!(card.strategy, PoolStrategy::CpuOnly);
         }
+    }
+
+    #[test]
+    fn cuda_slot_visibility_uses_pci_bus_order() {
+        apply_slot_backend_visibility(PoolStrategy::Single, &[1]);
+        assert_eq!(std::env::var("CUDA_DEVICE_ORDER").ok().as_deref(), Some("PCI_BUS_ID"));
+        assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(), Some("1"));
     }
 }

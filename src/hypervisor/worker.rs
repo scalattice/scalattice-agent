@@ -21,6 +21,7 @@ pub fn run_worker(config_json: &str) -> Result<()> {
         slot = %boot.slot_id,
         strategy = ?boot.card.strategy,
         cuda_visible = ?boot.cuda_visible,
+        cuda_device_order = %std::env::var("CUDA_DEVICE_ORDER").unwrap_or_default(),
         "compute worker starting"
     );
 
