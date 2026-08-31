@@ -1,5 +1,8 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
-use crate::models::{can_host_model, can_serve_vision_on_card, hosting_min_vram_gb, image_job_min_vram_gb};
+use crate::models::{
+    advertised_vram_can_gpu_full, can_host_model, can_serve_vision_on_card, hosting_min_vram_gb,
+    image_job_min_vram_gb,
+};
 use crate::protocol::CatalogModel;
 use tracing::debug;
 
@@ -38,7 +41,7 @@ pub fn pick_placement(
         .slots
         .iter()
         .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
-        .filter(|s| min_vram > 0 && s.card.total_vram_gb >= min_vram)
+        .filter(|s| advertised_vram_can_gpu_full(s.card.total_vram_gb, model, min_vram))
         .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
         .filter(|s| !need_vision || can_serve_vision_on_card(model, &s.card))
         .collect();
@@ -78,7 +81,7 @@ pub fn pick_placement(
         if need_vision && !can_serve_vision_on_card(model, &tp_card) {
             continue;
         }
-        if min_vram > 0 && tp_card.total_vram_gb < min_vram {
+        if !advertised_vram_can_gpu_full(tp_card.total_vram_gb, model, min_vram) {
             continue;
         }
         if !can_host_model(model, &tp_card, ram_gb, cpu_ram_headroom_gb) {
@@ -298,5 +301,46 @@ mod tests {
             pick_placement(&plan, &idle, &model(40.0, 30.0), 64, 2, &devices, false).unwrap();
         assert!(placement.use_tp_worker);
         assert_eq!(placement.slot_ids.len(), 2);
+    }
+
+    #[test]
+    fn qwen8b_skips_six_gb_card_when_ten_gb_is_idle() {
+        // Catalog minVramGb=4 would previously pick the 1660 as a "full fit".
+        // Weight + KV headroom (~6.7 GB) does not fit 6 GB, so the 3080 wins.
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1660 SUPER".into(),
+                vram_gb: Some(6),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "RTX 3080".into(),
+                vram_gb: Some(10),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let placement =
+            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cuda-1".to_string()]);
+        assert!(!placement.use_tp_worker);
     }
 }

@@ -491,6 +491,108 @@ fn live_cuda_free_vram_gb_from(bin: &str, wanted: &[u32]) -> Option<f64> {
     min_free
 }
 
+/// NVIDIA compute capability as major*10+minor (Ampere 8.0 → 80, Turing 7.5 → 75).
+/// Uses the process's pinned `CUDA_VISIBLE_DEVICES` GPU(s); `None` if unset or unknown.
+pub fn live_cuda_compute_cap() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        static CACHED: OnceLock<Option<u32>> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            let wanted = cuda_visible_physical_indices();
+            if wanted.is_empty() {
+                return None;
+            }
+            for bin in nvidia_smi_bins() {
+                if let Some(cap) = live_cuda_compute_cap_from(&bin, &wanted) {
+                    return Some(cap);
+                }
+            }
+            None
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_cuda_compute_cap_from(bin: &str, wanted: &[u32]) -> Option<u32> {
+    let output = configure_nvidia_smi_command(bin)
+        .args(["--query-gpu=index,compute_cap", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut min_cap: Option<u32> = None;
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let parts = parse_csv_fields(line);
+        if parts.len() < 2 {
+            continue;
+        }
+        let Ok(index) = parts[0].trim().parse::<u32>() else {
+            continue;
+        };
+        if !wanted.contains(&index) {
+            continue;
+        }
+        let Some(cap) = parse_compute_cap(parts[1].trim()) else {
+            continue;
+        };
+        min_cap = Some(match min_cap {
+            None => cap,
+            Some(prev) => prev.min(cap),
+        });
+    }
+    min_cap
+}
+
+pub(crate) fn parse_compute_cap(raw: &str) -> Option<u32> {
+    let s = raw.trim();
+    let mut parts = s.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().unwrap_or("0").chars().next()?.to_digit(10)?;
+    Some(major.saturating_mul(10).saturating_add(minor))
+}
+
+/// Turing / Pascal / Maxwell consumer and datacenter names. Ampere+ is false.
+pub fn nvidia_name_is_pre_ampere(name: &str) -> bool {
+    let n = name.to_ascii_lowercase().replace('-', " ");
+    if n.contains("gtx") {
+        return true;
+    }
+    if n.contains("rtx 20") || n.contains("rtx20") {
+        return true;
+    }
+    if n.contains("titan rtx") || n.contains("titan x") || n.contains("titan v") {
+        return true;
+    }
+    if n.contains("tesla t4")
+        || n.contains("tesla p")
+        || n.contains("tesla k")
+        || n.contains("tesla m")
+    {
+        return true;
+    }
+    // RTX Axxxx / RTX Ada are Ampere+; un-prefixed "Quadro RTX 4000" is Turing.
+    if n.contains("rtx a") || n.contains("rtx ada") {
+        return false;
+    }
+    if n.contains("quadro rtx") {
+        return true;
+    }
+    n.contains("quadro t")
+        || n.contains("quadro p")
+        || n.contains("quadro k")
+        || n.contains("quadro m")
+}
+
 /// Live free VRAM (GiB) for an AMD GPU via `rocm-smi`. `gpu_index` is the
 /// `amd:N` id; `None` uses the smallest free across cards.
 pub fn live_rocm_free_vram_gb(gpu_index: Option<usize>) -> Option<f64> {
@@ -2168,6 +2270,19 @@ mod tests {
         assert_eq!(fields[1], "NVIDIA RTX A6000, v2");
         assert_eq!(parse_util_pct("37"), Some(37));
         assert_eq!(parse_util_pct("[N/A]"), None);
+    }
+
+    #[test]
+    fn compute_cap_and_pre_ampere_names() {
+        assert_eq!(parse_compute_cap("7.5"), Some(75));
+        assert_eq!(parse_compute_cap("8.6"), Some(86));
+        assert_eq!(parse_compute_cap("12.0"), Some(120));
+        assert!(nvidia_name_is_pre_ampere("NVIDIA GeForce GTX 1660 SUPER"));
+        assert!(nvidia_name_is_pre_ampere("GeForce RTX 2080 Ti"));
+        assert!(nvidia_name_is_pre_ampere("Tesla T4"));
+        assert!(!nvidia_name_is_pre_ampere("NVIDIA GeForce RTX 3080"));
+        assert!(!nvidia_name_is_pre_ampere("NVIDIA RTX A6000"));
+        assert!(!nvidia_name_is_pre_ampere("NVIDIA GeForce RTX 4090"));
     }
 
     #[test]

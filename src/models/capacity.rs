@@ -24,6 +24,32 @@ pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
     gb_ceil(model.min_vram_gb)
 }
 
+/// KV/compute overhead reserved on top of GGUF weight for a GPU-full placement.
+pub const GPU_FULL_HEADROOM_GB: f64 = 2.0;
+
+/// VRAM a slot must advertise to count as a **full** GPU host (weights + headroom).
+///
+/// Catalog `min_vram_gb` is a marketing floor (Qwen3 8B is 4 GB) and must not send
+/// a ~4.7 GB GGUF onto a 6 GB card as a "full fit".
+pub fn gpu_full_host_need_gb(model: &CatalogModel) -> f64 {
+    match model.weight_size_gb.filter(|w| *w > 0.05) {
+        Some(w) => w + GPU_FULL_HEADROOM_GB,
+        None => f64::from(hosting_min_vram_gb(model)),
+    }
+}
+
+/// True when advertised VRAM can take weights + KV without CPU offload.
+pub fn advertised_vram_can_gpu_full(
+    advertised_vram_gb: u32,
+    model: &CatalogModel,
+    catalog_min_vram: u32,
+) -> bool {
+    if catalog_min_vram > 0 && advertised_vram_gb < catalog_min_vram {
+        return false;
+    }
+    f64::from(advertised_vram_gb) + 0.05 >= gpu_full_host_need_gb(model)
+}
+
 /// GPU floor for image jobs — catalog `minVramGbVision` from the server.
 pub fn image_job_min_vram_gb(model: &CatalogModel) -> u32 {
     if !model_is_vision(model) {
@@ -214,6 +240,16 @@ mod tests {
             vision_max_image_pixels: None,
             weights: None,
         }
+    }
+
+    #[test]
+    fn gpu_full_need_uses_weight_plus_headroom_not_catalog_floor() {
+        let qwen = catalog(4.0, 4.68, 8.0);
+        assert!((gpu_full_host_need_gb(&qwen) - 6.68).abs() < 1e-9);
+        assert!(!advertised_vram_can_gpu_full(6, &qwen, 4));
+        assert!(advertised_vram_can_gpu_full(10, &qwen, 4));
+        let eight_gb_ok = catalog(8.0, 5.0, 8.0);
+        assert!(advertised_vram_can_gpu_full(8, &eight_gb_ok, 8));
     }
 
     #[test]

@@ -185,9 +185,13 @@ pub fn generate_with_callback(
         need_vision,
         |model, mtmd| {
             let ctx_tokens = if need_vision { 8192 } else { 4096 };
-            let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
+            let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(
                 NonZeroU32::new(ctx_tokens).context("invalid default context size")?,
             ));
+            if should_disable_flash_attn(&config.pool) {
+                ctx_params = with_flash_attn_disabled(ctx_params);
+                tracing::info!("flash attention disabled (pre-Ampere GPU; llama.cpp FA abort()s)");
+            }
             super::progress::report("context", 0.0);
             let context_start = Instant::now();
             let mut ctx = model
@@ -673,6 +677,26 @@ pub(crate) fn should_attempt_tensor_parallel(
     min_v + 0.05 >= per_need && total + 0.05 >= tot_need
 }
 
+/// llama.cpp CUDA Flash Attention abort()s on pre-Ampere (Turing GTX 16 / RTX 20,
+/// Pascal GTX 10, Tesla T4). The worker then dies with "closed stdout during invoke".
+fn should_disable_flash_attn(pool: &VirtualCard) -> bool {
+    match pool.strategy {
+        PoolStrategy::Single | PoolStrategy::TensorParallel => {}
+        PoolStrategy::Vulkan | PoolStrategy::Metal | PoolStrategy::CpuOnly => return false,
+    }
+    if let Some(cap) = crate::specs::live_cuda_compute_cap() {
+        return cap < 80;
+    }
+    pool.devices
+        .iter()
+        .any(|d| crate::specs::nvidia_name_is_pre_ampere(&d.name))
+}
+
+/// llama.h `LLAMA_FLASH_ATTN_TYPE_DISABLED = 0`.
+fn with_flash_attn_disabled(params: LlamaContextParams) -> LlamaContextParams {
+    params.with_flash_attention_policy(unsafe { std::mem::transmute::<i32, _>(0) })
+}
+
 /// Whether a greedy all-layers load on the *primary* GPU is safe to attempt.
 pub(crate) fn should_attempt_single_gpu_full(
     pool: &VirtualCard,
@@ -1058,6 +1082,54 @@ mod tests {
         );
         assert!(!should_attempt_tensor_parallel(&pool, Some(4.0)));
         assert!(should_attempt_single_gpu_full(&pool, Some(4.0)));
+    }
+
+    #[test]
+    fn flash_attn_disabled_on_turing_not_ampere() {
+        let turing = build_virtual_card(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce GTX 1660 SUPER".into(),
+                vram_gb: Some(6),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+        let ampere = build_virtual_card(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce RTX 3080".into(),
+                vram_gb: Some(10),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+        assert!(should_disable_flash_attn(&turing));
+        assert!(!should_disable_flash_attn(&ampere));
     }
 
     #[test]
