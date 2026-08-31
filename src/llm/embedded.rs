@@ -1,7 +1,8 @@
 //! Embedded llama.cpp inference (no external llama-cli binary required).
 
 use crate::compute_pool::{
-    primary_cuda_device, primary_cuda_vram_gb, cuda_device_vram_gb, PoolStrategy, VirtualCard,
+    cuda_device_vram_gb, offload_layer_budget, primary_cuda_device, primary_cuda_vram_gb,
+    PoolStrategy, VirtualCard,
 };
 use crate::protocol::ChatMessage;
 use anyhow::{anyhow, Context, Result};
@@ -493,8 +494,12 @@ pub(crate) fn load_model_for_pool_starting_at(
 ) -> Result<(LlamaModel, usize)> {
     let candidates = load_param_candidates(pool, Some(model_path))?;
     let mut last_err: Option<anyhow::Error> = None;
+    let mut skip_gpu = false;
 
     for (idx, (label, params)) in candidates.into_iter().enumerate().skip(start_at) {
+        if skip_gpu && label != "cpu-only" {
+            continue;
+        }
         super::progress::report("load", 0.0);
         let params = super::progress::attach_llama_progress(params);
         match LlamaModel::load_from_file(backend, model_path, &params) {
@@ -516,7 +521,14 @@ pub(crate) fn load_model_for_pool_starting_at(
                         "corrupted or incomplete GGUF (tensor payloads exceed file size)",
                     );
                 }
+                let gpu_oom = label != "cpu-only" && is_gpu_alloc_failure(&wrapped);
                 last_err = Some(wrapped);
+                if gpu_oom {
+                    warn!(
+                        "GPU load '{label}' hit VRAM/CUDA failure; skipping remaining GPU tiers"
+                    );
+                    skip_gpu = true;
+                }
             }
         }
     }
@@ -560,6 +572,40 @@ pub(crate) fn gguf_weight_gb(path: &Path) -> Option<f64> {
     std::fs::metadata(path)
         .ok()
         .map(|m| m.len() as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+fn live_placement_vram_gb(advertised_gb: u32) -> u32 {
+    match crate::specs::live_cuda_free_vram_gb() {
+        Some(free) if free.is_finite() && free >= 0.0 => {
+            let free_u = free.floor() as u32;
+            if free_u < advertised_gb {
+                info!(
+                    advertised_gb,
+                    free_gb = format!("{:.2}", free),
+                    "live GPU free VRAM is below advertised capacity"
+                );
+            }
+            advertised_gb.min(free_u)
+        }
+        _ => advertised_gb,
+    }
+}
+
+fn gpu_full_fits_available(available_gb: u32, weight_gb: Option<f64>) -> bool {
+    const HEADROOM_GB: f64 = 2.0;
+    match weight_gb {
+        Some(w) if w > 0.05 => f64::from(available_gb.max(1)) + 0.05 >= w + HEADROOM_GB,
+        _ => false,
+    }
+}
+
+fn is_gpu_alloc_failure(err: &anyhow::Error) -> bool {
+    let detail = format!("{err:#}").to_lowercase();
+    detail.contains("out of memory")
+        || detail.contains("cudamalloc")
+        || detail.contains("unable to allocate")
+        || detail.contains("failed to allocate")
+        || detail.contains("null result")
 }
 
 fn full_placement_vram_gb(pool: &VirtualCard) -> u32 {
@@ -702,16 +748,19 @@ fn load_param_candidates_with_weight(
         return Ok(candidates);
     }
 
+    let advertised = full_placement_vram_gb(pool);
+    let available = live_placement_vram_gb(advertised);
+
     match pool.strategy {
         PoolStrategy::TensorParallel => {
             // Prefer largest single GPU whenever the model fits there. TP on mixed
             // consumer cards (and on tiny models that already fit one GPU) has been
             // aborting the process via ggml-cuda.cu.
-            if should_attempt_single_gpu_full(pool, weight_gb) {
+            if gpu_full_fits_available(available, weight_gb) {
                 if let Some(primary) = primary_cuda_device(pool) {
                     info!(
                         weight_gb = weight_gb.unwrap_or(-1.0),
-                        primary_vram_gb = primary_cuda_vram_gb(pool),
+                        primary_vram_gb = available,
                         gpus = pool.cuda_device_ids.len(),
                         "model fits largest GPU; using single-device full (not tensor-parallel)"
                     );
@@ -732,18 +781,18 @@ fn load_param_candidates_with_weight(
                         .into_iter()
                         .min()
                         .unwrap_or(0),
-                    primary_vram_gb = primary_cuda_vram_gb(pool),
+                    primary_vram_gb = available,
                     tp_compatible = cuda_devices_compatible_for_tp(pool),
                     "skipping gpu-full (model does not fit GPUs safely); starting at offload"
                 );
             }
         }
         PoolStrategy::Single | PoolStrategy::Vulkan | PoolStrategy::Metal => {
-            if should_attempt_gpu_full(pool, weight_gb) {
+            if gpu_full_fits_available(available, weight_gb) {
                 candidates.push(("gpu-full", model_params_for_pool(pool)?));
             } else {
                 info!(
-                    available_vram_gb = full_placement_vram_gb(pool),
+                    available_vram_gb = available,
                     weight_gb = weight_gb.unwrap_or(-1.0),
                     "skipping gpu-full placement (would not fit / risk CUDA abort); starting at offload"
                 );
@@ -752,8 +801,16 @@ fn load_param_candidates_with_weight(
         PoolStrategy::CpuOnly => {}
     }
 
-    let budget = pool.gpu_layer_budget.max(1);
-    if budget < 999 {
+    // Offload layer count from *free* VRAM, not nameplate. A 10 GB 3080 with 1 GB
+    // free must not try 32-layer offload (CUDA abort / worker stdout close).
+    let budget = if available >= 2 {
+        offload_layer_budget(available)
+            .min(pool.gpu_layer_budget)
+            .max(1)
+    } else {
+        0
+    };
+    if budget >= 1 && budget < 999 {
         match pool.strategy {
             PoolStrategy::Vulkan => {
                 candidates.push(("gpu-offload", vulkan_offload_params(budget)?));

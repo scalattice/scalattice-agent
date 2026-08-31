@@ -411,6 +411,127 @@ fn wsl_nvidia_lib_dir() -> Option<&'static str> {
     }
 }
 
+/// Physical CUDA indices from `CUDA_VISIBLE_DEVICES` (worker pin). Empty if unset.
+fn cuda_visible_physical_indices() -> Vec<u32> {
+    let Ok(raw) = std::env::var("CUDA_VISIBLE_DEVICES") else {
+        return Vec::new();
+    };
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    raw.split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect()
+}
+
+/// Live free VRAM (GiB) for this process's pinned NVIDIA GPU(s).
+///
+/// Only queries when `CUDA_VISIBLE_DEVICES` is set (per-slot workers). Unit tests
+/// and the supervisor leave it unset so advertised capacity stays in use.
+/// Returns the **minimum** free across visible devices.
+pub fn live_cuda_free_vram_gb() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = cuda_visible_physical_indices();
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let wanted = cuda_visible_physical_indices();
+        if wanted.is_empty() {
+            return None;
+        }
+        for bin in nvidia_smi_bins() {
+            if let Some(free) = live_cuda_free_vram_gb_from(&bin, &wanted) {
+                return Some(free);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_cuda_free_vram_gb_from(bin: &str, wanted: &[u32]) -> Option<f64> {
+    let output = configure_nvidia_smi_command(bin)
+        .args([
+            "--query-gpu=index,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut min_free: Option<f64> = None;
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let parts = parse_csv_fields(line);
+        if parts.len() < 2 {
+            continue;
+        }
+        let Ok(index) = parts[0].trim().parse::<u32>() else {
+            continue;
+        };
+        if !wanted.contains(&index) {
+            continue;
+        }
+        let Some(mb) = parse_nvidia_number(&parts[1]) else {
+            continue;
+        };
+        let gb = f64::from(mb) / 1024.0;
+        min_free = Some(match min_free {
+            None => gb,
+            Some(prev) => prev.min(gb),
+        });
+    }
+    min_free
+}
+
+/// Live free VRAM (GiB) for an AMD GPU via `rocm-smi`. `gpu_index` is the
+/// `amd:N` id; `None` uses the smallest free across cards.
+pub fn live_rocm_free_vram_gb(gpu_index: Option<usize>) -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = gpu_index;
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let output = hide_console(&mut Command::new("rocm-smi"))
+            .args(["--showmeminfo", "vram"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let free = parse_amd_vram_free_gib(&String::from_utf8_lossy(&output.stdout));
+        if let Some(index) = gpu_index {
+            return free.get(&index).copied();
+        }
+        free.values().copied().reduce(f64::min)
+    }
+}
+
+/// Live free Metal budget (GiB) from unified memory. None off macOS.
+pub fn live_metal_free_vram_gb() -> Option<f64> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ram = detect_ram_gb()?;
+        let used = detect_ram_used_gb().unwrap_or(0);
+        let usable = apple_usable_gpu_gb(ram);
+        let ram_free = ram.saturating_sub(used);
+        Some(f64::from(ram_free.min(usable)))
+    }
+}
+
 fn configure_nvidia_smi_command(bin: &str) -> Command {
     let mut cmd = Command::new(bin);
     hide_console(&mut cmd);
@@ -1238,6 +1359,60 @@ fn parse_rocm_mem_line_gb(line: &str) -> Option<u32> {
         return Some(value.round().max(1.0) as u32);
     }
     mb_to_gb(value as f32)
+}
+
+/// GiB from a rocm-smi meminfo line (no 1 GB floor — used/free can be fractional).
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_rocm_mem_line_gib(line: &str) -> Option<f64> {
+    let lower = line.to_ascii_lowercase();
+    let mut value: Option<f64> = None;
+    for token in line.split_whitespace() {
+        let token = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if token.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = token.parse::<f64>() {
+            value = Some(parsed);
+        }
+    }
+    let value = value.filter(|v| *v >= 0.0)?;
+    if lower.contains("(b)")
+        || lower.contains("bytes")
+        || (value >= 1_000_000.0 && !lower.contains("(mb)") && !lower.contains("(gb)"))
+    {
+        return Some(value / 1024.0 / 1024.0 / 1024.0);
+    }
+    if lower.contains("(gb)") {
+        return Some(value);
+    }
+    Some(value / 1024.0)
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_amd_vram_free_gib(stdout: &str) -> std::collections::HashMap<usize, f64> {
+    let mut total = std::collections::HashMap::new();
+    let mut used = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(index) = parse_rocm_gpu_index(line) else {
+            continue;
+        };
+        let Some(gib) = parse_rocm_mem_line_gib(line) else {
+            continue;
+        };
+        if lower.contains("used") {
+            used.insert(index, gib);
+        } else if lower.contains("total") {
+            total.insert(index, gib);
+        }
+    }
+    total
+        .into_iter()
+        .map(|(index, tot)| {
+            let used_gb = used.get(&index).copied().unwrap_or(0.0);
+            (index, (tot - used_gb).max(0.0))
+        })
+        .collect()
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -2092,6 +2267,11 @@ GPU[1]		: VRAM Total Memory (B): 2147483648
         parse_amd_vram_by_index(stdout, &mut out);
         assert_eq!(out.get(&0).copied(), Some(24));
         assert_eq!(out.get(&1).copied(), Some(2));
+        let free = parse_amd_vram_free_gib(stdout);
+        let g0 = free.get(&0).copied().unwrap();
+        assert!((g0 - 24.0).abs() < 0.2, "free {g0}");
+        let g1 = free.get(&1).copied().unwrap();
+        assert!((g1 - 2.0).abs() < 0.2, "free {g1}");
     }
 
     #[test]
