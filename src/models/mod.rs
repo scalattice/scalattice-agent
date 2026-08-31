@@ -8,14 +8,13 @@ mod sync;
 mod vram_plan;
 
 pub use capacity::{
-    advertised_vram_can_gpu_full, can_host_model, can_host_on_machine, can_serve_vision_on_card,
-    can_serve_vision_on_machine, gpu_full_host_need_gb, gpu_full_host_need_gb_for_job,
-    hosting_min_vram_gb, image_job_min_vram_gb, preferred_download_card, vram_can_gpu_full,
-    DEFAULT_CPU_RAM_HEADROOM_GB,
+    can_host_model, can_host_on_machine, can_serve_vision_on_card, can_serve_vision_on_machine,
+    gpu_full_host_need_gb_for_job, hosting_min_vram_gb, image_job_min_vram_gb,
+    preferred_download_card, vram_can_gpu_full, DEFAULT_CPU_RAM_HEADROOM_GB,
 };
-pub use gguf_arch::{gguf_shape, GgufShape};
+pub use gguf_arch::gguf_shape;
 pub use gguf_check::gguf_payload_in_bounds;
-pub use vram_plan::{full_host_need_from_weight, full_host_need_gb, job_n_ctx};
+pub use vram_plan::{full_host_need_from_weight, full_host_need_gb};
 pub use health::{
     clear_weight_health, handle_weight_load_failure, process_preload_paused, should_skip_preload,
     spawn_delete_staged_dirs, stage_purge_model_weights, sweep_staged_purge_dirs,

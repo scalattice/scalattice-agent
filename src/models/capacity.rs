@@ -31,6 +31,7 @@ pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
 pub const GPU_FULL_HEADROOM_GB: f64 = 2.0;
 
 /// VRAM a slot must have free to count as a **full** GPU host.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn gpu_full_host_need_gb(model: &CatalogModel) -> f64 {
     gpu_full_host_need_gb_for_job(model, false)
 }
@@ -79,6 +80,7 @@ pub fn vram_can_gpu_full(
 }
 
 /// Nameplate helper for tests and callers that only have advertised GB.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn advertised_vram_can_gpu_full(
     advertised_vram_gb: u32,
     model: &CatalogModel,
