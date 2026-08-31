@@ -25,29 +25,71 @@ pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
 }
 
 /// KV/compute overhead reserved on top of GGUF weight for a GPU-full placement.
+/// Prefer [`gpu_full_host_need_gb`] — this is only the unknown-shape catalog extra
+/// at 4k for an ~8B Q4 (kept as a name so older comments still grep).
+#[allow(dead_code)]
 pub const GPU_FULL_HEADROOM_GB: f64 = 2.0;
 
-/// VRAM a slot must advertise to count as a **full** GPU host (weights + headroom).
-///
-/// Catalog `min_vram_gb` is a marketing floor (Qwen3 8B is 4 GB) and must not send
-/// a ~4.7 GB GGUF onto a 6 GB card as a "full fit".
+/// VRAM a slot must have free to count as a **full** GPU host.
 pub fn gpu_full_host_need_gb(model: &CatalogModel) -> f64 {
-    match model.weight_size_gb.filter(|w| *w > 0.05) {
-        Some(w) => w + GPU_FULL_HEADROOM_GB,
-        None => f64::from(hosting_min_vram_gb(model)),
-    }
+    gpu_full_host_need_gb_for_job(model, false)
 }
 
-/// True when advertised VRAM can take weights + KV without CPU offload.
+pub fn gpu_full_host_need_gb_for_job(model: &CatalogModel, need_vision: bool) -> f64 {
+    let n_ctx = super::vram_plan::job_n_ctx(model, need_vision);
+    let weight = model
+        .weight_size_gb
+        .filter(|w| *w > 0.05)
+        .or_else(|| {
+            super::storage::resolve_model_gguf(&model.runtime_model).and_then(|path| {
+                std::fs::metadata(path)
+                    .ok()
+                    .map(|m| m.len() as f64 / (1024.0 * 1024.0 * 1024.0))
+            })
+        })
+        .unwrap_or(0.0);
+    let shape = super::storage::resolve_model_gguf(&model.runtime_model)
+        .and_then(|path| super::gguf_arch::gguf_shape(&path));
+    let mut need = super::vram_plan::full_host_need_gb(weight, shape, n_ctx);
+    if need_vision {
+        if let Some(mm) = model.mmproj_size_gb.filter(|v| *v > 0.0) {
+            need += mm;
+        }
+    }
+    let catalog_floor = if need_vision {
+        f64::from(image_job_min_vram_gb(model))
+    } else {
+        f64::from(hosting_min_vram_gb(model))
+    };
+    need.max(catalog_floor)
+}
+
+/// True when `available_gb` (live free, else advertised) can take weights + KV
+/// without CPU offload. Float slop only — not a 50 MB “maybe it fits” gift.
+pub fn vram_can_gpu_full(
+    available_gb: f64,
+    model: &CatalogModel,
+    catalog_min_vram: u32,
+    need_vision: bool,
+) -> bool {
+    if catalog_min_vram > 0 && available_gb + 0.005 < f64::from(catalog_min_vram) {
+        return false;
+    }
+    available_gb + 0.005 >= gpu_full_host_need_gb_for_job(model, need_vision)
+}
+
+/// Nameplate helper for tests and callers that only have advertised GB.
 pub fn advertised_vram_can_gpu_full(
     advertised_vram_gb: u32,
     model: &CatalogModel,
     catalog_min_vram: u32,
 ) -> bool {
-    if catalog_min_vram > 0 && advertised_vram_gb < catalog_min_vram {
-        return false;
-    }
-    f64::from(advertised_vram_gb) + 0.05 >= gpu_full_host_need_gb(model)
+    vram_can_gpu_full(
+        f64::from(advertised_vram_gb),
+        model,
+        catalog_min_vram,
+        false,
+    )
 }
 
 /// GPU floor for image jobs — catalog `minVramGbVision` from the server.
@@ -243,9 +285,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_full_need_uses_weight_plus_headroom_not_catalog_floor() {
+    fn gpu_full_need_uses_plan_not_catalog_floor() {
         let qwen = catalog(4.0, 4.68, 8.0);
-        assert!((gpu_full_host_need_gb(&qwen) - 6.68).abs() < 1e-9);
+        let need = gpu_full_host_need_gb(&qwen);
+        assert!(need > 6.0, "{need}");
+        assert!(need < 8.0, "{need}");
         assert!(!advertised_vram_can_gpu_full(6, &qwen, 4));
         assert!(advertised_vram_can_gpu_full(10, &qwen, 4));
         let eight_gb_ok = catalog(8.0, 5.0, 8.0);

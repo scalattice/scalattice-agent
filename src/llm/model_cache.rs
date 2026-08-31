@@ -31,8 +31,6 @@ use super::vision::init_mtmd_for_model;
 const GIB: u64 = 1024 * 1024 * 1024;
 /// Do not keep a RAM duplicate of a large offload model that is also on the GPU.
 const DROP_SHELF_WHEN_PROMOTING_BYTES: u64 = 3 * GIB;
-/// KV + compute buffer beyond GGUF bytes — same floor as gpu-full placement.
-const GPU_KV_HEADROOM_GB: f64 = 2.0;
 
 struct CachedModel {
     model: LlamaModel,
@@ -200,11 +198,8 @@ fn incoming_vram_need_gb(inner: &CacheInner, model_path: &Path) -> f64 {
             return measured.max(weight);
         }
     }
-    if weight <= 0.05 {
-        GPU_KV_HEADROOM_GB
-    } else {
-        weight + GPU_KV_HEADROOM_GB
-    }
+    let shape = crate::models::gguf_arch::gguf_shape(model_path);
+    crate::models::full_host_need_gb(weight, shape, 4096)
 }
 
 fn estimated_gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {

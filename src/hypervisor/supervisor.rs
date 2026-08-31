@@ -6,9 +6,9 @@ use crate::protocol::{CatalogModel, ChatMessage, InvokeTimings};
 use crate::specs::ComputeDevice;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -563,100 +563,155 @@ impl Hypervisor {
         model: &CatalogModel,
         ram_gb: u32,
         cpu_ram_headroom_gb: u32,
-        mut on_delta: Option<Box<dyn FnMut(String) + Send>>,
+        on_delta: Option<Box<dyn FnMut(String) + Send>>,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         self.record_demand(runtime_model).await;
         let cancel = self.register_job_cancel(job_id).await;
+        let sent_token = Arc::new(AtomicBool::new(false));
+        let mut on_delta: Option<Box<dyn FnMut(String) + Send>> = match on_delta {
+            None => None,
+            Some(mut inner) => {
+                let flag = Arc::clone(&sent_token);
+                Some(Box::new(move |s: String| {
+                    if !s.starts_with('\u{1e}') {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    inner(s);
+                }))
+            }
+        };
 
-        // Atomic pick+claim under one lock — prevents concurrent invokes all
-        // selecting the same idle slot (TOCTOU → "slot not available" → damage).
-        let placement = {
-            let mut workers = self.workers.lock().await;
-            let idle: Vec<String> = self
-                .plan
-                .slots
-                .iter()
-                .filter(|s| {
-                    workers
-                        .get(&s.id)
-                        .map(|w| w.healthy && !w.busy)
-                        .unwrap_or(false)
-                })
-                .map(|s| s.id.clone())
-                .collect();
-            let placement = match pick_placement(
-                &self.plan,
-                &idle,
-                model,
-                ram_gb,
-                cpu_ram_headroom_gb,
-                &self.devices,
-                crate::protocol::messages_have_images(messages),
-            ) {
-                Some(p) => p,
-                None => {
-                    let need_vision = crate::protocol::messages_have_images(messages);
-                    let detail =
-                        placement_miss_detail(&self.plan, &idle, model, need_vision);
-                    self.clear_job_cancel(job_id).await;
-                    return Err(anyhow!(detail));
-                }
-            };
+        let mut skip: HashSet<String> = HashSet::new();
+        let mut last_crash: Option<anyhow::Error> = None;
+        let accel_slots = self
+            .plan
+            .slots
+            .iter()
+            .filter(|s| s.kind != "cpu")
+            .count()
+            .max(1)
+            .min(4);
 
-            for sid in &placement.slot_ids {
-                let worker = match workers.get_mut(sid) {
-                    Some(w) => w,
+        for attempt in 0..accel_slots {
+            let placement = {
+                let mut workers = self.workers.lock().await;
+                let idle: Vec<String> = self
+                    .plan
+                    .slots
+                    .iter()
+                    .filter(|s| !skip.contains(&s.id))
+                    .filter(|s| {
+                        workers
+                            .get(&s.id)
+                            .map(|w| w.healthy && !w.busy)
+                            .unwrap_or(false)
+                    })
+                    .map(|s| s.id.clone())
+                    .collect();
+                let placement = match pick_placement(
+                    &self.plan,
+                    &idle,
+                    model,
+                    ram_gb,
+                    cpu_ram_headroom_gb,
+                    &self.devices,
+                    crate::protocol::messages_have_images(messages),
+                ) {
+                    Some(p) => p,
                     None => {
                         self.clear_job_cancel(job_id).await;
-                        return Err(anyhow!("slot worker {sid} missing"));
+                        if let Some(err) = last_crash {
+                            return Err(err);
+                        }
+                        let need_vision = crate::protocol::messages_have_images(messages);
+                        let detail =
+                            placement_miss_detail(&self.plan, &idle, model, need_vision);
+                        return Err(anyhow!(detail));
                     }
                 };
-                if worker.busy || !worker.healthy {
-                    // Roll back busy claims from this placement.
-                    for claimed in &placement.slot_ids {
-                        if claimed == sid {
-                            break;
-                        }
-                        if let Some(w) = workers.get_mut(claimed) {
-                            w.busy = false;
-                        }
-                    }
-                    self.clear_job_cancel(job_id).await;
-                    bail!("agent_busy: slot {sid} not available");
-                }
-                worker.busy = true;
-            }
-            placement
-        };
-        self.changed.notify_waiters();
 
-        let result = if placement.use_tp_worker {
-            self.invoke_tp(
-                &placement,
-                job_id,
-                model_id,
-                runtime_model,
-                messages,
-                max_tokens,
-                on_delta.as_mut(),
-                &cancel,
-            )
-            .await
-        } else {
-            self.invoke_single(
-                &placement,
-                job_id,
-                model_id,
-                runtime_model,
-                messages,
-                max_tokens,
-                on_delta.as_mut(),
-                &cancel,
-            )
-            .await
-        };
+                for sid in &placement.slot_ids {
+                    let worker = match workers.get_mut(sid) {
+                        Some(w) => w,
+                        None => {
+                            self.clear_job_cancel(job_id).await;
+                            return Err(anyhow!("slot worker {sid} missing"));
+                        }
+                    };
+                    if worker.busy || !worker.healthy {
+                        for claimed in &placement.slot_ids {
+                            if claimed == sid {
+                                break;
+                            }
+                            if let Some(w) = workers.get_mut(claimed) {
+                                w.busy = false;
+                            }
+                        }
+                        self.clear_job_cancel(job_id).await;
+                        bail!("agent_busy: slot {sid} not available");
+                    }
+                    worker.busy = true;
+                }
+                placement
+            };
+            self.changed.notify_waiters();
+
+            let result = if placement.use_tp_worker {
+                self.invoke_tp(
+                    &placement,
+                    job_id,
+                    model_id,
+                    runtime_model,
+                    messages,
+                    max_tokens,
+                    on_delta.as_mut(),
+                    &cancel,
+                )
+                .await
+            } else {
+                self.invoke_single(
+                    &placement,
+                    job_id,
+                    model_id,
+                    runtime_model,
+                    messages,
+                    max_tokens,
+                    on_delta.as_mut(),
+                    &cancel,
+                )
+                .await
+            };
+
+            match result {
+                Ok(ok) => {
+                    self.clear_job_cancel(job_id).await;
+                    return Ok(ok);
+                }
+                Err(err)
+                    if worker_crash_retryable(&err)
+                        && !sent_token.load(Ordering::Relaxed)
+                        && attempt + 1 < accel_slots =>
+                {
+                    for sid in &placement.slot_ids {
+                        skip.insert(sid.clone());
+                    }
+                    warn!(
+                        attempt = attempt + 1,
+                        slots = ?placement.slot_ids,
+                        error = %err,
+                        "slot worker crashed; retrying invoke on another slot"
+                    );
+                    last_crash = Some(err);
+                }
+                Err(err) => {
+                    self.clear_job_cancel(job_id).await;
+                    return Err(err);
+                }
+            }
+        }
+
         self.clear_job_cancel(job_id).await;
-        result
+        Err(last_crash.unwrap_or_else(|| anyhow!("agent_busy: no remaining compute slot")))
     }
 
     async fn invoke_single(
@@ -1122,5 +1177,44 @@ fn request_id(req: &WorkerRequest) -> String {
         | WorkerRequest::Evict { id }
         | WorkerRequest::Health { id }
         | WorkerRequest::Shutdown { id } => id.clone(),
+    }
+}
+
+/// Worker process died (CUDA abort / stdout close). Retry on another slot
+/// unless the client already received tokens or the error is a real reject.
+fn worker_crash_retryable(err: &anyhow::Error) -> bool {
+    let d = format!("{err:#}").to_lowercase();
+    if d.contains("request_canceled")
+        || d.contains("prompt too long")
+        || d.contains("invalid_image")
+        || d.contains("agent_busy")
+        || d.contains("insufficient_vram")
+    {
+        return false;
+    }
+    d.contains("closed stdout")
+        || d.contains("null result")
+        || d.contains("create llama context")
+        || d.contains("out of memory")
+        || d.contains("cudamalloc")
+        || d.contains("cuda error")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_crash_retryable;
+
+    #[test]
+    fn stdout_close_retries_on_another_slot() {
+        let err = anyhow::anyhow!("worker closed stdout during invoke");
+        assert!(worker_crash_retryable(&err));
+    }
+
+    #[test]
+    fn cancel_and_busy_do_not_retry() {
+        assert!(!worker_crash_retryable(&anyhow::anyhow!("request_canceled")));
+        assert!(!worker_crash_retryable(&anyhow::anyhow!(
+            "agent_busy: no idle compute slot"
+        )));
     }
 }

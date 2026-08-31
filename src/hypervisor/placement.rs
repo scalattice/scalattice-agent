@@ -1,7 +1,7 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
 use crate::models::{
-    advertised_vram_can_gpu_full, can_host_model, can_serve_vision_on_card, gpu_full_host_need_gb,
-    hosting_min_vram_gb, image_job_min_vram_gb,
+    can_host_model, can_serve_vision_on_card, gpu_full_host_need_gb_for_job, hosting_min_vram_gb,
+    image_job_min_vram_gb, vram_can_gpu_full,
 };
 use crate::protocol::CatalogModel;
 use tracing::debug;
@@ -38,11 +38,20 @@ pub fn pick_placement(
         hosting_min_vram_gb(model)
     };
 
+    let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+
     let mut full_fit: Vec<&ComputeSlot> = plan
         .slots
         .iter()
         .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
-        .filter(|s| advertised_vram_can_gpu_full(s.card.total_vram_gb, model, min_vram))
+        .filter(|s| {
+            vram_can_gpu_full(
+                slot_available_gb(s, &live_cuda),
+                model,
+                min_vram,
+                need_vision,
+            )
+        })
         .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
         .filter(|s| !need_vision || can_serve_vision_on_card(model, &s.card))
         .collect();
@@ -82,7 +91,12 @@ pub fn pick_placement(
         if need_vision && !can_serve_vision_on_card(model, &tp_card) {
             continue;
         }
-        if !advertised_vram_can_gpu_full(tp_card.total_vram_gb, model, min_vram) {
+        if !vram_can_gpu_full(
+            tp_available_gb(&tp_card, &live_cuda),
+            model,
+            min_vram,
+            need_vision,
+        ) {
             continue;
         }
         if !can_host_model(model, &tp_card, ram_gb, cpu_ram_headroom_gb) {
@@ -140,6 +154,61 @@ pub fn pick_placement(
     None
 }
 
+fn slot_available_gb(
+    slot: &ComputeSlot,
+    live_cuda: &std::collections::HashMap<u32, f64>,
+) -> f64 {
+    let advertised = f64::from(slot.card.total_vram_gb);
+    if cfg!(test) {
+        return advertised;
+    }
+    match slot.card.strategy {
+        PoolStrategy::Single | PoolStrategy::TensorParallel => {
+            let live = slot
+                .cuda_visible
+                .iter()
+                .filter_map(|idx| live_cuda.get(idx).copied())
+                .reduce(f64::min);
+            live.map(|gb| gb.min(advertised)).unwrap_or(advertised)
+        }
+        PoolStrategy::Vulkan => {
+            let index = slot.card.devices.iter().find_map(|device| {
+                device
+                    .id
+                    .strip_prefix("amd:")
+                    .and_then(|s| s.parse::<usize>().ok())
+            });
+            crate::specs::live_rocm_free_vram_gb(index)
+                .map(|gb| gb.min(advertised))
+                .unwrap_or(advertised)
+        }
+        PoolStrategy::Metal => crate::specs::live_metal_free_vram_gb()
+            .map(|gb| gb.min(advertised))
+            .unwrap_or(advertised),
+        PoolStrategy::CpuOnly => 0.0,
+    }
+}
+
+fn tp_available_gb(
+    card: &crate::compute_pool::VirtualCard,
+    live_cuda: &std::collections::HashMap<u32, f64>,
+) -> f64 {
+    let advertised = f64::from(card.total_vram_gb);
+    if cfg!(test) {
+        return advertised;
+    }
+    if card.cuda_device_ids.is_empty() {
+        return advertised;
+    }
+    let live_sum: Option<f64> = card
+        .cuda_device_ids
+        .iter()
+        .map(|idx| live_cuda.get(idx).copied())
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.into_iter().sum());
+    live_sum.map(|gb| gb.min(advertised)).unwrap_or(advertised)
+}
+
 /// Explain why [`pick_placement`] returned `None`. Vision misses with idle
 /// slots are capacity (insufficient VRAM), not "busy" — unless a fitting GPU
 /// exists on the machine and is just occupied.
@@ -167,13 +236,19 @@ pub fn placement_miss_detail(
     } else {
         hosting_min_vram_gb(model)
     };
+    let live_cuda = crate::specs::live_cuda_free_vram_by_index();
     let has_fitting_gpu = plan.slots.iter().any(|s| {
         s.kind != "cpu"
-            && advertised_vram_can_gpu_full(s.card.total_vram_gb, model, catalog_min)
+            && vram_can_gpu_full(
+                slot_available_gb(s, &live_cuda),
+                model,
+                catalog_min,
+                need_vision,
+            )
             && (!need_vision || can_serve_vision_on_card(model, &s.card))
     });
     if has_fitting_gpu {
-        let need = gpu_full_host_need_gb(model);
+        let need = gpu_full_host_need_gb_for_job(model, need_vision);
         return format!(
             "agent_busy: waiting for a GPU that can fully host {model_id} (need {need:.1} GB)"
         );

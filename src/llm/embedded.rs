@@ -596,9 +596,11 @@ fn live_placement_vram_gb(advertised_gb: u32) -> u32 {
 }
 
 fn gpu_full_fits_available(available_gb: u32, weight_gb: Option<f64>) -> bool {
-    const HEADROOM_GB: f64 = 2.0;
     match weight_gb {
-        Some(w) if w > 0.05 => f64::from(available_gb.max(1)) + 0.05 >= w + HEADROOM_GB,
+        Some(w) if w > 0.05 => {
+            f64::from(available_gb.max(1)) + 0.005
+                >= crate::models::full_host_need_from_weight(w, 4096)
+        }
         _ => false,
     }
 }
@@ -703,9 +705,10 @@ pub(crate) fn should_attempt_single_gpu_full(
     weight_gb: Option<f64>,
 ) -> bool {
     let available = f64::from(primary_cuda_vram_gb(pool).max(1));
-    const HEADROOM_GB: f64 = 2.0;
     match weight_gb {
-        Some(w) if w > 0.05 => available + 0.05 >= w + HEADROOM_GB,
+        Some(w) if w > 0.05 => {
+            available + 0.005 >= crate::models::full_host_need_from_weight(w, 4096)
+        }
         _ => false,
     }
 }
@@ -818,7 +821,11 @@ fn load_param_candidates_with_weight(
                 info!(
                     available_vram_gb = available,
                     weight_gb = weight_gb.unwrap_or(-1.0),
-                    "skipping gpu-full placement (would not fit / risk CUDA abort); starting at offload"
+                    need_gb = format!(
+                        "{:.2}",
+                        crate::models::full_host_need_from_weight(weight_gb.unwrap_or(0.0), 4096)
+                    ),
+                    "skipping gpu-full placement (plan exceeds live free); starting at offload"
                 );
             }
         }

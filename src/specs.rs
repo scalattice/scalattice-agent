@@ -426,8 +426,7 @@ fn cuda_visible_physical_indices() -> Vec<u32> {
 
 /// Live free VRAM (GiB) for this process's pinned NVIDIA GPU(s).
 ///
-/// Only queries when `CUDA_VISIBLE_DEVICES` is set (per-slot workers). Unit tests
-/// and the supervisor leave it unset so advertised capacity stays in use.
+/// Only queries when `CUDA_VISIBLE_DEVICES` is set (per-slot workers).
 /// Returns the **minimum** free across visible devices.
 pub fn live_cuda_free_vram_gb() -> Option<f64> {
     #[cfg(target_os = "macos")]
@@ -441,29 +440,50 @@ pub fn live_cuda_free_vram_gb() -> Option<f64> {
         if wanted.is_empty() {
             return None;
         }
+        let map = live_cuda_free_vram_by_index();
+        wanted
+            .iter()
+            .filter_map(|idx| map.get(idx).copied())
+            .reduce(f64::min)
+    }
+}
+
+/// Live free VRAM (GiB) for every NVIDIA GPU nvidia-smi can see.
+/// Used by the supervisor at placement time (no `CUDA_VISIBLE_DEVICES`).
+pub fn live_cuda_free_vram_by_index() -> std::collections::HashMap<u32, f64> {
+    #[cfg(target_os = "macos")]
+    {
+        std::collections::HashMap::new()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
         for bin in nvidia_smi_bins() {
-            if let Some(free) = live_cuda_free_vram_gb_from(&bin, &wanted) {
-                return Some(free);
+            let map = live_cuda_free_all_from(&bin);
+            if !map.is_empty() {
+                return map;
             }
         }
-        None
+        std::collections::HashMap::new()
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn live_cuda_free_vram_gb_from(bin: &str, wanted: &[u32]) -> Option<f64> {
-    let output = configure_nvidia_smi_command(bin)
+fn live_cuda_free_all_from(bin: &str) -> std::collections::HashMap<u32, f64> {
+    let mut map = std::collections::HashMap::new();
+    let Some(output) = configure_nvidia_smi_command(bin)
         .args([
             "--query-gpu=index,memory.free",
             "--format=csv,noheader,nounits",
         ])
         .output()
-        .ok()?;
+        .ok()
+    else {
+        return map;
+    };
     if !output.status.success() {
-        return None;
+        return map;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut min_free: Option<f64> = None;
     for line in stdout
         .lines()
         .map(str::trim)
@@ -476,19 +496,12 @@ fn live_cuda_free_vram_gb_from(bin: &str, wanted: &[u32]) -> Option<f64> {
         let Ok(index) = parts[0].trim().parse::<u32>() else {
             continue;
         };
-        if !wanted.contains(&index) {
-            continue;
-        }
         let Some(mb) = parse_nvidia_number(&parts[1]) else {
             continue;
         };
-        let gb = f64::from(mb) / 1024.0;
-        min_free = Some(match min_free {
-            None => gb,
-            Some(prev) => prev.min(gb),
-        });
+        map.insert(index, f64::from(mb) / 1024.0);
     }
-    min_free
+    map
 }
 
 /// NVIDIA compute capability as major*10+minor (Ampere 8.0 → 80, Turing 7.5 → 75).
