@@ -1,7 +1,7 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
 use crate::models::{
-    advertised_vram_can_gpu_full, can_host_model, can_serve_vision_on_card, hosting_min_vram_gb,
-    image_job_min_vram_gb,
+    advertised_vram_can_gpu_full, can_host_model, can_serve_vision_on_card, gpu_full_host_need_gb,
+    hosting_min_vram_gb, image_job_min_vram_gb,
 };
 use crate::protocol::CatalogModel;
 use tracing::debug;
@@ -17,8 +17,9 @@ pub struct Placement {
     pub use_tp_worker: bool,
 }
 
-/// Prefer the smallest idle accelerator that can **fully** host the model;
-/// fall back to TP group, then GPU offload, then CPU.
+/// Prefer the smallest idle accelerator that can **fully** host the model
+/// (weights + KV headroom). If none are free, offload on the largest idle
+/// accelerator (text only). Image jobs never offload.
 pub fn pick_placement(
     plan: &ComputePlan,
     idle_slot_ids: &[String],
@@ -140,7 +141,8 @@ pub fn pick_placement(
 }
 
 /// Explain why [`pick_placement`] returned `None`. Vision misses with idle
-/// slots are capacity (insufficient VRAM), not "busy".
+/// slots are capacity (insufficient VRAM), not "busy" — unless a fitting GPU
+/// exists on the machine and is just occupied.
 pub fn placement_miss_detail(
     plan: &ComputePlan,
     idle_slot_ids: &[String],
@@ -159,6 +161,24 @@ pub fn placement_miss_detail(
     if idle_accel.is_empty() && idle_slot_ids.is_empty() {
         return format!("agent_busy: no idle compute slot for {model_id}");
     }
+
+    let catalog_min = if need_vision {
+        image_job_min_vram_gb(model)
+    } else {
+        hosting_min_vram_gb(model)
+    };
+    let has_fitting_gpu = plan.slots.iter().any(|s| {
+        s.kind != "cpu"
+            && advertised_vram_can_gpu_full(s.card.total_vram_gb, model, catalog_min)
+            && (!need_vision || can_serve_vision_on_card(model, &s.card))
+    });
+    if has_fitting_gpu {
+        let need = gpu_full_host_need_gb(model);
+        return format!(
+            "agent_busy: waiting for a GPU that can fully host {model_id} (need {need:.1} GB)"
+        );
+    }
+
     if idle_accel.is_empty() {
         // Only CPU idle — vision cannot use it; text would have placed CPU.
         if need_vision {
@@ -305,9 +325,57 @@ mod tests {
 
     #[test]
     fn qwen8b_skips_six_gb_card_when_ten_gb_is_idle() {
-        // Catalog minVramGb=4 would previously pick the 1660 as a "full fit".
-        // Weight + KV headroom (~6.7 GB) does not fit 6 GB, so the 3080 wins.
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let placement =
+            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cuda-1".to_string()]);
+        assert!(!placement.use_tp_worker);
+    }
+
+    #[test]
+    fn qwen8b_offloads_to_six_gb_when_ten_gb_is_busy() {
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle = vec!["cuda-0".to_string(), "cpu-0".to_string()];
+        let placement =
+            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+        assert!(!placement.use_tp_worker);
+    }
+
+    #[test]
+    fn six_gb_only_machine_still_offloads() {
         let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1660 SUPER".into(),
+                vram_gb: Some(6),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let placement =
+            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+    }
+
+    fn mixed_1660_3080() -> [ComputeDevice; 3] {
+        [
             ComputeDevice {
                 id: "nvidia:0".into(),
                 kind: "discrete".into(),
@@ -335,12 +403,6 @@ mod tests {
                 util_pct: None,
                 enabled: true,
             },
-        ];
-        let plan = build_compute_slots(&devices).unwrap();
-        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let placement =
-            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
-        assert_eq!(placement.slot_ids, vec!["cuda-1".to_string()]);
-        assert!(!placement.use_tp_worker);
+        ]
     }
 }
