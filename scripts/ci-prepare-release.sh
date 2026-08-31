@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Create (or reuse) a GitHub release tag for CI. Used by .github/workflows/release.yml.
 #
-# On a production merge, pick the next free patch from the latest GitHub release
-# and Cargo.toml (whichever is higher), then skip any tags that already exist.
-# That way a stale development Cargo.toml cannot ship behind production.
+# On a production merge, pick the next free patch from the highest of Cargo.toml,
+# origin tags, and GitHub releases, then skip any tag/release that already exists.
+# A stale development Cargo.toml cannot ship behind production.
 #
 # Env:
 #   RELEASE_TAG          Optional explicit tag (v1.2.3)
@@ -55,29 +55,52 @@ normalize_tag() {
   echo "v${raw}"
 }
 
+semver_sort_highest() {
+  grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1
+}
+
 latest_github_version() {
-  local tag
-  tag="$(gh release list --repo "$REPO" --limit 20 --json tagName -q '.[].tagName' 2>/dev/null \
-    | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+  gh release list --repo "$REPO" --limit 100 --json tagName -q '.[].tagName' 2>/dev/null \
     | sed 's/^v//' \
-    | sort -t. -k1,1n -k2,2n -k3,3n \
-    | tail -1 || true)"
-  echo "$tag"
+    | semver_sort_highest || true
+}
+
+# Origin tags are the source of truth (a release can exist without Cargo.toml
+# on development matching it). Ignore local tags — they drift and clobber fetches.
+latest_origin_tag_version() {
+  git ls-remote --tags origin 'refs/tags/v*' 2>/dev/null \
+    | awk '{print $2}' \
+    | sed 's|refs/tags/||; s/\^{}$//' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sed 's/^v//' \
+    | semver_sort_highest || true
+}
+
+max_version() {
+  local best="" v
+  for v in "$@"; do
+    [[ -n "$v" ]] || continue
+    if [[ -z "$best" ]] || version_ge "$v" "$best"; then
+      best="$v"
+    fi
+  done
+  echo "$best"
+}
+
+origin_has_tag() {
+  git ls-remote --tags origin "refs/tags/v$1" 2>/dev/null | grep -q .
 }
 
 next_free_version() {
   local cargo latest next
   cargo="$(cargo_version)"
-  latest="$(latest_github_version)"
-  if [[ -n "$latest" ]]; then
-    next="$(bump_patch "$latest")"
-    if version_ge "$cargo" "$next"; then
-      next="$cargo"
-    fi
-  else
-    next="$cargo"
+  latest="$(max_version "$cargo" "$(latest_origin_tag_version)" "$(latest_github_version)")"
+  if [[ -z "$latest" ]]; then
+    echo "1.0.0"
+    return
   fi
-  while gh release view "v${next}" -R "$REPO" >/dev/null 2>&1; do
+  next="$(bump_patch "$latest")"
+  while origin_has_tag "$next" || gh release view "v${next}" -R "$REPO" >/dev/null 2>&1; do
     next="$(bump_patch "$next")"
   done
   echo "$next"
@@ -87,6 +110,10 @@ REPO="${GH_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 EXPLICIT="${RELEASE_TAG:-}"
 VERSION=""
 TAG=""
+
+# Annotated vs lightweight retags on GitHub make `git pull --tags` fail locally
+# ("would clobber existing tag"). CI must follow origin, not a stale checkout.
+git fetch origin --tags --force >/dev/null 2>&1 || true
 
 if [[ -n "$EXPLICIT" ]]; then
   TAG="$(normalize_tag "$EXPLICIT")"
@@ -107,7 +134,10 @@ if [[ -n "$(git status --porcelain Cargo.toml Cargo.lock 2>/dev/null)" ]]; then
   git push origin HEAD:production
 fi
 
-if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+if origin_has_tag "${TAG#v}"; then
+  echo "==> Tag ${TAG} already on origin"
+else
+  git tag -d "$TAG" 2>/dev/null || true
   git tag -a "$TAG" -m "$TAG"
   git push origin "$TAG"
 fi
