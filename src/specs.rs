@@ -96,7 +96,10 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
     {
         let mut devices = Vec::new();
         devices.extend(detect_apple_metal_device());
-        devices.extend(detect_cpu_device());
+        // Unified memory: CPU is not a second compute device beside Metal.
+        if !devices.iter().any(|d| d.kind == "metal") {
+            devices.extend(detect_cpu_device());
+        }
         for device in &mut devices {
             if device.kind == "metal" {
                 device.enabled = true;
