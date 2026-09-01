@@ -110,8 +110,6 @@ const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(300);
 const WORKER_INVOKE_WALL_CLOCK: Duration = Duration::from_secs(12 * 60);
 /// Checked-out slot with no progress path for this long → force reclaim.
 const STUCK_CHECKOUT: Duration = Duration::from_secs(13 * 60);
-/// Hosts at or below this RAM cannot mmap two 5 GB GGUFs at once.
-const TIGHT_RAM_GB: u32 = 24;
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
     if phase.eq_ignore_ascii_case("decode") {
@@ -219,12 +217,28 @@ impl Hypervisor {
         n
     }
 
-    async fn lock_mmap_if_tight(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-        if self.ram_gb > TIGHT_RAM_GB {
+    async fn lock_mmap_if_needed(
+        &self,
+        incoming_weight_gb: f64,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if self.ram_has_room_for_mmap(incoming_weight_gb) {
             None
         } else {
             Some(self.mmap_gate.lock().await)
         }
+    }
+
+    /// True when remaining system RAM can hold `incoming_weight_gb` on top of
+    /// what is already used, after OS reserve. Not a machine-size class.
+    fn ram_has_room_for_mmap(&self, incoming_weight_gb: f64) -> bool {
+        if incoming_weight_gb <= 0.0 {
+            return true;
+        }
+        let ram = f64::from(self.ram_gb.max(1));
+        let used = f64::from(crate::specs::detect_ram_used_gb().unwrap_or(0));
+        let reserve = crate::specs::system_ram_reserve_gb(self.ram_gb);
+        let avail = (ram - used).max(0.0);
+        avail + 0.05 >= incoming_weight_gb + reserve
     }
 
     /// How many slots are currently checked out to an invoke/warm stack.
@@ -505,7 +519,6 @@ impl Hypervisor {
         if runtime_models.is_empty() {
             return Ok(());
         }
-        let _mmap = self.lock_mmap_if_tight().await;
         let idle = self.idle_slot_ids().await;
         let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
         // Never fall back to warming cpu-0 while GPUs exist but are busy.
@@ -536,6 +549,9 @@ impl Hypervisor {
             let Some(model) = ordered.first().cloned() else {
                 continue;
             };
+
+            let incoming_gb = warm_model_weight_mb(&model) as f64 / 1024.0;
+            let _mmap = self.lock_mmap_if_needed(incoming_gb).await;
 
             let mut workers = self.workers.lock().await;
             let Some(worker) = workers.get_mut(&slot_id) else {
@@ -605,7 +621,8 @@ impl Hypervisor {
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         self.record_demand(runtime_model).await;
         let cancel = self.register_job_cancel(job_id).await;
-        let _mmap = if self.ram_gb > TIGHT_RAM_GB {
+        let incoming_gb = warm_model_weight_mb(runtime_model) as f64 / 1024.0;
+        let _mmap = if self.ram_has_room_for_mmap(incoming_gb) {
             None
         } else {
             tokio::select! {

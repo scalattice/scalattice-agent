@@ -246,6 +246,11 @@ fn live_free_vram_gb(pool: &VirtualCard) -> Option<f64> {
 }
 
 fn gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
+    // Unified memory: "live free RAM" includes our own Metal buffers, so the
+    // nvidia-smi-style probe is wrong. Subtract cache occupancy from advertised.
+    if matches!(pool.strategy, crate::compute_pool::PoolStrategy::Metal) {
+        return estimated_gpu_free_gb(inner, pool);
+    }
     live_free_vram_gb(pool).unwrap_or_else(|| estimated_gpu_free_gb(inner, pool))
 }
 
@@ -336,9 +341,8 @@ fn make_gpu_room(
             );
             // 16 GB hosts cannot mmap the next GGUF while the previous one stays
             // shelved; that OOM'd this box and dropped the WebSocket mid-debug.
-            if detect_ram_gb().unwrap_or(16) > 24 {
-                try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
-            }
+            // try_shelve_cpu already refuses when live RAM + budget cannot hold it.
+            try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
         }
         crate::llm::report_work_progress("evict", 1.0);
     }

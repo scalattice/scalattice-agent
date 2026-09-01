@@ -182,9 +182,7 @@ fn slot_available_gb(
                 .map(|gb| gb.min(advertised))
                 .unwrap_or(advertised)
         }
-        PoolStrategy::Metal => crate::specs::live_metal_free_vram_gb()
-            .map(|gb| gb.min(advertised))
-            .unwrap_or(advertised),
+        PoolStrategy::Metal => f64::from(slot.card.total_vram_gb),
         PoolStrategy::CpuOnly => 0.0,
     }
 }

@@ -2,7 +2,7 @@ use crate::specs::ComputeDevice;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -485,38 +485,45 @@ pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
         }
     }
 
-    let cpu_device = cpu.cloned().unwrap_or_else(|| ComputeDevice {
-        id: "cpu:0".into(),
-        kind: "cpu".into(),
-        name: "CPU".into(),
-        vram_gb: None,
-        vram_used_gb: None,
-        util_pct: None,
-        enabled: true,
-    });
-    let cpu_pool = PoolDevice {
-        id: cpu_device.id.clone(),
-        kind: "cpu".into(),
-        name: cpu_device.name.clone(),
-        vram_gb: 0,
-        cuda_index: None,
-    };
-    slots.push(ComputeSlot {
-        id: "cpu-0".into(),
-        kind: "cpu".into(),
-        priority: 90,
-        card: card_for_devices(
-            vec![cpu_pool],
-            PoolStrategy::CpuOnly,
-            0,
-            cpu_device.name,
-            Vec::new(),
-            Vec::new(),
-            false,
-        ),
-        cuda_visible: Vec::new(),
-        tp_group: None,
-    });
+    // Unified memory: cpu-0 also calls LlamaBackend::init(), which brings Metal
+    // up in a second process and fights metal-0 for the same RAM. Keep CPU as a
+    // slot only when there is no Metal GPU (CPU-only Mac / Metal disabled).
+    if metal_runtime_supported() && !metal.is_empty() {
+        info!("skipping cpu-0 slot; Apple Metal already owns unified memory");
+    } else {
+        let cpu_device = cpu.cloned().unwrap_or_else(|| ComputeDevice {
+            id: "cpu:0".into(),
+            kind: "cpu".into(),
+            name: "CPU".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        });
+        let cpu_pool = PoolDevice {
+            id: cpu_device.id.clone(),
+            kind: "cpu".into(),
+            name: cpu_device.name.clone(),
+            vram_gb: 0,
+            cuda_index: None,
+        };
+        slots.push(ComputeSlot {
+            id: "cpu-0".into(),
+            kind: "cpu".into(),
+            priority: 90,
+            card: card_for_devices(
+                vec![cpu_pool],
+                PoolStrategy::CpuOnly,
+                0,
+                cpu_device.name,
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+            cuda_visible: Vec::new(),
+            tp_group: None,
+        });
+    }
 
     if slots.is_empty() {
         bail!("no compute slots built");
@@ -1293,6 +1300,38 @@ mod tests {
             assert!(!card.uses_vulkan);
         } else {
             assert_eq!(card.strategy, PoolStrategy::CpuOnly);
+        }
+    }
+
+    #[test]
+    fn apple_silicon_does_not_spawn_cpu_overflow_beside_metal() {
+        let plan = build_compute_slots(&[
+            ComputeDevice {
+                id: "metal:0".into(),
+                kind: "metal".into(),
+                name: "Apple M1 Max GPU".into(),
+                vram_gb: Some(52),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "Apple M1 Max".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+        if metal_runtime_supported() {
+            assert!(plan.slots.iter().any(|s| s.id == "metal-0"));
+            assert!(
+                !plan.slots.iter().any(|s| s.id == "cpu-0"),
+                "cpu-0 beside Metal fights unified memory"
+            );
         }
     }
 
