@@ -637,6 +637,11 @@ pub fn live_rocm_free_vram_gb(gpu_index: Option<usize>) -> Option<f64> {
 }
 
 /// Live free Metal budget (GiB) from unified memory. None off macOS.
+///
+/// Do **not** use `vm_stat` free pages here. Metal weights live in the same
+/// RAM those pages measure, so a 64 GB M1 Max with a model loaded reports ~5 GB
+/// "free" while llama.cpp still sees ~52 GB. That made us evict every resident
+/// on every model switch.
 pub fn live_metal_free_vram_gb() -> Option<f64> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -645,10 +650,7 @@ pub fn live_metal_free_vram_gb() -> Option<f64> {
     #[cfg(target_os = "macos")]
     {
         let ram = detect_ram_gb()?;
-        let used = detect_ram_used_gb().unwrap_or(0);
-        let usable = apple_usable_gpu_gb(ram);
-        let ram_free = ram.saturating_sub(used);
-        Some(f64::from(ram_free.min(usable)))
+        Some(f64::from(apple_usable_gpu_gb(ram)))
     }
 }
 
@@ -1330,19 +1332,18 @@ fn detect_apple_metal_device() -> Vec<ComputeDevice> {
     }]
 }
 
+/// OS/UI RAM that must stay off the Metal GPU budget, and off a second GGUF mmap.
+/// 12.5% of installed RAM, at least 4 GB so the OS still has a floor on 8 GB machines.
+pub(crate) fn system_ram_reserve_gb(ram_gb: u32) -> f64 {
+    (f64::from(ram_gb) * 0.125).max(4.0)
+}
+
 /// Unified memory minus OS/UI headroom — advertised as Metal "VRAM" for catalog fit.
-#[cfg(target_os = "macos")]
-fn apple_usable_gpu_gb(ram_gb: u32) -> u32 {
-    let headroom = if ram_gb >= 64 {
-        12
-    } else if ram_gb >= 32 {
-        8
-    } else if ram_gb >= 16 {
-        6
-    } else {
-        4
-    };
-    ram_gb.saturating_sub(headroom).max(1)
+/// This is `ram - reserve(ram)`, not a 16/32/64 GB size class.
+pub(crate) fn apple_usable_gpu_gb(ram_gb: u32) -> u32 {
+    ram_gb
+        .saturating_sub(system_ram_reserve_gb(ram_gb).round() as u32)
+        .max(1)
 }
 
 #[cfg(target_os = "macos")]
@@ -2304,6 +2305,28 @@ mod tests {
             "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800]"
         ));
         assert!(!is_integrated_pci_name("Intel Corporation DG2 [Arc A770]"));
+    }
+
+    #[test]
+    fn apple_usable_gpu_scales_with_unified_memory_not_size_classes() {
+        // reserve = clamp(ram * 12.5%, 4, 16)
+        assert_eq!(apple_usable_gpu_gb(8), 4);
+        assert_eq!(apple_usable_gpu_gb(16), 12);
+        assert_eq!(apple_usable_gpu_gb(18), 14);
+        assert_eq!(apple_usable_gpu_gb(24), 20);
+        assert_eq!(apple_usable_gpu_gb(32), 28);
+        assert_eq!(apple_usable_gpu_gb(36), 31);
+        assert_eq!(apple_usable_gpu_gb(48), 42);
+        assert_eq!(apple_usable_gpu_gb(64), 56);
+        assert_eq!(apple_usable_gpu_gb(96), 84);
+        assert_eq!(apple_usable_gpu_gb(128), 112);
+        assert_eq!(apple_usable_gpu_gb(192), 168);
+        let reserve = system_ram_reserve_gb(64);
+        assert!((reserve - 8.0).abs() < 0.01);
+        assert_eq!(
+            apple_usable_gpu_gb(64),
+            64u32.saturating_sub(reserve.round() as u32)
+        );
     }
 
     #[test]
