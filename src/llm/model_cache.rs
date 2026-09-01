@@ -141,6 +141,23 @@ fn trim_ram_lru(inner: &mut CacheInner, extra_bytes: u64) {
     }
 }
 
+fn drop_other_ram_shelves(inner: &mut CacheInner, keep_path: &Path) {
+    let keep = path_key(keep_path);
+    let dropped: Vec<String> = inner
+        .ram
+        .keys()
+        .filter(|k| k.as_str() != keep)
+        .cloned()
+        .collect();
+    for key in dropped {
+        info!(
+            evicted = %key,
+            "dropping RAM-shelved model before loading a different GGUF"
+        );
+        inner.ram.remove(&key);
+    }
+}
+
 fn try_shelve_cpu(inner: &mut CacheInner, backend: &llama_cpp_2::llama_backend::LlamaBackend, path: &Path) {
     let key = path_key(path);
     if inner.ram.contains_key(&key) {
@@ -274,6 +291,25 @@ fn make_gpu_room(
         return;
     }
 
+    drop_other_ram_shelves(inner, model_path);
+
+    // CPU-pinned residents (0 GPU layers) sit in the GPU map with ~0 occupancy.
+    // VRAM-fit checks skip them, so the next GGUF mmap'd beside them and OOMed
+    // 16 GB boxes (WebSocket reset → five-minute invoke_timeout).
+    let cpu_pinned: Vec<String> = inner
+        .gpu
+        .iter()
+        .filter(|(k, e)| k.as_str() != keep_key && e.occupancy_gb <= 0.05)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in cpu_pinned {
+        info!(
+            evicted = %path_from_gpu_key(&key),
+            "dropping CPU-resident weights before loading a different GGUF"
+        );
+        inner.gpu.remove(&key);
+    }
+
     let need = incoming_vram_need_gb(inner, model_path);
     loop {
         let free = gpu_free_gb(inner, pool);
@@ -296,9 +332,13 @@ fn make_gpu_room(
                 occupancy_gb = format!("{:.2}", entry.occupancy_gb),
                 free_gb = format!("{:.2}", free),
                 need_gb = format!("{:.2}", need),
-                "evicting GPU resident to RAM — incoming model does not fit beside it"
+                "evicting GPU resident — incoming model does not fit beside it"
             );
-            try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
+            // 16 GB hosts cannot mmap the next GGUF while the previous one stays
+            // shelved; that OOM'd this box and dropped the WebSocket mid-debug.
+            if detect_ram_gb().unwrap_or(16) > 24 {
+                try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
+            }
         }
         crate::llm::report_work_progress("evict", 1.0);
     }

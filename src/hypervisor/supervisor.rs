@@ -95,6 +95,9 @@ pub struct Hypervisor {
     job_cancels: Mutex<HashMap<String, Arc<Notify>>>,
     /// Slots whose worker is currently owned by an invoke/warm stack frame.
     checkouts: Mutex<HashMap<String, SlotCheckout>>,
+    ram_gb: u32,
+    /// On tight RAM, two concurrent GGUF mmaps OOM the box and drop the WebSocket.
+    mmap_gate: Mutex<()>,
 }
 
 /// Give up only when the worker stops sending progress/token lines.
@@ -107,6 +110,8 @@ const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(300);
 const WORKER_INVOKE_WALL_CLOCK: Duration = Duration::from_secs(12 * 60);
 /// Checked-out slot with no progress path for this long → force reclaim.
 const STUCK_CHECKOUT: Duration = Duration::from_secs(13 * 60);
+/// Hosts at or below this RAM cannot mmap two 5 GB GGUFs at once.
+const TIGHT_RAM_GB: u32 = 24;
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
     if phase.eq_ignore_ascii_case("decode") {
@@ -139,6 +144,7 @@ impl Hypervisor {
         if workers.is_empty() {
             bail!("no compute slot workers started");
         }
+        let ram_gb = crate::specs::detect_ram_gb().unwrap_or(16);
         Ok(Arc::new(Self {
             plan,
             devices: devices.to_vec(),
@@ -147,6 +153,8 @@ impl Hypervisor {
             changed: Notify::new(),
             job_cancels: Mutex::new(HashMap::new()),
             checkouts: Mutex::new(HashMap::new()),
+            ram_gb,
+            mmap_gate: Mutex::new(()),
         }))
     }
 
@@ -188,6 +196,35 @@ impl Hypervisor {
             notify.notify_waiters();
         }
         n
+    }
+
+    /// Cancel in-flight work and wait for workers to die so the next load does
+    /// not mmap beside a still-resident GGUF (16 GB boxes reset the WebSocket).
+    pub async fn cancel_all_invokes_and_drain(&self, timeout: Duration) -> usize {
+        let n = self.cancel_all_invokes().await;
+        let deadline = Instant::now() + timeout;
+        while self.has_in_flight_work().await {
+            if Instant::now() >= deadline {
+                let checkouts = self.checkouts.lock().await;
+                for (slot, checkout) in checkouts.iter() {
+                    if let Some(pid) = checkout.pid {
+                        warn!(slot = %slot, pid, "force-killing leftover checkout after cancel");
+                        force_kill_pid(pid);
+                    }
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        n
+    }
+
+    async fn lock_mmap_if_tight(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if self.ram_gb > TIGHT_RAM_GB {
+            None
+        } else {
+            Some(self.mmap_gate.lock().await)
+        }
     }
 
     /// How many slots are currently checked out to an invoke/warm stack.
@@ -468,6 +505,7 @@ impl Hypervisor {
         if runtime_models.is_empty() {
             return Ok(());
         }
+        let _mmap = self.lock_mmap_if_tight().await;
         let idle = self.idle_slot_ids().await;
         let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
         // Never fall back to warming cpu-0 while GPUs exist but are busy.
@@ -567,6 +605,18 @@ impl Hypervisor {
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         self.record_demand(runtime_model).await;
         let cancel = self.register_job_cancel(job_id).await;
+        let _mmap = if self.ram_gb > TIGHT_RAM_GB {
+            None
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.notified() => {
+                    self.clear_job_cancel(job_id).await;
+                    bail!("request_canceled");
+                }
+                guard = self.mmap_gate.lock() => Some(guard),
+            }
+        };
         let sent_token = Arc::new(AtomicBool::new(false));
         let mut on_delta: Option<Box<dyn FnMut(String) + Send>> = match on_delta {
             None => None,

@@ -1188,6 +1188,9 @@ async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
 async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
     let (should_preload, warm_models, hv) = {
         let guard = state.lock().await;
+        if guard.active_job_count > 0 {
+            return;
+        }
         let config = guard.vram_config();
         if !guard.vram_lifecycle.should_preload(&config) {
             return;
@@ -1204,8 +1207,17 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
     if !should_preload {
         return;
     }
+    if hv.has_in_flight_work().await {
+        return;
+    }
     let state_for_task = state.clone();
     tokio::spawn(async move {
+        if state_for_task.lock().await.active_job_count > 0 {
+            return;
+        }
+        if hv.has_in_flight_work().await {
+            return;
+        }
         if hv.warm_models(&warm_models).await.is_ok() {
             let mut guard = state_for_task.lock().await;
             guard.vram_lifecycle.on_vram_loaded();
@@ -1312,15 +1324,20 @@ async fn handle_server_message(
                 "ready" => {
                     let ready = parse_ready(data)?;
                     info!("assigned node {}", ready.node_id);
-                    {
+                    let canceled = {
                         let hv = state.lock().await.hypervisor.clone();
                         if let Some(hv) = hv {
-                            let canceled = hv.cancel_all_invokes().await;
-                            if canceled > 0 {
-                                info!(canceled, "canceled orphan invoke(s) from prior session");
+                            let n = hv
+                                .cancel_all_invokes_and_drain(Duration::from_secs(20))
+                                .await;
+                            if n > 0 {
+                                info!(canceled = n, "canceled orphan invoke(s) from prior session");
                             }
+                            n
+                        } else {
+                            0
                         }
-                    }
+                    };
                     {
                         let mut guard = state.lock().await;
                         guard.node_id = Some(ready.node_id.clone());
@@ -1334,7 +1351,7 @@ async fn handle_server_message(
                         guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);
                         guard.persist_local_state();
                         drop(guard);
-                        if transition.entered_earning {
+                        if transition.entered_earning && canceled == 0 {
                             maybe_warm_models(state.clone()).await;
                         }
                     }
@@ -1346,7 +1363,11 @@ async fn handle_server_message(
                     tokio::spawn(async move {
                         refresh_disk_inventory(&state_bg).await;
                         refresh_slot_cache(&state_bg).await;
-                        maybe_warm_models(state_bg.clone()).await;
+                        // A reconnect that killed a live job must not immediately mmap
+                        // another GGUF beside the dying worker (16 GB WS reset).
+                        if canceled == 0 {
+                            maybe_warm_models(state_bg.clone()).await;
+                        }
                         if state_bg.lock().await.needs_reregister() {
                             if let Err(err) = send_register_message(&state_bg, &write_bg).await {
                                 debug!("post-ready re-register failed: {err:#}");
