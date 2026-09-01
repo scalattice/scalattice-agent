@@ -78,10 +78,6 @@ impl Drop for ActiveJobLease {
     }
 }
 
-/// If no inbound server frame (pong, invoke, etc.) for this long while registered,
-/// treat the WebSocket as zombie and reconnect. ~3 missed heartbeats; cloud Redis TTL is 90s.
-const COMMS_STALE_AFTER: Duration = Duration::from_secs(45);
-
 /// Full Windows specs detection (PowerShell + nvidia-smi) is expensive. Cache it so the
 /// WebSocket loop is not blocked for tens of seconds every heartbeat / invoke.
 const SPECS_CACHE_TTL: Duration = Duration::from_secs(20);
@@ -824,9 +820,15 @@ impl SessionState {
 }
 
 const TOKEN_UPDATED: &str = "token_updated";
+const ALREADY_CONNECTED: &str = "already_connected";
+/// Redis live TTL is 90s; Cloudflare idle is ~100s. 45s was short enough that
+/// macOS App Nap / Metal shader compile made the agent reconnect and cancel
+/// in-flight jobs (`agent disconnected: superseded`).
+const COMMS_STALE_AFTER: Duration = Duration::from_secs(90);
 /// Fixed short delay only - no exponential backoff. Tiny pause so a dead server
 /// cannot pin a core in a tight reconnect loop.
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const ALREADY_CONNECTED_DELAY: Duration = Duration::from_secs(8);
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     // Supervisor never touches CUDA — per-slot workers set CUDA_VISIBLE_DEVICES themselves.
@@ -873,6 +875,17 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
                     tokio::time::sleep(RECONNECT_DELAY).await;
                     continue;
                 }
+                if err_str.contains(ALREADY_CONNECTED) {
+                    state::mark_disconnected(Some(
+                        "another session is still serving a job".to_string(),
+                    ));
+                    warn!(
+                        "cloud refused this connection (job still running on another session); retrying in {}s",
+                        ALREADY_CONNECTED_DELAY.as_secs()
+                    );
+                    tokio::time::sleep(ALREADY_CONNECTED_DELAY).await;
+                    continue;
+                }
                 state::mark_disconnected(Some(err_str.clone()));
                 if is_token_auth_error(&err_str) {
                     warn!(
@@ -913,13 +926,9 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     }
     let _streaming_guard = StreamingGuard;
 
-    // Prior WS sessions share this hypervisor; abort orphan invokes so slots are
-    // not left checked-out forever (UI stuck Busy / serving_job).
-    let canceled = hypervisor.cancel_all_invokes().await;
-    if canceled > 0 {
-        info!(canceled, "canceled orphan invoke(s) from prior session");
-        tokio::time::sleep(Duration::from_millis(750)).await;
-    }
+    // Do not cancel in-flight jobs before the socket is accepted. A false
+    // reconnect used to abort Metal loads, then the new session stole the key
+    // and the cloud saw `agent disconnected: superseded`.
     let recovered = hypervisor.reconcile_slots().await;
     if recovered > 0 {
         info!(recovered, "reclaimed slot(s) at session start");
@@ -1019,11 +1028,18 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                         let guard = state.lock().await;
                         guard.persist_local_state();
                         if guard.cloud_link_stale() {
-                            warn!(
-                                "no cloud response for {}s; reconnecting",
-                                COMMS_STALE_AFTER.as_secs()
-                            );
-                            bail!("cloud link stale (no server response)");
+                            if guard.active_job_count > 0 {
+                                warn!(
+                                    "no cloud response for {}s during in-flight job; keeping session",
+                                    COMMS_STALE_AFTER.as_secs()
+                                );
+                            } else {
+                                warn!(
+                                    "no cloud response for {}s; reconnecting",
+                                    COMMS_STALE_AFTER.as_secs()
+                                );
+                                bail!("cloud link stale (no server response)");
+                            }
                         }
                     }
                     if maintenance_busy
@@ -1297,6 +1313,15 @@ async fn handle_server_message(
                     let ready = parse_ready(data)?;
                     info!("assigned node {}", ready.node_id);
                     {
+                        let hv = state.lock().await.hypervisor.clone();
+                        if let Some(hv) = hv {
+                            let canceled = hv.cancel_all_invokes().await;
+                            if canceled > 0 {
+                                info!(canceled, "canceled orphan invoke(s) from prior session");
+                            }
+                        }
+                    }
+                    {
                         let mut guard = state.lock().await;
                         guard.node_id = Some(ready.node_id.clone());
                         guard.apply_compute_devices(&ready.compute_devices);
@@ -1430,6 +1455,9 @@ async fn handle_server_message(
                             "server error: {message} (token {})",
                             token_snippet(&config.token)
                         ));
+                    }
+                    if message == ALREADY_CONNECTED {
+                        return Err(anyhow!("{ALREADY_CONNECTED}"));
                     }
                     return Err(anyhow!("server error: {message}"));
                 }
