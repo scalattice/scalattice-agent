@@ -190,6 +190,9 @@ fn ensure_service_running(config: &AgentConfig) -> Result<()> {
 }
 
 fn write_launch_agent() -> Result<()> {
+    // ProcessType=Background lets App Nap / jetsam freeze or kill the agent during
+    // Metal loads. The next KeepAlive spawn then steals the WebSocket and in-flight
+    // jobs fail as `agent disconnected: superseded`. Standard keeps the WS loop alive.
     let plist_path = launch_agent_plist_path()?;
     let bin = resolve_agent_binary()?;
     let env_pairs = parse_agent_env()?;
@@ -238,7 +241,7 @@ fn write_launch_agent() -> Result<()> {
     <key>KeepAlive</key>
     <true/>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
     <key>StandardOutPath</key>
     <string>{stdout}</string>
     <key>StandardErrorPath</key>

@@ -134,6 +134,10 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
 /// CPU is off by default when a GPU exists. With no accelerator (typical GitHub
 /// runner, CPU-only provider), leave it off and the hypervisor exits immediately
 /// — systemd Restart=always then crash-loops and the agent never reaches Cloud.
+fn is_accelerator_kind(kind: &str) -> bool {
+    kind == "discrete" || kind == "integrated" || kind == "metal"
+}
+
 fn enable_cpu_if_no_accelerator(devices: &mut Vec<ComputeDevice>) {
     if devices.iter().any(|d| d.enabled) {
         return;
@@ -207,13 +211,19 @@ pub fn build_specs_from_devices(
     cuda_version: Option<String>,
 ) -> MachineSpecs {
     let enabled: Vec<&ComputeDevice> = devices.iter().filter(|d| d.enabled).collect();
-    let discrete_count = enabled.iter().filter(|d| d.kind == "discrete").count();
+    let accelerators: Vec<&ComputeDevice> = enabled
+        .iter()
+        .copied()
+        .filter(|d| is_accelerator_kind(&d.kind))
+        .collect();
+    let discrete_count = accelerators.iter().filter(|d| d.kind == "discrete").count();
 
-    let gpu_name = if enabled.len() == 1 {
-        Some(enabled[0].name.clone())
-    } else if enabled.len() > 1 {
+    // GPU line is accelerators only — do not concatenate the CPU brand into it.
+    let gpu_name = if accelerators.len() == 1 {
+        Some(accelerators[0].name.clone())
+    } else if accelerators.len() > 1 {
         Some(
-            enabled
+            accelerators
                 .iter()
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>()
@@ -223,19 +233,14 @@ pub fn build_specs_from_devices(
         None
     };
 
-    let vram_gb = sum_option(
-        enabled
-            .iter()
-            .filter(|d| d.kind == "discrete" || d.kind == "integrated")
-            .filter_map(|d| d.vram_gb),
-    );
+    let vram_gb = sum_option(accelerators.iter().filter_map(|d| d.vram_gb));
     let vram_used_gb = sum_option(enabled.iter().filter_map(|d| d.vram_used_gb));
     let gpu_util_pct = enabled.iter().filter_map(|d| d.util_pct).max();
 
     let gpu_count = if discrete_count > 0 {
         Some(discrete_count.min(255) as u8)
-    } else if !enabled.is_empty() {
-        Some(enabled.len().min(255) as u8)
+    } else if !accelerators.is_empty() {
+        Some(accelerators.len().min(255) as u8)
     } else {
         None
     };
@@ -1890,8 +1895,56 @@ fn cpuinfo_field(info: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Windows `PROCESSOR_IDENTIFIER` is a raw Family/Model/Stepping string
+/// (e.g. `AMD64 Family 25 Model 68 Stepping 1, AuthenticAMD`), not a product name.
+#[cfg(any(test, windows))]
+fn looks_like_processor_identifier(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.contains("family") && lower.contains("model") && lower.contains("stepping"))
+        || lower.contains("authenticamd")
+        || lower.contains("genuineintel")
+}
+
+#[cfg(windows)]
+fn registry_processor_name() -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
+    };
+    let subkey: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\0"
+        .encode_utf16()
+        .collect();
+    let value: Vec<u16> = "ProcessorNameString\0".encode_utf16().collect();
+    let mut buf = vec![0u16; 256];
+    let mut size = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut _,
+            &mut size,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let nchars = (size as usize / 2).saturating_sub(1).min(buf.len());
+    let name = String::from_utf16_lossy(&buf[..nchars]).trim().to_string();
+    if name.is_empty() || looks_like_processor_identifier(&name) {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 #[cfg(windows)]
 fn detect_cpu_model_windows() -> Option<String> {
+    if let Some(name) = registry_processor_name() {
+        return Some(name);
+    }
     if let Ok(output) = powershell_hidden(&[
         "-Command",
         "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
@@ -1900,15 +1953,12 @@ fn detect_cpu_model_windows() -> Option<String> {
     {
         if output.status.success() {
             let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !name.is_empty() {
+            if !name.is_empty() && !looks_like_processor_identifier(&name) {
                 return Some(name);
             }
         }
     }
-    std::env::var("PROCESSOR_IDENTIFIER")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    None
 }
 
 pub fn detect_ram_gb() -> Option<u32> {
@@ -2354,6 +2404,20 @@ CPU revision	: 1
         assert_eq!(pretty_macos("15.1"), "macOS Sequoia");
         assert_eq!(pretty_macos("14.6.1"), "macOS Sonoma");
         assert_eq!(pretty_macos("26.0"), "macOS Tahoe");
+    }
+
+    #[test]
+    fn processor_identifier_is_not_a_cpu_product_name() {
+        assert!(looks_like_processor_identifier(
+            "AMD64 Family 25 Model 68 Stepping 1, AuthenticAMD"
+        ));
+        assert!(looks_like_processor_identifier(
+            "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel"
+        ));
+        assert!(!looks_like_processor_identifier(
+            "AMD Ryzen 7 6800H with Radeon Graphics"
+        ));
+        assert!(!looks_like_processor_identifier("Apple M3"));
     }
 
     #[test]
