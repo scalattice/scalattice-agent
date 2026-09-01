@@ -14,10 +14,11 @@ use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -205,7 +206,7 @@ pub fn generate_with_callback(
             super::progress::report("context", 1.0);
 
             let prefill_start = Instant::now();
-            let prompt = build_chat_prompt(model, &config.messages)?;
+            let prompt = build_chat_prompt(model, &config.messages, config.max_tokens, ctx_tokens)?;
             let max_tokens = config.max_tokens.max(1).min(8192) as usize;
 
             let (prompt_token_count, mut position, mut sample_idx) = if need_vision {
@@ -426,10 +427,13 @@ fn metal_full_params() -> Result<LlamaModelParams> {
             .with_devices(&indices)
             .context("configure Metal ggml devices")?;
     } else {
-        warn!(
-            "Metal pool: no ggml Metal devices enumerated yet; \
-             loading with n_gpu_layers only"
-        );
+        static LOG_EMPTY: Once = Once::new();
+        LOG_EMPTY.call_once(|| {
+            tracing::debug!(
+                "Metal pool: ggml has not enumerated Metal devices yet; \
+                 loading with n_gpu_layers (llama.cpp still offloads to MTL0)"
+            );
+        });
     }
     Ok(params)
 }
@@ -468,6 +472,69 @@ fn cuda_offload_params(device: usize, layers: u32) -> Result<LlamaModelParams> {
         .with_n_gpu_layers(layers))
 }
 
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Sequential read so unified-memory mmap during `load_tensors` hits warm pages.
+/// On an M1 Max, walking 20 GiB of GGUF tensors cold was ~86s (~240 MiB/s);
+/// SSD sequential is several GiB/s.
+fn prefault_gguf_for_metal(model_path: &Path, pool: &VirtualCard) {
+    if !matches!(pool.strategy, PoolStrategy::Metal) {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(model_path) else {
+        return;
+    };
+    let len = meta.len();
+    if len == 0 {
+        return;
+    }
+    let ram = crate::specs::detect_ram_gb().unwrap_or(pool.total_vram_gb.max(1));
+    if !gguf_fits_unified_prefault(len, ram) {
+        info!(
+            path = %model_path.display(),
+            file_gb = format!("{:.1}", len as f64 / GIB),
+            ram_gb = ram,
+            "skip GGUF prefault; file larger than unified working set"
+        );
+        return;
+    }
+    let start = Instant::now();
+    match prefault_gguf_pages(model_path) {
+        Ok(got) => info!(
+            path = %model_path.display(),
+            bytes = got,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "prefaulted GGUF into page cache"
+        ),
+        Err(err) => warn!(
+            path = %model_path.display(),
+            error = %err,
+            "GGUF prefault failed; llama.cpp will fault pages during load"
+        ),
+    }
+}
+
+/// True when `file_bytes` plus twice the OS RAM reserve still fits in `ram_gb`.
+pub(crate) fn gguf_fits_unified_prefault(file_bytes: u64, ram_gb: u32) -> bool {
+    let reserve = crate::specs::system_ram_reserve_gb(ram_gb);
+    let room = ((f64::from(ram_gb) - 2.0 * reserve) * GIB).max(0.0);
+    file_bytes as f64 + 0.05 <= room
+}
+
+fn prefault_gguf_pages(path: &Path) -> Result<u64> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut got = 0u64;
+    loop {
+        let n = file.read(&mut buf).context("read GGUF for prefault")?;
+        if n == 0 {
+            break;
+        }
+        got += n as u64;
+    }
+    Ok(got)
+}
+
 /// Load the model for this pool, degrading gracefully instead of hard-failing.
 ///
 /// Small / memory-constrained pools frequently OOM inside llama.cpp during load,
@@ -496,6 +563,7 @@ pub(crate) fn load_model_for_pool_starting_at(
     pool: &VirtualCard,
     start_at: usize,
 ) -> Result<(LlamaModel, usize)> {
+    prefault_gguf_for_metal(model_path, pool);
     let candidates = load_param_candidates(pool, Some(model_path))?;
     let mut last_err: Option<anyhow::Error> = None;
     let mut skip_gpu = false;
@@ -556,6 +624,7 @@ pub(crate) fn load_cpu_mmap_model(
 }
 
 /// Number of ordered load configurations for this pool / model.
+#[allow(dead_code)]
 pub(crate) fn load_candidate_count(pool: &VirtualCard, model_path: &Path) -> Result<usize> {
     Ok(load_param_candidates(pool, Some(model_path))?.len())
 }
@@ -569,6 +638,16 @@ pub(crate) fn load_candidate_label(
     Ok(load_param_candidates(pool, Some(model_path))?
         .get(index)
         .map(|(label, _)| *label))
+}
+
+pub(crate) fn load_candidate_labels(
+    pool: &VirtualCard,
+    model_path: &Path,
+) -> Result<Vec<&'static str>> {
+    Ok(load_param_candidates(pool, Some(model_path))?
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect())
 }
 
 /// GGUF on-disk size in GiB (approx weights). Used to skip suicidal gpu-full attempts.
@@ -717,6 +796,7 @@ pub(crate) fn should_attempt_single_gpu_full(
 ///
 /// llama.cpp's CUDA backend often `abort()`s on OOM instead of returning an error,
 /// which kills the agent process and looks like a disconnect.
+#[cfg(test)]
 pub(crate) fn should_attempt_gpu_full(pool: &VirtualCard, weight_gb: Option<f64>) -> bool {
     match pool.strategy {
         PoolStrategy::TensorParallel => {
@@ -756,12 +836,66 @@ fn load_param_candidates(
     pool: &VirtualCard,
     model_path: Option<&Path>,
 ) -> Result<Vec<(&'static str, LlamaModelParams)>> {
-    load_param_candidates_with_weight(pool, model_path.and_then(gguf_weight_gb))
+    let weight = model_path.and_then(gguf_weight_gb);
+    let n_layer = model_path
+        .and_then(crate::models::gguf_shape)
+        .filter(|s| s.usable())
+        .map(|s| s.n_layer);
+    load_param_candidates_with_plan(pool, weight, n_layer)
 }
 
 fn load_param_candidates_with_weight(
     pool: &VirtualCard,
     weight_gb: Option<f64>,
+) -> Result<Vec<(&'static str, LlamaModelParams)>> {
+    load_param_candidates_with_plan(pool, weight_gb, None)
+}
+
+/// When GGUF `block_count` is missing, assume heavy layers so `n_gpu_layers`
+/// under-shoots. Overestimating layer count dumps a 47-layer MoE onto 17 GB.
+pub(crate) fn estimated_n_layer(weight_gb: f64) -> u32 {
+    const HEAVY_LAYER_GB: f64 = 0.5;
+    if weight_gb <= 0.05 {
+        return 1;
+    }
+    ((weight_gb / HEAVY_LAYER_GB).round() as u32).max(1)
+}
+
+/// How many repeating layers fit in `available_gb` after KV/compute/CUDA extra.
+///
+/// Layer count comes from GGUF `block_count` (or a heavy-layer estimate).
+/// `offload_layer_budget` is only a VRAM-sized backstop when weight is unknown.
+pub(crate) fn offload_layers_for_available(
+    available_gb: u32,
+    weight_gb: Option<f64>,
+    n_layer: Option<u32>,
+) -> u32 {
+    let vram_guess = offload_layer_budget(available_gb);
+    let Some(w) = weight_gb.filter(|w| *w > 0.05) else {
+        return vram_guess;
+    };
+    let extra = crate::models::full_host_need_from_weight(w, 4096) - w;
+    let for_weights = (f64::from(available_gb) - extra).max(0.0);
+    if for_weights < 0.01 || vram_guess == 0 {
+        return 0;
+    }
+    let layers = n_layer
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| estimated_n_layer(w))
+        .max(1);
+    let per = w / f64::from(layers);
+    let by_weight = if per > 0.01 {
+        (for_weights / per).floor() as u32
+    } else {
+        vram_guess
+    };
+    by_weight.min(vram_guess)
+}
+
+fn load_param_candidates_with_plan(
+    pool: &VirtualCard,
+    weight_gb: Option<f64>,
+    n_layer: Option<u32>,
 ) -> Result<Vec<(&'static str, LlamaModelParams)>> {
     let mut candidates = Vec::new();
 
@@ -832,15 +966,11 @@ fn load_param_candidates_with_weight(
         PoolStrategy::CpuOnly => {}
     }
 
-    // Offload layer count from *free* VRAM, not nameplate. A 10 GB 3080 with 1 GB
-    // free must not try 32-layer offload (CUDA abort / worker stdout close).
-    let budget = if available >= 2 {
-        offload_layer_budget(available)
-            .min(pool.gpu_layer_budget)
-            .max(1)
-    } else {
-        0
-    };
+    // Offload layer count from *free* VRAM and weight, not nameplate. A 10 GB
+    // 3080 with 1 GB free must not try 32-layer offload (CUDA abort). A 48 GB
+    // Turing card with 17 GB free must not offload all 47 GLM layers.
+    let budget = offload_layers_for_available(available, weight_gb, n_layer)
+        .min(pool.gpu_layer_budget);
     if budget >= 1 && budget < 999 {
         match pool.strategy {
             PoolStrategy::Vulkan => {
@@ -1166,5 +1296,27 @@ mod tests {
                 "cpu-only",
             ]
         );
+    }
+
+    #[test]
+    fn unified_prefault_fits_20gb_on_64gb_mac() {
+        let gib = 1024u64 * 1024 * 1024;
+        assert!(gguf_fits_unified_prefault(20 * gib, 64));
+        assert!(gguf_fits_unified_prefault(40 * gib, 64));
+        // 64 - 2*8 = 48 GiB working set; 50 GiB would squeeze the OS.
+        assert!(!gguf_fits_unified_prefault(50 * gib, 64));
+        assert!(!gguf_fits_unified_prefault(20 * gib, 16));
+    }
+
+    #[test]
+    fn glm_flash_offload_does_not_claim_all_layers_on_partial_free() {
+        // 19.8 GB MoE, 47 layers, 17 GB live free — must leave KV/compute room.
+        let n = offload_layers_for_available(17, Some(19.77), Some(47));
+        assert!(n > 0, "{n}");
+        assert!(n < 47, "would dump all layers into 17 GB free, got {n}");
+        let guessed = offload_layers_for_available(17, Some(19.77), None);
+        assert!(guessed < 47, "missing shape must not dump all layers, got {guessed}");
+        assert!(estimated_n_layer(19.77) < 47);
+        assert_eq!(estimated_n_layer(4.7), 9);
     }
 }

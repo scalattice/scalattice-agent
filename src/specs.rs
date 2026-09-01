@@ -584,6 +584,7 @@ fn live_cuda_compute_cap_from(bin: &str, wanted: &[u32]) -> Option<u32> {
     min_cap
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn parse_compute_cap(raw: &str) -> Option<u32> {
     let s = raw.trim();
     let mut parts = s.split('.');

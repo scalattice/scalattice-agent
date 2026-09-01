@@ -822,11 +822,16 @@ pub fn metal_runtime_supported() -> bool {
     cfg!(feature = "metal")
 }
 
-/// Conservative layer estimate for CPU-offload fallbacks after a full-GPU OOM.
+/// Conservative layer estimate for CPU-offload fallbacks after a full-GPU OOM
+/// when GGUF weight/shape is unknown: leftover MiB / 300 MiB per layer.
 pub fn offload_layer_budget(total_discrete_vram_gb: u32) -> u32 {
+    const MIB_PER_LAYER: f32 = 300.0;
     const KV_HEADROOM_MIB: f32 = 768.0;
-    let usable_mib = (total_discrete_vram_gb as f32 * 1024.0 - KV_HEADROOM_MIB).max(300.0);
-    (usable_mib / 300.0).round().clamp(1.0, 80.0) as u32
+    let usable_mib = (total_discrete_vram_gb as f32 * 1024.0 - KV_HEADROOM_MIB).max(0.0);
+    if usable_mib < MIB_PER_LAYER {
+        return 0;
+    }
+    (usable_mib / MIB_PER_LAYER).round() as u32
 }
 
 /// CUDA index of the largest enabled NVIDIA GPU (offload / Single fallbacks).
@@ -1162,8 +1167,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(card.strategy, PoolStrategy::Single);
-        assert_eq!(card.gpu_layer_budget, 25);
+        assert_eq!(card.gpu_layer_budget, offload_layer_budget(8));
         assert_eq!(primary_cuda_device(&card), Some(0));
+    }
+
+    #[test]
+    fn offload_layer_budget_scales_past_eighty_layers() {
+        // 192 GB H100-class: 80-layer clamp would leave most of the card idle.
+        let n = offload_layer_budget(192);
+        assert!(n > 80, "{n}");
+        assert_eq!(n, ((192.0 * 1024.0 - 768.0) / 300.0).round() as u32);
+        assert_eq!(offload_layer_budget(0), 0);
     }
 
     #[test]

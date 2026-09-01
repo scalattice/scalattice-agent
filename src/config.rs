@@ -69,6 +69,7 @@ fn trim_env_line(line: &str) -> &str {
     line.trim().trim_start_matches('\u{feff}').trim()
 }
 
+#[cfg(test)]
 fn parse_token_from_env_file(raw: &str) -> Option<String> {
     parse_env_key(raw, "SCALATTICE_AGENT_TOKEN")
 }

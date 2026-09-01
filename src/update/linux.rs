@@ -1,6 +1,5 @@
 use super::cloud::{download_release_asset, fetch_latest_release};
 use super::{compare_versions, current_version, UpdateCheckOutcome, UpdateInfo};
-use crate::paths::{lib_dir, unix_agent_install_targets};
 use crate::service;
 use anyhow::{bail, Context, Result};
 use std::cmp::Ordering;
@@ -8,6 +7,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[cfg(target_os = "linux")]
+use crate::paths::{lib_dir, unix_agent_install_targets};
 
 #[cfg(target_os = "linux")]
 const UPDATE_SERVICE: &str = "scalattice-agent-update.service";
@@ -117,6 +119,7 @@ pub fn sync_auto_update_timer(enable: bool) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn unix_archive_name() -> Result<String> {
     Ok(format!(
         "scalattice-agent-{}.tar.gz",
@@ -124,25 +127,12 @@ fn unix_archive_name() -> Result<String> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn unix_release_target() -> Result<&'static str> {
-    #[cfg(target_os = "macos")]
-    {
-        if std::env::consts::ARCH != "aarch64" {
-            bail!("automatic updates support Apple Silicon only");
-        }
-        return Ok("aarch64-apple-darwin");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return match std::env::consts::ARCH {
-            "x86_64" => Ok("x86_64-unknown-linux-gnu"),
-            "aarch64" => Ok("aarch64-unknown-linux-gnu"),
-            other => bail!("automatic updates are not supported on Linux arch: {other}"),
-        };
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        bail!("automatic updates are not supported on this platform")
+    match std::env::consts::ARCH {
+        "x86_64" => Ok("x86_64-unknown-linux-gnu"),
+        "aarch64" => Ok("aarch64-unknown-linux-gnu"),
+        other => bail!("automatic updates are not supported on Linux arch: {other}"),
     }
 }
 
@@ -317,6 +307,7 @@ fn apply_macos_dmg_update(dmg: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn download_and_extract(tag: &str) -> Result<PathBuf> {
     let latest = fetch_latest_release().await?;
     let archive_name = unix_archive_name()?;
@@ -358,6 +349,7 @@ fn update_work_dir(tag: &str) -> Result<PathBuf> {
         .join(unique))
 }
 
+#[cfg(target_os = "linux")]
 fn extract_tarball(archive: &Path, dest: &Path) -> Result<()> {
     // Prefer in-process extract: systemd user units often run with a PATH that
     // does not include `tar` (ENOENT → "run tar to extract… No such file or directory").
@@ -393,6 +385,7 @@ fn extract_tarball(archive: &Path, dest: &Path) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn extract_tarball_rust(archive: &Path, dest: &Path) -> Result<()> {
     use flate2::read::GzDecoder;
     use tar::Archive;
@@ -434,6 +427,7 @@ fn extract_tarball_rust(archive: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
@@ -448,6 +442,7 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_tar_binary() -> Option<PathBuf> {
     const CANDIDATES: &[&str] = &["/usr/bin/tar", "/bin/tar", "/usr/local/bin/tar"];
     for path in CANDIDATES {
@@ -465,6 +460,7 @@ fn resolve_tar_binary() -> Option<PathBuf> {
         .map(|_| PathBuf::from("tar"))
 }
 
+#[cfg(target_os = "linux")]
 fn apply_update(staging: &Path) -> Result<()> {
     let source_bin = staging.join("scalattice-agent");
     if !source_bin.is_file() {
@@ -590,6 +586,7 @@ fn replace_unix_binary(source: &Path, dest: &Path) -> Result<()> {
 /// same CUDA-linked binary as the agent, with `$ORIGIN/../lib/scalattice` already
 /// mapped, so overwriting those `.so` files in place SIGSEGVs after "success"
 /// (`returncode -11`). Rename keeps the old inode alive until this process exits.
+#[cfg(target_os = "linux")]
 fn replace_unix_file(source: &Path, dest: &Path) -> Result<()> {
     replace_unix_file_with_mode(source, dest, None)
 }

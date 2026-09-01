@@ -132,7 +132,7 @@ fn looks_like_agent_binary(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn paths_eq(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -147,7 +147,7 @@ fn paths_eq(a: &Path, b: &Path) -> bool {
 ///
 /// macOS ships as an .app bundle; `install_dir()` is `~/.local/bin`. Replacing
 /// only the latter leaves launchd running the old bundle binary.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub fn unix_agent_install_targets() -> Result<Vec<PathBuf>> {
     let mut targets: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {

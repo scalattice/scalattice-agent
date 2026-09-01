@@ -4,6 +4,12 @@ use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
+/// Completion must cover this many slices of `n_ctx` or thinking eats the probe.
+/// 48 tokens at 4096 ctx is a debug/health completion, not a reasoned reply.
+const THINK_COMPLETION_CTX_SLICES: u32 = 32;
+const NO_THINK_TAG: &str = "/no_think";
+const THINK_TAG: &str = "/think";
+
 pub fn prepare_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = messages
         .iter()
@@ -24,8 +30,18 @@ pub fn prepare_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     out
 }
 
-pub fn build_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String> {
-    let prepared = prepare_messages(messages);
+pub fn build_chat_prompt(
+    model: &LlamaModel,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    n_ctx: u32,
+) -> Result<String> {
+    let mut prepared = prepare_messages(messages);
+    if let Ok(tmpl) = model.chat_template(None) {
+        if let Ok(s) = tmpl.to_str() {
+            suppress_short_completion_thinking(s, &mut prepared, max_tokens, n_ctx);
+        }
+    }
     let llama_messages: Vec<LlamaChatMessage> = prepared
         .iter()
         .map(|m| {
@@ -45,6 +61,46 @@ pub fn build_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result
             }
         },
         Err(_) => Ok(messages_to_prompt_fallback(&prepared)),
+    }
+}
+
+pub(crate) fn template_has_thinking_switch(template: &str) -> bool {
+    template.contains("enable_thinking")
+        || template.contains("no_think")
+        || template.contains("/think")
+}
+
+/// True when `max_tokens` is a large enough slice of the context window to
+/// hold chain-of-thought and still emit an answer.
+pub(crate) fn completion_can_afford_thinking(max_tokens: u32, n_ctx: u32) -> bool {
+    max_tokens.saturating_mul(THINK_COMPLETION_CTX_SLICES) >= n_ctx.max(1)
+}
+
+/// Qwen3-family Jinja looks for `/no_think` on the last user turn when
+/// `enable_thinking` is not passed through llama-cpp-2's apply_chat_template.
+pub(crate) fn suppress_short_completion_thinking(
+    template: &str,
+    messages: &mut [ChatMessage],
+    max_tokens: u32,
+    n_ctx: u32,
+) {
+    if completion_can_afford_thinking(max_tokens, n_ctx) {
+        return;
+    }
+    if !template_has_thinking_switch(template) {
+        return;
+    }
+    let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") else {
+        return;
+    };
+    if last_user.content.contains(NO_THINK_TAG) || last_user.content.contains(THINK_TAG) {
+        return;
+    }
+    if last_user.content.is_empty() {
+        last_user.content = NO_THINK_TAG.to_string();
+    } else {
+        last_user.content.push('\n');
+        last_user.content.push_str(NO_THINK_TAG);
     }
 }
 
@@ -118,5 +174,49 @@ mod tests {
         assert_eq!(prepared[1].role, "user");
         assert!(prepared[1].has_images());
         assert!(crate::llm::vision::content_with_media_markers(&prepared[1]).contains("<__media__>"));
+    }
+
+    #[test]
+    fn short_debug_probe_appends_no_think() {
+        let tmpl = "{%- if enable_thinking is defined %}x{% endif %}";
+        let mut msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "Say ok.".into(),
+            images: Vec::new(),
+        }]);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 48, 4096);
+        assert!(msgs.iter().any(|m| m.role == "user" && m.content.contains("/no_think")));
+    }
+
+    #[test]
+    fn long_completions_keep_default_thinking() {
+        let tmpl = "{%- if enable_thinking is defined %}x{% endif %}";
+        let mut msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "Write an essay.".into(),
+            images: Vec::new(),
+        }]);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 1024, 4096);
+        assert!(!msgs.iter().any(|m| m.content.contains("/no_think")));
+    }
+
+    #[test]
+    fn thinking_cutoff_scales_with_context_window() {
+        assert!(!completion_can_afford_thinking(48, 4096));
+        assert!(!completion_can_afford_thinking(48, 8192));
+        assert!(completion_can_afford_thinking(128, 4096));
+        assert!(completion_can_afford_thinking(1024, 8192));
+    }
+
+    #[test]
+    fn does_not_override_explicit_think_tag() {
+        let tmpl = "enable_thinking";
+        let mut msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "Plan this /think".into(),
+            images: Vec::new(),
+        }]);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 48, 4096);
+        assert!(!msgs[1].content.contains("/no_think"));
     }
 }
