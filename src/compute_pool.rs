@@ -2,7 +2,7 @@ use crate::specs::ComputeDevice;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -488,9 +488,7 @@ pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
     // Unified memory: cpu-0 also calls LlamaBackend::init(), which brings Metal
     // up in a second process and fights metal-0 for the same RAM. Keep CPU as a
     // slot only when there is no Metal GPU (CPU-only Mac / Metal disabled).
-    if metal_runtime_supported() && !metal.is_empty() {
-        info!("skipping cpu-0 slot; Apple Metal already owns unified memory");
-    } else {
+    if !(metal_runtime_supported() && !metal.is_empty()) {
         let cpu_device = cpu.cloned().unwrap_or_else(|| ComputeDevice {
             id: "cpu:0".into(),
             kind: "cpu".into(),
