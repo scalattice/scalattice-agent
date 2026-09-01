@@ -2078,8 +2078,11 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     } else if detail.contains("insufficient_vram")
         || detail.contains("no_vision_capacity")
         || (detail.contains("need") && detail.contains("vision job") && detail.contains("gb"))
+        || detail.contains("create llama context")
     {
         // Idle slots exist but none meet the image-job VRAM floor — not "busy".
+        // Context OOM after packing weights (GLM 4.7 Flash on a 48 GB Turing card
+        // with 17 GB free) is the same class: capacity, not contention.
         "insufficient_vram"
     } else if detail.contains("agent_busy")
         || detail.contains("no idle compute slot")
@@ -2088,8 +2091,6 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         // Backend memory fights / failed load under fanout (llama null ptr).
         || detail.contains("erroroutdevicememory")
         || detail.contains("out of device memory")
-        || detail.contains("create llama context")
-        || detail.contains("null reference")
         || detail.contains("null result")
     {
         "agent_busy"
@@ -2150,6 +2151,12 @@ mod invoke_error_code_tests {
         let err = anyhow::anyhow!(
             "insufficient_vram: need 8 GB GPU for vision job qwen-3-vl-8b; largest idle 4 GB across 2 slot(s)"
         );
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+    }
+
+    #[test]
+    fn llama_context_oom_is_insufficient_vram_not_busy() {
+        let err = anyhow::anyhow!("create llama context: null reference from llama.cpp");
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }
 }

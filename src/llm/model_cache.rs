@@ -1,8 +1,9 @@
 //! In-process GGUF cache - avoids reloading multi-GB weights on every invoke.
 //!
-//! GPU cache keeps as many models in VRAM as currently **fit**. Room is decided
-//! from live free VRAM (nvidia-smi) and each resident's measured occupancy, not
-//! nameplate size buckets. Idle models that do not fit are mmap'd on the RAM shelf.
+//! GPU cache keeps as many models as currently **fit**. Discrete cards use live
+//! free VRAM minus occupancy. Metal counts occupancy **plus** each GGUF mmap
+//! because those pages share unified RAM with the OS. Idle CUDA/Vulkan models
+//! that do not fit are mmap'd on the RAM shelf (never on Metal).
 //!
 //! Every CUDA / Vulkan pool tries the safest placement first. If weight load or
 //! context/KV alloc OOMs *and returns an error*, we walk:
@@ -19,18 +20,17 @@ use llama_cpp_2::mtmd::MtmdContext;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::embedded::{
-    backend, gguf_weight_gb, load_candidate_count, load_candidate_label, load_cpu_mmap_model,
-    load_model_for_pool, load_model_for_pool_starting_at,
+    backend, estimated_n_layer, gguf_weight_gb, load_candidate_label, load_cpu_mmap_model,
+    load_model_for_pool, load_model_for_pool_starting_at, load_candidate_labels,
+    offload_layers_for_available,
 };
 use super::vision::init_mtmd_for_model;
 
 const GIB: u64 = 1024 * 1024 * 1024;
-/// Do not keep a RAM duplicate of a large offload model that is also on the GPU.
-const DROP_SHELF_WHEN_PROMOTING_BYTES: u64 = 3 * GIB;
 
 struct CachedModel {
     model: LlamaModel,
@@ -92,11 +92,7 @@ fn file_bytes(path: &Path) -> u64 {
 }
 
 fn ram_reserve_gb(ram_gb: u32) -> u32 {
-    match ram_gb {
-        0..=8 => (ram_gb / 2).max(2),
-        9..=16 => 8,
-        _ => 10,
-    }
+    crate::specs::system_ram_reserve_gb(ram_gb).round() as u32
 }
 
 fn ram_budget_bytes(ram_gb: u32) -> u64 {
@@ -118,7 +114,7 @@ fn can_shelve(inner: &CacheInner, add_bytes: u64) -> bool {
     }
     if let (Some(total), Some(used)) = (detect_ram_gb(), detect_ram_used_gb()) {
         let avail_gb = total.saturating_sub(used);
-        let need_gb = ((add_bytes + GIB - 1) / GIB) as u32 + 2;
+        let need_gb = ((add_bytes + GIB - 1) / GIB) as u32;
         if avail_gb < need_gb {
             return false;
         }
@@ -220,8 +216,23 @@ fn incoming_vram_need_gb(inner: &CacheInner, model_path: &Path) -> f64 {
 }
 
 fn estimated_gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
-    let used: f64 = inner.gpu.values().map(|e| e.occupancy_gb).sum();
+    let metal = matches!(pool.strategy, crate::compute_pool::PoolStrategy::Metal);
+    let used: f64 = inner
+        .gpu
+        .iter()
+        .map(|(k, e)| resident_accounted_gb(k, e.occupancy_gb, metal))
+        .sum();
     (f64::from(pool.total_vram_gb) - used).max(0.0)
+}
+
+/// CUDA/Vulkan occupancy is dedicated VRAM. Metal occupancy lives in the same
+/// RAM as the GGUF mmap, so each resident costs occupancy + on-disk weight.
+fn resident_accounted_gb(key: &str, occupancy_gb: f64, metal: bool) -> f64 {
+    let occ = occupancy_gb.max(0.0);
+    if !metal {
+        return occ;
+    }
+    occ + gguf_weight_gb(Path::new(path_from_gpu_key(key))).unwrap_or(0.0)
 }
 
 fn live_free_vram_gb(pool: &VirtualCard) -> Option<f64> {
@@ -256,24 +267,30 @@ fn gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
 
 fn fallback_occupancy_gb(model_path: &Path, pool: &VirtualCard, load_tier: usize) -> f64 {
     let weight = gguf_weight_gb(model_path).unwrap_or(0.0);
+    if weight <= 0.05 {
+        return 0.0;
+    }
+    let shape = crate::models::gguf_shape(model_path);
+    let full = crate::models::full_host_need_gb(weight, shape, 4096);
     match load_candidate_label(pool, model_path, load_tier)
         .ok()
         .flatten()
     {
         Some("cpu-only") => 0.0,
-        Some("gpu-offload-reduced") => {
-            (weight * 0.45 + 1.0).min(crate::models::full_host_need_from_weight(weight, 4096))
-        }
-        Some("gpu-offload") => {
-            (weight * 0.7 + 1.0).min(crate::models::full_host_need_from_weight(weight, 4096))
-        }
-        _ => {
-            if weight <= 0.05 {
-                0.0
-            } else {
-                crate::models::full_host_need_from_weight(weight, 4096)
+        Some(label) if label == "gpu-offload" || label == "gpu-offload-reduced" => {
+            let n_layer = shape.filter(|s| s.usable()).map(|s| s.n_layer);
+            let mut layers =
+                offload_layers_for_available(pool.total_vram_gb, Some(weight), n_layer);
+            if label == "gpu-offload-reduced" {
+                layers = (layers / 2).max(1);
             }
+            let denom = n_layer
+                .filter(|n| *n > 0)
+                .unwrap_or_else(|| estimated_n_layer(weight))
+                .max(1);
+            full * (f64::from(layers) / f64::from(denom)).clamp(0.0, 1.0)
         }
+        _ => full,
     }
 }
 
@@ -297,6 +314,8 @@ fn make_gpu_room(
     }
 
     drop_other_ram_shelves(inner, model_path);
+
+    let metal = matches!(pool.strategy, crate::compute_pool::PoolStrategy::Metal);
 
     // CPU-pinned residents (0 GPU layers) sit in the GPU map with ~0 occupancy.
     // VRAM-fit checks skip them, so the next GGUF mmap'd beside them and OOMed
@@ -324,7 +343,10 @@ fn make_gpu_room(
         let victim = inner
             .gpu
             .iter()
-            .filter(|(k, e)| k.as_str() != keep_key && e.occupancy_gb > 0.05)
+            .filter(|(k, e)| {
+                k.as_str() != keep_key
+                    && resident_accounted_gb(k, e.occupancy_gb, metal) > 0.05
+            })
             .min_by_key(|(_, e)| e.last_used)
             .map(|(k, _)| k.clone());
         let Some(key) = victim else {
@@ -339,12 +361,43 @@ fn make_gpu_room(
                 need_gb = format!("{:.2}", need),
                 "evicting GPU resident — incoming model does not fit beside it"
             );
-            // 16 GB hosts cannot mmap the next GGUF while the previous one stays
-            // shelved; that OOM'd this box and dropped the WebSocket mid-debug.
-            // try_shelve_cpu already refuses when live RAM + budget cannot hold it.
-            try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
+            // Discrete VRAM: RAM-shelve when live RAM can hold the mmap.
+            // Unified memory: shelving re-mmaps the same pages Metal just freed.
+            if !metal {
+                try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
+            }
         }
         crate::llm::report_work_progress("evict", 1.0);
+    }
+
+    // CUDA frees asynchronously. nvidia-smi still showed 17.5 GB free after
+    // dropping a resident, so GLM 4.7 Flash skipped gpu-full on a 48 GB RTX 8000.
+    if matches!(
+        pool.strategy,
+        crate::compute_pool::PoolStrategy::Single
+            | crate::compute_pool::PoolStrategy::TensorParallel
+    ) {
+        wait_cuda_reclaim(pool, need);
+    }
+}
+
+fn wait_cuda_reclaim(pool: &VirtualCard, need_gb: f64) {
+    let Some(mut free) = live_free_vram_gb(pool) else {
+        return;
+    };
+    if incoming_model_fits(free, need_gb) {
+        return;
+    }
+    // cudaFree is asynchronous; wait in proportion to the GiB still outstanding.
+    let gap = (need_gb - free).max(0.0);
+    let budget = Duration::from_millis((80.0 + 50.0 * gap).clamp(80.0, 2_000.0) as u64);
+    let start = Instant::now();
+    while start.elapsed() < budget {
+        std::thread::sleep(Duration::from_millis(40));
+        free = live_free_vram_gb(pool).unwrap_or(0.0);
+        if incoming_model_fits(free, need_gb) {
+            return;
+        }
     }
 }
 
@@ -354,6 +407,7 @@ fn is_vram_pressure(err: &anyhow::Error) -> bool {
         || detail.contains("cudamalloc")
         || detail.contains("failed to allocate")
         || detail.contains("create llama context")
+        || detail.contains("null reference")
         || detail.contains("ggml_backend_cuda")
 }
 
@@ -467,14 +521,9 @@ pub fn with_loaded_weights<R>(
     let mut model_load_ms = 0u64;
     if !guard.gpu.contains_key(&key) {
         let pk = path_key(model_path);
-        if file_bytes(model_path) >= DROP_SHELF_WHEN_PROMOTING_BYTES {
-            guard.ram.remove(&pk);
-        }
+        guard.ram.remove(&pk);
         let (ms, _) = ensure_loaded(&mut guard, backend, model_path, pool, &key, 0)?;
         model_load_ms = ms;
-        if let Some(entry) = guard.ram.get_mut(&pk) {
-            entry.last_used = Instant::now();
-        }
     }
 
     let mut load_tier = guard
@@ -482,6 +531,8 @@ pub fn with_loaded_weights<R>(
         .get(&key)
         .context("model missing immediately after cache insert")?
         .load_tier;
+    let mut labels = load_candidate_labels(pool, model_path).unwrap_or_default();
+    let mut oom_hops = 0u8;
 
     if need_vision {
         ensure_mtmd(&mut guard, model_path, pool, &key)?;
@@ -499,18 +550,30 @@ pub fn with_loaded_weights<R>(
         match out {
             Ok(result) => return Ok((result, model_load_ms)),
             Err(err) if is_vram_pressure(&err) => {
-                let next_tier = load_tier + 1;
-                let tier_count = load_candidate_count(pool, model_path)?;
-                if next_tier >= tier_count {
+                oom_hops += 1;
+                let failed = labels.get(load_tier).copied().unwrap_or("gpu-full");
+                warn!(
+                    failed_tier = failed,
+                    hop = oom_hops,
+                    error = %err,
+                    "context OOM; dropping GPU residents and continuing cascade"
+                );
+                guard.gpu.clear();
+                if oom_hops > 4 {
                     return Err(err);
                 }
-                let label = load_candidate_label(pool, model_path, next_tier)?.unwrap_or("next");
+                let new_labels = load_candidate_labels(pool, model_path)?;
+                let start = next_cascade_index(&new_labels, failed);
+                if start >= new_labels.len() {
+                    return Err(err);
+                }
+                let label = new_labels.get(start).copied().unwrap_or("next");
                 warn!("context OOM; reloading via '{label}'");
-                guard.gpu.clear();
                 let (ms, new_tier) =
-                    ensure_loaded(&mut guard, backend, model_path, pool, &key, next_tier)?;
+                    ensure_loaded(&mut guard, backend, model_path, pool, &key, start)?;
                 model_load_ms = model_load_ms.saturating_add(ms);
                 load_tier = new_tier;
+                labels = new_labels;
                 if need_vision {
                     ensure_mtmd(&mut guard, model_path, pool, &key)?;
                 }
@@ -576,6 +639,26 @@ pub fn cached_model_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// After a context OOM, pick the next cascade index on a *fresh* live-VRAM list.
+/// Index 0 of the old list may have been `gpu-offload` while the new list starts
+/// at `gpu-full` once residents are dropped.
+pub(crate) fn next_cascade_index(new_labels: &[&str], failed: &str) -> usize {
+    if failed == "gpu-full" {
+        return new_labels
+            .iter()
+            .position(|l| *l != "gpu-full")
+            .unwrap_or(new_labels.len());
+    }
+    if new_labels.first().copied() == Some("gpu-full") {
+        return 0;
+    }
+    new_labels
+        .iter()
+        .position(|l| *l == failed)
+        .map(|i| i + 1)
+        .unwrap_or(new_labels.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,9 +670,27 @@ mod tests {
     }
 
     #[test]
-    fn typical_laptop_keeps_8gb_free() {
-        assert_eq!(ram_reserve_gb(16), 8);
-        assert_eq!(ram_budget_bytes(16), 8 * GIB);
+    fn ram_shelf_uses_percent_reserve() {
+        assert_eq!(ram_reserve_gb(16), 4);
+        assert_eq!(ram_budget_bytes(16), 12 * GIB);
+        assert_eq!(ram_reserve_gb(64), 8);
+        assert_eq!(ram_budget_bytes(64), 56 * GIB);
+    }
+
+    #[test]
+    fn metal_mmap_plus_buffers_evicts_35b_before_14b() {
+        // 64 GB Mac advertised 56 GB. Ornith 35B occupancy + GGUF mmap cannot
+        // sit beside Qwen3 14B (need includes KV/compute).
+        let advertised = 56.0;
+        let ornith35 = 26.0 + 23.7;
+        assert!(!incoming_model_fits(advertised - ornith35, 12.0));
+    }
+
+    #[test]
+    fn metal_two_small_text_models_still_co_reside() {
+        let advertised = 56.0;
+        let qwen8 = 7.0 + 4.7;
+        assert!(incoming_model_fits(advertised - qwen8, 12.0));
     }
 
     #[test]
@@ -601,5 +702,20 @@ mod tests {
         // 24 GB card already holding one 8B (~6.7 used → ~17 free).
         assert!(incoming_model_fits(17.3, 6.7));
         assert!(incoming_model_fits(6.7, 6.7));
+    }
+
+    #[test]
+    fn cascade_retries_gpu_full_after_offload_oom_once_vram_recovers() {
+        let recovered = ["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only"];
+        assert_eq!(next_cascade_index(&recovered, "gpu-offload"), 0);
+        assert_eq!(next_cascade_index(&recovered, "gpu-full"), 1);
+    }
+
+    #[test]
+    fn cascade_advances_when_live_vram_still_tight() {
+        let tight = ["gpu-offload", "gpu-offload-reduced", "cpu-only"];
+        assert_eq!(next_cascade_index(&tight, "gpu-offload"), 1);
+        assert_eq!(next_cascade_index(&tight, "gpu-offload-reduced"), 2);
+        assert_eq!(next_cascade_index(&tight, "cpu-only"), 3);
     }
 }
