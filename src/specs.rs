@@ -156,11 +156,21 @@ fn enable_cpu_if_no_accelerator(devices: &mut Vec<ComputeDevice>) {
 
 /// Update smoke only needs a live Cloud session. Pin to CPU so CI does not
 /// initialize Metal/CUDA (slow, and on Windows it would fight the host agent).
+///
+/// macOS production omits `cpu:0` beside Metal. Smoke still has to inject CPU
+/// *before* disabling accelerators, or hypervisor start fails with nothing
+/// enabled and the agent never registers with the mock Cloud WS.
 fn prefer_cpu_only_for_update_smoke(devices: &mut Vec<ComputeDevice>) {
     if !crate::config::update_smoke_test() {
         return;
     }
-    enable_cpu_if_no_accelerator(devices);
+    pin_devices_to_cpu_only(devices);
+}
+
+fn pin_devices_to_cpu_only(devices: &mut Vec<ComputeDevice>) {
+    if !devices.iter().any(|d| d.kind == "cpu") {
+        devices.push(fallback_cpu_device());
+    }
     for device in devices.iter_mut() {
         device.enabled = device.kind == "cpu";
     }
@@ -2415,6 +2425,26 @@ CPU revision	: 1
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].kind, "cpu");
         assert!(devices[0].enabled);
+    }
+
+    #[test]
+    fn update_smoke_pins_cpu_even_when_macos_omits_it_beside_metal() {
+        let mut devices = vec![ComputeDevice {
+            id: "metal:0".to_string(),
+            kind: "metal".to_string(),
+            name: "Apple M3 GPU".to_string(),
+            vram_gb: Some(16),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }];
+        pin_devices_to_cpu_only(&mut devices);
+        assert_eq!(devices.len(), 2);
+        let metal = devices.iter().find(|d| d.kind == "metal").expect("metal");
+        let cpu = devices.iter().find(|d| d.kind == "cpu").expect("cpu");
+        assert!(!metal.enabled);
+        assert!(cpu.enabled);
+        assert!(devices.iter().any(|d| d.enabled));
     }
 
     #[test]
