@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use tracing::warn;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PoolDevice {
     pub id: String,
     pub kind: String,
@@ -37,7 +36,6 @@ pub struct VirtualCard {
     pub display_name: String,
     pub total_vram_gb: u32,
     /// Fraction of model tensors per CUDA device (sums to 1.0). Empty unless CUDA TP.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub tensor_split: Vec<f32>,
     pub cuda_device_ids: Vec<u32>,
     /// True when strategy is Vulkan (AMD/Intel enabled, no CUDA in the pool).
@@ -46,53 +44,7 @@ pub struct VirtualCard {
     pub gpu_layer_budget: u32,
 }
 
-/// Must run **before** `init_backend()` when the supervisor still hosts llama in-process.
-/// Mixed NVIDIA gens (e.g. 1650 Super + 1050 Ti) make llama.cpp CUDA abort even on
-/// "single device" loads while both cards stay visible. Prefer per-slot workers with
-/// `apply_slot_cuda_visibility` instead; this remains for legacy single-process paths.
-#[allow(dead_code)]
-pub fn restrict_heterogeneous_cuda_visibility(devices: &[ComputeDevice]) {
-    use std::sync::Once;
-    static WARNED: Once = Once::new();
-
-    let mut cuda: Vec<(u32, String, u32)> = Vec::new();
-    for device in devices.iter().filter(|d| d.enabled) {
-        let Some(idx) = parse_cuda_index(&device.id) else {
-            continue;
-        };
-        if device.kind != "discrete" {
-            continue;
-        }
-        cuda.push((idx, device.name.clone(), effective_vram_gb(device)));
-    }
-    if cuda.len() < 2 {
-        return;
-    }
-    let names: Vec<String> = cuda.iter().map(|c| c.1.clone()).collect();
-    let vrams: Vec<u32> = cuda.iter().map(|c| c.2).collect();
-    if cuda_name_vram_homogeneous(&names, &vrams) {
-        return;
-    }
-
-    let primary_pos = pick_primary_cuda_pos(
-        &cuda.iter().map(|c| c.0).collect::<Vec<_>>(),
-        &vrams,
-    );
-    let (physical, name, vram) = &cuda[primary_pos];
-    // SAFETY: must be set before the first CUDA / llama.cpp backend init in this process.
-    pin_cuda_indices_to_pci_bus();
-    std::env::set_var("CUDA_VISIBLE_DEVICES", physical.to_string());
-    WARNED.call_once(|| {
-        warn!(
-            kept_cuda_index = physical,
-            kept_name = %name,
-            kept_vram_gb = vram,
-            hidden_gpus = cuda.len() - 1,
-            "mixed NVIDIA GPUs: CUDA_VISIBLE_DEVICES limited to the largest card so llama.cpp cannot abort on multi-arch init"
-        );
-    });
-}
-
+/// True when CUDA_VISIBLE_DEVICES already pins this physical index as device 0.
 fn cuda_visibility_remapped_to_zero(physical: u32) -> bool {
     let Ok(raw) = std::env::var("CUDA_VISIBLE_DEVICES") else {
         return false;
@@ -108,14 +60,7 @@ fn cuda_visibility_remapped_to_zero(physical: u32) -> bool {
 /// Normalize NVIDIA marketing names so "NVIDIA GeForce RTX 4090" == "rtx 4090" family match.
 pub fn normalize_cuda_sku(name: &str) -> String {
     let mut s = name.trim().to_ascii_lowercase();
-    for prefix in [
-        "nvidia ",
-        "geforce ",
-        "tesla ",
-        "quadro ",
-        "rtx ",
-        "gtx ",
-    ] {
+    for prefix in ["nvidia ", "geforce ", "tesla ", "quadro ", "rtx ", "gtx "] {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest.trim_start().to_string();
         }
@@ -147,7 +92,7 @@ fn pick_primary_cuda_pos(ids: &[u32], vrams: &[u32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Schedulable compute unit: one accelerator (or CPU) the hypervisor can assign a job to.
+/// Schedulable compute unit: one accelerator (or CPU) the supervisor can assign a job to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeSlot {
     pub id: String,
@@ -560,7 +505,11 @@ pub fn build_tp_card_for_group(
         pool_devices,
         PoolStrategy::TensorParallel,
         total,
-        format!("Virtual {} ({} GPUs)", format_vram(total), physical_cuda_ids.len()),
+        format!(
+            "Virtual {} ({} GPUs)",
+            format_vram(total),
+            physical_cuda_ids.len()
+        ),
         vram_proportions(&vrams),
         llama_ids,
         false,
@@ -570,19 +519,8 @@ pub fn build_tp_card_for_group(
 /// Apply CUDA_VISIBLE_DEVICES / GGML_VK_VISIBLE_DEVICES for a worker before llama init.
 ///
 /// CpuOnly workers must hide **both** CUDA and Vulkan. Hiding only CUDA still lets
-/// ggml-vulkan see NVIDIA devices and allocate VRAM — under concurrent CUDA offload
+/// ggml-vulkan see NVIDIA devices and allocate VRAM: under concurrent CUDA offload
 /// that OOMs (`ErrorOutOfDeviceMemory`) and damages the machine.
-/// Legacy helper: pin CUDA devices and hide Vulkan (CUDA worker default).
-#[allow(dead_code)]
-pub fn apply_slot_cuda_visibility(cuda_visible: &[u32]) {
-    let strategy = if cuda_visible.is_empty() {
-        PoolStrategy::CpuOnly
-    } else {
-        PoolStrategy::Single
-    };
-    apply_slot_backend_visibility(strategy, cuda_visible);
-}
-
 pub fn apply_slot_backend_visibility(strategy: PoolStrategy, cuda_visible: &[u32]) {
     match strategy {
         PoolStrategy::Vulkan => {
@@ -748,7 +686,7 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
             )
         };
 
-    // Offload budgets are for the primary GPU (largest), even on TP pools — cascade
+    // Offload budgets are for the primary GPU (largest), even on TP pools: cascade
     // offload tiers always pin a single device.
     let budget_vram = if !cuda_vram.is_empty() {
         cuda_vram.iter().copied().max().unwrap_or(1)
@@ -772,7 +710,7 @@ pub fn build_virtual_card(devices: &[ComputeDevice]) -> Result<VirtualCard> {
     })
 }
 
-/// AMD discrete, Intel Arc, or integrated GPUs — served via Vulkan when CUDA is absent.
+/// AMD discrete, Intel Arc, or integrated GPUs: served via Vulkan when CUDA is absent.
 pub fn is_vulkan_accelerator(device: &ComputeDevice) -> bool {
     if is_metal_accelerator(device) {
         return false;
@@ -801,7 +739,7 @@ fn effective_vram_gb(device: &ComputeDevice) -> u32 {
         return v;
     }
     match device.kind.as_str() {
-        // Soft estimate for shared iGPU memory — cascade + RAM checks are the real gate.
+        // Soft estimate for shared iGPU memory: cascade + RAM checks are the real gate.
         "integrated" => 2,
         "discrete" | "metal" => 1,
         _ => 0,
@@ -906,10 +844,7 @@ fn pin_cuda_indices_to_pci_bus() {
 
 fn vram_proportions(vram_gb: &[u32]) -> Vec<f32> {
     let total = vram_gb.iter().copied().sum::<u32>().max(1) as f32;
-    vram_gb
-        .iter()
-        .map(|gb| *gb as f32 / total)
-        .collect()
+    vram_gb.iter().map(|gb| *gb as f32 / total).collect()
 }
 
 #[cfg(test)]
@@ -1090,17 +1025,15 @@ mod tests {
 
     #[test]
     fn integrated_only_uses_vulkan_when_feature_enabled() {
-        let card = build_virtual_card(&[
-            ComputeDevice {
-                id: "pci:0".into(),
-                kind: "integrated".into(),
-                name: "Intel UHD Graphics".into(),
-                vram_gb: None,
-                vram_used_gb: None,
-                util_pct: None,
-                enabled: true,
-            },
-        ])
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "pci:0".into(),
+            kind: "integrated".into(),
+            name: "Intel UHD Graphics".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
         .unwrap();
 
         if vulkan_runtime_supported() {
@@ -1280,7 +1213,9 @@ mod tests {
             .filter(|s| s.kind == "discrete_cuda")
             .collect();
         assert_eq!(cuda.len(), 2);
-        assert!(cuda.iter().all(|s| s.tp_group.as_deref() == Some("cuda-tp-0")));
+        assert!(cuda
+            .iter()
+            .all(|s| s.tp_group.as_deref() == Some("cuda-tp-0")));
     }
 
     #[test]
@@ -1350,7 +1285,13 @@ mod tests {
     #[test]
     fn cuda_slot_visibility_uses_pci_bus_order() {
         apply_slot_backend_visibility(PoolStrategy::Single, &[1]);
-        assert_eq!(std::env::var("CUDA_DEVICE_ORDER").ok().as_deref(), Some("PCI_BUS_ID"));
-        assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(), Some("1"));
+        assert_eq!(
+            std::env::var("CUDA_DEVICE_ORDER").ok().as_deref(),
+            Some("PCI_BUS_ID")
+        );
+        assert_eq!(
+            std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(),
+            Some("1")
+        );
     }
 }

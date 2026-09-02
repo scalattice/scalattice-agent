@@ -48,7 +48,7 @@ pub async fn install_latest_update() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         // Replacing only the Mach-O inside a notarized .app invalidates the
-        // bundle signature — Gatekeeper then shows "Unable to open the
+        // bundle signature. Gatekeeper then shows "Unable to open the
         // application". Install the whole signed DMG instead (same artifact as
         // a manual download).
         println!(
@@ -167,15 +167,9 @@ fn macos_applications_app() -> PathBuf {
 async fn download_macos_dmg(tag: &str) -> Result<PathBuf> {
     let latest = fetch_latest_release().await?;
     let dmg_name = macos_dmg_name();
-    let expected = latest
-        .checksums
-        .get(dmg_name)
-        .cloned()
-        .with_context(|| {
-            format!(
-                "Cloud release {tag} has no SHA-256 checksum for {dmg_name}; refusing to update"
-            )
-        })?;
+    let expected = latest.checksums.get(dmg_name).cloned().with_context(|| {
+        format!("Cloud release {tag} has no SHA-256 checksum for {dmg_name}; refusing to update")
+    })?;
     let work = update_work_dir(tag)?;
     fs::create_dir_all(&work).context("create update work directory")?;
     let dmg_path = work.join(dmg_name);
@@ -204,12 +198,7 @@ fn apply_macos_dmg_update(dmg: &Path) -> Result<()> {
     fs::create_dir_all(&mount).context("create DMG mount point")?;
 
     let attach = Command::new("hdiutil")
-        .args([
-            "attach",
-            "-nobrowse",
-            "-readonly",
-            "-mountpoint",
-        ])
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
         .arg(&mount)
         .arg(dmg)
         .output()
@@ -256,8 +245,7 @@ fn apply_macos_dmg_update(dmg: &Path) -> Result<()> {
         let backup = dest.with_extension(format!("app.bak.{}", std::process::id()));
         let _ = fs::remove_dir_all(&backup);
         if dest.exists() {
-            fs::rename(&dest, &backup)
-                .with_context(|| format!("move aside {}", dest.display()))?;
+            fs::rename(&dest, &backup).with_context(|| format!("move aside {}", dest.display()))?;
         }
         if let Err(err) = fs::rename(&staged, &dest) {
             if backup.exists() {
@@ -397,7 +385,7 @@ fn extract_tarball_rust(archive: &Path, dest: &Path) -> Result<()> {
         .unpack(dest)
         .with_context(|| format!("unpack release archive into {}", dest.display()))?;
 
-    // Some releases nest files under a top-level directory — flatten one level if needed.
+    // Some releases nest files under a top-level directory: flatten one level if needed.
     let direct_bin = dest.join("scalattice-agent");
     if direct_bin.is_file() {
         return Ok(());
@@ -471,10 +459,10 @@ fn apply_update(staging: &Path) -> Result<()> {
     }
 
     // Remote/website update runs inside `foreground` (the live agent). Stopping the
-    // systemd/launchd unit here kills this process before the binary is replaced —
+    // systemd/launchd unit here kills this process before the binary is replaced  - 
     // that is why Linux force-update from the dashboard failed while Windows
     // (detached installer) worked. CLI `scalattice-agent update` is a separate
-    // process and should still stop the service first — but only once we are
+    // process and should still stop the service first: but only once we are
     // ready to replace files (download already finished above).
     let self_replace = running_as_live_agent();
     let tray_update = crate::service::in_tray_process();
@@ -483,7 +471,7 @@ fn apply_update(staging: &Path) -> Result<()> {
     }
 
     // Linux: rename over ~/.local/bin is enough (systemd unit points there).
-    // macOS: launchd often execs the .app bundle binary, not ~/.local/bin —
+    // macOS: launchd often execs the .app bundle binary, not ~/.local/bin  - 
     // replacing only install_dir left KeepAlive restarting the old image.
     let targets = unix_agent_install_targets().context("resolve install targets")?;
     let mut replaced = 0usize;

@@ -1,5 +1,5 @@
 # Inventory CPU + GPUs for the Scalattice Agent installer (Inno Setup).
-# Uses only built-in Windows APIs — no nvidia-smi / CUDA / vendor SDKs required.
+# Uses only built-in Windows APIs: no nvidia-smi / CUDA / vendor SDKs required.
 param(
     [Parameter(Mandatory = $true)][string]$OutFile
 )
@@ -187,7 +187,7 @@ function Get-VideoControllers {
                 VramMb        = 0
                 DriverOk      = $driverOk
                 DriverVersion = $driverVer
-                # Stable unique id — identical card names (e.g. 2x T400) must not collapse.
+                # Stable unique id: identical card names (e.g. 2x T400) must not collapse.
                 InstanceId    = if ($pnp) { $pnp.Trim() } else { "$($name.Trim())|$($list.Count)" }
             }
         }

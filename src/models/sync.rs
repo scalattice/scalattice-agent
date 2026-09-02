@@ -1,6 +1,8 @@
 use crate::compute_pool::VirtualCard;
 use crate::models::capacity::can_host_model;
-use crate::models::download::{download_catalog_model, is_no_space_error, is_retryable_transfer_error};
+use crate::models::download::{
+    download_catalog_model, is_no_space_error, is_retryable_transfer_error,
+};
 use crate::models::storage::{
     catalog_model_weights_ready, purge_failed_download, purge_incomplete_model_weights,
 };
@@ -64,8 +66,7 @@ pub fn spawn_catalog_sync(
                 continue;
             }
             state::set_downloading_model(Some(&model.model_id));
-            let result =
-                download_catalog_model(&model, &agent_token, hf_token.as_deref()).await;
+            let result = download_catalog_model(&model, &agent_token, hf_token.as_deref()).await;
             state::set_downloading_model(None);
             if cancel.load(Ordering::Relaxed) {
                 purge_incomplete_model_weights(runtime_model);
@@ -81,10 +82,7 @@ pub fn spawn_catalog_sync(
                     );
                 } else {
                     purge_failed_download(runtime_model);
-                    warn!(
-                        "model download failed for {}: {err:#}",
-                        model.model_id
-                    );
+                    warn!("model download failed for {}: {err:#}", model.model_id);
                 }
                 if is_no_space_error(&err) {
                     crate::state::set_disk_full(true);

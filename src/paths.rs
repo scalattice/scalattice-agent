@@ -107,7 +107,11 @@ pub fn agent_log_path() -> Result<PathBuf> {
 
     #[cfg(unix)]
     {
-        Ok(home_dir()?.join(".local").join("share").join("scalattice").join("agent.log"))
+        Ok(home_dir()?
+            .join(".local")
+            .join("share")
+            .join("scalattice")
+            .join("agent.log"))
     }
 }
 
@@ -310,7 +314,9 @@ mod tests {
     #[test]
     fn unix_install_targets_include_local_bin() {
         let targets = unix_agent_install_targets().expect("targets");
-        let expected = install_dir().expect("install dir").join(agent_binary_name());
+        let expected = install_dir()
+            .expect("install dir")
+            .join(agent_binary_name());
         assert!(
             targets
                 .iter()

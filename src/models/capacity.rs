@@ -24,18 +24,6 @@ pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
     gb_ceil(model.min_vram_gb)
 }
 
-/// KV/compute overhead reserved on top of GGUF weight for a GPU-full placement.
-/// Prefer [`gpu_full_host_need_gb`] — this is only the unknown-shape catalog extra
-/// at 4k for an ~8B Q4 (kept as a name so older comments still grep).
-#[allow(dead_code)]
-pub const GPU_FULL_HEADROOM_GB: f64 = 2.0;
-
-/// VRAM a slot must have free to count as a **full** GPU host.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn gpu_full_host_need_gb(model: &CatalogModel) -> f64 {
-    gpu_full_host_need_gb_for_job(model, false)
-}
-
 pub fn gpu_full_host_need_gb_for_job(model: &CatalogModel, need_vision: bool) -> f64 {
     let n_ctx = super::vram_plan::job_n_ctx(model, need_vision);
     let weight = model
@@ -66,7 +54,7 @@ pub fn gpu_full_host_need_gb_for_job(model: &CatalogModel, need_vision: bool) ->
 }
 
 /// True when `available_gb` (live free, else advertised) can take weights + KV
-/// without CPU offload. Float slop only — not a 50 MB “maybe it fits” gift.
+/// without CPU offload. Float slop only: not a 50 MB "maybe it fits" gift.
 pub fn vram_can_gpu_full(
     available_gb: f64,
     model: &CatalogModel,
@@ -79,22 +67,7 @@ pub fn vram_can_gpu_full(
     available_gb + 0.005 >= gpu_full_host_need_gb_for_job(model, need_vision)
 }
 
-/// Nameplate helper for tests and callers that only have advertised GB.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn advertised_vram_can_gpu_full(
-    advertised_vram_gb: u32,
-    model: &CatalogModel,
-    catalog_min_vram: u32,
-) -> bool {
-    vram_can_gpu_full(
-        f64::from(advertised_vram_gb),
-        model,
-        catalog_min_vram,
-        false,
-    )
-}
-
-/// GPU floor for image jobs — catalog `minVramGbVision` from the server.
+/// GPU floor for image jobs: catalog `minVramGbVision` from the server.
 pub fn image_job_min_vram_gb(model: &CatalogModel) -> u32 {
     if !model_is_vision(model) {
         return hosting_min_vram_gb(model);
@@ -106,18 +79,12 @@ pub fn image_job_min_vram_gb(model: &CatalogModel) -> u32 {
     hosting_min_vram_gb(model)
 }
 
-#[allow(dead_code)]
-pub fn resolve_min_vram_gb_vision(model: &CatalogModel) -> u32 {
-    image_job_min_vram_gb(model)
-}
-
 pub fn can_serve_vision_on_card(model: &CatalogModel, card: &VirtualCard) -> bool {
     let need = image_job_min_vram_gb(model);
     if need == 0 {
         return true;
     }
-    card.total_vram_gb >= need
-        && !matches!(card.strategy, PoolStrategy::CpuOnly)
+    card.total_vram_gb >= need && !matches!(card.strategy, PoolStrategy::CpuOnly)
 }
 
 /// True if any independent slot or homogeneous TP group can run image jobs for this model.
@@ -172,9 +139,14 @@ pub fn can_host_model(
     // Partial accelerator VRAM: full-GPU may OOM, but offload cascade can still serve.
     let has_accelerator = matches!(
         card.strategy,
-        PoolStrategy::Single | PoolStrategy::TensorParallel | PoolStrategy::Vulkan | PoolStrategy::Metal
+        PoolStrategy::Single
+            | PoolStrategy::TensorParallel
+            | PoolStrategy::Vulkan
+            | PoolStrategy::Metal
     );
-    if has_accelerator && (card.total_vram_gb >= 4 || card.uses_vulkan || card.strategy == PoolStrategy::Metal) {
+    if has_accelerator
+        && (card.total_vram_gb >= 4 || card.uses_vulkan || card.strategy == PoolStrategy::Metal)
+    {
         return ram_gb >= ram_needed;
     }
 
@@ -289,13 +261,13 @@ mod tests {
     #[test]
     fn gpu_full_need_uses_plan_not_catalog_floor() {
         let qwen = catalog(4.0, 4.68, 8.0);
-        let need = gpu_full_host_need_gb(&qwen);
+        let need = gpu_full_host_need_gb_for_job(&qwen, false);
         assert!(need > 6.0, "{need}");
         assert!(need < 8.0, "{need}");
-        assert!(!advertised_vram_can_gpu_full(6, &qwen, 4));
-        assert!(advertised_vram_can_gpu_full(10, &qwen, 4));
+        assert!(!vram_can_gpu_full(6.0, &qwen, 4, false));
+        assert!(vram_can_gpu_full(10.0, &qwen, 4, false));
         let eight_gb_ok = catalog(8.0, 5.0, 8.0);
-        assert!(advertised_vram_can_gpu_full(8, &eight_gb_ok, 8));
+        assert!(vram_can_gpu_full(8.0, &eight_gb_ok, 8, false));
     }
 
     #[test]

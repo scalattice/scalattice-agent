@@ -74,7 +74,7 @@ pub fn classify_weight_load_error(err: &anyhow::Error) -> WeightLoadKind {
     {
         return WeightLoadKind::ResourceLimit;
     }
-    // Disabled / undersized compute is not a bad GGUF — never quarantine for capacity.
+    // Disabled / undersized compute is not a bad GGUF: never quarantine for capacity.
     if is_capacity_or_device_error(&detail) {
         return WeightLoadKind::Other;
     }
@@ -93,7 +93,7 @@ pub fn classify_load_failure_for_path(
         return from_err;
     }
     let detail = format!("{err:#}").to_lowercase();
-    // Capacity / device failures must never fall through to the GGUF structural check —
+    // Capacity / device failures must never fall through to the GGUF structural check  - 
     // that path can false-positive and delete healthy weights after a GPU is disabled.
     if is_capacity_or_device_error(&detail) {
         crate::llm::evict_all();
@@ -147,7 +147,9 @@ fn write_weight_health(runtime_model: &str, state: &str, error: Option<&str>) {
     let _ = std::fs::create_dir_all(&dir);
     let payload = HealthFile {
         state: state.to_string(),
-        error: error.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        error: error
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         at: Some(chrono_like_now()),
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
@@ -168,8 +170,7 @@ fn chrono_like_now() -> String {
 /// User-facing, path-free reason for dashboard/email.
 pub fn sanitize_weight_error(err: &anyhow::Error) -> String {
     let detail = format!("{err:#}").to_lowercase();
-    if detail.contains("not within the file bounds") || detail.contains("corrupted or incomplete")
-    {
+    if detail.contains("not within the file bounds") || detail.contains("corrupted or incomplete") {
         return "Weights file is corrupted or incomplete.".to_string();
     }
     if detail.contains("unexpected eof") || detail.contains("unexpected end of file") {
@@ -246,7 +247,9 @@ pub fn should_skip_preload(runtime_model: &str) -> bool {
         return true;
     }
     if matches!(
-        read_weight_health(runtime_model).as_ref().map(|(s, _)| s.as_str()),
+        read_weight_health(runtime_model)
+            .as_ref()
+            .map(|(s, _)| s.as_str()),
         Some("corrupt") | Some("removing")
     ) {
         return true;

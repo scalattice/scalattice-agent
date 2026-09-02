@@ -19,8 +19,7 @@ pub fn loopback_http_override(key: &str) -> Option<String> {
 /// not `ws://127.0.0.1|localhost|::1` so a compromised env cannot redirect the
 /// fleet to an attacker.
 pub fn agent_ws_url() -> String {
-    loopback_override("SCALATTICE_WS_URL", &["ws"])
-        .unwrap_or_else(|| SCALATTICE_WS_URL.to_string())
+    loopback_override("SCALATTICE_WS_URL", &["ws"]).unwrap_or_else(|| SCALATTICE_WS_URL.to_string())
 }
 
 /// True when this process is the CI update smoke (isolated HOME, mock Cloud).
@@ -51,7 +50,10 @@ fn is_loopback_url(url: &str, schemes: &[&str]) -> bool {
     let Ok(parsed) = url::Url::parse(url.trim()) else {
         return false;
     };
-    if !schemes.iter().any(|s| parsed.scheme().eq_ignore_ascii_case(s)) {
+    if !schemes
+        .iter()
+        .any(|s| parsed.scheme().eq_ignore_ascii_case(s))
+    {
         return false;
     }
     matches!(
@@ -132,7 +134,11 @@ pub fn token_snippet(token: &str) -> String {
     if trimmed.len() <= 20 {
         return trimmed.to_string();
     }
-    format!("{}…{}", &trimmed[..20], &trimmed[trimmed.len().saturating_sub(4)..])
+    format!(
+        "{}…{}",
+        &trimmed[..20],
+        &trimmed[trimmed.len().saturating_sub(4)..]
+    )
 }
 
 pub fn read_saved_agent_token() -> Option<String> {
@@ -291,18 +297,9 @@ mod tests {
 
     #[test]
     fn loopback_rejects_non_loopback_and_tls() {
-        assert!(!is_loopback_url(
-            "https://127.0.0.1/api",
-            &["http"]
-        ));
-        assert!(!is_loopback_url(
-            "wss://127.0.0.1/ws",
-            &["ws"]
-        ));
-        assert!(!is_loopback_url(
-            "http://scalattice.cloud/api",
-            &["http"]
-        ));
+        assert!(!is_loopback_url("https://127.0.0.1/api", &["http"]));
+        assert!(!is_loopback_url("wss://127.0.0.1/ws", &["ws"]));
+        assert!(!is_loopback_url("http://scalattice.cloud/api", &["http"]));
         assert!(!is_loopback_url(
             "http://127.0.0.1.attacker.example/x",
             &["http"]

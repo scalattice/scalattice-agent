@@ -31,7 +31,7 @@ Silent install with token (IT/automation):
 ScalatticeAgentSetup-x86_64.exe /TOKEN=slt_provider_… /VERYSILENT
 ```
 
-**In-app / CLI update:** `scalattice-agent update` (and the tray Updates button) download the latest `ScalatticeAgentSetup-x86_64.exe` and launch the setup wizard. Finish the wizard to complete the upgrade — silent in-place replace is not used.
+**In-app / CLI update:** `scalattice-agent update` (and the tray Updates button) download the latest `ScalatticeAgentSetup-x86_64.exe` and launch the setup wizard. Finish the wizard to complete the upgrade: silent in-place replace is not used.
 
 **Reinstall / upgrade:** Setup stops any running Scalattice Agent (tray + background), clears the bundled `lib` folder, then installs fresh CUDA/runtime DLLs. If setup reports that libraries could not be replaced, quit the agent from the notification area or Task Manager and run setup again.
 

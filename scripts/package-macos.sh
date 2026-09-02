@@ -24,11 +24,11 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   exit 1
 fi
 if [[ ! -f "$BIN" && "$DMG_FROM_APP" -eq 0 ]]; then
-  echo "Missing $BIN — build the Metal binary first." >&2
+  echo "Missing $BIN: build the Metal binary first." >&2
   exit 1
 fi
 if [[ "$DMG_FROM_APP" -eq 1 && ! -d "$APP" ]]; then
-  echo "Missing $APP — run package-macos.sh before --dmg-from-app." >&2
+  echo "Missing $APP: run package-macos.sh before --dmg-from-app." >&2
   exit 1
 fi
 

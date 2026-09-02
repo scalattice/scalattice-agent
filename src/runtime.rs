@@ -1,4 +1,4 @@
-use crate::hypervisor::SlotStatus;
+use crate::supervisor::SlotStatus;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -82,7 +82,7 @@ pub fn build_runtime(
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
     // Report real busyness for dashboards. Routing uses claim slots / idleSlots,
-    // not this flag — forcing Idle whenever any slot (often cpu-0) was free hid
+    // not this flag: forcing Idle whenever any slot (often cpu-0) was free hid
     // active GPU jobs as "in the inference pool".
     // idle_slots==0 alone used to mark Busy forever when a worker was checked out
     // by an abandoned invoke; prefer the session job flag, and only use empty
@@ -109,7 +109,7 @@ pub fn build_runtime(
     );
     let disk_full = crate::state::disk_full();
     if disk_full && downloading_model.is_none() && reported_state != JobState::Busy {
-        status_label = "Disk full — paused model downloads".to_string();
+        status_label = "Disk full: paused model downloads".to_string();
     }
 
     AgentRuntime {
@@ -183,7 +183,7 @@ fn status_label(
             if idle_slots < total_slots {
                 return format!("Running {model} · {idle_slots}/{total_slots} slots free");
             }
-            // Slot cache still shows all idle — the job has started; don't say Ready.
+            // Slot cache still shows all idle: the job has started; don't say Ready.
             return format!("Running {model}");
         }
         return format!("Running {model}");

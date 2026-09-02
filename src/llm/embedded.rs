@@ -7,13 +7,13 @@ use crate::compute_pool::{
 use crate::protocol::ChatMessage;
 use anyhow::{anyhow, Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::LogOptions;
-use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::LogOptions;
 use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -49,9 +49,9 @@ fn backend_init_timeout() -> Duration {
 
 fn backend_timeout_message() -> &'static str {
     if cfg!(target_os = "macos") {
-        "timed out initializing llama.cpp Metal — first GPU setup can take a while; will keep trying"
+        "timed out initializing llama.cpp Metal: first GPU setup can take a while; will keep trying"
     } else {
-        "timed out initializing llama.cpp — update the NVIDIA driver or use CPU-only models"
+        "timed out initializing llama.cpp: update the NVIDIA driver or use CPU-only models"
     }
 }
 
@@ -168,10 +168,6 @@ pub(crate) fn backend() -> Result<&'static LlamaBackend> {
         .map_err(|err| anyhow::anyhow!(err.clone()))
 }
 
-pub fn generate(config: &GenerateConfig) -> Result<GenerateOutput> {
-    generate_with_callback(config, |_| {})
-}
-
 pub fn generate_with_callback(
     config: &GenerateConfig,
     mut on_token: impl FnMut(&str),
@@ -214,14 +210,8 @@ pub fn generate_with_callback(
                     anyhow!("image input requested but mmproj did not initialize")
                 })?;
                 let used_template = model.chat_template(None).is_ok();
-                let (prompt_tokens, next_pos) = prefill_vision(
-                    model,
-                    mtmd,
-                    &ctx,
-                    &prompt,
-                    &config.messages,
-                    !used_template,
-                )?;
+                let (prompt_tokens, next_pos) =
+                    prefill_vision(model, mtmd, &ctx, &prompt, &config.messages, !used_template)?;
                 if prompt_tokens as usize + max_tokens > ctx.n_ctx() as usize {
                     anyhow::bail!(
                         "prompt too long for context window ({} + {} > {})",
@@ -345,11 +335,7 @@ pub fn generate_with_callback(
 }
 
 pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelParams> {
-    let ggml_devices: Vec<usize> = pool
-        .cuda_device_ids
-        .iter()
-        .map(|id| *id as usize)
-        .collect();
+    let ggml_devices: Vec<usize> = pool.cuda_device_ids.iter().map(|id| *id as usize).collect();
 
     let mut model_params = LlamaModelParams::default();
 
@@ -394,7 +380,7 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
 /// Full Vulkan placement: pin ggml Vulkan GPU/iGPU indices when the backend exposes them.
 ///
 /// If enumeration is empty (no ICD / wrong build), still request GPU layers and let
-/// llama.cpp choose — cascade falls to CPU on failure.
+/// llama.cpp choose: cascade falls to CPU on failure.
 fn vulkan_full_params() -> Result<LlamaModelParams> {
     let indices = vulkan_ggml_device_indices();
     let mut params = LlamaModelParams::default().with_use_mmap(true);
@@ -587,18 +573,14 @@ pub(crate) fn load_model_for_pool_starting_at(
                 // llama-cpp-2 often only returns "null result from llama cpp" even when
                 // the log line said "tensor … not within the file bounds". Attach that
                 // so health quarantine / model_load_failed classify correctly.
-                if crate::models::gguf_payload_in_bounds(model_path).unwrap_or(true) == false
-                {
-                    wrapped = wrapped.context(
-                        "corrupted or incomplete GGUF (tensor payloads exceed file size)",
-                    );
+                if crate::models::gguf_payload_in_bounds(model_path).unwrap_or(true) == false {
+                    wrapped = wrapped
+                        .context("corrupted or incomplete GGUF (tensor payloads exceed file size)");
                 }
                 let gpu_oom = label != "cpu-only" && is_gpu_alloc_failure(&wrapped);
                 last_err = Some(wrapped);
                 if gpu_oom {
-                    warn!(
-                        "GPU load '{label}' hit VRAM/CUDA failure; skipping remaining GPU tiers"
-                    );
+                    warn!("GPU load '{label}' hit VRAM/CUDA failure; skipping remaining GPU tiers");
                     skip_gpu = true;
                 }
             }
@@ -609,10 +591,7 @@ pub(crate) fn load_model_for_pool_starting_at(
 }
 
 /// mmap GGUF into RAM with no GPU layers. Used to keep idle models hot for a later VRAM load.
-pub(crate) fn load_cpu_mmap_model(
-    backend: &LlamaBackend,
-    model_path: &Path,
-) -> Result<LlamaModel> {
+pub(crate) fn load_cpu_mmap_model(backend: &LlamaBackend, model_path: &Path) -> Result<LlamaModel> {
     let params = super::progress::attach_llama_progress(
         LlamaModelParams::default()
             .with_use_mmap(true)
@@ -621,12 +600,6 @@ pub(crate) fn load_cpu_mmap_model(
     LlamaModel::load_from_file(backend, model_path, &params)
         .map_err(|err| anyhow!(err))
         .with_context(|| format!("cpu mmap load {}", model_path.display()))
-}
-
-/// Number of ordered load configurations for this pool / model.
-#[allow(dead_code)]
-pub(crate) fn load_candidate_count(pool: &VirtualCard, model_path: &Path) -> Result<usize> {
-    Ok(load_param_candidates(pool, Some(model_path))?.len())
 }
 
 /// Label for the load candidate at `index`, if any.
@@ -722,11 +695,8 @@ pub(crate) fn cuda_devices_compatible_for_tp(pool: &VirtualCard) -> bool {
 
 /// Tensor-parallel gpu-full is safe for *this* model when GPUs are homogeneous and
 /// each can hold its weight slice plus local KV/compute overhead. Prefer single-GPU
-/// full when the model fits the largest card — TP is for models that need pooled VRAM.
-pub(crate) fn should_attempt_tensor_parallel(
-    pool: &VirtualCard,
-    weight_gb: Option<f64>,
-) -> bool {
+/// full when the model fits the largest card. TP is for models that need pooled VRAM.
+pub(crate) fn should_attempt_tensor_parallel(pool: &VirtualCard, weight_gb: Option<f64>) -> bool {
     if pool.cuda_device_ids.len() < 2 {
         return false;
     }
@@ -749,7 +719,7 @@ pub(crate) fn should_attempt_tensor_parallel(
     let min_v = f64::from(*vrams.iter().min().unwrap_or(&0));
     let total = f64::from(vrams.iter().copied().sum::<u32>());
 
-    // llama.cpp TP is not a perfect weight/n split — reserve overhead per device
+    // llama.cpp TP is not a perfect weight/n split: reserve overhead per device
     // and for the pool so we never ask CUDA for an allocation that abort()s.
     const PER_GPU_OVERHEAD_GB: f64 = 2.0;
     const TOTAL_OVERHEAD_GB: f64 = 2.0;
@@ -779,10 +749,7 @@ fn with_flash_attn_disabled(params: LlamaContextParams) -> LlamaContextParams {
 }
 
 /// Whether a greedy all-layers load on the *primary* GPU is safe to attempt.
-pub(crate) fn should_attempt_single_gpu_full(
-    pool: &VirtualCard,
-    weight_gb: Option<f64>,
-) -> bool {
+pub(crate) fn should_attempt_single_gpu_full(pool: &VirtualCard, weight_gb: Option<f64>) -> bool {
     let available = f64::from(primary_cuda_vram_gb(pool).max(1));
     match weight_gb {
         Some(w) if w > 0.05 => {
@@ -828,10 +795,10 @@ fn single_gpu_full_params(device: usize) -> Result<LlamaModelParams> {
         .with_n_gpu_layers(999))
 }
 
-/// Ordered load configurations — CUDA and Vulkan share the same ladder.
+/// Ordered load configurations. CUDA and Vulkan share the same ladder.
 ///
 /// For multi-GPU pools, TP gpu-full is only queued when the model fits per-GPU;
-/// otherwise we try largest-GPU full, then offload — never a blind TP that abort()s.
+/// otherwise we try largest-GPU full, then offload: never a blind TP that abort()s.
 fn load_param_candidates(
     pool: &VirtualCard,
     model_path: Option<&Path>,
@@ -844,6 +811,7 @@ fn load_param_candidates(
     load_param_candidates_with_plan(pool, weight, n_layer)
 }
 
+#[cfg(test)]
 fn load_param_candidates_with_weight(
     pool: &VirtualCard,
     weight_gb: Option<f64>,
@@ -938,10 +906,7 @@ fn load_param_candidates_with_plan(
             } else {
                 info!(
                     weight_gb = weight_gb.unwrap_or(-1.0),
-                    min_vram_gb = cuda_device_vram_gb(pool)
-                        .into_iter()
-                        .min()
-                        .unwrap_or(0),
+                    min_vram_gb = cuda_device_vram_gb(pool).into_iter().min().unwrap_or(0),
                     primary_vram_gb = available,
                     tp_compatible = cuda_devices_compatible_for_tp(pool),
                     "skipping gpu-full (model does not fit GPUs safely); starting at offload"
@@ -969,8 +934,8 @@ fn load_param_candidates_with_plan(
     // Offload layer count from *free* VRAM and weight, not nameplate. A 10 GB
     // 3080 with 1 GB free must not try 32-layer offload (CUDA abort). A 48 GB
     // Turing card with 17 GB free must not offload all 47 GLM layers.
-    let budget = offload_layers_for_available(available, weight_gb, n_layer)
-        .min(pool.gpu_layer_budget);
+    let budget =
+        offload_layers_for_available(available, weight_gb, n_layer).min(pool.gpu_layer_budget);
     if budget >= 1 && budget < 999 {
         match pool.strategy {
             PoolStrategy::Vulkan => {
@@ -993,10 +958,8 @@ fn load_param_candidates_with_plan(
                     candidates.push(("gpu-offload", cuda_offload_params(device, budget)?));
                     let reduced = (budget / 2).max(1);
                     if reduced < budget {
-                        candidates.push((
-                            "gpu-offload-reduced",
-                            cuda_offload_params(device, reduced)?,
-                        ));
+                        candidates
+                            .push(("gpu-offload-reduced", cuda_offload_params(device, reduced)?));
                     }
                 }
             }
@@ -1087,12 +1050,7 @@ mod tests {
             assert_eq!(pool.strategy, PoolStrategy::Single);
             assert_eq!(
                 cascade_labels(&pool, Some(4.0)),
-                vec![
-                    "gpu-full",
-                    "gpu-offload",
-                    "gpu-offload-reduced",
-                    "cpu-only",
-                ]
+                vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
             );
         }
     }
@@ -1101,7 +1059,7 @@ mod tests {
     fn small_vram_skips_gpu_full_when_weights_do_not_fit() {
         let pool = gpu_and_cpu(4);
         assert_eq!(pool.strategy, PoolStrategy::Single);
-        // ~5GB Q4 8B on 4GB card — must not attempt gpu-full (CUDA abort risk).
+        // ~5GB Q4 8B on 4GB card: must not attempt gpu-full (CUDA abort risk).
         assert_eq!(
             cascade_labels(&pool, Some(4.7)),
             vec!["gpu-offload", "gpu-offload-reduced", "cpu-only"]
@@ -1115,12 +1073,7 @@ mod tests {
         assert!(should_attempt_gpu_full(&pool, Some(4.68)));
         assert_eq!(
             cascade_labels(&pool, Some(4.68)),
-            vec![
-                "gpu-full",
-                "gpu-offload",
-                "gpu-offload-reduced",
-                "cpu-only",
-            ]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
         );
     }
 
@@ -1149,12 +1102,7 @@ mod tests {
         assert!(should_attempt_single_gpu_full(&pool, Some(1.2)));
         assert_eq!(
             cascade_labels(&pool, Some(1.2)),
-            vec![
-                "gpu-full",
-                "gpu-offload",
-                "gpu-offload-reduced",
-                "cpu-only",
-            ]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
         );
     }
 
@@ -1166,12 +1114,7 @@ mod tests {
         assert!(!should_attempt_tensor_parallel(&pool, Some(20.0)));
         assert_eq!(
             cascade_labels(&pool, Some(20.0)),
-            vec![
-                "gpu-full",
-                "gpu-offload",
-                "gpu-offload-reduced",
-                "cpu-only",
-            ]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
         );
     }
 
@@ -1183,12 +1126,7 @@ mod tests {
         assert!(should_attempt_tensor_parallel(&pool, Some(30.0)));
         assert_eq!(
             cascade_labels(&pool, Some(30.0)),
-            vec![
-                "gpu-full",
-                "gpu-offload",
-                "gpu-offload-reduced",
-                "cpu-only",
-            ]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
         );
     }
 
@@ -1210,12 +1148,7 @@ mod tests {
         assert_eq!(pool.strategy, PoolStrategy::TensorParallel);
         assert_eq!(
             cascade_labels(&pool, Some(4.0)),
-            vec![
-                "gpu-full",
-                "gpu-offload",
-                "gpu-offload-reduced",
-                "cpu-only",
-            ]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
         );
         assert!(!should_attempt_tensor_parallel(&pool, Some(4.0)));
         assert!(should_attempt_single_gpu_full(&pool, Some(4.0)));
@@ -1274,27 +1207,20 @@ mod tests {
         if !vulkan_runtime_supported() {
             return;
         }
-        let pool = build_virtual_card(&[
-            ComputeDevice {
-                id: "amd:0".into(),
-                kind: "discrete".into(),
-                name: "AMD Radeon RX 6800".into(),
-                vram_gb: Some(16),
-                vram_used_gb: None,
-                util_pct: None,
-                enabled: true,
-            },
-        ])
+        let pool = build_virtual_card(&[ComputeDevice {
+            id: "amd:0".into(),
+            kind: "discrete".into(),
+            name: "AMD Radeon RX 6800".into(),
+            vram_gb: Some(16),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
         .unwrap();
         assert_eq!(pool.strategy, PoolStrategy::Vulkan);
         assert_eq!(
             cascade_labels(&pool, Some(4.0)),
-            vec![
-                "gpu-full",
-                "gpu-offload",
-                "gpu-offload-reduced",
-                "cpu-only",
-            ]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
         );
     }
 
@@ -1310,12 +1236,15 @@ mod tests {
 
     #[test]
     fn glm_flash_offload_does_not_claim_all_layers_on_partial_free() {
-        // 19.8 GB MoE, 47 layers, 17 GB live free — must leave KV/compute room.
+        // 19.8 GB MoE, 47 layers, 17 GB live free: must leave KV/compute room.
         let n = offload_layers_for_available(17, Some(19.77), Some(47));
         assert!(n > 0, "{n}");
         assert!(n < 47, "would dump all layers into 17 GB free, got {n}");
         let guessed = offload_layers_for_available(17, Some(19.77), None);
-        assert!(guessed < 47, "missing shape must not dump all layers, got {guessed}");
+        assert!(
+            guessed < 47,
+            "missing shape must not dump all layers, got {guessed}"
+        );
         assert!(estimated_n_layer(19.77) < 47);
         assert_eq!(estimated_n_layer(4.7), 9);
     }

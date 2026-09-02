@@ -60,17 +60,15 @@ pub fn split_lower(config: &SplitLowerConfig) -> Result<SplitLowerOutput> {
                 .add(*token, pos as i32, &[0], pos == last)
                 .context("add prompt token to batch")?;
         }
-        ctx.decode(&mut batch).context("decode prompt for split lower")?;
+        ctx.decode(&mut batch)
+            .context("decode prompt for split lower")?;
 
-        let state_path = std::env::temp_dir().join(format!(
-            "scalattice-split-lower-{}.bin",
-            std::process::id()
-        ));
+        let state_path =
+            std::env::temp_dir().join(format!("scalattice-split-lower-{}.bin", std::process::id()));
         ctx.state_save_file(&state_path, &prompt_tokens)
             .with_context(|| format!("save split state to {}", state_path.display()))?;
-        let state_bytes = std::fs::read(&state_path).with_context(|| {
-            format!("read split state file {}", state_path.display())
-        })?;
+        let state_bytes = std::fs::read(&state_path)
+            .with_context(|| format!("read split state file {}", state_path.display()))?;
         let _ = std::fs::remove_file(&state_path);
 
         Ok(SplitLowerOutput {
@@ -94,10 +92,8 @@ pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
         let state_bytes = STANDARD
             .decode(config.state_b64.trim())
             .context("decode split state blob")?;
-        let state_path = std::env::temp_dir().join(format!(
-            "scalattice-split-upper-{}.bin",
-            std::process::id()
-        ));
+        let state_path =
+            std::env::temp_dir().join(format!("scalattice-split-upper-{}.bin", std::process::id()));
         std::fs::write(&state_path, state_bytes)
             .with_context(|| format!("write split state {}", state_path.display()))?;
 
@@ -113,19 +109,20 @@ pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
         }
 
         let max_tokens = config.max_tokens.max(1).min(8192);
-        let last = *restored.last().context("restored context missing last token")?;
+        let last = *restored
+            .last()
+            .context("restored context missing last token")?;
         let mut position = restored.len() as i32;
 
         let mut batch = LlamaBatch::new(1, 1);
         batch
             .add(last, position, &[0], true)
             .context("replay last token for split upper")?;
-        ctx.decode(&mut batch).context("replay decode for split upper")?;
+        ctx.decode(&mut batch)
+            .context("replay decode for split upper")?;
 
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::dist(0x5CA1A7CE),
-            LlamaSampler::greedy(),
-        ]);
+        let mut sampler =
+            LlamaSampler::chain_simple([LlamaSampler::dist(0x5CA1A7CE), LlamaSampler::greedy()]);
 
         let mut content = String::new();
         let mut generated = 0u32;

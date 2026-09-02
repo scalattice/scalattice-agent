@@ -11,7 +11,10 @@ const UPDATE_LABEL: &str = "com.scalattice.agent.update";
 const TRAY_LABEL: &str = "com.scalattice.agent.tray";
 
 pub fn background_status() -> BackgroundStatus {
-    if !launch_agent_plist_path_home().map(|p| p.is_file()).unwrap_or(false) {
+    if !launch_agent_plist_path_home()
+        .map(|p| p.is_file())
+        .unwrap_or(false)
+    {
         return BackgroundStatus::NotInstalled;
     }
     if service_active() {
@@ -25,12 +28,6 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     ensure_service_running(config)
 }
 
-#[allow(dead_code)]
-pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
-    restart_background_from_config(config)
-}
-
-#[allow(dead_code)]
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     let _ = crate::service::persist_agent_token(&config.token)?;
     write_launch_agent()?;
@@ -196,7 +193,8 @@ fn write_launch_agent() -> Result<()> {
     let plist_path = launch_agent_plist_path()?;
     let bin = resolve_agent_binary()?;
     let env_pairs = parse_agent_env()?;
-    let mut env_xml = String::from("        <key>SCALATTICE_LAUNCHD</key>\n        <string>1</string>\n");
+    let mut env_xml =
+        String::from("        <key>SCALATTICE_LAUNCHD</key>\n        <string>1</string>\n");
     for (k, v) in env_pairs {
         env_xml.push_str(&format!(
             "        <key>{}</key>\n        <string>{}</string>\n",
@@ -206,7 +204,9 @@ fn write_launch_agent() -> Result<()> {
     }
     let path_prefix = format!(
         "{}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-        bin.parent().unwrap_or(Path::new("/usr/local/bin")).display()
+        bin.parent()
+            .unwrap_or(Path::new("/usr/local/bin"))
+            .display()
     );
     env_xml.push_str(&format!(
         "        <key>PATH</key>\n        <string>{}</string>\n",
@@ -216,7 +216,11 @@ fn write_launch_agent() -> Result<()> {
     let log_dir = crate::paths::agent_log_path()?
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| crate::paths::home_dir().unwrap_or_default().join("Library/Logs"));
+        .unwrap_or_else(|| {
+            crate::paths::home_dir()
+                .unwrap_or_default()
+                .join("Library/Logs")
+        });
     fs::create_dir_all(&log_dir).ok();
     let stdout_log = log_dir.join("launchd.out.log");
     let stderr_log = log_dir.join("launchd.err.log");
@@ -262,9 +266,7 @@ fn write_launch_agent() -> Result<()> {
 }
 
 fn write_tray_plist() -> Result<()> {
-    let bin = resolve_agent_binary().unwrap_or_else(|_| {
-        crate::paths::bundled_macos_agent_binary()
-    });
+    let bin = resolve_agent_binary().unwrap_or_else(|_| crate::paths::bundled_macos_agent_binary());
     let plist_path = tray_plist_path()?;
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

@@ -30,35 +30,6 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     ensure_service_running(config)
 }
 
-#[allow(dead_code)]
-pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
-    restart_background_from_config(config)
-}
-
-#[allow(dead_code)]
-pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
-    if !background_service_available() {
-        return ensure_service_running(config);
-    }
-
-    let os_home = crate::paths::os_user_home()?;
-    let data_home = crate::paths::home_dir()?;
-    let unit_path = systemd_user_unit_path(&os_home);
-    let _ = crate::service::persist_agent_token(&config.token)?;
-    let _ = write_user_unit(&os_home, &data_home)?;
-    sync_systemd_env_file(&data_home)?;
-    run_systemctl(&["--user", "daemon-reload"])?;
-
-    if unit_path.is_file() {
-        run_systemctl(&["--user", "restart", UNIT_NAME])?;
-    } else {
-        run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
-    }
-
-    verify_service_active()?;
-    Ok(())
-}
-
 pub fn invoked_by_systemd() -> bool {
     std::env::var("INVOCATION_ID").is_ok() || std::env::var("JOURNAL_STREAM").is_ok()
 }
@@ -116,25 +87,14 @@ pub fn follow_service_logs(verbose: bool) -> Result<()> {
     }
 
     let mut child = Command::new("journalctl")
-        .args([
-            "--user",
-            "-f",
-            "-u",
-            UNIT_NAME,
-            "-n",
-            "30",
-            "--no-pager",
-        ])
+        .args(["--user", "-f", "-u", UNIT_NAME, "-n", "30", "--no-pager"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .context("failed to run journalctl")?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .context("journalctl stdout missing")?;
+    let stdout = child.stdout.take().context("journalctl stdout missing")?;
     crate::logging::pipe_log_lines(stdout, verbose)?;
 
     match child.wait().context("wait for journalctl")?.code() {
@@ -226,7 +186,9 @@ fn write_user_unit(os_home: &Path, data_home: &Path) -> Result<bool> {
     let systemd_env = systemd_env_path(data_home);
     let path_prefix = format!(
         "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        bin.parent().unwrap_or(Path::new("/usr/local/bin")).display()
+        bin.parent()
+            .unwrap_or(Path::new("/usr/local/bin"))
+            .display()
     );
     let home_override = if os_home != data_home {
         format!("Environment=SCALATTICE_HOME={}\n", data_home.display())
@@ -378,10 +340,7 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 }
 
 fn try_enable_linger(home: &Path) -> bool {
-    let user = home
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let user = home.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
     if user.is_empty() {
         return false;

@@ -66,7 +66,7 @@ latest_github_version() {
 }
 
 # Origin tags are the source of truth (a release can exist without Cargo.toml
-# on development matching it). Ignore local tags — they drift and clobber fetches.
+# on development matching it). Ignore local tags: they drift and clobber fetches.
 latest_origin_tag_version() {
   git ls-remote --tags origin 'refs/tags/v*' 2>/dev/null \
     | awk '{print $2}' \

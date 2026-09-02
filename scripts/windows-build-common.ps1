@@ -869,7 +869,7 @@ function Import-VulkanSdkEnv {
         Write-Error @"
 Vulkan SDK not found (need Bin\glslc.exe for win-gpu Vulkan builds).
 
-Install from https://vulkan.lunarg.com/ — Core components only is enough.
+Install from https://vulkan.lunarg.com/. Core components only is enough.
 Default folder: C:\VulkanSDK\<version>
 Then open a new PowerShell and re-run the build.
 "@

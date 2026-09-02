@@ -267,7 +267,8 @@ pub fn agent_activity_summary() -> Option<AgentActivitySummary> {
         }
         if service_hint() {
             #[cfg(unix)]
-            let status = "not registered (check: journalctl --user -u scalattice-agent -n 30)".to_string();
+            let status =
+                "not registered (check: journalctl --user -u scalattice-agent -n 30)".to_string();
             #[cfg(windows)]
             let status = "not registered (open the tray icon and check the live log)".to_string();
             #[cfg(not(any(unix, windows)))]
@@ -341,10 +342,10 @@ fn is_recent(updated_at_ms: u64) -> bool {
 }
 
 /// True when the background process looks alive but has not updated connection
-/// state for long enough that it is likely wedged in DNS/`connect` (Wi‑Fi flap,
+/// state for long enough that it is likely wedged in DNS/`connect` (Wi-Fi flap,
 /// resolver hang). Active reconnects keep `updated_at_ms` fresh.
 /// Used by the Windows/macOS tray watchdog (no tray on Linux).
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn connection_state_looks_wedged() -> bool {
     let Some(state) = read_state() else {
         return false;

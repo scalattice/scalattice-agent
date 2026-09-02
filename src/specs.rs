@@ -135,8 +135,8 @@ pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {
 }
 
 /// CPU is off by default when a GPU exists. With no accelerator (typical GitHub
-/// runner, CPU-only provider), leave it off and the hypervisor exits immediately
-/// — systemd Restart=always then crash-loops and the agent never reaches Cloud.
+/// runner, CPU-only provider), leave it off and the supervisor exits immediately.
+/// systemd Restart=always then crash-loops and the agent never reaches Cloud.
 fn is_accelerator_kind(kind: &str) -> bool {
     kind == "discrete" || kind == "integrated" || kind == "metal"
 }
@@ -158,7 +158,7 @@ fn enable_cpu_if_no_accelerator(devices: &mut Vec<ComputeDevice>) {
 /// initialize Metal/CUDA (slow, and on Windows it would fight the host agent).
 ///
 /// macOS production omits `cpu:0` beside Metal. Smoke still has to inject CPU
-/// *before* disabling accelerators, or hypervisor start fails with nothing
+/// *before* disabling accelerators, or supervisor start fails with nothing
 /// enabled and the agent never registers with the mock Cloud WS.
 fn prefer_cpu_only_for_update_smoke(devices: &mut Vec<ComputeDevice>) {
     if !crate::config::update_smoke_test() {
@@ -231,7 +231,7 @@ pub fn build_specs_from_devices(
         .collect();
     let discrete_count = accelerators.iter().filter(|d| d.kind == "discrete").count();
 
-    // GPU line is accelerators only — do not concatenate the CPU brand into it.
+    // GPU line is accelerators only: do not concatenate the CPU brand into it.
     let gpu_name = if accelerators.len() == 1 {
         Some(accelerators[0].name.clone())
     } else if accelerators.len() > 1 {
@@ -402,23 +402,6 @@ fn nvidia_smi_bins() -> Vec<String> {
     {
         vec!["nvidia-smi".into()]
     }
-}
-
-/// First working `nvidia-smi` for diagnostics (absolute path preferred).
-#[allow(dead_code)]
-pub fn resolve_nvidia_smi() -> Option<String> {
-    for bin in nvidia_smi_bins() {
-        if bin != "nvidia-smi" && bin != "nvidia-smi.exe" && !std::path::Path::new(&bin).is_file() {
-            continue;
-        }
-        let Ok(output) = configure_nvidia_smi_command(&bin).args(["-L"]).output() else {
-            continue;
-        };
-        if output.status.success() {
-            return Some(bin);
-        }
-    }
-    None
 }
 
 fn wsl_nvidia_lib_dir() -> Option<&'static str> {
@@ -842,7 +825,7 @@ struct AmdGpuDraft {
 }
 
 /// Group rocm-smi `--showproductname` by GPU[N]. Card series and card model are
-/// two lines for the same device — treating each line as a GPU duplicated the
+/// two lines for the same device: treating each line as a GPU duplicated the
 /// 7900 XTX as both "RX 7900 XTX" and "0x744c".
 #[cfg(any(test, not(target_os = "macos")))]
 fn parse_amd_devices_from_rocm(
@@ -1113,7 +1096,7 @@ fn detect_pci_vulkan_discrete_linux(existing: &[ComputeDevice]) -> Vec<ComputeDe
                 intel_i += 1;
                 (id, name)
             } else {
-                // rocm-smi already enumerated AMD GPUs — skip lspci duplicates.
+                // rocm-smi already enumerated AMD GPUs: skip lspci duplicates.
                 if has_rocm_amd {
                     return None;
                 }
@@ -1271,7 +1254,7 @@ fn is_integrated_pci_name(raw: &str) -> bool {
         || lower.contains("geforce")
         || lower.contains("quadro")
         || lower.contains("arc")
-    // discrete Intel Arc — not iGPU
+    // discrete Intel Arc: not iGPU
     {
         return false;
     }
@@ -1352,8 +1335,9 @@ pub(crate) fn system_ram_reserve_gb(ram_gb: u32) -> f64 {
     (f64::from(ram_gb) * 0.125).max(4.0)
 }
 
-/// Unified memory minus OS/UI headroom — advertised as Metal "VRAM" for catalog fit.
+/// Unified memory minus OS/UI headroom: advertised as Metal "VRAM" for catalog fit.
 /// This is `ram - reserve(ram)`, not a 16/32/64 GB size class.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn apple_usable_gpu_gb(ram_gb: u32) -> u32 {
     ram_gb
         .saturating_sub(system_ram_reserve_gb(ram_gb).round() as u32)
@@ -1486,7 +1470,9 @@ fn parse_rocm_mem_line_gb(line: &str) -> Option<u32> {
         }
     }
     let value = value.filter(|v| *v > 0.0)?;
-    if lower.contains("(b)") || lower.contains("bytes") || (value >= 1_000_000.0 && !lower.contains("(mb)") && !lower.contains("(gb)"))
+    if lower.contains("(b)")
+        || lower.contains("bytes")
+        || (value >= 1_000_000.0 && !lower.contains("(mb)") && !lower.contains("(gb)"))
     {
         return Some(bytes_to_gb(value as u64));
     }
@@ -1496,7 +1482,7 @@ fn parse_rocm_mem_line_gb(line: &str) -> Option<u32> {
     mb_to_gb(value as f32)
 }
 
-/// GiB from a rocm-smi meminfo line (no 1 GB floor — used/free can be fractional).
+/// GiB from a rocm-smi meminfo line (no 1 GB floor: used/free can be fractional).
 #[cfg(any(test, not(target_os = "macos")))]
 fn parse_rocm_mem_line_gib(line: &str) -> Option<f64> {
     let lower = line.to_ascii_lowercase();
@@ -1923,9 +1909,7 @@ fn looks_like_processor_identifier(name: &str) -> bool {
 #[cfg(windows)]
 fn registry_processor_name() -> Option<String> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::System::Registry::{
-        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
-    };
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
     let subkey: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\0"
         .encode_utf16()
         .collect();
@@ -2036,7 +2020,7 @@ pub fn disk_avail_bytes() -> Option<u64> {
     disk_avail_bytes_for_path(&path)
 }
 
-/// True when less than 2 GiB is free — too little for another catalog GGUF.
+/// True when less than 2 GiB is free: too little for another catalog GGUF.
 pub fn disk_is_full() -> bool {
     const MIN_FREE: u64 = 2 * 1024 * 1024 * 1024;
     disk_avail_bytes().is_some_and(|avail| avail < MIN_FREE)
@@ -2174,7 +2158,7 @@ fn detect_linux_memtotal_gb() -> Option<u32> {
     Some(((kb as f64) / 1024.0 / 1024.0).round().max(1.0) as u32)
 }
 
-/// Prefer Win32 `GlobalMemoryStatusEx` — PowerShell/WMI often fails for the
+/// Prefer Win32 `GlobalMemoryStatusEx`. PowerShell/WMI often fails for the
 /// Windows service account (no interactive session / CIM blocked), which made
 /// capacity checks see 0 GB RAM and reject every model.
 #[cfg(windows)]
@@ -2323,7 +2307,7 @@ mod tests {
 
     #[test]
     fn apple_usable_gpu_scales_with_unified_memory_not_size_classes() {
-        // reserve = clamp(ram * 12.5%, 4, 16)
+        // reserve = max(ram * 12.5%, 4 GB); usable = ram - round(reserve)
         assert_eq!(apple_usable_gpu_gb(8), 4);
         assert_eq!(apple_usable_gpu_gb(16), 12);
         assert_eq!(apple_usable_gpu_gb(18), 14);
@@ -2534,7 +2518,9 @@ GPU[1]		: VRAM Total Memory (B): 2147483648
     #[test]
     fn amd_igpu_names_are_integrated() {
         assert!(is_integrated_pci_name("AMD Radeon Graphics"));
-        assert!(is_integrated_pci_name("AMD Ryzen AI 9 HX PRO 370 w/ Radeon 890M"));
+        assert!(is_integrated_pci_name(
+            "AMD Ryzen AI 9 HX PRO 370 w/ Radeon 890M"
+        ));
         assert!(!is_integrated_pci_name("AMD Radeon RX 7900 XTX"));
     }
 }

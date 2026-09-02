@@ -80,10 +80,6 @@ pub struct ComputeDevicePolicy {
 pub struct AgentSchedule {
     #[serde(rename = "acceptingJobs", default = "default_true")]
     pub accepting_jobs: bool,
-    /// Server schedule mode label (kept for wire compat; agent uses acceptingJobs / minutes).
-    #[serde(rename = "scheduleMode", default)]
-    #[allow(dead_code)]
-    pub schedule_mode: String,
     #[serde(rename = "minutesUntilEarning", default)]
     pub minutes_until_earning: Option<u32>,
 }
@@ -96,7 +92,6 @@ impl Default for AgentSchedule {
     fn default() -> Self {
         Self {
             accepting_jobs: false,
-            schedule_mode: String::new(),
             minutes_until_earning: None,
         }
     }
@@ -119,6 +114,9 @@ pub struct ReadyMessage {
     pub cpu_ram_headroom_gb: u32,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
+    /// Runtime the Go hypervisor wants preloaded. Empty / omitted = stay empty.
+    #[serde(rename = "warmRuntimeModel", default)]
+    pub warm_runtime_model: Option<String>,
     #[serde(default)]
     pub schedule: AgentSchedule,
 }
@@ -144,6 +142,9 @@ pub struct PongMessage {
     pub catalog: Option<Vec<CatalogModel>>,
     #[serde(rename = "cpuRamHeadroomGb", default)]
     pub cpu_ram_headroom_gb: Option<u32>,
+    /// Runtime the Go hypervisor wants preloaded. Omitted on older routers.
+    #[serde(rename = "warmRuntimeModel", default)]
+    pub warm_runtime_model: Option<String>,
     #[serde(default)]
     pub schedule: AgentSchedule,
 }
@@ -217,9 +218,6 @@ pub struct InvokeMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct InvokeCancelMessage {
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    pub kind: String,
     pub id: String,
 }
 
@@ -401,9 +399,6 @@ pub struct InvokeErrorMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct ControlMessage {
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    pub kind: String,
     pub action: String,
 }
 
@@ -419,9 +414,6 @@ pub struct ControlAckMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct LogsSubscribeMessage {
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    pub kind: String,
     /// subscribe | unsubscribe
     pub action: String,
     /// When true, include llama.cpp / ggml noise in cloud batches.
@@ -516,7 +508,8 @@ mod tests {
 
     #[test]
     fn deserializes_string_content() {
-        let msg: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        let msg: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
         assert_eq!(msg.content, "hello");
         assert!(msg.images.is_empty());
     }
@@ -539,7 +532,8 @@ mod tests {
 
     #[test]
     fn deserializes_inlined_images_field() {
-        let raw = r#"{"role":"user","content":"look","images":[{"mime":"image/jpeg","data":"bbbb"}]}"#;
+        let raw =
+            r#"{"role":"user","content":"look","images":[{"mime":"image/jpeg","data":"bbbb"}]}"#;
         let msg: ChatMessage = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.content, "look");
         assert_eq!(msg.images[0].data, "bbbb");

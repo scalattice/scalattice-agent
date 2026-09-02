@@ -9,7 +9,6 @@ mod agent;
 mod cloud_log;
 mod compute_pool;
 mod config;
-mod hypervisor;
 mod inference;
 mod llm;
 mod logging;
@@ -21,22 +20,19 @@ mod service;
 mod settings;
 mod specs;
 mod state;
-mod update;
-mod vram_lifecycle;
+mod supervisor;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
+mod update;
+mod vram_lifecycle;
 
-use anyhow::Result;
 #[cfg(windows)]
 use anyhow::Context;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "scalattice-agent",
-    about = "Scalattice GPU agent",
-    version
-)]
+#[command(name = "scalattice-agent", about = "Scalattice GPU agent", version)]
 struct Cli {
     /// Emit full llama.cpp / GGML detail (default is provider-friendly Simplified logs)
     #[arg(long, global = true)]
@@ -101,7 +97,7 @@ enum Commands {
     #[cfg(windows)]
     #[command(hide = true)]
     InstallBootStart,
-    /// Internal: run a per-slot inference worker (spawned by the hypervisor)
+    /// Internal: run a per-slot inference worker (spawned by the supervisor)
     Worker {
         /// JSON WorkerBootConfig (or set SCALATTICE_WORKER_CONFIG)
         #[arg(long)]
@@ -130,7 +126,7 @@ fn main() -> Result<()> {
             .ok_or_else(|| {
                 anyhow::anyhow!("worker requires --config or SCALATTICE_WORKER_CONFIG")
             })?;
-        return hypervisor::run_worker(&config);
+        return supervisor::run_worker(&config);
     }
 
     logging::init_logging(verbose);
@@ -202,9 +198,7 @@ fn refuse_intel_mac() -> Result<()> {
     }
     let arm64 = macos_sysctl_i32("hw.optional.arm64").unwrap_or(0);
     if arm64 != 1 {
-        anyhow::bail!(
-            "scalattice-agent requires Apple Silicon. Intel Macs are not supported."
-        );
+        anyhow::bail!("scalattice-agent requires Apple Silicon. Intel Macs are not supported.");
     }
     Ok(())
 }
@@ -386,7 +380,9 @@ async fn run_foreground(token: Option<String>, verbose: bool) -> Result<()> {
             }
             return service::follow_service_logs(verbose);
         }
-        anyhow::bail!("agent not running. Run: scalattice-agent set-token --token slt_provider_...");
+        anyhow::bail!(
+            "agent not running. Run: scalattice-agent set-token --token slt_provider_..."
+        );
     }
 
     let config = config::AgentConfig::from_env_and_cli(token)?;

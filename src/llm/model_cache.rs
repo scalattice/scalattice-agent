@@ -9,7 +9,7 @@
 //! context/KV alloc OOMs *and returns an error*, we walk:
 //!   [gpu-full if it fits] → gpu-offload → gpu-offload-reduced → cpu-only
 //!
-//! `gpu-full` is skipped when on-disk weights + headroom exceed available VRAM —
+//! `gpu-full` is skipped when on-disk weights + headroom exceed available VRAM  - 
 //! llama.cpp CUDA often abort()s on OOM (kills the agent) instead of returning Err.
 
 use crate::compute_pool::VirtualCard;
@@ -18,14 +18,14 @@ use anyhow::{Context, Result};
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::MtmdContext;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::embedded::{
-    backend, estimated_n_layer, gguf_weight_gb, load_candidate_label, load_cpu_mmap_model,
-    load_model_for_pool, load_model_for_pool_starting_at, load_candidate_labels,
+    backend, estimated_n_layer, gguf_weight_gb, load_candidate_label, load_candidate_labels,
+    load_cpu_mmap_model, load_model_for_pool, load_model_for_pool_starting_at,
     offload_layers_for_available,
 };
 use super::vision::init_mtmd_for_model;
@@ -44,8 +44,7 @@ struct CachedModel {
 
 struct RamShelfEntry {
     /// Held so llama.cpp keeps the GGUF mmap'd; not read until the model returns to GPU.
-    #[allow(dead_code)]
-    model: LlamaModel,
+    _model: LlamaModel,
     bytes: u64,
     last_used: Instant,
 }
@@ -154,7 +153,11 @@ fn drop_other_ram_shelves(inner: &mut CacheInner, keep_path: &Path) {
     }
 }
 
-fn try_shelve_cpu(inner: &mut CacheInner, backend: &llama_cpp_2::llama_backend::LlamaBackend, path: &Path) {
+fn try_shelve_cpu(
+    inner: &mut CacheInner,
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    path: &Path,
+) {
     let key = path_key(path);
     if inner.ram.contains_key(&key) {
         if let Some(entry) = inner.ram.get_mut(&key) {
@@ -177,7 +180,7 @@ fn try_shelve_cpu(inner: &mut CacheInner, backend: &llama_cpp_2::llama_backend::
             inner.ram.insert(
                 key,
                 RamShelfEntry {
-                    model,
+                    _model: model,
                     bytes,
                     last_used: Instant::now(),
                 },
@@ -344,8 +347,7 @@ fn make_gpu_room(
             .gpu
             .iter()
             .filter(|(k, e)| {
-                k.as_str() != keep_key
-                    && resident_accounted_gb(k, e.occupancy_gb, metal) > 0.05
+                k.as_str() != keep_key && resident_accounted_gb(k, e.occupancy_gb, metal) > 0.05
             })
             .min_by_key(|(_, e)| e.last_used)
             .map(|(k, _)| k.clone());
@@ -359,7 +361,7 @@ fn make_gpu_room(
                 occupancy_gb = format!("{:.2}", entry.occupancy_gb),
                 free_gb = format!("{:.2}", free),
                 need_gb = format!("{:.2}", need),
-                "evicting GPU resident — incoming model does not fit beside it"
+                "evicting GPU resident: incoming model does not fit beside it"
             );
             // Discrete VRAM: RAM-shelve when live RAM can hold the mmap.
             // Unified memory: shelving re-mmaps the same pages Metal just freed.
@@ -623,20 +625,6 @@ pub fn evict_all_for_path(model_path: &Path) {
         guard.gpu.retain(|key, _| !key.starts_with(&prefix));
         guard.ram.remove(&prefix);
     }
-}
-
-#[allow(dead_code)]
-pub fn cached_model_paths() -> Vec<PathBuf> {
-    let Ok(guard) = cache().lock() else {
-        return Vec::new();
-    };
-    let mut paths: Vec<PathBuf> = guard
-        .gpu
-        .keys()
-        .filter_map(|key| key.split('|').next().map(PathBuf::from))
-        .collect();
-    paths.extend(guard.ram.keys().map(PathBuf::from));
-    paths
 }
 
 /// After a context OOM, pick the next cascade index on a *fresh* live-VRAM list.

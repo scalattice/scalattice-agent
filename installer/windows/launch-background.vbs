@@ -5,7 +5,7 @@ If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.
 lib = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\lib")
 If Not fso.FolderExists(lib) Then lib = install & "\lib"
 If Not CudaRuntimeOk(fso, lib, install) Then
-  ' Log but still start — do not block reboot bring-up when CUDA libs are briefly missing.
+  ' Log but still start: do not block reboot bring-up when CUDA libs are briefly missing.
   LogCudaMissing sh, fso, lib
 End If
 Set env = sh.Environment("PROCESS")
@@ -35,7 +35,7 @@ Sub LogCudaMissing(sh, fso, lib)
   logPath = logDir & "\agent.log"
   ts = Now
   Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — starting agent anyway (Vulkan/CPU)"
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & ": starting agent anyway (Vulkan/CPU)"
   stream.Close
   On Error Goto 0
 End Sub

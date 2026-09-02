@@ -196,18 +196,14 @@ async fn download_release_asset_once(
     if let Some(expected_len) = total {
         if downloaded != expected_len {
             tokio::fs::remove_file(&tmp).await.ok();
-            bail!(
-                "incomplete download for {asset_name}: got {downloaded} of {expected_len} bytes"
-            );
+            bail!("incomplete download for {asset_name}: got {downloaded} of {expected_len} bytes");
         }
     }
 
     let actual = format!("{:x}", hasher.finalize());
     if actual != expected_sha256 {
         tokio::fs::remove_file(&tmp).await.ok();
-        bail!(
-            "checksum mismatch for {asset_name}: expected {expected_sha256}, got {actual}"
-        );
+        bail!("checksum mismatch for {asset_name}: expected {expected_sha256}, got {actual}");
     }
 
     if let Some(parent) = dest.parent() {

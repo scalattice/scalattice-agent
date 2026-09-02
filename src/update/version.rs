@@ -30,17 +30,11 @@ mod tests {
 
     #[test]
     fn newer_patch_version() {
-        assert_eq!(
-            compare_versions("1.0.33", "1.0.32"),
-            Ordering::Greater
-        );
+        assert_eq!(compare_versions("1.0.33", "1.0.32"), Ordering::Greater);
     }
 
     #[test]
     fn same_with_v_prefix() {
-        assert_eq!(
-            compare_versions("v1.0.32", "1.0.32"),
-            Ordering::Equal
-        );
+        assert_eq!(compare_versions("v1.0.32", "1.0.32"), Ordering::Equal);
     }
 }

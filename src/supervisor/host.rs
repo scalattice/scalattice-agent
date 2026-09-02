@@ -1,4 +1,3 @@
-use super::demand::DemandTracker;
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use super::placement::{pick_placement, placement_miss_detail, Placement};
 use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot};
@@ -85,11 +84,10 @@ struct SlotCheckout {
     pid: Option<u32>,
 }
 
-pub struct Hypervisor {
+pub struct Supervisor {
     plan: ComputePlan,
     devices: Vec<ComputeDevice>,
     workers: Mutex<HashMap<String, SlotWorker>>,
-    demand: Mutex<DemandTracker>,
     changed: Notify,
     /// In-flight job_id → cancel signal (kill worker when router abandons).
     job_cancels: Mutex<HashMap<String, Arc<Notify>>>,
@@ -119,13 +117,13 @@ fn worker_silence_for_phase(phase: &str) -> Duration {
     }
 }
 
-impl Hypervisor {
+impl Supervisor {
     pub async fn start(devices: &[ComputeDevice]) -> Result<Arc<Self>> {
         let plan = build_compute_slots(devices)?;
         info!(
             slots = plan.slots.len(),
             tp_groups = plan.tp_groups.len(),
-            "compute hypervisor partitioning slots"
+            "compute supervisor partitioning slots"
         );
         let mut workers = HashMap::new();
         for slot in &plan.slots {
@@ -147,7 +145,6 @@ impl Hypervisor {
             plan,
             devices: devices.to_vec(),
             workers: Mutex::new(workers),
-            demand: Mutex::new(DemandTracker::default()),
             changed: Notify::new(),
             job_cancels: Mutex::new(HashMap::new()),
             checkouts: Mutex::new(HashMap::new()),
@@ -158,10 +155,6 @@ impl Hypervisor {
 
     pub fn plan(&self) -> &ComputePlan {
         &self.plan
-    }
-
-    pub async fn record_demand(&self, runtime_model: &str) {
-        self.demand.lock().await.record_hit(runtime_model);
     }
 
     async fn register_job_cancel(&self, job_id: &str) -> Arc<Notify> {
@@ -241,13 +234,7 @@ impl Hypervisor {
         avail + 0.05 >= incoming_weight_gb + reserve
     }
 
-    /// How many slots are currently checked out to an invoke/warm stack.
-    #[allow(dead_code)]
-    pub async fn checked_out_count(&self) -> u32 {
-        self.checkouts.lock().await.len() as u32
-    }
-
-    /// True when the hypervisor has real in-flight work (checked-out slots or cancel waiters).
+    /// True when the supervisor has real in-flight work (checked-out slots or cancel waiters).
     pub async fn has_in_flight_work(&self) -> bool {
         !self.checkouts.lock().await.is_empty() || !self.job_cancels.lock().await.is_empty()
     }
@@ -342,7 +329,11 @@ impl Hypervisor {
             self.clear_job_cancel(&checkout.job_id).await;
 
             let mut workers = self.workers.lock().await;
-            if workers.get(&slot_id).map(|w| w.healthy && !w.busy).unwrap_or(false) {
+            if workers
+                .get(&slot_id)
+                .map(|w| w.healthy && !w.busy)
+                .unwrap_or(false)
+            {
                 continue;
             }
             workers.remove(&slot_id);
@@ -390,40 +381,6 @@ impl Hypervisor {
             self.changed.notify_waiters();
         }
         recovered
-    }
-
-    #[allow(dead_code)]
-    pub async fn order_models_by_demand(&self, models: &[String]) -> Vec<String> {
-        self.demand
-            .lock()
-            .await
-            .order_by_demand(models, Duration::from_secs(30 * 60))
-    }
-
-    /// Demand first; ties prefer models that fit in `max_vram_gb`, then lightest on disk.
-    /// Avoids cold-start alphabetical picks like `Qwen/…-7B` over `qwen/qwen3-1.7b`.
-    pub async fn order_models_for_warm(&self, models: &[String], max_vram_gb: u32) -> Vec<String> {
-        let window = Duration::from_secs(30 * 60);
-        let demand = self.demand.lock().await;
-        let mut scored: Vec<(u32, u8, u64, String)> = models
-            .iter()
-            .map(|m| {
-                let hits = demand.score(m, window);
-                let weight_mb = warm_model_weight_mb(m);
-                let fits = max_vram_gb > 0
-                    && weight_mb > 0
-                    && weight_mb <= u64::from(max_vram_gb).saturating_mul(1024);
-                let fit_penalty: u8 = if fits { 0 } else { 1 };
-                (hits, fit_penalty, weight_mb, m.clone())
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.cmp(&b.2))
-                .then_with(|| a.3.to_ascii_lowercase().cmp(&b.3.to_ascii_lowercase()))
-        });
-        scored.into_iter().map(|(_, _, _, m)| m).collect()
     }
 
     pub async fn slot_statuses(&self) -> Vec<SlotStatus> {
@@ -487,12 +444,6 @@ impl Hypervisor {
         accel.max(1) as u32
     }
 
-    #[allow(dead_code)]
-    pub async fn any_busy(&self) -> bool {
-        let workers = self.workers.lock().await;
-        workers.values().any(|w| w.busy)
-    }
-
     pub async fn loaded_models_union(&self) -> Vec<String> {
         let workers = self.workers.lock().await;
         let mut set = std::collections::BTreeSet::new();
@@ -515,9 +466,10 @@ impl Hypervisor {
         }
     }
 
-    pub async fn warm_models(&self, runtime_models: &[String]) -> Result<()> {
+    /// Preload only the runtime the Go hypervisor named. Empty = stay empty.
+    pub async fn warm_models(&self, runtime_models: &[String]) -> Result<bool> {
         if runtime_models.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let idle = self.idle_slot_ids().await;
         let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
@@ -533,20 +485,12 @@ impl Hypervisor {
             })
             .collect();
         if targets.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut warmed_any = false;
         for slot_id in targets {
-            let slot_vram = self
-                .plan
-                .slots
-                .iter()
-                .find(|s| s.id == slot_id)
-                .map(|s| s.card.total_vram_gb)
-                .unwrap_or(0);
-            // Per-slot pick: demand → fits this card → lightest.
-            let ordered = self.order_models_for_warm(runtime_models, slot_vram).await;
-            let Some(model) = ordered.first().cloned() else {
+            let Some(model) = runtime_models.first().cloned() else {
                 continue;
             };
 
@@ -560,9 +504,10 @@ impl Hypervisor {
             if worker.busy || !worker.healthy {
                 continue;
             }
-            // Already resident — keep it. Advisory warm must not evict/offload a
+            // Already resident: keep it. Advisory warm must not evict/offload a
             // warm model just to chase a different catalog preference.
             if !worker.loaded_models.is_empty() {
+                warmed_any = true;
                 continue;
             }
             worker.busy = true;
@@ -594,6 +539,7 @@ impl Hypervisor {
                     if !worker.loaded_models.iter().any(|m| m == &model) {
                         worker.loaded_models.push(model.clone());
                     }
+                    warmed_any = true;
                     info!(slot = %slot_id, model = %model, "warmed model on slot");
                 }
                 Ok(WorkerResponse::Error { error, .. }) => {
@@ -604,7 +550,7 @@ impl Hypervisor {
             }
             self.return_worker(slot_id, worker).await;
         }
-        Ok(())
+        Ok(warmed_any)
     }
 
     pub async fn invoke(
@@ -619,7 +565,6 @@ impl Hypervisor {
         cpu_ram_headroom_gb: u32,
         on_delta: Option<Box<dyn FnMut(String) + Send>>,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
-        self.record_demand(runtime_model).await;
         let cancel = self.register_job_cancel(job_id).await;
         let incoming_gb = warm_model_weight_mb(runtime_model) as f64 / 1024.0;
         let _mmap = if self.ram_has_room_for_mmap(incoming_gb) {
@@ -691,8 +636,7 @@ impl Hypervisor {
                             return Err(err);
                         }
                         let need_vision = crate::protocol::messages_have_images(messages);
-                        let detail =
-                            placement_miss_detail(&self.plan, &idle, model, need_vision);
+                        let detail = placement_miss_detail(&self.plan, &idle, model, need_vision);
                         return Err(anyhow!(detail));
                     }
                 };
@@ -980,9 +924,8 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
     let boot_json = serde_json::to_string(&boot)?;
     // Always re-exec this binary so PATH can't pick an older agent without `worker`.
     let bin = std::env::current_exe().unwrap_or_else(|_| {
-        crate::paths::resolve_agent_binary().unwrap_or_else(|_| {
-            std::path::PathBuf::from("scalattice-agent")
-        })
+        crate::paths::resolve_agent_binary()
+            .unwrap_or_else(|_| std::path::PathBuf::from("scalattice-agent"))
     });
 
     let mut child = Command::new(&bin)
@@ -1146,9 +1089,7 @@ async fn worker_rpc_invoke_cancellable(
         let wall_left = WORKER_INVOKE_WALL_CLOCK
             .checked_sub(started.elapsed())
             .unwrap_or(Duration::from_millis(1));
-        let wait = silence_left
-            .min(wall_left)
-            .max(Duration::from_millis(50));
+        let wait = silence_left.min(wall_left).max(Duration::from_millis(50));
         tokio::select! {
             biased;
             _ = cancel.notified() => {
@@ -1279,7 +1220,9 @@ mod tests {
 
     #[test]
     fn cancel_and_busy_do_not_retry() {
-        assert!(!worker_crash_retryable(&anyhow::anyhow!("request_canceled")));
+        assert!(!worker_crash_retryable(&anyhow::anyhow!(
+            "request_canceled"
+        )));
         assert!(!worker_crash_retryable(&anyhow::anyhow!(
             "agent_busy: no idle compute slot"
         )));

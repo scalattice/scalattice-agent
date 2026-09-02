@@ -14,9 +14,8 @@ pub use capacity::{
 };
 pub use gguf_arch::gguf_shape;
 pub use gguf_check::gguf_payload_in_bounds;
-pub use vram_plan::{full_host_need_from_weight, full_host_need_gb};
 pub use health::{
-    clear_weight_health, handle_weight_load_failure, process_preload_paused, should_skip_preload,
+    clear_weight_health, handle_weight_load_failure, should_skip_preload,
     spawn_delete_staged_dirs, stage_purge_model_weights, sweep_staged_purge_dirs,
 };
 pub use storage::{
@@ -24,3 +23,4 @@ pub use storage::{
     purge_incomplete_model_weights, resolve_mmproj, resolve_model_gguf, ModelDiskStatus,
 };
 pub use sync::spawn_catalog_sync;
+pub use vram_plan::{full_host_need_from_weight, full_host_need_gb};

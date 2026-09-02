@@ -8,9 +8,9 @@ real version so the restarted agent does not loop.
 
 It vets both paths that can brick a fleet:
 
-  live/remote  — mock WS sends ``{"type":"control","action":"update"}`` to the
+  live/remote : mock WS sends ``{"type":"control","action":"update"}`` to the
                  running foreground job (the macOS launchd-suicide bug)
-  CLI          — ``scalattice-agent update`` (daily timer / manual)
+  CLI         : ``scalattice-agent update`` (daily timer / manual)
 
 Failing this step must block uploading the GitHub release asset.
 """
@@ -567,7 +567,7 @@ def package_macos_smoke_dmg(agent_bin: Path, dest_dmg: Path) -> Path:
     for attempt in range(1, 7):
         if dest_dmg.exists():
             dest_dmg.unlink()
-        # Drop leftover Scalattice attaches — GHA runners sometimes leave
+        # Drop leftover Scalattice attaches. GHA runners sometimes leave
         # diskimages-helper wedged ("Resource busy").
         info = subprocess.run(
             ["hdiutil", "info"],
@@ -1423,7 +1423,7 @@ def isolate_env(home: Path, localappdata: Optional[Path], bin_path: Path, http: 
     env["SCALATTICE_AGENT_BIN"] = str(bin_path)
     env["SCALATTICE_VERBOSE"] = "1"
     # Keep the real HOME on Unix so systemd/launchd session lookup still works.
-    # Windows must isolate USERPROFILE/LOCALAPPDATA — the self-hosted runner
+    # Windows must isolate USERPROFILE/LOCALAPPDATA: the self-hosted runner
     # has a real agent install.
     if sys.platform in ("win32", "cygwin"):
         env["USERPROFILE"] = str(home)

@@ -29,8 +29,7 @@ pub fn pick_placement(
     devices: &[crate::specs::ComputeDevice],
     need_vision: bool,
 ) -> Option<Placement> {
-    let idle: std::collections::HashSet<&str> =
-        idle_slot_ids.iter().map(|s| s.as_str()).collect();
+    let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
     let min_vram = if need_vision {
         image_job_min_vram_gb(model)
@@ -111,53 +110,50 @@ pub fn pick_placement(
         });
     }
 
-    // Offload on the largest idle accelerator (text only — image jobs need full vision VRAM).
+    // Offload on the largest idle accelerator (text only: image jobs need full vision VRAM).
     if !need_vision {
-    let mut offload: Vec<&ComputeSlot> = plan
-        .slots
-        .iter()
-        .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
-        .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
-        .collect();
-    offload.sort_by(|a, b| {
-        b.card
-            .total_vram_gb
-            .cmp(&a.card.total_vram_gb)
-            .then_with(|| a.priority.cmp(&b.priority))
-    });
-    if let Some(slot) = offload.first() {
-        debug!(slot = %slot.id, "placement: accelerator offload");
-        return Some(Placement {
-            slot_ids: vec![slot.id.clone()],
-            card: slot.card.clone(),
-            cuda_visible: slot.cuda_visible.clone(),
-            use_tp_worker: false,
+        let mut offload: Vec<&ComputeSlot> = plan
+            .slots
+            .iter()
+            .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
+            .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
+            .collect();
+        offload.sort_by(|a, b| {
+            b.card
+                .total_vram_gb
+                .cmp(&a.card.total_vram_gb)
+                .then_with(|| a.priority.cmp(&b.priority))
         });
-    }
+        if let Some(slot) = offload.first() {
+            debug!(slot = %slot.id, "placement: accelerator offload");
+            return Some(Placement {
+                slot_ids: vec![slot.id.clone()],
+                card: slot.card.clone(),
+                cuda_visible: slot.cuda_visible.clone(),
+                use_tp_worker: false,
+            });
+        }
 
-    if let Some(slot) = plan
-        .slots
-        .iter()
-        .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
-        .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
-    {
-        debug!(slot = %slot.id, "placement: cpu overflow");
-        return Some(Placement {
-            slot_ids: vec![slot.id.clone()],
-            card: slot.card.clone(),
-            cuda_visible: slot.cuda_visible.clone(),
-            use_tp_worker: false,
-        });
-    }
+        if let Some(slot) = plan
+            .slots
+            .iter()
+            .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
+            .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
+        {
+            debug!(slot = %slot.id, "placement: cpu overflow");
+            return Some(Placement {
+                slot_ids: vec![slot.id.clone()],
+                card: slot.card.clone(),
+                cuda_visible: slot.cuda_visible.clone(),
+                use_tp_worker: false,
+            });
+        }
     }
 
     None
 }
 
-fn slot_available_gb(
-    slot: &ComputeSlot,
-    live_cuda: &std::collections::HashMap<u32, f64>,
-) -> f64 {
+fn slot_available_gb(slot: &ComputeSlot, live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {
     let advertised = f64::from(slot.card.total_vram_gb);
     if cfg!(test) {
         return advertised;
@@ -208,7 +204,7 @@ fn tp_available_gb(
 }
 
 /// Explain why [`pick_placement`] returned `None`. Vision misses with idle
-/// slots are capacity (insufficient VRAM), not "busy" — unless a fitting GPU
+/// slots are capacity (insufficient VRAM), not "busy": unless a fitting GPU
 /// exists on the machine and is just occupied.
 pub fn placement_miss_detail(
     plan: &ComputePlan,
@@ -217,8 +213,7 @@ pub fn placement_miss_detail(
     need_vision: bool,
 ) -> String {
     let model_id = model.model_id.as_str();
-    let idle: std::collections::HashSet<&str> =
-        idle_slot_ids.iter().map(|s| s.as_str()).collect();
+    let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
     let idle_accel: Vec<&ComputeSlot> = plan
         .slots
         .iter()
@@ -253,7 +248,7 @@ pub fn placement_miss_detail(
     }
 
     if idle_accel.is_empty() {
-        // Only CPU idle — vision cannot use it; text would have placed CPU.
+        // Only CPU idle: vision cannot use it; text would have placed CPU.
         if need_vision {
             let need = image_job_min_vram_gb(model);
             return format!(
@@ -352,7 +347,8 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let placement = pick_placement(&plan, &idle, &model(8.0, 5.0), 64, 2, &devices, false).unwrap();
+        let placement =
+            pick_placement(&plan, &idle, &model(8.0, 5.0), 64, 2, &devices, false).unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
         assert!(!placement.use_tp_worker);
     }
