@@ -96,11 +96,28 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
       - name: Install build deps (Vulkan)
+        timeout-minutes: 8
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
+          # apt-get can sit forever on a dpkg lock / frozen mirror. timeout so
+          # retries actually run instead of hanging the release for 3 hours.
+          wait_dpkg() {
+            local i=0
+            while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+              i=$((i + 1))
+              if [ "$i" -ge 20 ]; then
+                echo "==> dpkg lock still held after 40s; trying apt anyway"
+                break
+              fi
+              sleep 2
+            done
+          }
           apt_retry() {
-            local n=0 max=5 delay=20
-            until sudo "$@"; do
+            local n=0 max=4 delay=10
+            wait_dpkg
+            until sudo timeout 90 "$@"; do
               n=$((n + 1))
               if [ "$n" -ge "$max" ]; then
                 echo "apt command failed after ${max} attempts: $*" >&2
@@ -109,10 +126,11 @@ jobs:
               echo "==> apt failed (attempt ${n}/${max}), retrying in ${delay}s: $*"
               sudo rm -rf /var/lib/apt/lists/*
               sleep "$delay"
-              delay=$((delay + 15))
+              delay=$((delay + 10))
+              wait_dpkg
             done
           }
-          apt_retry apt-get update
+          apt_retry apt-get update -y
           apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget glslc \
             libvulkan-dev spirv-headers libshaderc-dev spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
       - name: Install CUDA
@@ -161,11 +179,26 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - name: Install build deps (Vulkan)
+        timeout-minutes: 8
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
+          wait_dpkg() {
+            local i=0
+            while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+              i=$((i + 1))
+              if [ "$i" -ge 20 ]; then
+                echo "==> dpkg lock still held after 40s; trying apt anyway"
+                break
+              fi
+              sleep 2
+            done
+          }
           apt_retry() {
-            local n=0 max=5 delay=20
-            until sudo "$@"; do
+            local n=0 max=4 delay=10
+            wait_dpkg
+            until sudo timeout 90 "$@"; do
               n=$((n + 1))
               if [ "$n" -ge "$max" ]; then
                 echo "apt command failed after ${max} attempts: $*" >&2
@@ -174,10 +207,11 @@ jobs:
               echo "==> apt failed (attempt ${n}/${max}), retrying in ${delay}s: $*"
               sudo rm -rf /var/lib/apt/lists/*
               sleep "$delay"
-              delay=$((delay + 15))
+              delay=$((delay + 10))
+              wait_dpkg
             done
           }
-          apt_retry apt-get update
+          apt_retry apt-get update -y
           apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget glslc \
             libvulkan-dev spirv-headers libshaderc-dev spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
       - name: Install CUDA
