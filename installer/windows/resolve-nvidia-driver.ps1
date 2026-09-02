@@ -98,7 +98,7 @@ function Resolve-DriverFromGfe {
 
     $win = Get-WindowsBuildInfo
     $iLp = if ($Laptop) { "1" } else { "0" }
-    # Build JSON by hand — Windows PowerShell 5 flattens single-element arrays in ConvertTo-Json.
+    # Build JSON by hand. Windows PowerShell 5 flattens single-element arrays in ConvertTo-Json.
     $json = (@'
 {"dIDa":["DEVICE_10DE"],"osC":"OSC","osB":"OSB","is6":"1","lg":"1033","iLp":"ILP","prvMd":"0","gcV":"3.28.0.417","gIsB":"0","dch":"1","upCRD":"0","isCRD":"0"}
 '@).Replace("DEVICE", $DeviceId).Replace("OSC", $win.OsC).Replace("OSB", $win.OsB).Replace("ILP", $iLp)

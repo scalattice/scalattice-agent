@@ -72,11 +72,11 @@ exit /b 1
 :LogCudaMissing
 set "LOGDIR=%LOCALAPPDATA%\Scalattice\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
->>"%LOGDIR%\agent.log" echo [%DATE% %TIME%] CUDA runtime missing under %LIB% — reinstall Scalattice Agent
+>>"%LOGDIR%\agent.log" echo [%DATE% %TIME%] CUDA runtime missing under %LIB%: reinstall Scalattice Agent
 exit /b 0
 
 :LogNvidiaDriverMissing
 set "LOGDIR=%LOCALAPPDATA%\Scalattice\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
->>"%LOGDIR%\agent.log" echo [%DATE% %TIME%] NVIDIA driver missing (nvcuda.dll) — install Game Ready/Studio driver for GPU jobs
+>>"%LOGDIR%\agent.log" echo [%DATE% %TIME%] NVIDIA driver missing (nvcuda.dll): install Game Ready/Studio driver for GPU jobs
 exit /b 0

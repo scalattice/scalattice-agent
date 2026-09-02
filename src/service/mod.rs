@@ -12,9 +12,9 @@ use std::path::PathBuf;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+mod uninstall_notify;
 #[cfg(windows)]
 mod windows;
-mod uninstall_notify;
 
 /// Best-effort cloud notify used by the Inno uninstaller before process kill.
 pub fn notify_server_uninstall(reason: &str) {
@@ -67,15 +67,9 @@ pub fn ensure_background_running_if_configured() -> Result<()> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::restart_background_from_config(config)
-}
-
-/// Persist the token and restart background + tray (Windows relaunches the whole app).
-#[allow(dead_code)]
-pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
-    platform::restart_after_token_change(config)
 }
 
 /// Restart background (+ tray on Windows) from the saved token after an update.
@@ -107,7 +101,7 @@ pub fn save_agent_token(config: &AgentConfig) -> Result<()> {
     start_background_from_config(config)?;
     #[cfg(windows)]
     {
-        // Interactive set-token / tray Save only — may show UAC once if boot task missing.
+        // Interactive set-token / tray Save only: may show UAC once if boot task missing.
         let _ = platform::ensure_boot_start_interactive();
     }
     Ok(())
@@ -131,12 +125,6 @@ pub fn sync_macos_auto_update(enable: bool) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub fn ensure_tray_login_item() -> Result<()> {
     platform::ensure_tray_login_item()
-}
-
-#[cfg(windows)]
-#[allow(dead_code)]
-pub fn in_tray_process() -> bool {
-    platform::in_tray_process()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -195,10 +183,7 @@ pub fn persist_agent_token(token: &str) -> Result<bool> {
         let bytes = fs::read(&env_file).with_context(|| format!("read {}", env_file.display()))?;
         let raw = crate::config::decode_text_bytes(&bytes);
         let rewrite = crate::config::text_file_needs_utf8_rewrite(&bytes, &raw);
-        (
-            raw.lines().map(str::to_string).collect::<Vec<_>>(),
-            rewrite,
-        )
+        (raw.lines().map(str::to_string).collect::<Vec<_>>(), rewrite)
     } else {
         (Vec::new(), false)
     };
@@ -389,7 +374,7 @@ pub fn uninstall_agent(mut opts: UninstallOptions) -> Result<()> {
     uninstall_notify::notify_server_uninstall("uninstall");
 
     // Always clear autostart (Startup folder + scheduled tasks) and stop processes,
-    // even when nothing looks "installed" — leftovers cause reboot Script Host errors.
+    // even when nothing looks "installed": leftovers cause reboot Script Host errors.
     let _ = platform::remove_background_service();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

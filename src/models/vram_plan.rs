@@ -7,14 +7,18 @@ use crate::protocol::CatalogModel;
 
 /// CUDA context, allocator fragmentation, driver reservation.
 pub const CUDA_RUNTIME_OVERHEAD_GB: f64 = 0.40;
-/// Qwen3-8B GQA KV at 4k / fp16 — catalog fallback scales from this.
+/// Qwen3-8B GQA KV at 4k / fp16: catalog fallback scales from this.
 const KV_REF_GB_8B_4K: f64 = 0.56;
 const WEIGHT_REF_GB: f64 = 4.7;
 const TEXT_N_CTX: u32 = 4096;
 const VISION_N_CTX: u32 = 8192;
 
 pub fn job_n_ctx(model: &CatalogModel, need_vision: bool) -> u32 {
-    let default = if need_vision { VISION_N_CTX } else { TEXT_N_CTX };
+    let default = if need_vision {
+        VISION_N_CTX
+    } else {
+        TEXT_N_CTX
+    };
     let cap = model.max_context_tokens;
     if cap == 0 {
         default
@@ -85,7 +89,10 @@ mod tests {
     #[test]
     fn large_model_extra_exceeds_flat_two_gb_fence() {
         let need = full_host_need_from_weight(40.0, 4096);
-        assert!(need > 42.0, "70B-class must not use a +2 GB constant, got {need}");
+        assert!(
+            need > 42.0,
+            "70B-class must not use a +2 GB constant, got {need}"
+        );
     }
 
     #[test]

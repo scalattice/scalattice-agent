@@ -40,7 +40,7 @@ Sub LogCudaMissing(sh, fso, lib)
   logPath = logDir & "\agent.log"
   ts = Now
   Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — reinstall Scalattice Agent"
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & ": reinstall Scalattice Agent"
   stream.Close
   On Error Goto 0
 End Sub

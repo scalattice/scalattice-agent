@@ -25,10 +25,8 @@ fn assert_allowed_mirror_url(raw: &str) -> Result<()> {
         .host_str()
         .map(|h| h.to_ascii_lowercase())
         .context("mirror URL missing host")?;
-    let allowed = matches!(
-        host.as_str(),
-        "api.scalattice.cloud" | "scalattice.cloud"
-    ) || host.ends_with(".scalattice.cloud");
+    let allowed = matches!(host.as_str(), "api.scalattice.cloud" | "scalattice.cloud")
+        || host.ends_with(".scalattice.cloud");
     if !allowed {
         bail!("mirror URL host not allowed: {host}");
     }
@@ -111,9 +109,8 @@ async fn finalize_download(tmp: &Path, dest: &Path) -> Result<()> {
             }
             Err(err) => {
                 let _ = tokio::fs::remove_file(dest).await;
-                return Err(err).with_context(|| {
-                    format!("validate downloaded GGUF {}", dest.display())
-                });
+                return Err(err)
+                    .with_context(|| format!("validate downloaded GGUF {}", dest.display()));
             }
         }
     }
@@ -163,8 +160,11 @@ async fn stream_url_once(
     }
     let start_at = if resume { existing } else { 0 };
     let expected_total = if resume {
-        content_range_total(response.headers().get(CONTENT_RANGE))
-            .or_else(|| response.content_length().map(|n| start_at.saturating_add(n)))
+        content_range_total(response.headers().get(CONTENT_RANGE)).or_else(|| {
+            response
+                .content_length()
+                .map(|n| start_at.saturating_add(n))
+        })
     } else {
         response.content_length()
     };
@@ -276,9 +276,9 @@ fn prefer_scalattice_mirror(weights: &ModelWeights) -> bool {
 }
 
 fn weights_download_complete(runtime_model: &str, weights: &ModelWeights) -> bool {
-    weight_filenames(weights)
-        .iter()
-        .all(|filename| is_manifest_weight_file(runtime_model, &target_gguf_path(runtime_model, filename)))
+    weight_filenames(weights).iter().all(|filename| {
+        is_manifest_weight_file(runtime_model, &target_gguf_path(runtime_model, filename))
+    })
 }
 
 async fn download_hf_file(

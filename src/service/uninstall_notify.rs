@@ -10,7 +10,11 @@ pub fn notify_server_uninstall(reason: &str) {
         return;
     };
     let reason = reason.trim();
-    let reason = if reason.is_empty() { "uninstall" } else { reason };
+    let reason = if reason.is_empty() {
+        "uninstall"
+    } else {
+        reason
+    };
 
     let result = std::panic::catch_unwind(|| {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -36,12 +40,7 @@ pub fn notify_server_uninstall(reason: &str) {
                 "agentVersion": env!("CARGO_PKG_VERSION"),
                 "platform": std::env::consts::OS,
             });
-            let _ = client
-                .post(url)
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await;
+            let _ = client.post(url).bearer_auth(token).json(&body).send().await;
         });
     });
     let _ = result;

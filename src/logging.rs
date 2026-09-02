@@ -6,8 +6,8 @@ use crate::paths::agent_env_path;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 
 /// Soft cap for the active `agent.log`. A single `agent.log.1` backup keeps roughly 2× this.
@@ -71,7 +71,7 @@ pub fn init_logging(verbose: bool) {
         .init();
 }
 
-/// Slot workers speak JSON on stdout — keep tracing off stdout.
+/// Slot workers speak JSON on stdout: keep tracing off stdout.
 /// Disk `agent.log` always gets full llama.cpp detail.
 ///
 /// Stderr is **piped to the supervisor** (never a GUI console). Always mirror
@@ -164,10 +164,7 @@ impl CappedLogWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let mut writer = Self {
             path,
             file: Some(file),
@@ -205,9 +202,9 @@ impl CappedLogWriter {
     }
 
     fn file_mut(&mut self) -> io::Result<&mut File> {
-        self.file.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "agent log file handle is closed")
-        })
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "agent log file handle is closed"))
     }
 }
 
@@ -230,9 +227,7 @@ fn rotated_log_path(path: &Path) -> PathBuf {
 
 impl Write for CappedLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.bytes_since_check = self
-            .bytes_since_check
-            .saturating_add(buf.len() as u64);
+        self.bytes_since_check = self.bytes_since_check.saturating_add(buf.len() as u64);
         if self.bytes_since_check >= ROTATE_CHECK_EVERY {
             self.rotate_if_needed()?;
         }
@@ -288,7 +283,7 @@ pub fn pipe_log_lines(reader: impl std::io::Read, verbose: bool) -> anyhow::Resu
 }
 
 /// Filter a multi-line log chunk for the Simplified view.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn simplify_log_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() / 2);
     for line in raw.lines() {
@@ -307,8 +302,8 @@ pub fn simplify_log_text(raw: &str) -> String {
 }
 
 /// Keep agent/status lines across llama.cpp floods that would otherwise wipe a small tail buffer.
-/// Linux builds have no tray UI; Windows tray and unit tests use this.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Linux production has no tray UI; Windows/macOS tray and unit tests use this.
+#[cfg(any(windows, target_os = "macos", test))]
 pub fn retain_simplified_history(
     lines: &mut Vec<String>,
     chunk: &str,
@@ -380,7 +375,9 @@ mod tests {
         assert!(is_verbose_only_log_line(
             "INFO llama-cpp-2: BOS token = 1 module=\"llama.cpp::print_info\""
         ));
-        assert!(is_verbose_only_log_line("ggml_cuda_init: found 1 CUDA devices"));
+        assert!(is_verbose_only_log_line(
+            "ggml_cuda_init: found 1 CUDA devices"
+        ));
         assert!(!is_verbose_only_log_line(
             "INFO scalattice_agent::agent: invoke abc · model qwen-3-8b"
         ));
@@ -426,10 +423,7 @@ INFO scalattice_agent::llm::model_cache: context OOM; reloading via 'gpu-offload
 
     #[test]
     fn capped_writer_rotates_when_over_limit() {
-        let dir = std::env::temp_dir().join(format!(
-            "scalattice-log-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("scalattice-log-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.log");

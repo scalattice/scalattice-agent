@@ -33,7 +33,12 @@ mod windows_impl {
 
     fn toast_icon_path() -> Option<PathBuf> {
         let dir = install_dir().ok()?;
-        for name in ["scalattice.ico", "scalattice-agent.ico", "app.ico", "icon.ico"] {
+        for name in [
+            "scalattice.ico",
+            "scalattice-agent.ico",
+            "app.ico",
+            "icon.ico",
+        ] {
             let path = dir.join(name);
             if path.is_file() {
                 return Some(path);

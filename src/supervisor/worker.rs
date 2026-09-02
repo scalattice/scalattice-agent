@@ -1,8 +1,6 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use crate::compute_pool::apply_slot_backend_visibility;
-use crate::llm::{
-    evict_all, generate_with_callback, init_backend, preload_model, GenerateConfig,
-};
+use crate::llm::{evict_all, generate_with_callback, init_backend, preload_model, GenerateConfig};
 use crate::models::{list_cached_runtime_models, resolve_model_gguf};
 use crate::protocol::InvokeTimings;
 use anyhow::{Context, Result};
@@ -12,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
-/// Entry point for `scalattice-agent worker` — owns one slot's llama backend.
+/// Entry point for `scalattice-agent worker`: owns one slot's llama backend.
 pub fn run_worker(config_json: &str) -> Result<()> {
     let boot: WorkerBootConfig =
         serde_json::from_str(config_json).context("parse worker boot config")?;
@@ -191,9 +189,8 @@ fn run_invoke(
                 model = %runtime_model,
                 "worker invoke accepted"
             );
-            let model_path = resolve_model_gguf(runtime_model).with_context(|| {
-                format!("model weights not found for {runtime_model}")
-            })?;
+            let model_path = resolve_model_gguf(runtime_model)
+                .with_context(|| format!("model weights not found for {runtime_model}"))?;
             info!(
                 slot = %boot.slot_id,
                 elapsed_ms = started.elapsed().as_millis() as u64,

@@ -177,8 +177,8 @@ fn skip_value(file: &mut File, value_type: u32) -> std::io::Result<()> {
             // BOOL
             file.seek(SeekFrom::Current(1))?;
         }
-        8 => skip_string(file)?,                                      // STRING
-        9 => skip_array(file)?,                                       // ARRAY
+        8 => skip_string(file)?, // STRING
+        9 => skip_array(file)?,  // ARRAY
         10 => {
             file.seek(SeekFrom::Current(8))?;
         } // UINT64
@@ -216,22 +216,22 @@ fn skip_array(file: &mut File) -> std::io::Result<()> {
 fn ggml_type_nbytes(ggml_type: u32, nelements: u64) -> Option<u64> {
     // ggml type enum → (block_size, type_size in bytes). None = unknown / skip strict check.
     let (block_size, type_size) = match ggml_type {
-        0 => (1u64, 4u64),   // F32
-        1 => (1, 2),         // F16
-        2 => (32, 18),       // Q4_0
-        3 => (32, 20),       // Q4_1
-        6 => (32, 22),       // Q5_0
-        7 => (32, 24),       // Q5_1
-        8 => (32, 34),       // Q8_0
-        9 => (32, 36),       // Q8_1
-        10 => (256, 84),     // Q2_K
-        11 => (256, 110),    // Q3_K
-        12 => (256, 144),    // Q4_K
-        13 => (256, 176),    // Q5_K
-        14 => (256, 210),    // Q6_K
-        15 => (256, 292),    // Q8_K
-        30 => (1, 2),        // BF16
-        39 => (32, 17),      // MXFP4 (QK_MXFP4=32, 17 bytes/block)
+        0 => (1u64, 4u64), // F32
+        1 => (1, 2),       // F16
+        2 => (32, 18),     // Q4_0
+        3 => (32, 20),     // Q4_1
+        6 => (32, 22),     // Q5_0
+        7 => (32, 24),     // Q5_1
+        8 => (32, 34),     // Q8_0
+        9 => (32, 36),     // Q8_1
+        10 => (256, 84),   // Q2_K
+        11 => (256, 110),  // Q3_K
+        12 => (256, 144),  // Q4_K
+        13 => (256, 176),  // Q5_K
+        14 => (256, 210),  // Q6_K
+        15 => (256, 292),  // Q8_K
+        30 => (1, 2),      // BF16
+        39 => (32, 17),    // MXFP4 (QK_MXFP4=32, 17 bytes/block)
         _ => return None,
     };
     let blocks = nelements.div_ceil(block_size);

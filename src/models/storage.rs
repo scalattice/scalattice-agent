@@ -195,7 +195,8 @@ fn adopt_existing_gguf(runtime_model: &str, weights: &crate::protocol::ModelWeig
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()) == Some("gguf") && is_download_complete(path)
+            path.extension().and_then(|ext| ext.to_str()) == Some("gguf")
+                && is_download_complete(path)
         })
         .collect();
     if ggufs.len() != 1 {
@@ -236,7 +237,9 @@ fn write_adopted_manifest(
 
 pub fn model_weights_ready(runtime_model: &str) -> bool {
     if matches!(
-        read_weight_health(runtime_model).as_ref().map(|(s, _)| s.as_str()),
+        read_weight_health(runtime_model)
+            .as_ref()
+            .map(|(s, _)| s.as_str()),
         Some("corrupt") | Some("removing")
     ) {
         return false;
@@ -244,9 +247,9 @@ pub fn model_weights_ready(runtime_model: &str) -> bool {
     let Some(filenames) = read_manifest_filenames(runtime_model) else {
         return false;
     };
-    filenames
-        .iter()
-        .all(|filename| is_manifest_weight_file(runtime_model, &target_gguf_path(runtime_model, filename)))
+    filenames.iter().all(|filename| {
+        is_manifest_weight_file(runtime_model, &target_gguf_path(runtime_model, filename))
+    })
 }
 
 /// True when weights are ready under the HF runtime id, a legacy modelId cache folder,
@@ -466,7 +469,10 @@ pub fn list_cached_runtime_models() -> Vec<String> {
             continue;
         }
         let key = runtime_model.to_ascii_lowercase();
-        if out.iter().any(|existing| existing.to_ascii_lowercase() == key) {
+        if out
+            .iter()
+            .any(|existing| existing.to_ascii_lowercase() == key)
+        {
             continue;
         }
         out.push(runtime_model);

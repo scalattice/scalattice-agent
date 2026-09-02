@@ -49,22 +49,18 @@ pub fn init_mtmd_for_model(
 ) -> Result<MtmdContext> {
     let path = resolve_mmproj(model_path).ok_or_else(|| {
         anyhow!(
-            "image input needs an mmproj companion next to {} — enable the catalog companion and wait for download",
+            "image input needs an mmproj companion next to {}: enable the catalog companion and wait for download",
             model_path.display()
         )
     })?;
-    let path_str = path.to_str().ok_or_else(|| {
-        anyhow!(
-            "mmproj path is not valid UTF-8: {}",
-            path.display()
-        )
-    })?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow!("mmproj path is not valid UTF-8: {}", path.display()))?;
     let mut params = MtmdContextParams::default();
     params.use_gpu = !matches!(pool.strategy, PoolStrategy::CpuOnly);
     params.print_timings = false;
-    MtmdContext::init_from_file(path_str, model, &params).with_context(|| {
-        format!("init mmproj {}", path.display())
-    })
+    MtmdContext::init_from_file(path_str, model, &params)
+        .with_context(|| format!("init mmproj {}", path.display()))
 }
 
 fn decode_image_bytes(image: &ChatImage) -> Result<Vec<u8>> {
@@ -103,7 +99,7 @@ pub fn prefill_vision(
             anyhow::bail!("image exceeds 12 MB decoded");
         }
         let bitmap = MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(|err| {
-            // Stable client-input code — router/backend must not treat as operator fault.
+            // Stable client-input code: router/backend must not treat as operator fault.
             anyhow!("invalid_image: {err}")
         })?;
         bitmaps.push(bitmap);

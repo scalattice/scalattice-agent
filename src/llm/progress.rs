@@ -1,7 +1,7 @@
 //! Work-tied progress for GGUF load / prefill / decode.
 //!
-//! The hypervisor treats silence on this channel as a dead worker. Reports must
-//! come from the thread that is actually loading or generating — never a sidecar
+//! The supervisor treats silence on this channel as a dead worker. Reports must
+//! come from the thread that is actually loading or generating: never a sidecar
 //! timer, which would hide a CUDA hang.
 
 use std::cell::RefCell;
@@ -67,6 +67,8 @@ pub fn report(phase: &str, pct: f32) {
     });
 }
 
-pub fn attach_llama_progress(params: llama_cpp_2::model::params::LlamaModelParams) -> llama_cpp_2::model::params::LlamaModelParams {
+pub fn attach_llama_progress(
+    params: llama_cpp_2::model::params::LlamaModelParams,
+) -> llama_cpp_2::model::params::LlamaModelParams {
     params.with_progress_callback(llama_load_callback)
 }

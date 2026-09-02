@@ -104,7 +104,7 @@ pub(crate) fn suppress_short_completion_thinking(
     }
 }
 
-/// Trim only — do not strip model-specific reasoning markers.
+/// Trim only: do not strip model-specific reasoning markers.
 /// Open R1-class hosts leave `<think>…</think>` in `content` for the client.
 pub fn sanitize_completion(_model_id: &str, content: &str) -> String {
     content.trim().to_string()
@@ -173,7 +173,9 @@ mod tests {
         }]);
         assert_eq!(prepared[1].role, "user");
         assert!(prepared[1].has_images());
-        assert!(crate::llm::vision::content_with_media_markers(&prepared[1]).contains("<__media__>"));
+        assert!(
+            crate::llm::vision::content_with_media_markers(&prepared[1]).contains("<__media__>")
+        );
     }
 
     #[test]
@@ -185,7 +187,9 @@ mod tests {
             images: Vec::new(),
         }]);
         suppress_short_completion_thinking(tmpl, &mut msgs, 48, 4096);
-        assert!(msgs.iter().any(|m| m.role == "user" && m.content.contains("/no_think")));
+        assert!(msgs
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("/no_think")));
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub fn background_status() -> BackgroundStatus {
     if service_active() {
         return BackgroundStatus::Running;
     }
-    // A saved token means setup was requested — treat as Stopped so the tray watchdog
+    // A saved token means setup was requested: treat as Stopped so the tray watchdog
     // restarts the worker even if Startup shortcuts were never registered (common after
     // installer launch-without-set-token, or an early-return save path).
     if autostart_configured() || crate::config::read_saved_agent_token().is_some() {
@@ -39,14 +39,8 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     ensure_background_task(config, false)
 }
 
-#[allow(dead_code)]
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     force_restart_background(config, true)
-}
-
-#[allow(dead_code)]
-pub fn restart_after_token_change(config: &AgentConfig) -> Result<()> {
-    ensure_background_task(config, false)
 }
 
 /// Force-stop then start background + tray using the saved provider token.
@@ -221,11 +215,6 @@ pub fn background_runner_path() -> Result<PathBuf> {
     Ok(install_dir()?.join("run-background.cmd"))
 }
 
-#[allow(dead_code)]
-pub fn systemd_unit_path() -> Result<PathBuf> {
-    background_runner_path()
-}
-
 pub fn autostart_method_line() -> Option<String> {
     let mut agent_parts = Vec::new();
     if startup_agent_shortcut_exists() {
@@ -294,7 +283,7 @@ fn start_background_with_retry() -> Result<()> {
 }
 
 fn wait_for_background_start_gentle() {
-    // Keep this short — callers (tray Save token) must not look hung. The watchdog
+    // Keep this short: callers (tray Save token) must not look hung. The watchdog
     // retries if the mutex is not held yet.
     for delay_ms in [200_u64, 400, 800] {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
@@ -305,7 +294,7 @@ fn wait_for_background_start_gentle() {
 }
 
 /// True when the background single-instance mutex is held.
-/// Prefer this over WMI/`Get-CimInstance` — that path can hang while CUDA/driver init is wedged.
+/// Prefer this over WMI/`Get-CimInstance`: that path can hang while CUDA/driver init is wedged.
 fn background_agent_running() -> bool {
     if crate::config::update_smoke_test() {
         // The self-hosted Windows runner already has a production agent. Global
@@ -568,7 +557,7 @@ fn stop_background_agent_only() {
         }
         let _ = fs::remove_file(&path);
     }
-    // Never taskkill /IM — that would also kill the tray. Prefer the pid file;
+    // Never taskkill /IM: that would also kill the tray. Prefer the pid file;
     // if it's missing, skip anything that looks like the tray instance.
     if !killed && background_mutex_held() {
         let tray_pid = install_dir()
@@ -751,13 +740,13 @@ exit /b 1\r\n\
 :LogCudaMissing\r\n\
 set \"LOGDIR=%LOCALAPPDATA%\\Scalattice\\logs\"\r\n\
 if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\" >nul 2>&1\r\n\
->>\"%LOGDIR%\\agent.log\" echo [%DATE% %TIME%] CUDA runtime missing under %LIB% — reinstall Scalattice Agent\r\n\
+>>\"%LOGDIR%\\agent.log\" echo [%DATE% %TIME%] CUDA runtime missing under %LIB%: reinstall Scalattice Agent\r\n\
 exit /b 0\r\n\
 \r\n\
 :LogNvidiaDriverMissing\r\n\
 set \"LOGDIR=%LOCALAPPDATA%\\Scalattice\\logs\"\r\n\
 if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\" >nul 2>&1\r\n\
->>\"%LOGDIR%\\agent.log\" echo [%DATE% %TIME%] NVIDIA driver missing (nvcuda.dll) — install Game Ready/Studio driver for GPU jobs\r\n\
+>>\"%LOGDIR%\\agent.log\" echo [%DATE% %TIME%] NVIDIA driver missing (nvcuda.dll): install Game Ready/Studio driver for GPU jobs\r\n\
 exit /b 0\r\n";
 
     fs::write(install.join("scalattice-run.cmd"), run_cmd)?;
@@ -822,7 +811,7 @@ Sub LogCudaMissing(sh, fso, lib)
   logPath = logDir & "\agent.log"
   ts = Now
   Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — reinstall Scalattice Agent"
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & ": reinstall Scalattice Agent"
   stream.Close
   On Error Goto 0
 End Sub
@@ -870,7 +859,7 @@ Sub LogCudaMissing(sh, fso, lib)
   logPath = logDir & "\agent.log"
   ts = Now
   Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — reinstall Scalattice Agent"
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & ": reinstall Scalattice Agent"
   stream.Close
   On Error Goto 0
 End Sub
@@ -879,7 +868,7 @@ End Sub
 // Launch the agent exe directly (no cmd.exe host). A blocking .cmd console used to
 // survive reboot paths and kill the agent when closed. Crash recovery is handled by
 // the tray watchdog (and Linux systemd Restart=always).
-// CUDA missing: log and still start — Vulkan/CPU paths should not block reboot bring-up.
+// CUDA missing: log and still start. Vulkan/CPU paths should not block reboot bring-up.
 const LAUNCH_BACKGROUND_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
@@ -916,7 +905,7 @@ Sub LogCudaMissing(sh, fso, lib)
   logPath = logDir & "\agent.log"
   ts = Now
   Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & " — starting agent anyway (Vulkan/CPU)"
+  stream.WriteLine "[" & ts & "] CUDA runtime missing under " & lib & ": starting agent anyway (Vulkan/CPU)"
   stream.Close
   On Error Goto 0
 End Sub
@@ -1060,7 +1049,7 @@ fn write_boot_runner_script() -> Result<PathBuf> {
     let script = format!(
         "@echo off\r\n\
 setlocal\r\n\
-rem Generated by Scalattice — starts the agent at boot before interactive login.\r\n\
+rem Generated by Scalattice: starts the agent at boot before interactive login.\r\n\
 set \"USERPROFILE={userprofile}\"\r\n\
 set \"HOMEDRIVE={homedrive}\"\r\n\
 set \"HOMEPATH={homepath}\"\r\n\
@@ -1087,7 +1076,7 @@ cd /d \"{install}\"\r\n\
 }
 
 /// Keep the boot runner script fresh. Never recreate the SYSTEM task from normal
-/// launches — `/Create /RU SYSTEM` elevates and pops UAC on every sign-in.
+/// launches: `/Create /RU SYSTEM` elevates and pops UAC on every sign-in.
 fn ensure_boot_start_registered() -> Result<()> {
     let _ = write_boot_runner_script()?;
     Ok(())
@@ -1130,7 +1119,7 @@ fn try_create_boot_task() -> Result<()> {
 }
 
 /// One-shot elevated registration (set-token / tray Save). Never call from boot or
-/// background watchdog — that re-prompts UAC on every sign-in.
+/// background watchdog: that re-prompts UAC on every sign-in.
 pub fn install_boot_start_elevated() -> Result<()> {
     write_boot_runner_script()?;
     if boot_task_exists() {
@@ -1380,38 +1369,6 @@ fn remove_startup_shortcuts() {
     }
 }
 
-#[allow(dead_code)]
-fn run_scheduled_task_now() -> Result<()> {
-    let output = Command::new("schtasks")
-        .args(["/Run", "/TN", TASK_NAME])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .context("failed to start background task")?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("already running") {
-        return Ok(());
-    }
-
-    spawn_background_detached()
-}
-
-#[allow(dead_code)]
-fn run_tray_task_now() -> Result<()> {
-    if !tray_task_exists() {
-        return launch_tray_if_needed();
-    }
-    let _ = Command::new("schtasks")
-        .args(["/Run", "/TN", TRAY_TASK_NAME])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    launch_tray_if_needed()
-}
-
 /// `CommandExt::inherit_handles` is still unstable (rustc 1.98). Clearing
 /// HANDLE_FLAG_INHERIT on this process's stdio is the stable equivalent: a
 /// piped parent (CI `communicate()`, shells) then gets EOF when we exit,
@@ -1451,9 +1408,7 @@ fn spawn_background_detached() -> Result<()> {
     }
     let vbs = install_dir()?.join("launch-background.vbs");
     if vbs.is_file() {
-        spawn_detached(
-            Command::new("wscript.exe").args(["//nologo", &vbs.display().to_string()]),
-        )?;
+        spawn_detached(Command::new("wscript.exe").args(["//nologo", &vbs.display().to_string()]))?;
         return Ok(());
     }
 

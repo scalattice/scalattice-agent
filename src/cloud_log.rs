@@ -126,7 +126,9 @@ pub fn normalize_tracing_message(raw: &str) -> (String, String) {
     // Drop a trailing duplicate `slot=…` when the supervisor re-tagged a worker line.
     if let Some((a, b)) = rest.rsplit_once(" slot=") {
         if let Some((_, first_slot)) = a.rsplit_once(" slot=") {
-            if first_slot.split_whitespace().next() == Some(b.split_whitespace().next().unwrap_or("")) {
+            if first_slot.split_whitespace().next()
+                == Some(b.split_whitespace().next().unwrap_or(""))
+            {
                 rest = a.to_string();
             }
         }
@@ -231,18 +233,7 @@ pub fn set_streaming_verbose(verbose: bool) {
 }
 
 pub fn is_streaming() -> bool {
-    state()
-        .lock()
-        .map(|g| g.streaming)
-        .unwrap_or(false)
-}
-
-#[allow(dead_code)]
-pub fn streaming_verbose() -> bool {
-    state()
-        .lock()
-        .map(|g| g.streaming_verbose)
-        .unwrap_or(false)
+    state().lock().map(|g| g.streaming).unwrap_or(false)
 }
 
 /// Snapshot of the local ring (oldest → newest).
@@ -250,11 +241,7 @@ pub fn snapshot(verbose: bool) -> Vec<CloudLogLine> {
     state()
         .lock()
         .map(|g| {
-            let ring = if verbose {
-                &g.lines_verbose
-            } else {
-                &g.lines
-            };
+            let ring = if verbose { &g.lines_verbose } else { &g.lines };
             ring.iter().cloned().collect()
         })
         .unwrap_or_default()
@@ -286,10 +273,13 @@ mod tests {
 
     #[test]
     fn normalize_strips_nested_worker_supervisor_wrap() {
-        let raw = "2026-08-20T20:26:32.700132Z  INFO scalattice_agent::hypervisor::supervisor: 2026-08-20T20:26:32.699996Z  INFO load_from_file: llama-cpp-2: file size = 4.83 GiB slot=cuda-0";
+        let raw = "2026-08-20T20:26:32.700132Z  INFO scalattice_agent::supervisor::host: 2026-08-20T20:26:32.699996Z  INFO load_from_file: llama-cpp-2: file size = 4.83 GiB slot=cuda-0";
         let (level, msg) = normalize_tracing_message(raw);
         assert_eq!(level, "info");
-        assert_eq!(msg, "load_from_file: llama-cpp-2: file size = 4.83 GiB slot=cuda-0");
+        assert_eq!(
+            msg,
+            "load_from_file: llama-cpp-2: file size = 4.83 GiB slot=cuda-0"
+        );
     }
 
     #[test]

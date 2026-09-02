@@ -1,26 +1,29 @@
 use crate::config::{read_saved_agent_token, token_snippet, AgentConfig};
-use crate::protocol::{
-    parse_envelope, parse_error, parse_invoke, parse_invoke_cancel, parse_invoke_split, parse_pong, parse_ready, parse_registered,
-    AgentSchedule, CatalogModel, ComputeDevicePolicy, ControlAckMessage, ControlMessage, HeartbeatMessage,
-    InvokeDeltaMessage, InvokeErrorMessage, InvokeResultMessage, LogsBatchMessage, LogsLinePayload,
-    LogsSubscribeMessage, ModelPolicyEntry, RegisterMessage,
-};
-use crate::vram_lifecycle::{ScheduleTransition, VramLifecycleConfig, VramLifecycleState, VramTickAction};
-use crate::hypervisor::{Hypervisor, SlotStatus};
 use crate::inference::InferenceEngine;
 use crate::models::{
     can_host_on_machine, can_serve_vision_on_machine, handle_weight_load_failure,
-    preferred_download_card, purge_incomplete_model_weights,
-    should_skip_preload, spawn_delete_staged_dirs, stage_purge_model_weights,
-    sweep_staged_purge_dirs, spawn_catalog_sync,
+    preferred_download_card, purge_incomplete_model_weights, should_skip_preload,
+    spawn_catalog_sync, spawn_delete_staged_dirs, stage_purge_model_weights,
+    sweep_staged_purge_dirs,
+};
+use crate::protocol::{
+    parse_envelope, parse_error, parse_invoke, parse_invoke_cancel, parse_invoke_split, parse_pong,
+    parse_ready, parse_registered, AgentSchedule, CatalogModel, ComputeDevicePolicy,
+    ControlAckMessage, ControlMessage, HeartbeatMessage, InvokeDeltaMessage, InvokeErrorMessage,
+    InvokeResultMessage, LogsBatchMessage, LogsLinePayload, LogsSubscribeMessage, ModelPolicyEntry,
+    RegisterMessage,
 };
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::{
     apply_compute_policy, build_specs_from_devices, detect_all_compute_devices, detect_cpu_model,
-    detect_cuda_version, detect_driver_version, detect_hostname, detect_machine_specs, detect_ram_gb,
-    MachineSpecs,
+    detect_cuda_version, detect_driver_version, detect_hostname, detect_machine_specs,
+    detect_ram_gb, MachineSpecs,
 };
 use crate::state;
+use crate::supervisor::{SlotStatus, Supervisor};
+use crate::vram_lifecycle::{
+    ScheduleTransition, VramLifecycleConfig, VramLifecycleState, VramTickAction,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -105,13 +108,13 @@ struct SessionState {
     vram_lifecycle: VramLifecycleState,
     /// Cached machine specs. RefCell: SessionState is only accessed while holding the tokio Mutex.
     specs_cache: RefCell<Option<(Instant, MachineSpecs)>>,
-    hypervisor: Option<Arc<Hypervisor>>,
+    supervisor: Option<Arc<Supervisor>>,
     cached_slots: Vec<SlotStatus>,
     cached_idle_slots: u32,
     cached_max_jobs: u32,
     cached_loaded_models: Vec<String>,
-    pending_hypervisor_restart: bool,
-    /// Disk inventory for heartbeats. Refreshed off the WS thread — walking GGUFs
+    pending_supervisor_restart: bool,
+    /// Disk inventory for heartbeats. Refreshed off the WS thread: walking GGUFs
     /// inline stalls invoke/log frames for tens of seconds on some machines.
     disk_inventory_primed: bool,
     cached_disk_ready: Vec<String>,
@@ -119,6 +122,8 @@ struct SessionState {
     cached_model_disk: Vec<(String, crate::models::ModelDiskStatus)>,
     /// Last inbound server activity (pong, ready, invoke, …). Used to detect half-open links.
     last_server_activity: Instant,
+    /// Runtime the Go hypervisor told us to preload. Empty = do not guess.
+    warm_runtime_model: Option<String>,
 }
 
 impl SessionState {
@@ -143,17 +148,18 @@ impl SessionState {
             logged_download_blockers: false,
             vram_lifecycle: VramLifecycleState::default(),
             specs_cache: RefCell::new(None),
-            hypervisor: None,
+            supervisor: None,
             cached_slots: Vec::new(),
             cached_idle_slots: 0,
             cached_max_jobs: 1,
             cached_loaded_models: Vec::new(),
-            pending_hypervisor_restart: false,
+            pending_supervisor_restart: false,
             disk_inventory_primed: false,
             cached_disk_ready: Vec::new(),
             cached_disk_gb: 0,
             cached_model_disk: Vec::new(),
             last_server_activity: Instant::now(),
+            warm_runtime_model: None,
         }
     }
 
@@ -173,7 +179,9 @@ impl SessionState {
         if want.is_empty() {
             return false;
         }
-        self.cached_disk_ready.iter().any(|id| id.eq_ignore_ascii_case(want))
+        self.cached_disk_ready
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(want))
     }
 
     fn catalog_ready_on_disk(&self, model: &CatalogModel) -> bool {
@@ -196,10 +204,10 @@ impl SessionState {
 
     fn evict_vram_cache(&self) {
         info!("evicting in-memory model weights from VRAM");
-        if let Some(hv) = &self.hypervisor {
-            let hv = hv.clone();
+        if let Some(supervisor) = &self.supervisor {
+            let supervisor = supervisor.clone();
             tokio::spawn(async move {
-                hv.evict_all().await;
+                supervisor.evict_all().await;
             });
         } else {
             crate::llm::evict_all();
@@ -207,13 +215,12 @@ impl SessionState {
     }
 
     fn apply_max_completion_tokens(&mut self, raw: u32) {
-        let next = if raw == 0 {
-            1024
-        } else {
-            raw.clamp(16, 8192)
-        };
+        let next = if raw == 0 { 1024 } else { raw.clamp(16, 8192) };
         if self.max_completion_tokens != next {
-            info!(max_completion_tokens = next, "updated platform completion token ceiling");
+            info!(
+                max_completion_tokens = next,
+                "updated platform completion token ceiling"
+            );
             self.max_completion_tokens = next;
         }
     }
@@ -239,25 +246,18 @@ impl SessionState {
         }
     }
 
-    fn warm_runtime_models(&self) -> Vec<String> {
-        let models = self
-            .register_model_ids()
-            .into_iter()
-            .filter_map(|model_id| {
-                let model = self.catalog_for_advertised_id(&model_id)?;
-                let runtime = if model.runtime_model.trim().is_empty() {
-                    model.model_id.clone()
-                } else {
-                    model.runtime_model.clone()
-                };
-                if should_skip_preload(&runtime) {
-                    return None;
-                }
-                Some(runtime)
-            })
-            .collect::<Vec<_>>();
-        // Demand ordering + one-resident-per-small-slot happens in warm_models.
-        models
+    fn instructed_warm_runtime(&self) -> Option<String> {
+        let runtime = self.warm_runtime_model.as_ref()?.trim();
+        if runtime.is_empty() {
+            return None;
+        }
+        if should_skip_preload(runtime) {
+            return None;
+        }
+        if self.disk_inventory_primed && !self.disk_has_runtime(runtime) {
+            return None;
+        }
+        Some(runtime.to_string())
     }
 
     fn effective_hf_token(&self, server_token: Option<String>) -> Option<String> {
@@ -310,10 +310,8 @@ impl SessionState {
             "starting model weight downloads for {} eligible model(s)",
             pending.len()
         );
-        let enabled_ids: std::collections::HashSet<String> = pending
-            .iter()
-            .map(|model| model.model_id.clone())
-            .collect();
+        let enabled_ids: std::collections::HashSet<String> =
+            pending.iter().map(|model| model.model_id.clone()).collect();
         self.sync_in_flight.store(true, Ordering::Relaxed);
         spawn_catalog_sync(
             pending,
@@ -344,8 +342,12 @@ impl SessionState {
             if self.catalog_ready_on_disk(model) {
                 continue;
             }
-            if !can_host_on_machine(model, &specs.compute_devices, ram_gb, self.cpu_ram_headroom_gb)
-            {
+            if !can_host_on_machine(
+                model,
+                &specs.compute_devices,
+                ram_gb,
+                self.cpu_ram_headroom_gb,
+            ) {
                 warn!(
                     "model {} cannot run on this machine (needs {} GB VRAM / {} GB RAM; machine has {} GB RAM)",
                     model.model_id,
@@ -463,11 +465,7 @@ impl SessionState {
 
     /// Resolve catalog + runtime for an invoke. Text jobs may run on VL weights when
     /// the text GGUF is missing but a ready VL sibling declares this text id.
-    fn resolve_invoke_catalog(
-        &self,
-        model_id: &str,
-        runtime_hint: &str,
-    ) -> (CatalogModel, String) {
+    fn resolve_invoke_catalog(&self, model_id: &str, runtime_hint: &str) -> (CatalogModel, String) {
         let fallback = CatalogModel {
             model_id: model_id.to_string(),
             display_name: model_id.to_string(),
@@ -529,7 +527,7 @@ impl SessionState {
             return (m.clone(), runtime);
         }
 
-        // Advertised text sibling with no text catalog row — only VL present.
+        // Advertised text sibling with no text catalog row: only VL present.
         if let Some(vl) = self.catalog.iter().find(|cand| {
             cand.vision_model
                 && cand
@@ -650,7 +648,7 @@ impl SessionState {
             .iter()
             .map(|device| (device.id.clone(), device.enabled))
             .collect();
-        // Order-independent compare — server may reshuffle the same set.
+        // Order-independent compare: server may reshuffle the same set.
         next.sort_by(|a, b| a.0.cmp(&b.0));
         let mut current = self.compute_policy.clone();
         current.sort_by(|a, b| a.0.cmp(&b.0));
@@ -671,7 +669,7 @@ impl SessionState {
         }
         self.compute_policy = next;
         self.invalidate_specs_cache();
-        self.pending_hypervisor_restart = true;
+        self.pending_supervisor_restart = true;
     }
 
     fn invalidate_specs_cache(&self) {
@@ -828,7 +826,7 @@ const ALREADY_CONNECTED: &str = "already_connected";
 /// macOS App Nap / Metal shader compile made the agent reconnect and cancel
 /// in-flight jobs (`agent disconnected: superseded`).
 const COMMS_STALE_AFTER: Duration = Duration::from_secs(90);
-/// `getaddrinfo` / TLS can hang for minutes after Wi‑Fi or resolver flaps.
+/// `getaddrinfo` / TLS can hang for minutes after Wi-Fi or resolver flaps.
 /// Bound every Cloud connect so the reconnect loop always gets another turn.
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 /// Half-open TCP after a local network drop: writes retransmit until the OS
@@ -847,21 +845,21 @@ const ALREADY_CONNECTED_DELAY: Duration = Duration::from_secs(8);
 const EVENT_LOOP_WEDGE_AFTER: Duration = Duration::from_secs(180);
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
-    // Supervisor never touches CUDA — per-slot workers set CUDA_VISIBLE_DEVICES themselves.
+    // Supervisor never touches CUDA: per-slot workers set CUDA_VISIBLE_DEVICES themselves.
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
     sweep_staged_purge_dirs();
 
-    let hypervisor = match Hypervisor::start(&specs.compute_devices).await {
-        Ok(hv) => hv,
+    let supervisor = match Supervisor::start(&specs.compute_devices).await {
+        Ok(supervisor) => supervisor,
         Err(err) => {
-            warn!("start compute hypervisor failed: {err:#}");
-            return Err(err).context("start compute hypervisor");
+            warn!("start compute supervisor failed: {err:#}");
+            return Err(err).context("start compute supervisor");
         }
     };
     info!(
-        slots = hypervisor.plan().slots.len(),
-        "compute hypervisor online"
+        slots = supervisor.plan().slots.len(),
+        "compute supervisor online"
     );
 
     let liveness = EventLoopLiveness::spawn();
@@ -879,7 +877,7 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
             }
         }
 
-        match run_agent_session(&config, hypervisor.clone(), &liveness, &mut backoff).await {
+        match run_agent_session(&config, supervisor.clone(), &liveness, &mut backoff).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 let err_str = format!("{err:#}");
@@ -914,10 +912,7 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
                     );
                     if let Some(fresh) = read_saved_agent_token() {
                         if fresh != config.token {
-                            info!(
-                                "retrying with saved token {}",
-                                token_snippet(&fresh)
-                            );
+                            info!("retrying with saved token {}", token_snippet(&fresh));
                             config.token = fresh;
                             continue;
                         }
@@ -975,7 +970,8 @@ impl EventLoopLiveness {
     }
 
     fn tick(&self) {
-        self.last_tick_ms.store(liveness_now_ms(), Ordering::Relaxed);
+        self.last_tick_ms
+            .store(liveness_now_ms(), Ordering::Relaxed);
     }
 }
 
@@ -1026,9 +1022,7 @@ async fn connect_agent_websocket(
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
         Ok(Ok((ws, _))) => Ok(ws),
-        Ok(Err(err)) => {
-            Err(err).context("WebSocket connect failed (check token and network)")
-        }
+        Ok(Err(err)) => Err(err).context("WebSocket connect failed (check token and network)"),
         Err(_) => bail!(
             "WebSocket connect timed out after {}s (DNS or network not ready yet)",
             WS_CONNECT_TIMEOUT.as_secs()
@@ -1050,7 +1044,7 @@ async fn send_ws_message_timed(write: &SharedWsWrite, message: Message) -> Resul
 
 async fn run_agent_session(
     config: &AgentConfig,
-    hypervisor: Arc<Hypervisor>,
+    supervisor: Arc<Supervisor>,
     liveness: &EventLoopLiveness,
     reconnect_backoff: &mut Duration,
 ) -> Result<()> {
@@ -1063,7 +1057,7 @@ async fn run_agent_session(
     let _streaming_guard = StreamingGuard;
 
     liveness.tick();
-    let recovered = hypervisor.reconcile_slots().await;
+    let recovered = supervisor.reconcile_slots().await;
     liveness.tick();
     if recovered > 0 {
         info!(recovered, "reclaimed slot(s) at session start");
@@ -1076,7 +1070,7 @@ async fn run_agent_session(
     let state = Arc::new(Mutex::new(SessionState::new()));
     {
         let mut guard = state.lock().await;
-        guard.hypervisor = Some(hypervisor.clone());
+        guard.supervisor = Some(supervisor.clone());
     }
     refresh_slot_cache(&state).await;
 
@@ -1181,7 +1175,7 @@ async fn run_agent_session(
                     guard.registered
                 };
                 if registered {
-                    // Keepalive frame FIRST — never await warm/hypervisor work before
+                    // Keepalive frame FIRST: never await warm/supervisor work before
                     // putting bytes on the wire (edge proxies idle-close ~100s).
                     send_heartbeat(&state, &write).await?;
                     {
@@ -1242,64 +1236,62 @@ impl Drop for MaintenanceGuard {
 async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
     // Restart workers when provider toggles devices.
     // Claim the pending flag immediately so concurrent refresh callers don't
-    // start a second Hypervisor::start in parallel.
+    // start a second Supervisor::start in parallel.
     let policy = {
         let mut guard = state.lock().await;
-        if !(guard.pending_hypervisor_restart && guard.active_job_count == 0) {
+        if !(guard.pending_supervisor_restart && guard.active_job_count == 0) {
             None
         } else {
-            guard.pending_hypervisor_restart = false;
+            guard.pending_supervisor_restart = false;
             Some(guard.compute_policy.clone())
         }
     };
     if let Some(policy) = policy {
-        let specs = tokio::task::spawn_blocking(move || {
-            SessionState::detect_enabled_devices(&policy)
-        })
-        .await;
+        let specs =
+            tokio::task::spawn_blocking(move || SessionState::detect_enabled_devices(&policy))
+                .await;
         if let Ok(specs) = specs {
-            match Hypervisor::start(&specs.compute_devices).await {
-                Ok(hv) => {
+            match Supervisor::start(&specs.compute_devices).await {
+                Ok(supervisor) => {
                     let mut guard = state.lock().await;
-                    guard.hypervisor = Some(hv);
-                    info!("compute hypervisor restarted after device policy change");
+                    guard.supervisor = Some(supervisor);
+                    info!("compute supervisor restarted after device policy change");
                 }
                 Err(err) => {
-                    warn!("hypervisor restart failed: {err:#}");
+                    warn!("supervisor restart failed: {err:#}");
                     // Allow a later refresh to retry.
-                    state.lock().await.pending_hypervisor_restart = true;
+                    state.lock().await.pending_supervisor_restart = true;
                 }
             }
         } else {
-            state.lock().await.pending_hypervisor_restart = true;
+            state.lock().await.pending_supervisor_restart = true;
         }
     }
 
-    let hv = state.lock().await.hypervisor.clone();
-    let Some(hv) = hv else {
+    let supervisor = state.lock().await.supervisor.clone();
+    let Some(supervisor) = supervisor else {
         return;
     };
-    let recovered = hv.reconcile_slots().await;
+    let recovered = supervisor.reconcile_slots().await;
     if recovered > 0 {
-        info!(recovered, "hypervisor reclaimed stuck compute slot(s)");
+        info!(recovered, "supervisor reclaimed stuck compute slot(s)");
     }
-    let slots = hv.slot_statuses().await;
-    let idle = hv.idle_slot_count().await;
-    let max = hv.max_concurrent_jobs().await;
-    let loaded = hv.loaded_models_union().await;
-    let in_flight = hv.has_in_flight_work().await;
+    let slots = supervisor.slot_statuses().await;
+    let idle = supervisor.idle_slot_count().await;
+    let max = supervisor.max_concurrent_jobs().await;
+    let loaded = supervisor.loaded_models_union().await;
+    let in_flight = supervisor.has_in_flight_work().await;
     let mut guard = state.lock().await;
     guard.cached_slots = slots;
     guard.cached_idle_slots = idle;
     guard.cached_max_jobs = max;
     guard.cached_loaded_models = loaded;
-    // Heal lied-about busy: counter says jobs remain but hypervisor has nothing
+    // Heal lied-about busy: counter says jobs remain but supervisor has nothing
     // checked out and no cancel waiters (WS reconnect / panicked invoke task).
     if guard.active_job_count > 0 && !in_flight && idle > 0 {
         warn!(
             stale = guard.active_job_count,
-            idle,
-            "clearing stale active_job_count; hypervisor has no in-flight work"
+            idle, "clearing stale active_job_count; supervisor has no in-flight work"
         );
         guard.active_job_count = 0;
         guard.job_state = JobState::Idle;
@@ -1317,22 +1309,21 @@ async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
     if !need_refresh {
         return;
     }
-    let specs = match tokio::task::spawn_blocking(move || {
-        SessionState::detect_enabled_devices(&policy)
-    })
-    .await
-    {
-        Ok(specs) => specs,
-        Err(err) => {
-            warn!("specs refresh task failed: {err:#}");
-            return;
-        }
-    };
+    let specs =
+        match tokio::task::spawn_blocking(move || SessionState::detect_enabled_devices(&policy))
+            .await
+        {
+            Ok(specs) => specs,
+            Err(err) => {
+                warn!("specs refresh task failed: {err:#}");
+                return;
+            }
+        };
     state.lock().await.store_specs_cache(specs);
 }
 
 async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
-    let (should_preload, warm_models, hv) = {
+    let (runtime, supervisor) = {
         let guard = state.lock().await;
         if guard.active_job_count > 0 {
             return;
@@ -1341,19 +1332,15 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
         if !guard.vram_lifecycle.should_preload(&config) {
             return;
         }
-        let warm_models = guard.warm_runtime_models();
-        if warm_models.is_empty() {
-            return;
-        }
-        let Some(hv) = guard.hypervisor.clone() else {
+        let Some(runtime) = guard.instructed_warm_runtime() else {
             return;
         };
-        (true, warm_models, hv)
+        let Some(supervisor) = guard.supervisor.clone() else {
+            return;
+        };
+        (runtime, supervisor)
     };
-    if !should_preload {
-        return;
-    }
-    if hv.has_in_flight_work().await {
+    if supervisor.has_in_flight_work().await {
         return;
     }
     let state_for_task = state.clone();
@@ -1361,10 +1348,10 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
         if state_for_task.lock().await.active_job_count > 0 {
             return;
         }
-        if hv.has_in_flight_work().await {
+        if supervisor.has_in_flight_work().await {
             return;
         }
-        if hv.warm_models(&warm_models).await.is_ok() {
+        if supervisor.warm_models(&[runtime]).await.ok() == Some(true) {
             let mut guard = state_for_task.lock().await;
             guard.vram_lifecycle.on_vram_loaded();
         }
@@ -1372,8 +1359,11 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
     });
 }
 
-async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite) -> Result<()> {
-    // Do not await hypervisor restart here — that can stall the WS loop past edge
+async fn send_register_message(
+    state: &Arc<Mutex<SessionState>>,
+    write: &SharedWsWrite,
+) -> Result<()> {
+    // Do not await supervisor restart here: that can stall the WS loop past edge
     // idle timeouts. Slot cache is refreshed on the background maintenance path.
     let register = {
         let mut guard = state.lock().await;
@@ -1395,7 +1385,7 @@ async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &SharedW
 }
 
 async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite) -> Result<()> {
-    // Intentionally light: keepalive must not await hypervisor/warm work.
+    // Intentionally light: keepalive must not await supervisor/warm work.
     let (specs, runtime) = {
         let guard = state.lock().await;
         (guard.live_specs(), guard.runtime())
@@ -1430,10 +1420,15 @@ async fn refresh_disk_inventory(state: &Arc<Mutex<SessionState>>) {
     guard.persist_local_state();
 }
 
-/// Best-effort WS write. Returns Ok even if the peer already reset — invoke tasks
+/// Best-effort WS write. Returns Ok even if the peer already reset: invoke tasks
 /// must not treat a dying socket as a logic failure that races the reconnect loop.
 async fn ws_send_text(write: &SharedWsWrite, text: &str) -> Result<()> {
-    match write.lock().await.send(Message::Text(text.to_string())).await {
+    match write
+        .lock()
+        .await
+        .send(Message::Text(text.to_string()))
+        .await
+    {
         Ok(()) => Ok(()),
         Err(err) => {
             let msg = err.to_string().to_lowercase();
@@ -1467,9 +1462,9 @@ async fn handle_server_message(
                     let ready = parse_ready(data)?;
                     info!("assigned node {}", ready.node_id);
                     let canceled = {
-                        let hv = state.lock().await.hypervisor.clone();
-                        if let Some(hv) = hv {
-                            let n = hv
+                        let supervisor = state.lock().await.supervisor.clone();
+                        if let Some(supervisor) = supervisor {
+                            let n = supervisor
                                 .cancel_all_invokes_and_drain(Duration::from_secs(20))
                                 .await;
                             if n > 0 {
@@ -1488,14 +1483,16 @@ async fn handle_server_message(
                         guard.apply_max_completion_tokens(ready.max_completion_tokens);
                         guard.cpu_ram_headroom_gb = ready.cpu_ram_headroom_gb;
                         guard.catalog = ready.catalog.clone();
+                        guard.warm_runtime_model = ready
+                            .warm_runtime_model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
                         guard.last_sync_token = None;
-                        let transition = guard.apply_schedule(ready.schedule.clone());
+                        guard.apply_schedule(ready.schedule.clone());
                         guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);
                         guard.persist_local_state();
-                        drop(guard);
-                        if transition.entered_earning && canceled == 0 {
-                            maybe_warm_models(state.clone()).await;
-                        }
                     }
                     // Register immediately so the session stays alive; restart workers
                     // and warm in the background (can take tens of seconds).
@@ -1553,9 +1550,9 @@ async fn handle_server_message(
                 }
                 "invoke_cancel" => {
                     if let Ok(msg) = parse_invoke_cancel(data) {
-                        let hv = state.lock().await.hypervisor.clone();
-                        if let Some(hv) = hv {
-                            if hv.cancel_invoke(&msg.id).await {
+                        let supervisor = state.lock().await.supervisor.clone();
+                        if let Some(supervisor) = supervisor {
+                            if supervisor.cancel_invoke(&msg.id).await {
                                 info!("canceled in-flight invoke {}", msg.id);
                             } else {
                                 debug!("invoke_cancel for unknown/finished job {}", msg.id);
@@ -1590,8 +1587,17 @@ async fn handle_server_message(
                                 guard.apply_catalog(catalog, pong.cpu_ram_headroom_gb);
                             }
                             let trash = guard.apply_purge_models(&pong.purge_models);
+                            if let Some(raw) = pong.warm_runtime_model.as_deref() {
+                                let trimmed = raw.trim();
+                                guard.warm_runtime_model = if trimmed.is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                };
+                            }
                             let transition = guard.apply_schedule(pong.schedule.clone());
-                            guard.sync_model_weights(pong.hugging_face_token.clone(), &config.token);
+                            guard
+                                .sync_model_weights(pong.hugging_face_token.clone(), &config.token);
                             guard.tick_vram_lifecycle();
                             guard.persist_local_state();
                             (transition, trash)
@@ -1712,11 +1718,11 @@ async fn handle_remote_control(
     let action = action.trim().to_ascii_lowercase();
     match action.as_str() {
         "cancel_jobs" | "stop_jobs" => {
-            let hv = state.lock().await.hypervisor.clone();
-            let canceled = if let Some(ref hv) = hv {
-                let n = hv.cancel_all_invokes().await;
+            let supervisor = state.lock().await.supervisor.clone();
+            let canceled = if let Some(ref supervisor) = supervisor {
+                let n = supervisor.cancel_all_invokes().await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let recovered = hv.reconcile_slots().await;
+                let recovered = supervisor.reconcile_slots().await;
                 if recovered > 0 {
                     info!(recovered, "reclaimed slot(s) after cancel_jobs");
                 }
@@ -1724,9 +1730,9 @@ async fn handle_remote_control(
             } else {
                 0
             };
-            // Drop lied session counters if hypervisor is idle.
-            let clear_counter = match &hv {
-                Some(hv) => !hv.has_in_flight_work().await,
+            // Drop lied session counters if supervisor is idle.
+            let clear_counter = match &supervisor {
+                Some(supervisor) => !supervisor.has_in_flight_work().await,
                 None => true,
             };
             if clear_counter {
@@ -1757,8 +1763,10 @@ async fn handle_remote_control(
             // Detach so the WS ack can flush before this process is replaced.
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(400)).await;
-                match tokio::task::spawn_blocking(|| crate::service::restart_runtime_from_saved_token())
-                    .await
+                match tokio::task::spawn_blocking(|| {
+                    crate::service::restart_runtime_from_saved_token()
+                })
+                .await
                 {
                     Ok(Ok(())) => {
                         // Process should be going down; exit as a fallback.
@@ -1806,11 +1814,13 @@ async fn handle_remote_control(
                             ok: true,
                             detail: Some(detail),
                         };
-                        let _ = ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default()).await;
+                        let _ =
+                            ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default())
+                                .await;
                         if will_restart {
                             tokio::time::sleep(Duration::from_millis(800)).await;
                             // Linux: systemctl restart is atomic (systemd respawns).
-                            // macOS: must not launchctl bootout from inside the job —
+                            // macOS: must not launchctl bootout from inside the job  - 
                             // that unloads it and the agent never comes back. The
                             // macOS helper kickstarts in-place (or KeepAlive after exit).
                             match tokio::task::spawn_blocking(|| {
@@ -1823,7 +1833,9 @@ async fn handle_remote_control(
                                     warn!("post-update restart failed (exiting anyway): {err:#}");
                                 }
                                 Err(err) => {
-                                    warn!("post-update restart task failed (exiting anyway): {err:#}");
+                                    warn!(
+                                        "post-update restart task failed (exiting anyway): {err:#}"
+                                    );
                                 }
                             }
                             std::process::exit(0);
@@ -1837,7 +1849,9 @@ async fn handle_remote_control(
                             ok: false,
                             detail: Some(format!("{err:#}").chars().take(240).collect()),
                         };
-                        let _ = ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default()).await;
+                        let _ =
+                            ws_send_text(&write, &serde_json::to_string(&ack).unwrap_or_default())
+                                .await;
                     }
                 }
             });
@@ -1867,7 +1881,7 @@ async fn respond_invoke(
     // Push the invoke line to live cloud logs immediately (don't wait for the 1s ticker).
     let _ = flush_live_logs(write).await;
 
-    let (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens, mut job_lease) = {
+    let (supervisor, catalog_model, runtime_model, ram_gb, headroom, max_tokens, mut job_lease) = {
         let mut guard = state.lock().await;
         let max_jobs = guard.cached_max_jobs.max(1);
         if guard.active_job_count >= max_jobs {
@@ -1890,19 +1904,27 @@ async fn respond_invoke(
         }
         guard.vram_lifecycle.on_job_started();
         let lease = ActiveJobLease::new(state.clone());
-        let hv = guard
-            .hypervisor
+        let supervisor = guard
+            .supervisor
             .clone()
-            .context("compute hypervisor not started")?;
+            .context("compute supervisor not started")?;
         let (catalog_model, runtime_model) =
             guard.resolve_invoke_catalog(&invoke.model_id, &invoke.runtime_model);
         let specs = guard.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let headroom = guard.cpu_ram_headroom_gb;
         let max_tokens = guard.effective_max_tokens(invoke.max_tokens);
-        (hv, catalog_model, runtime_model, ram_gb, headroom, max_tokens, lease)
+        (
+            supervisor,
+            catalog_model,
+            runtime_model,
+            ram_gb,
+            headroom,
+            max_tokens,
+            lease,
+        )
     };
-    // Do not heartbeat per-invoke — under concurrency that floods the WS with
+    // Do not heartbeat per-invoke: under concurrency that floods the WS with
     // heartbeat/pong/policy traffic and resets the provider connection.
 
     let invoke_id = invoke.id.clone();
@@ -1918,46 +1940,47 @@ async fn respond_invoke(
             }
         });
         let delta_tx_cb = delta_tx.clone();
-        let on_delta: Option<Box<dyn FnMut(String) + Send>> = Some(Box::new(move |delta: String| {
-            let invoke_id = invoke_id_cb.clone();
-            let forward_tokens = stream;
-            let text = if let Some(rest) = delta.strip_prefix('\u{1e}') {
-                let mut parts = rest.split('\u{1e}');
-                let phase = parts.next().unwrap_or("working").to_string();
-                let pct = parts
-                    .next()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .filter(|v| *v >= 0.0);
-                serde_json::to_string(&crate::protocol::InvokeProgressMessage {
-                    kind: "invoke_progress",
-                    id: invoke_id,
-                    phase,
-                    pct,
-                })
-            } else if delta.is_empty() || !forward_tokens {
-                serde_json::to_string(&crate::protocol::InvokeProgressMessage {
-                    kind: "invoke_progress",
-                    id: invoke_id,
-                    phase: if delta.is_empty() {
-                        "working".into()
-                    } else {
-                        "decode".into()
-                    },
-                    pct: None,
-                })
-            } else {
-                serde_json::to_string(&InvokeDeltaMessage {
-                    kind: "invoke_delta",
-                    id: invoke_id,
-                    delta,
-                })
-            };
-            if let Ok(text) = text {
-                let _ = delta_tx_cb.send(text);
-            }
-        }));
+        let on_delta: Option<Box<dyn FnMut(String) + Send>> =
+            Some(Box::new(move |delta: String| {
+                let invoke_id = invoke_id_cb.clone();
+                let forward_tokens = stream;
+                let text = if let Some(rest) = delta.strip_prefix('\u{1e}') {
+                    let mut parts = rest.split('\u{1e}');
+                    let phase = parts.next().unwrap_or("working").to_string();
+                    let pct = parts
+                        .next()
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .filter(|v| *v >= 0.0);
+                    serde_json::to_string(&crate::protocol::InvokeProgressMessage {
+                        kind: "invoke_progress",
+                        id: invoke_id,
+                        phase,
+                        pct,
+                    })
+                } else if delta.is_empty() || !forward_tokens {
+                    serde_json::to_string(&crate::protocol::InvokeProgressMessage {
+                        kind: "invoke_progress",
+                        id: invoke_id,
+                        phase: if delta.is_empty() {
+                            "working".into()
+                        } else {
+                            "decode".into()
+                        },
+                        pct: None,
+                    })
+                } else {
+                    serde_json::to_string(&InvokeDeltaMessage {
+                        kind: "invoke_delta",
+                        id: invoke_id,
+                        delta,
+                    })
+                };
+                if let Ok(text) = text {
+                    let _ = delta_tx_cb.send(text);
+                }
+            }));
 
-        let invoke_out = hv
+        let invoke_out = supervisor
             .invoke(
                 &invoke.id,
                 &invoke.model_id,
@@ -1973,8 +1996,7 @@ async fn respond_invoke(
         drop(delta_tx);
         let _ = delta_writer.await;
 
-        match invoke_out
-        {
+        match invoke_out {
             Ok((content, prompt_tokens, completion_tokens, timings, slot_id)) => {
                 info!(slot = %slot_id, "invoke {} completed", invoke_id);
                 let result = InvokeResultMessage {
@@ -2198,7 +2220,7 @@ async fn send_invoke_split_error(
 
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     let detail = format!("{err:#}").to_lowercase();
-    // Capacity / contention — router must not damage the machine.
+    // Capacity / contention: router must not damage the machine.
     if detail.contains("request_canceled")
         || detail.contains("request_cancelled")
         || detail.contains("invoke_timeout")
@@ -2222,7 +2244,7 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || (detail.contains("need") && detail.contains("vision job") && detail.contains("gb"))
         || detail.contains("create llama context")
     {
-        // Idle slots exist but none meet the image-job VRAM floor — not "busy".
+        // Idle slots exist but none meet the image-job VRAM floor: not "busy".
         // Context OOM after packing weights (GLM 4.7 Flash on a 48 GB Turing card
         // with 17 GB free) is the same class: capacity, not contention.
         "insufficient_vram"
@@ -2305,7 +2327,10 @@ mod invoke_error_code_tests {
 
 #[cfg(test)]
 mod reconnect_tests {
-    use super::{is_transient_network_error, next_reconnect_delay, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN};
+    use super::{
+        is_transient_network_error, next_reconnect_delay, RECONNECT_BACKOFF_MAX,
+        RECONNECT_BACKOFF_MIN,
+    };
     use std::time::Duration;
 
     #[test]

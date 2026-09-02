@@ -17,13 +17,13 @@
 ; Fail the installer compile if the release bundle omitted CUDA runtime DLLs.
 ; (skipifsourcedoesntexist used to ship a broken setup.exe with an empty lib folder.)
 #if !FileExists("..\..\dist\lib\cudart64_12.dll")
-  #error dist\lib\cudart64_12.dll missing — run scripts\bundle-release-windows.ps1 before building the installer
+  #error dist\lib\cudart64_12.dll missing: run scripts\bundle-release-windows.ps1 before building the installer
 #endif
 #if !FileExists("..\..\dist\lib\cublas64_12.dll")
-  #error dist\lib\cublas64_12.dll missing — run scripts\bundle-release-windows.ps1 before building the installer
+  #error dist\lib\cublas64_12.dll missing: run scripts\bundle-release-windows.ps1 before building the installer
 #endif
 #if !FileExists("..\..\dist\lib\cublasLt64_12.dll")
-  #error dist\lib\cublasLt64_12.dll missing — run scripts\bundle-release-windows.ps1 before building the installer
+  #error dist\lib\cublasLt64_12.dll missing: run scripts\bundle-release-windows.ps1 before building the installer
 #endif
 
 [Setup]
@@ -610,7 +610,7 @@ begin
       VramMb := GetIniString('Gpu' + IntToStr(I), 'VramMb', '0', IniPath);
       Line := '  - ' + Name + '  (' + FormatGpuKind(Kind, Vendor) + ')';
       Vram := StrToIntDef(VramMb, 0);
-      { VRAM comes from registry qwMemorySize / dxdiag — never WMI AdapterRAM. }
+      { VRAM comes from registry qwMemorySize / dxdiag: never WMI AdapterRAM. }
       if Vram >= 1024 then
         Line := Line + '  · ' + IntToStr((Vram + 512) div 1024) + ' GB VRAM'
       else if Vram > 0 then
@@ -698,7 +698,7 @@ begin
     Exit;
   end;
 
-  { NVIDIA present but driver missing / broken — show download guidance }
+  { NVIDIA present but driver missing / broken: show download guidance }
   if DriverDownloadBtn <> nil then
     DriverDownloadBtn.Visible := True;
 

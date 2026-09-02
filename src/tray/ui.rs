@@ -54,7 +54,10 @@ enum CloudLinkState {
     Disconnected,
 }
 
-fn spawn_update_worker() -> (mpsc::Sender<UpdateWorkerCmd>, mpsc::Receiver<UpdateWorkerMsg>) {
+fn spawn_update_worker() -> (
+    mpsc::Sender<UpdateWorkerCmd>,
+    mpsc::Receiver<UpdateWorkerMsg>,
+) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<UpdateWorkerCmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<UpdateWorkerMsg>();
     std::thread::spawn(move || {
@@ -204,16 +207,16 @@ fn run_tray_ui_inner(force: bool, open: bool) -> Result<()> {
 
     write_tray_log("tray started");
 
-    std::thread::spawn(|| {
-        match service::ensure_background_running_if_configured() {
+    std::thread::spawn(
+        || match service::ensure_background_running_if_configured() {
             Ok(()) => {
                 if service::service_active() {
                     write_tray_log("background agent auto-started");
                 }
             }
             Err(err) => write_tray_log(&format!("background auto-start failed: {err:#}")),
-        }
-    });
+        },
+    );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -442,7 +445,7 @@ impl TrayApp {
     }
 
     /// If the background agent crashed/stopped but a token is saved, bring it back
-    /// with that token — even while the panel is hidden in the notification area.
+    /// with that token: even while the panel is hidden in the notification area.
     fn tick_agent_watchdog(&mut self, ctx: &egui::Context) {
         if Instant::now() < self.next_agent_watchdog {
             let until = self
@@ -461,7 +464,7 @@ impl TrayApp {
             ctx.request_repaint_after(Duration::from_secs(5));
             return;
         }
-        // Only peek status with the fast mutex/pid check — never block the UI thread
+        // Only peek status with the fast mutex/pid check: never block the UI thread
         // on ensure/start (that previously froze the panel as Not Responding).
         match service::background_status() {
             service::BackgroundStatus::Stopped => {
@@ -492,12 +495,10 @@ impl TrayApp {
                             .and_then(|token| AgentConfig::from_env_and_cli(Some(token)))
                             .and_then(|config| service::restart_background_from_config(&config));
                         match result {
-                            Ok(()) => {
-                                write_tray_log("watchdog restarted wedged background agent")
+                            Ok(()) => write_tray_log("watchdog restarted wedged background agent"),
+                            Err(err) => {
+                                write_tray_log(&format!("watchdog wedge restart failed: {err:#}"))
                             }
-                            Err(err) => write_tray_log(&format!(
-                                "watchdog wedge restart failed: {err:#}"
-                            )),
                         }
                         inflight.store(false, Ordering::SeqCst);
                     });
@@ -519,8 +520,7 @@ impl TrayApp {
         }
         self.update_busy = true;
         self.update_notice =
-            "Downloading update… Scalattice will restart in the background when ready."
-                .to_string();
+            "Downloading update… Scalattice will restart in the background when ready.".to_string();
         self.clear_action_message();
         let _ = self.update_cmd_tx.send(UpdateWorkerCmd::Install);
     }
@@ -656,7 +656,10 @@ impl TrayApp {
 
     fn apply_cloud_link_transition(&mut self, next: CloudLinkState) {
         match (self.cloud_link_state, next) {
-            (Some(CloudLinkState::Disconnected) | Some(CloudLinkState::Connecting), CloudLinkState::Connected) => {
+            (
+                Some(CloudLinkState::Disconnected) | Some(CloudLinkState::Connecting),
+                CloudLinkState::Connected,
+            ) => {
                 self.notify_desktop("Connected", "Scalattice Agent is online and ready.");
             }
             (Some(CloudLinkState::Connected), CloudLinkState::Disconnected) => {
@@ -833,7 +836,7 @@ impl TrayApp {
 
         self.token_revealed = false;
         self.token_save_inflight = true;
-        // Sticky until the worker replies — then we set a timed result message.
+        // Sticky until the worker replies: then we set a timed result message.
         self.set_action_message("Saving token…", None);
         let tx = self.token_msg_tx.clone();
         std::thread::spawn(move || {
@@ -850,10 +853,7 @@ impl TrayApp {
             self.token_save_inflight = false;
             match msg {
                 TokenWorkerMsg::Saved => {
-                    self.set_action_message(
-                        "Token saved. Reconnecting…",
-                        Some(ACTION_MESSAGE_TTL),
-                    );
+                    self.set_action_message("Token saved. Reconnecting…", Some(ACTION_MESSAGE_TTL));
                     self.notify_desktop(
                         "Token saved",
                         "Reconnecting to Scalattice Cloud with the new token.",
@@ -897,7 +897,7 @@ impl eframe::App for TrayApp {
             self.panel_hidden = true;
         }
 
-        // Some Windows/eframe builds ignore with_visible(false) on create — re-hide
+        // Some Windows/eframe builds ignore with_visible(false) on create: re-hide
         // until the user explicitly opens the panel from the tray menu.
         if self.panel_hidden {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1018,7 +1018,10 @@ impl eframe::App for TrayApp {
 
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(!self.token_save_inflight, egui::Button::new("Save token"))
+                                .add_enabled(
+                                    !self.token_save_inflight,
+                                    egui::Button::new("Save token"),
+                                )
                                 .clicked()
                             {
                                 self.save_token();
@@ -1066,7 +1069,10 @@ impl eframe::App for TrayApp {
                             let button =
                                 egui::Button::new(update_label).min_size(egui::vec2(140.0, 0.0));
                             if ui
-                                .add_enabled(!self.update_busy && !self.update_check_inflight, button)
+                                .add_enabled(
+                                    !self.update_busy && !self.update_check_inflight,
+                                    button,
+                                )
                                 .clicked()
                             {
                                 if self.update_available {
@@ -1075,7 +1081,10 @@ impl eframe::App for TrayApp {
                                     self.kick_update_check();
                                 }
                             }
-                            if self.update_available && !self.update_busy && !self.update_check_inflight {
+                            if self.update_available
+                                && !self.update_busy
+                                && !self.update_check_inflight
+                            {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "v{} available",
@@ -1131,13 +1140,13 @@ impl eframe::App for TrayApp {
                                 "Simplified"
                             };
                             let toggle = egui::Button::new(
-                                egui::RichText::new(toggle_label)
-                                    .size(12.0)
-                                    .color(if self.log_verbose {
+                                egui::RichText::new(toggle_label).size(12.0).color(
+                                    if self.log_verbose {
                                         egui::Color32::from_rgb(255, 200, 120)
                                     } else {
                                         egui::Color32::from_rgb(160, 200, 160)
-                                    }),
+                                    },
+                                ),
                             )
                             .fill(egui::Color32::from_rgb(40, 44, 52))
                             .stroke(egui::Stroke::new(
@@ -1239,12 +1248,7 @@ fn render_status_line(ui: &mut egui::Ui, line: &str) {
                     .size(13.0)
                     .color(emphasis),
             );
-            ui.label(
-                egui::RichText::new(rest)
-                    .strong()
-                    .size(13.0)
-                    .color(body),
-            );
+            ui.label(egui::RichText::new(rest).strong().size(13.0).color(body));
         });
     } else if let Some(rest) = line.strip_prefix("Status: ") {
         ui.horizontal_wrapped(|ui| {
@@ -1254,12 +1258,7 @@ fn render_status_line(ui: &mut egui::Ui, line: &str) {
                     .size(13.0)
                     .color(emphasis),
             );
-            ui.label(
-                egui::RichText::new(rest)
-                    .strong()
-                    .size(13.0)
-                    .color(body),
-            );
+            ui.label(egui::RichText::new(rest).strong().size(13.0).color(body));
         });
     } else if let Some(rest) = line.strip_prefix("Node: ") {
         ui.horizontal_wrapped(|ui| {
@@ -1467,8 +1466,7 @@ fn process_exists(pid: u32) -> bool {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map(|o| {
-                o.status.success()
-                    && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
             })
             .unwrap_or(false);
     }
