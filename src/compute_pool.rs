@@ -1176,7 +1176,7 @@ mod tests {
         // 192 GB H100-class: 80-layer clamp would leave most of the card idle.
         let n = offload_layer_budget(192);
         assert!(n > 80, "{n}");
-        assert_eq!(n, ((192.0 * 1024.0 - 768.0) / 300.0).round() as u32);
+        assert_eq!(n, ((192.0f64 * 1024.0 - 768.0) / 300.0).round() as u32);
         assert_eq!(offload_layer_budget(0), 0);
     }
 

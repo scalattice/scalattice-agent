@@ -25,12 +25,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -162,7 +162,10 @@ impl SessionState {
     }
 
     fn cloud_link_stale(&self) -> bool {
-        self.registered && self.last_server_activity.elapsed() >= COMMS_STALE_AFTER
+        // Also fire before `registered`: a half-open TCP after connect, before
+        // the server `ready` frame, used to sit in `read.next()` forever because
+        // heartbeats only run once registered.
+        self.last_server_activity.elapsed() >= COMMS_STALE_AFTER
     }
 
     fn disk_has_runtime(&self, runtime_or_id: &str) -> bool {
@@ -825,10 +828,23 @@ const ALREADY_CONNECTED: &str = "already_connected";
 /// macOS App Nap / Metal shader compile made the agent reconnect and cancel
 /// in-flight jobs (`agent disconnected: superseded`).
 const COMMS_STALE_AFTER: Duration = Duration::from_secs(90);
-/// Fixed short delay only - no exponential backoff. Tiny pause so a dead server
-/// cannot pin a core in a tight reconnect loop.
+/// `getaddrinfo` / TLS can hang for minutes after Wi‑Fi or resolver flaps.
+/// Bound every Cloud connect so the reconnect loop always gets another turn.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+/// Half-open TCP after a local network drop: writes retransmit until the OS
+/// gives up (often many minutes). Fail the session instead of sitting idle.
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Tiny pause so a dead server cannot pin a core in a tight reconnect loop.
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+/// DNS/offline retries start here and double up to `RECONNECT_BACKOFF_MAX`.
+/// Hammering systemd-resolved every 500ms after `EAI_AGAIN` keeps the lookup
+/// failing even after the network is back.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const ALREADY_CONNECTED_DELAY: Duration = Duration::from_secs(8);
+/// If the async loop stops ticking this long, exit so systemd / the Windows
+/// tray watchdog can spawn a fresh process (native DNS can ignore cancellation).
+const EVENT_LOOP_WEDGE_AFTER: Duration = Duration::from_secs(180);
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     // Supervisor never touches CUDA — per-slot workers set CUDA_VISIBLE_DEVICES themselves.
@@ -848,7 +864,11 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
         "compute hypervisor online"
     );
 
+    let liveness = EventLoopLiveness::spawn();
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+
     loop {
+        liveness.tick();
         if let Some(fresh) = read_saved_agent_token() {
             if fresh != config.token {
                 info!(
@@ -859,7 +879,7 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
             }
         }
 
-        match run_agent_session(&config, hypervisor.clone()).await {
+        match run_agent_session(&config, hypervisor.clone(), &liveness, &mut backoff).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 let err_str = format!("{err:#}");
@@ -902,13 +922,68 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
                             continue;
                         }
                     }
+                }
+                let delay = if is_transient_network_error(&err_str) {
+                    let delay = backoff;
+                    backoff = next_reconnect_delay(backoff);
+                    delay
+                } else {
+                    backoff = RECONNECT_BACKOFF_MIN;
+                    RECONNECT_DELAY
+                };
+                if delay >= Duration::from_secs(1) {
+                    warn!(
+                        "disconnected: {err_str}; reconnecting in {}s...",
+                        delay.as_secs()
+                    );
                 } else {
                     warn!("disconnected: {err_str}; reconnecting...");
                 }
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                tokio::time::sleep(delay).await;
             }
         }
     }
+}
+
+struct EventLoopLiveness {
+    last_tick_ms: Arc<AtomicU64>,
+}
+
+impl EventLoopLiveness {
+    fn spawn() -> Self {
+        let last_tick_ms = Arc::new(AtomicU64::new(liveness_now_ms()));
+        let watch = last_tick_ms.clone();
+        let _ = std::thread::Builder::new()
+            .name("scalattice-liveness".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(15));
+                let last = watch.load(Ordering::Relaxed);
+                let hung_for = liveness_now_ms().saturating_sub(last);
+                if hung_for >= EVENT_LOOP_WEDGE_AFTER.as_millis() as u64 {
+                    warn!(
+                        hung_secs = hung_for / 1000,
+                        "event loop wedged; exiting so the service manager restarts the agent"
+                    );
+                    eprintln!(
+                        "scalattice-agent: event loop wedged for {}s; exiting for service restart",
+                        hung_for / 1000
+                    );
+                    std::process::exit(75);
+                }
+            });
+        Self { last_tick_ms }
+    }
+
+    fn tick(&self) {
+        self.last_tick_ms.store(liveness_now_ms(), Ordering::Relaxed);
+    }
+}
+
+fn liveness_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn is_token_auth_error(message: &str) -> bool {
@@ -917,7 +992,68 @@ fn is_token_auth_error(message: &str) -> bool {
         || message.contains("invalid agent token")
 }
 
-async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) -> Result<()> {
+fn is_transient_network_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("temporary failure in name resolution")
+        || m.contains("failed to lookup address")
+        || m.contains("name or service not known")
+        || m.contains("nodename nor servname provided")
+        || m.contains("no such host")
+        || m.contains("network is unreachable")
+        || m.contains("no route to host")
+        || m.contains("connection refused")
+        || m.contains("connection reset")
+        || m.contains("network not ready")
+        || m.contains("timed out")
+        || m.contains("timeout")
+        || m.contains("temporarily unavailable")
+        || m.contains("try again")
+        || m.contains("os error 110")
+        || m.contains("os error 101")
+        || m.contains("os error 111")
+        || m.contains("os error 51")
+        || m.contains("os error 64")
+}
+
+fn next_reconnect_delay(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(RECONNECT_BACKOFF_MIN, RECONNECT_BACKOFF_MAX)
+}
+
+async fn connect_agent_websocket(
+    request: impl IntoClientRequest + Unpin,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+        Ok(Ok((ws, _))) => Ok(ws),
+        Ok(Err(err)) => {
+            Err(err).context("WebSocket connect failed (check token and network)")
+        }
+        Err(_) => bail!(
+            "WebSocket connect timed out after {}s (DNS or network not ready yet)",
+            WS_CONNECT_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+async fn send_ws_message_timed(write: &SharedWsWrite, message: Message) -> Result<()> {
+    match timeout(WS_WRITE_TIMEOUT, async {
+        write.lock().await.send(message).await
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err).context("websocket write failed"),
+        Err(_) => bail!("websocket write timed out (network likely dropped)"),
+    }
+}
+
+async fn run_agent_session(
+    config: &AgentConfig,
+    hypervisor: Arc<Hypervisor>,
+    liveness: &EventLoopLiveness,
+    reconnect_backoff: &mut Duration,
+) -> Result<()> {
     struct StreamingGuard;
     impl Drop for StreamingGuard {
         fn drop(&mut self) {
@@ -926,10 +1062,9 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     }
     let _streaming_guard = StreamingGuard;
 
-    // Do not cancel in-flight jobs before the socket is accepted. A false
-    // reconnect used to abort Metal loads, then the new session stole the key
-    // and the cloud saw `agent disconnected: superseded`.
+    liveness.tick();
     let recovered = hypervisor.reconcile_slots().await;
+    liveness.tick();
     if recovered > 0 {
         info!(recovered, "reclaimed slot(s) at session start");
     }
@@ -954,9 +1089,10 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
         .headers_mut()
         .insert("Authorization", format!("Bearer {}", config.token).parse()?);
 
-    let (ws, _) = connect_async(request)
-        .await
-        .context("WebSocket connect failed (check token and network)")?;
+    liveness.tick();
+    let ws = connect_agent_websocket(request).await?;
+    *reconnect_backoff = RECONNECT_BACKOFF_MIN;
+    liveness.tick();
 
     {
         let mut guard = state.lock().await;
@@ -983,6 +1119,8 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     logs_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut token_poll = interval(Duration::from_secs(1));
     token_poll.tick().await;
+    let mut stale_check = interval(Duration::from_secs(15));
+    stale_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Only one background maintenance pass at a time so warm/refresh cannot
     // stack and starve the WS select loop (Cloudflare idle ~100s).
     let maintenance_busy = Arc::new(AtomicBool::new(false));
@@ -990,6 +1128,7 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
     loop {
         tokio::select! {
             msg = read.next() => {
+                liveness.tick();
                 let Some(msg) = msg else {
                     bail!("connection closed by server");
                 };
@@ -999,6 +1138,7 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                 }
             }
             _ = token_poll.tick() => {
+                liveness.tick();
                 if let Some(fresh) = read_saved_agent_token() {
                     if fresh != config.token {
                         info!(
@@ -1009,12 +1149,32 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                     }
                 }
             }
+            _ = stale_check.tick() => {
+                liveness.tick();
+                let (stale, busy) = {
+                    let guard = state.lock().await;
+                    (guard.cloud_link_stale(), guard.active_job_count > 0)
+                };
+                if stale && busy {
+                    warn!(
+                        "no cloud response for {}s during in-flight job; keeping session",
+                        COMMS_STALE_AFTER.as_secs()
+                    );
+                } else if stale {
+                    warn!(
+                        "no cloud response for {}s; reconnecting",
+                        COMMS_STALE_AFTER.as_secs()
+                    );
+                    bail!("cloud link stale (no server response)");
+                }
+            }
             _ = logs_flush.tick() => {
                 if crate::cloud_log::is_streaming() {
                     let _ = flush_live_logs(&write).await;
                 }
             }
             _ = heartbeat.tick() => {
+                liveness.tick();
                 let registered = {
                     let mut guard = state.lock().await;
                     guard.tick_vram_lifecycle();
@@ -1027,20 +1187,6 @@ async fn run_agent_session(config: &AgentConfig, hypervisor: Arc<Hypervisor>) ->
                     {
                         let guard = state.lock().await;
                         guard.persist_local_state();
-                        if guard.cloud_link_stale() {
-                            if guard.active_job_count > 0 {
-                                warn!(
-                                    "no cloud response for {}s during in-flight job; keeping session",
-                                    COMMS_STALE_AFTER.as_secs()
-                                );
-                            } else {
-                                warn!(
-                                    "no cloud response for {}s; reconnecting",
-                                    COMMS_STALE_AFTER.as_secs()
-                                );
-                                bail!("cloud link stale (no server response)");
-                            }
-                        }
                     }
                     if maintenance_busy
                         .compare_exchange(
@@ -1244,11 +1390,7 @@ async fn send_register_message(state: &Arc<Mutex<SessionState>>, write: &SharedW
             runtime: Some(runtime),
         }
     };
-    write
-        .lock()
-        .await
-        .send(Message::Text(serde_json::to_string(&register)?))
-        .await?;
+    send_ws_message_timed(write, Message::Text(serde_json::to_string(&register)?)).await?;
     Ok(())
 }
 
@@ -1263,7 +1405,7 @@ async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite)
         specs: Some(specs),
         runtime: Some(runtime),
     })?;
-    write.lock().await.send(Message::Text(hb)).await?;
+    send_ws_message_timed(write, Message::Text(hb)).await?;
     Ok(())
 }
 
@@ -2158,5 +2300,50 @@ mod invoke_error_code_tests {
     fn llama_context_oom_is_insufficient_vram_not_busy() {
         let err = anyhow::anyhow!("create llama context: null reference from llama.cpp");
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::{is_transient_network_error, next_reconnect_delay, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN};
+    use std::time::Duration;
+
+    #[test]
+    fn dns_lookup_failure_is_transient() {
+        assert!(is_transient_network_error(
+            "WebSocket connect failed (check token and network): IO error: failed to lookup address information: Temporary failure in name resolution"
+        ));
+    }
+
+    #[test]
+    fn connect_timeout_is_transient() {
+        assert!(is_transient_network_error(
+            "WebSocket connect timed out after 25s (DNS or network not ready yet)"
+        ));
+    }
+
+    #[test]
+    fn write_timeout_is_transient() {
+        assert!(is_transient_network_error(
+            "websocket write timed out (network likely dropped)"
+        ));
+    }
+
+    #[test]
+    fn token_error_is_not_transient() {
+        assert!(!is_transient_network_error("invalid_agent_token"));
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        let mut delay = RECONNECT_BACKOFF_MIN;
+        delay = next_reconnect_delay(delay);
+        assert_eq!(delay, Duration::from_secs(2));
+        delay = next_reconnect_delay(delay);
+        assert_eq!(delay, Duration::from_secs(4));
+        for _ in 0..8 {
+            delay = next_reconnect_delay(delay);
+        }
+        assert_eq!(delay, RECONNECT_BACKOFF_MAX);
     }
 }

@@ -95,6 +95,7 @@ enum Commands {
         disable_auto: bool,
     },
     /// Restart the background agent (and Windows tray) using the saved token
+    #[command(visible_alias = "connect")]
     Restart,
     /// Internal/elevated: register ONSTART SYSTEM task so the agent runs before sign-in
     #[cfg(windows)]
