@@ -237,7 +237,7 @@ fn write_user_unit(os_home: &Path, data_home: &Path) -> Result<bool> {
     let unit = format!(
         r#"[Unit]
 Description=Scalattice GPU Agent
-After=network-online.target
+After=network-online.target network.target nss-lookup.target
 Wants=network-online.target
 
 [Service]

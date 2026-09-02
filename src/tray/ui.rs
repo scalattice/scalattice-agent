@@ -479,7 +479,31 @@ impl TrayApp {
                     inflight.store(false, Ordering::SeqCst);
                 });
             }
-            service::BackgroundStatus::Running | service::BackgroundStatus::NotInstalled => {}
+            service::BackgroundStatus::Running => {
+                if state::connection_state_looks_wedged() {
+                    let inflight = Arc::clone(&self.watchdog_inflight);
+                    inflight.store(true, Ordering::SeqCst);
+                    std::thread::spawn(move || {
+                        write_tray_log(
+                            "watchdog restarting wedged background agent (connection state stale)",
+                        );
+                        let result = crate::config::read_saved_agent_token()
+                            .ok_or_else(|| anyhow::anyhow!("no saved provider token"))
+                            .and_then(|token| AgentConfig::from_env_and_cli(Some(token)))
+                            .and_then(|config| service::restart_background_from_config(&config));
+                        match result {
+                            Ok(()) => {
+                                write_tray_log("watchdog restarted wedged background agent")
+                            }
+                            Err(err) => write_tray_log(&format!(
+                                "watchdog wedge restart failed: {err:#}"
+                            )),
+                        }
+                        inflight.store(false, Ordering::SeqCst);
+                    });
+                }
+            }
+            service::BackgroundStatus::NotInstalled => {}
         }
         ctx.request_repaint_after(Duration::from_secs(5));
     }

@@ -340,6 +340,24 @@ fn is_recent(updated_at_ms: u64) -> bool {
     now_ms().saturating_sub(updated_at_ms) < 120_000
 }
 
+/// True when the background process looks alive but has not updated connection
+/// state for long enough that it is likely wedged in DNS/`connect` (Wi‑Fi flap,
+/// resolver hang). Active reconnects keep `updated_at_ms` fresh.
+/// Used by the Windows/macOS tray watchdog (no tray on Linux).
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub fn connection_state_looks_wedged() -> bool {
+    let Some(state) = read_state() else {
+        return false;
+    };
+    if state.server_connected || state.server_registered {
+        return false;
+    }
+    if state.updated_at_ms == 0 {
+        return false;
+    }
+    now_ms().saturating_sub(state.updated_at_ms) >= 180_000
+}
+
 fn write_state(state: &AgentLocalState) {
     let Some(path) = state_file_path() else {
         return;
