@@ -22,9 +22,10 @@ curl -fsSL https://scalattice.cloud/install/agent | sh -s -- --token slt_provide
 **Please do not report security vulnerabilities through public GitHub issues.**
 
 If you believe you have found a security issue in this repository or in how the
-agent interacts with Scalattice Cloud, report it privately to:
+agent interacts with Scalattice Cloud, report it privately using the
+[Vulnerability Disclosure Policy](https://scalattice.com/security/):
 
-**[security@robottik.co.uk](mailto:security@robottik.co.uk)**
+**[support@scalattice.com](mailto:support@scalattice.com)**
 
 If you do not receive a response within five business days, you may follow up at
 **[admin@robottik.co.uk](mailto:admin@robottik.co.uk)** with the subject line
