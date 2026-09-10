@@ -43,6 +43,14 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     force_restart_background(config, true)
 }
 
+pub fn ensure_reconnect_watchdog() -> Result<()> {
+    if crate::config::update_smoke_test() {
+        return Ok(());
+    }
+    sync_launch_scripts()?;
+    try_create_retry_task()
+}
+
 /// Force-stop then start background + tray using the saved provider token.
 /// Used after silent in-place updates so the new binary always comes back up.
 pub fn restart_runtime_from_saved_token() -> Result<()> {
@@ -227,7 +235,7 @@ pub fn autostart_method_line() -> Option<String> {
         agent_parts.push("Boot");
     }
     if retry_task_exists() {
-        agent_parts.push("RetryTask");
+        agent_parts.push("Watchdog");
     }
     if run_key_agent_exists() {
         agent_parts.push("Run");
@@ -759,6 +767,7 @@ exit /b 0\r\n";
             "launch-background-delayed.vbs",
             LAUNCH_BACKGROUND_DELAYED_VBS,
         ),
+        ("launch-watchdog.vbs", LAUNCH_WATCHDOG_VBS),
     ] {
         fs::write(install.join(name), content)?;
     }
@@ -865,10 +874,9 @@ Sub LogCudaMissing(sh, fso, lib)
 End Sub
 "#;
 
-// Launch the agent exe directly (no cmd.exe host). A blocking .cmd console used to
-// survive reboot paths and kill the agent when closed. Crash recovery is handled by
-// the tray watchdog (and Linux systemd Restart=always).
-// CUDA missing: log and still start. Vulkan/CPU paths should not block reboot bring-up.
+// Crash/wedge recovery: OS watchdog every 2 minutes (scalattice-agent watchdog)
+// plus the tray watchdog. Linux uses systemd Restart=always + a timer; macOS
+// uses KeepAlive + a StartInterval LaunchAgent. Do not host the agent in cmd.exe.
 const LAUNCH_BACKGROUND_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
@@ -920,6 +928,15 @@ target = install & "\launch-background.vbs"
 If Not fso.FileExists(target) Then WScript.Quit 0
 WScript.Sleep 45000
 sh.Run "wscript.exe //nologo """ & target & """", 0, False
+"#;
+
+const LAUNCH_WATCHDOG_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
+exe = install & "\scalattice-agent.exe"
+If Not fso.FileExists(exe) Then WScript.Quit 0
+sh.Run """" & exe & """ watchdog", 0, False
 "#;
 
 const STARTUP_AGENT_VBS_CONTENT: &str = r#"Set sh = CreateObject("WScript.Shell")
@@ -1210,7 +1227,7 @@ fn try_create_scheduled_task() -> Result<()> {
 }
 
 fn try_create_retry_task() -> Result<()> {
-    let vbs = install_dir()?.join("launch-background-delayed.vbs");
+    let vbs = install_dir()?.join("launch-watchdog.vbs");
     if !vbs.is_file() {
         bail!("failed to write {}", vbs.display());
     }
@@ -1224,7 +1241,9 @@ fn try_create_retry_task() -> Result<()> {
             "/TR",
             &tr,
             "/SC",
-            "ONLOGON",
+            "MINUTE",
+            "/MO",
+            "2",
             "/RL",
             "LIMITED",
             "/F",

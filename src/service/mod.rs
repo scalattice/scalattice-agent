@@ -47,6 +47,39 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::start_background_from_config(config)
 }
 
+pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
+    platform::restart_background_from_config(config)
+}
+
+/// OS scheduler tick: start a dead agent, or kill one that has frozen mid-session.
+/// Independent of the Windows/macOS tray: that UI used to be the only restarter,
+/// so quitting the tray (or App Nap) left machines offline until someone opened it.
+pub fn run_watchdog_tick() -> Result<()> {
+    if crate::config::read_saved_agent_token().is_none() {
+        return Ok(());
+    }
+    if !background_service_available() {
+        return Ok(());
+    }
+    if service_active() {
+        if crate::state::connection_state_looks_wedged() {
+            tracing::warn!("watchdog: background agent looks wedged; restarting");
+            let token = crate::config::read_saved_agent_token()
+                .ok_or_else(|| anyhow::anyhow!("no saved provider token"))?;
+            let config = AgentConfig::from_env_and_cli(Some(token))?;
+            restart_background_from_config(&config)?;
+        }
+        return Ok(());
+    }
+    ensure_background_running_if_configured()
+}
+
+/// Install the OS reconnect watchdog without restarting this process.
+/// Safe to call from the live background agent after an upgrade.
+pub fn ensure_reconnect_watchdog() -> Result<()> {
+    platform::ensure_reconnect_watchdog()
+}
+
 /// Start the background agent when a token is saved but the foreground worker is not running.
 pub fn ensure_background_running_if_configured() -> Result<()> {
     if !background_service_available() {
@@ -65,11 +98,6 @@ pub fn ensure_background_running_if_configured() -> Result<()> {
             start_background_from_config(&config)
         }
     }
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
-    platform::restart_background_from_config(config)
 }
 
 /// Restart background (+ tray on Windows) from the saved token after an update.
@@ -286,6 +314,11 @@ pub fn uninstall_agent(mut opts: UninstallOptions) -> Result<()> {
     {
         targets.push(config.join("agent.systemd.env"));
         targets.push(platform::systemd_unit_path()?);
+        if let Ok(home) = crate::paths::os_user_home() {
+            let dir = home.join(".config/systemd/user");
+            targets.push(dir.join("scalattice-agent-watchdog.service"));
+            targets.push(dir.join("scalattice-agent-watchdog.timer"));
+        }
         if let Ok(log) = crate::paths::agent_log_path() {
             if let Some(logs_dir) = log.parent() {
                 targets.push(logs_dir.to_path_buf());
@@ -299,6 +332,7 @@ pub fn uninstall_agent(mut opts: UninstallOptions) -> Result<()> {
         if let Ok(home) = crate::paths::home_dir() {
             targets.push(home.join("Library/LaunchAgents/com.scalattice.agent.update.plist"));
             targets.push(home.join("Library/LaunchAgents/com.scalattice.agent.tray.plist"));
+            targets.push(home.join("Library/LaunchAgents/com.scalattice.agent.watchdog.plist"));
         }
         if let Ok(log) = crate::paths::agent_log_path() {
             if let Some(logs_dir) = log.parent() {
@@ -316,6 +350,7 @@ pub fn uninstall_agent(mut opts: UninstallOptions) -> Result<()> {
         targets.push(install.join("launch-tray-interactive.vbs"));
         targets.push(install.join("launch-background.vbs"));
         targets.push(install.join("launch-background-delayed.vbs"));
+        targets.push(install.join("launch-watchdog.vbs"));
         targets.push(install.join("open-tray-debug.cmd"));
         targets.push(install.join("tray.pid"));
         targets.push(install.join("background.pid"));
