@@ -396,6 +396,8 @@ fn load_watchdog_plist() -> Result<()> {
     run_launchctl(&["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])?;
     Ok(())
 }
+
+fn reload_launch_agent() -> Result<()> {
     let uid = user_id();
     let domain = format!("gui/{uid}/{LABEL}");
     if invoked_by_background_service() {
