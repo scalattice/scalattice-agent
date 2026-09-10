@@ -30,13 +30,14 @@ use futures_util::{SinkExt, StreamExt};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -120,8 +121,9 @@ struct SessionState {
     cached_disk_ready: Vec<String>,
     cached_disk_gb: u32,
     cached_model_disk: Vec<(String, crate::models::ModelDiskStatus)>,
-    /// Last inbound server activity (pong, ready, invoke, …). Used to detect half-open links.
-    last_server_activity: Instant,
+    /// Last inbound *application* frame (pong/ready/invoke/…). Wall clock so
+    /// sleep/wake is detected; protocol Ping from a proxy must not refresh this.
+    last_server_activity_ms: u64,
     /// Runtime the Go hypervisor told us to preload. Empty = do not guess.
     warm_runtime_model: Option<String>,
 }
@@ -158,20 +160,20 @@ impl SessionState {
             cached_disk_ready: Vec::new(),
             cached_disk_gb: 0,
             cached_model_disk: Vec::new(),
-            last_server_activity: Instant::now(),
+            last_server_activity_ms: wall_now_ms(),
             warm_runtime_model: None,
         }
     }
 
     fn touch_server_activity(&mut self) {
-        self.last_server_activity = Instant::now();
+        self.last_server_activity_ms = wall_now_ms();
     }
 
     fn cloud_link_stale(&self) -> bool {
         // Also fire before `registered`: a half-open TCP after connect, before
         // the server `ready` frame, used to sit in `read.next()` forever because
         // heartbeats only run once registered.
-        self.last_server_activity.elapsed() >= COMMS_STALE_AFTER
+        cloud_link_is_stale(self.last_server_activity_ms, wall_now_ms())
     }
 
     fn disk_has_runtime(&self, runtime_or_id: &str) -> bool {
@@ -878,6 +880,10 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
         }
 
         match run_agent_session(&config, supervisor.clone(), &liveness, &mut backoff).await {
+            // Only Ctrl+C / explicit shutdown returns Ok. A server Close, idle
+            // proxy drop, or any other session end must reconnect — on Windows the
+            // background process is a one-shot task, so exiting here used to stay
+            // dead until the tray watchdog (or a reboot) started it again.
             Ok(()) => return Ok(()),
             Err(err) => {
                 let err_str = format!("{err:#}");
@@ -976,10 +982,28 @@ impl EventLoopLiveness {
 }
 
 fn liveness_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // Monotonic: a laptop sleep must not look like a wedged event loop (wall
+    // clock jumps of hours used to exit(75) and, on Windows, stay dead).
+    monotonic_ms()
+}
+
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn wall_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn cloud_link_is_stale(last_activity_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(last_activity_ms) >= COMMS_STALE_AFTER.as_millis() as u64
 }
 
 fn is_token_auth_error(message: &str) -> bool {
@@ -1020,13 +1044,37 @@ fn next_reconnect_delay(current: Duration) -> Duration {
 async fn connect_agent_websocket(
     request: impl IntoClientRequest + Unpin,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
-        Ok(Ok((ws, _))) => Ok(ws),
+    match timeout(
+        WS_CONNECT_TIMEOUT,
+        connect_async_with_config(request, None, true),
+    )
+    .await
+    {
+        Ok(Ok((ws, _))) => {
+            configure_websocket_tcp(ws.get_ref());
+            Ok(ws)
+        }
         Ok(Err(err)) => Err(err).context("WebSocket connect failed (check token and network)"),
         Err(_) => bail!(
             "WebSocket connect timed out after {}s (DNS or network not ready yet)",
             WS_CONNECT_TIMEOUT.as_secs()
         ),
+    }
+}
+
+fn configure_websocket_tcp(stream: &MaybeTlsStream<TcpStream>) {
+    let tcp = match stream {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::Rustls(tls) => tls.get_ref().0,
+        _ => return,
+    };
+    let _ = tcp.set_nodelay(true);
+    let sock = SockRef::from(tcp);
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(5));
+    if let Err(err) = sock.set_tcp_keepalive(&keepalive) {
+        debug!("tcp keepalive not set: {err}");
     }
 }
 
@@ -1127,9 +1175,7 @@ async fn run_agent_session(
                     bail!("connection closed by server");
                 };
                 let msg = msg.context("websocket read error")?;
-                if !handle_server_message(config, &state, &write, msg).await? {
-                    break;
-                }
+                handle_server_message(config, &state, &write, msg).await?;
             }
             _ = token_poll.tick() => {
                 liveness.tick();
@@ -1149,16 +1195,20 @@ async fn run_agent_session(
                     let guard = state.lock().await;
                     (guard.cloud_link_stale(), guard.active_job_count > 0)
                 };
-                if stale && busy {
-                    warn!(
-                        "no cloud response for {}s during in-flight job; keeping session",
-                        COMMS_STALE_AFTER.as_secs()
-                    );
-                } else if stale {
-                    warn!(
-                        "no cloud response for {}s; reconnecting",
-                        COMMS_STALE_AFTER.as_secs()
-                    );
+                if stale {
+                    // A dead socket during a job is already lost on the cloud side.
+                    // Holding it used to pin the session forever (lied-about busy).
+                    if busy {
+                        warn!(
+                            "no cloud response for {}s during in-flight job; reconnecting",
+                            COMMS_STALE_AFTER.as_secs()
+                        );
+                    } else {
+                        warn!(
+                            "no cloud response for {}s; reconnecting",
+                            COMMS_STALE_AFTER.as_secs()
+                        );
+                    }
                     bail!("cloud link stale (no server response)");
                 }
             }
@@ -1178,6 +1228,7 @@ async fn run_agent_session(
                     // Keepalive frame FIRST: never await warm/supervisor work before
                     // putting bytes on the wire (edge proxies idle-close ~100s).
                     send_heartbeat(&state, &write).await?;
+                    send_ws_message_timed(&write, Message::Ping(Vec::new())).await?;
                     {
                         let guard = state.lock().await;
                         guard.persist_local_state();
@@ -1222,8 +1273,6 @@ async fn run_agent_session(
             }
         }
     }
-
-    Ok(())
 }
 
 struct MaintenanceGuard(Arc<AtomicBool>);
@@ -1451,7 +1500,7 @@ async fn handle_server_message(
     state: &Arc<Mutex<SessionState>>,
     write: &SharedWsWrite,
     msg: Message,
-) -> Result<bool> {
+) -> Result<()> {
     match msg {
         Message::Text(text) => {
             state.lock().await.touch_server_activity();
@@ -1646,13 +1695,14 @@ async fn handle_server_message(
             }
         }
         Message::Ping(payload) => {
-            state.lock().await.touch_server_activity();
-            write.lock().await.send(Message::Pong(payload)).await?;
+            // Proxy/WebSocket pings are not Cloud application activity.
+            send_ws_message_timed(write, Message::Pong(payload)).await?;
         }
-        Message::Close(_) => return Ok(false),
+        Message::Pong(_) => {}
+        Message::Close(_) => bail!("server closed websocket"),
         _ => {}
     }
-    Ok(true)
+    Ok(())
 }
 
 async fn handle_logs_subscribe(write: &SharedWsWrite, action: &str, verbose: bool) -> Result<()> {
@@ -2328,8 +2378,8 @@ mod invoke_error_code_tests {
 #[cfg(test)]
 mod reconnect_tests {
     use super::{
-        is_transient_network_error, next_reconnect_delay, RECONNECT_BACKOFF_MAX,
-        RECONNECT_BACKOFF_MIN,
+        cloud_link_is_stale, is_transient_network_error, next_reconnect_delay, COMMS_STALE_AFTER,
+        RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
     };
     use std::time::Duration;
 
@@ -2370,5 +2420,18 @@ mod reconnect_tests {
             delay = next_reconnect_delay(delay);
         }
         assert_eq!(delay, RECONNECT_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn cloud_link_stale_after_ninety_seconds() {
+        let stale_ms = COMMS_STALE_AFTER.as_millis() as u64;
+        assert!(!cloud_link_is_stale(1_000, 1_000 + stale_ms - 1));
+        assert!(cloud_link_is_stale(1_000, 1_000 + stale_ms));
+    }
+
+    #[test]
+    fn cloud_link_stale_detects_wall_clock_jump() {
+        // Sleep/wake: last activity is hours ago on the wall clock.
+        assert!(cloud_link_is_stale(1_000, 1_000 + 8 * 60 * 60 * 1000));
     }
 }

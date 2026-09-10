@@ -9,6 +9,7 @@ use std::process::Command;
 const LABEL: &str = "com.scalattice.agent";
 const UPDATE_LABEL: &str = "com.scalattice.agent.update";
 const TRAY_LABEL: &str = "com.scalattice.agent.tray";
+const WATCHDOG_LABEL: &str = "com.scalattice.agent.watchdog";
 
 pub fn background_status() -> BackgroundStatus {
     if !launch_agent_plist_path_home()
@@ -31,8 +32,18 @@ pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
 pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     let _ = crate::service::persist_agent_token(&config.token)?;
     write_launch_agent()?;
+    write_watchdog_plist()?;
     reload_launch_agent()?;
+    let _ = load_watchdog_plist();
     verify_service_active()
+}
+
+pub fn ensure_reconnect_watchdog() -> Result<()> {
+    if !launch_agent_plist_path()?.is_file() {
+        return Ok(());
+    }
+    write_watchdog_plist()?;
+    load_watchdog_plist()
 }
 
 pub fn invoked_by_systemd() -> bool {
@@ -92,6 +103,8 @@ pub fn follow_service_logs(verbose: bool) -> Result<()> {
 pub fn sync_background_env() -> Result<()> {
     if launch_agent_plist_path()?.is_file() {
         write_launch_agent()?;
+        write_watchdog_plist()?;
+        let _ = load_watchdog_plist();
     }
     Ok(())
 }
@@ -101,6 +114,7 @@ pub fn remove_background_service() -> Result<()> {
     bootout(&format!("gui/{uid}/{LABEL}"));
     bootout(&format!("gui/{uid}/{UPDATE_LABEL}"));
     bootout(&format!("gui/{uid}/{TRAY_LABEL}"));
+    bootout(&format!("gui/{uid}/{WATCHDOG_LABEL}"));
     let plist = launch_agent_plist_path()?;
     if plist.is_file() {
         fs::remove_file(&plist)?;
@@ -113,6 +127,10 @@ pub fn remove_background_service() -> Result<()> {
     let tray_plist = tray_plist_path()?;
     if tray_plist.is_file() {
         fs::remove_file(&tray_plist)?;
+    }
+    let watchdog_plist = watchdog_plist_path()?;
+    if watchdog_plist.is_file() {
+        fs::remove_file(&watchdog_plist)?;
     }
     Ok(())
 }
@@ -135,6 +153,8 @@ pub fn restart_background_after_update() -> Result<()> {
     if !launch_agent_plist_path()?.is_file() {
         return Ok(());
     }
+    write_watchdog_plist()?;
+    let _ = load_watchdog_plist();
     reload_launch_agent()
 }
 
@@ -182,7 +202,9 @@ fn ensure_service_running(config: &AgentConfig) -> Result<()> {
     }
     let _ = crate::service::persist_agent_token(&config.token)?;
     write_launch_agent()?;
+    write_watchdog_plist()?;
     reload_launch_agent()?;
+    let _ = load_watchdog_plist();
     verify_service_active()
 }
 
@@ -336,7 +358,44 @@ fn write_update_plist() -> Result<()> {
     Ok(())
 }
 
-fn reload_launch_agent() -> Result<()> {
+fn write_watchdog_plist() -> Result<()> {
+    let bin = resolve_agent_binary().unwrap_or_else(|_| crate::paths::bundled_macos_agent_binary());
+    let plist_path = watchdog_plist_path()?;
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>watchdog</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        label = WATCHDOG_LABEL,
+        bin = xml_escape(&bin.display().to_string()),
+    );
+    fs::create_dir_all(plist_path.parent().context("LaunchAgents parent")?)?;
+    fs::write(&plist_path, plist)?;
+    Ok(())
+}
+
+fn load_watchdog_plist() -> Result<()> {
+    let uid = user_id();
+    let domain = format!("gui/{uid}/{WATCHDOG_LABEL}");
+    let plist = watchdog_plist_path()?;
+    bootout(&domain);
+    run_launchctl(&["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])?;
+    Ok(())
+}
     let uid = user_id();
     let domain = format!("gui/{uid}/{LABEL}");
     if invoked_by_background_service() {
@@ -459,4 +518,10 @@ fn tray_plist_path() -> Result<PathBuf> {
     Ok(crate::paths::home_dir()?
         .join("Library/LaunchAgents")
         .join(format!("{TRAY_LABEL}.plist")))
+}
+
+fn watchdog_plist_path() -> Result<PathBuf> {
+    Ok(crate::paths::home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{WATCHDOG_LABEL}.plist")))
 }

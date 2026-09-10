@@ -93,6 +93,9 @@ enum Commands {
     /// Restart the background agent (and Windows tray) using the saved token
     #[command(visible_alias = "connect")]
     Restart,
+    /// Internal: start or restart the background agent if it is down or wedged
+    #[command(hide = true)]
+    Watchdog,
     /// Internal/elevated: register ONSTART SYSTEM task so the agent runs before sign-in
     #[cfg(windows)]
     #[command(hide = true)]
@@ -156,6 +159,7 @@ fn prepare_windows_process(cli: &Cli) -> Result<()> {
     let background = matches!(cli.command, Some(Commands::Foreground { .. }))
         && service::invoked_by_background_service();
     let tray = should_run_tray_ui(cli);
+    let watchdog = matches!(cli.command, Some(Commands::Watchdog));
 
     if background {
         match service::try_acquire_background_instance_mutex()? {
@@ -169,7 +173,7 @@ fn prepare_windows_process(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    if tray {
+    if tray || watchdog {
         unsafe {
             FreeConsole();
         }
@@ -296,6 +300,9 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
             service::restart_runtime_from_saved_token()?;
             println!("Scalattice Agent restarted.");
         }
+        Some(Commands::Watchdog) => {
+            service::run_watchdog_tick()?;
+        }
         #[cfg(windows)]
         Some(Commands::InstallBootStart) => {
             service::install_boot_start_elevated()?;
@@ -358,6 +365,7 @@ fn clear_background_pid() {
 async fn run_foreground(token: Option<String>, verbose: bool) -> Result<()> {
     if service::invoked_by_systemd() || service::invoked_by_background_service() {
         let _ = update::maybe_sync_auto_update_timer();
+        let _ = service::ensure_reconnect_watchdog();
         let token = token
             .filter(|t| !t.trim().is_empty())
             .or_else(config::read_saved_agent_token);

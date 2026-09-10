@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const UNIT_NAME: &str = "scalattice-agent.service";
+const WATCHDOG_SERVICE: &str = "scalattice-agent-watchdog.service";
+const WATCHDOG_TIMER: &str = "scalattice-agent-watchdog.timer";
 
 pub fn background_status() -> BackgroundStatus {
     if !background_service_available() {
@@ -28,6 +30,31 @@ pub fn background_status() -> BackgroundStatus {
 
 pub fn start_background_from_config(config: &AgentConfig) -> Result<()> {
     ensure_service_running(config)
+}
+
+pub fn restart_background_from_config(_config: &AgentConfig) -> Result<()> {
+    if !background_service_available() {
+        bail!("systemd is required for background mode - use: scalattice-agent foreground");
+    }
+    run_systemctl(&["--user", "restart", UNIT_NAME])?;
+    verify_service_active()
+}
+
+pub fn ensure_reconnect_watchdog() -> Result<()> {
+    if !background_service_available() {
+        return Ok(());
+    }
+    let os_home = crate::paths::os_user_home()?;
+    if !systemd_user_unit_path(&os_home).is_file() {
+        return Ok(());
+    }
+    let data_home = crate::paths::home_dir()?;
+    let changed = write_watchdog_units(&os_home, &data_home)?;
+    if changed {
+        let _ = run_systemctl(&["--user", "daemon-reload"]);
+    }
+    let _ = run_systemctl(&["--user", "enable", "--now", WATCHDOG_TIMER]);
+    Ok(())
 }
 
 pub fn invoked_by_systemd() -> bool {
@@ -133,6 +160,10 @@ pub fn restart_background_after_update() -> Result<()> {
     if !systemd_user_unit_path(&os_home).is_file() {
         return Ok(());
     }
+    let _ = write_user_unit(&os_home, &crate::paths::home_dir()?);
+    let _ = write_watchdog_units(&os_home, &crate::paths::home_dir()?);
+    let _ = run_systemctl(&["--user", "daemon-reload"]);
+    let _ = run_systemctl(&["--user", "enable", "--now", WATCHDOG_TIMER]);
     run_systemctl(&["--user", "restart", UNIT_NAME])?;
     Ok(())
 }
@@ -157,6 +188,7 @@ fn ensure_service_running(config: &AgentConfig) -> Result<()> {
     }
 
     sync_systemd_env_file(&data_home)?;
+    let watchdog_changed = write_watchdog_units(&os_home, &data_home)?;
     run_systemctl(&["--user", "daemon-reload"])?;
 
     let was_active = run_systemctl(&["--user", "is-active", UNIT_NAME]).is_ok();
@@ -169,8 +201,10 @@ fn ensure_service_running(config: &AgentConfig) -> Result<()> {
         }
     } else if !was_active {
         run_systemctl(&["--user", "enable", "--now", UNIT_NAME])?;
-    } else {
-        return Ok(());
+    }
+
+    if token_changed || unit_changed || watchdog_changed || !was_active {
+        let _ = run_systemctl(&["--user", "enable", "--now", WATCHDOG_TIMER]);
     }
 
     verify_service_active()?;
@@ -232,14 +266,80 @@ WantedBy=default.target
     Ok(changed)
 }
 
+fn write_watchdog_units(os_home: &Path, data_home: &Path) -> Result<bool> {
+    let bin = resolve_agent_binary()?;
+    let dir = systemd_user_unit_path(os_home)
+        .parent()
+        .context("unit path parent")?
+        .to_path_buf();
+    let service_path = dir.join(WATCHDOG_SERVICE);
+    let timer_path = dir.join(WATCHDOG_TIMER);
+    let path_prefix = format!(
+        "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        bin.parent()
+            .unwrap_or(Path::new("/usr/local/bin"))
+            .display()
+    );
+    let home_override = if os_home != data_home {
+        format!("Environment=SCALATTICE_HOME={}\n", data_home.display())
+    } else {
+        String::new()
+    };
+    let service = format!(
+        r#"[Unit]
+Description=Scalattice GPU Agent reconnect watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH={path}
+{home_override}ExecStart={bin} watchdog
+"#,
+        path = path_prefix,
+        home_override = home_override,
+        bin = bin.display(),
+    );
+    let timer = "\
+[Unit]
+Description=Scalattice GPU Agent reconnect watchdog
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"
+    .to_string();
+    fs::create_dir_all(&dir)?;
+    let service_changed = fs::read_to_string(&service_path).unwrap_or_default() != service;
+    let timer_changed = fs::read_to_string(&timer_path).unwrap_or_default() != timer;
+    fs::write(&service_path, service)?;
+    fs::write(&timer_path, timer)?;
+    Ok(service_changed || timer_changed)
+}
+
 fn uninstall_user_service() -> Result<()> {
     let home = crate::paths::os_user_home()?;
     let unit_path = systemd_user_unit_path(&home);
+    let dir = unit_path.parent().map(Path::to_path_buf);
 
+    let _ = run_systemctl(&["--user", "disable", "--now", WATCHDOG_TIMER]);
+    let _ = run_systemctl(&["--user", "stop", WATCHDOG_SERVICE]);
     let _ = run_systemctl(&["--user", "disable", "--now", UNIT_NAME]);
     if unit_path.is_file() {
         fs::remove_file(&unit_path)?;
         println!("Removed {}", unit_path.display());
+    }
+    if let Some(dir) = dir {
+        for name in [WATCHDOG_SERVICE, WATCHDOG_TIMER] {
+            let path = dir.join(name);
+            if path.is_file() {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
     let _ = run_systemctl(&["--user", "daemon-reload"]);
     Ok(())

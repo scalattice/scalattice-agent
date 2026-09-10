@@ -341,22 +341,27 @@ fn is_recent(updated_at_ms: u64) -> bool {
     now_ms().saturating_sub(updated_at_ms) < 120_000
 }
 
+const WEDGE_AFTER_MS: u64 = 180_000;
+
 /// True when the background process looks alive but has not updated connection
-/// state for long enough that it is likely wedged in DNS/`connect` (Wi-Fi flap,
-/// resolver hang). Active reconnects keep `updated_at_ms` fresh.
-/// Used by the Windows/macOS tray watchdog (no tray on Linux).
-#[cfg(any(windows, target_os = "macos"))]
+/// state for long enough that it is likely frozen (sleep/wake leftover, DNS hang,
+/// App Nap). Active heartbeats and reconnects keep `updated_at_ms` fresh.
+///
+/// A process that last wrote `server_connected=true` and then froze used to be
+/// treated as healthy because of that flag. Opening the tray was the only thing
+/// that brought it back.
 pub fn connection_state_looks_wedged() -> bool {
     let Some(state) = read_state() else {
         return false;
     };
-    if state.server_connected || state.server_registered {
-        return false;
-    }
+    state_looks_wedged(&state, now_ms())
+}
+
+fn state_looks_wedged(state: &AgentLocalState, now: u64) -> bool {
     if state.updated_at_ms == 0 {
         return false;
     }
-    now_ms().saturating_sub(state.updated_at_ms) >= 180_000
+    now.saturating_sub(state.updated_at_ms) >= WEDGE_AFTER_MS
 }
 
 fn write_state(state: &AgentLocalState) {
@@ -392,4 +397,48 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod wedge_tests {
+    use super::{state_looks_wedged, AgentLocalState, WEDGE_AFTER_MS};
+
+    fn sample(connected: bool, updated_at_ms: u64) -> AgentLocalState {
+        AgentLocalState {
+            status_label: None,
+            downloading_model: None,
+            node_id: None,
+            server_connected: connected,
+            server_registered: connected,
+            compute_devices: Vec::new(),
+            last_error: None,
+            last_inference_error: None,
+            last_inference_error_code: None,
+            last_inference_error_at_ms: None,
+            updated_at_ms,
+        }
+    }
+
+    #[test]
+    fn fresh_connected_state_is_not_wedged() {
+        assert!(!state_looks_wedged(&sample(true, 10_000), 10_000 + 5_000));
+    }
+
+    #[test]
+    fn frozen_connected_state_is_wedged() {
+        assert!(state_looks_wedged(
+            &sample(true, 10_000),
+            10_000 + WEDGE_AFTER_MS
+        ));
+    }
+
+    #[test]
+    fn reconnecting_state_with_fresh_writes_is_not_wedged() {
+        assert!(!state_looks_wedged(&sample(false, 50_000), 50_000 + 1_000));
+    }
+
+    #[test]
+    fn never_written_state_is_not_wedged() {
+        assert!(!state_looks_wedged(&sample(false, 0), 1_000_000));
+    }
 }
