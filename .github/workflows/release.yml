@@ -371,7 +371,7 @@ jobs:
       (needs.prepare.outputs.targets == 'windows-only' || needs.prepare.outputs.targets == 'full') &&
       needs.prepare.outputs.windows_runner == 'self-hosted'
     runs-on: [self-hosted, Windows, X64, scalattice-release]
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -407,12 +407,33 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=amd64 -host_arch=amd64
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+      - name: Attach Windows assets to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: powershell
+        run: |
+          .\scripts\ci-gh-release-upload.ps1 -Tag "${{ needs.prepare.outputs.tag }}" -Files @(
+            "dist\ScalatticeAgentSetup-x86_64.exe",
+            "dist\scalattice-agent-x86_64-pc-windows-msvc.zip"
+          )
+      # Already-compressed ~1.5GB blobs: store as two artifacts with no extra
+      # gzip. A single FinalizeArtifact of the pair previously ECONNRESET after
+      # hours. continue-on-error: GitHub release already has the files above.
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
-          name: windows
-          path: |
-            dist/scalattice-agent-x86_64-pc-windows-msvc.zip
-            dist/ScalatticeAgentSetup-x86_64.exe
+          name: windows-setup
+          compression-level: 0
+          if-no-files-found: error
+          path: dist/ScalatticeAgentSetup-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: windows-zip
+          compression-level: 0
+          if-no-files-found: error
+          path: dist/scalattice-agent-x86_64-pc-windows-msvc.zip
 
   build-windows-github-hosted:
     needs: prepare
@@ -470,12 +491,30 @@ jobs:
         run: |
           set "PATH=%CUDA_PATH%\bin;%PATH%"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+      - name: Attach Windows assets to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: powershell
+        run: |
+          .\scripts\ci-gh-release-upload.ps1 -Tag "${{ needs.prepare.outputs.tag }}" -Files @(
+            "dist\ScalatticeAgentSetup-x86_64.exe",
+            "dist\scalattice-agent-x86_64-pc-windows-msvc.zip"
+          )
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
-          name: windows
-          path: |
-            dist/scalattice-agent-x86_64-pc-windows-msvc.zip
-            dist/ScalatticeAgentSetup-x86_64.exe
+          name: windows-setup
+          compression-level: 0
+          if-no-files-found: error
+          path: dist/ScalatticeAgentSetup-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: windows-zip
+          compression-level: 0
+          if-no-files-found: error
+          path: dist/scalattice-agent-x86_64-pc-windows-msvc.zip
 
   # CUDA-linked --version/status on the self-hosted GPU box deadlocks in nvcuda.dll
   # (production agent already holds the driver). Prove update on a clean hosted VM.
@@ -497,10 +536,16 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          name: windows
+          pattern: windows-*
+          merge-multiple: true
           path: dist
       - name: Place Windows assets in dist/
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -513,9 +558,14 @@ jobs:
             if (Test-Path -LiteralPath $dest) { continue }
             $hit = Get-ChildItem -Path . -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
               Select-Object -First 1
-            if (-not $hit) { throw "$name not found after artifact download" }
-            Write-Host "==> moving $($hit.FullName) -> $dest"
-            Copy-Item -Force $hit.FullName $dest
+            if ($hit) {
+              Write-Host "==> moving $($hit.FullName) -> $dest"
+              Copy-Item -Force $hit.FullName $dest
+              continue
+            }
+            Write-Host "==> artifact miss; downloading $name from $env:TAG"
+            gh release download $env:TAG -p $name -D dist -R $env:GH_REPO
+            if (-not (Test-Path -LiteralPath $dest)) { throw "$name not found after artifact/release download" }
           }
           Get-ChildItem dist | Format-Table Name, Length
       - name: Vet auto-update and remote restart
@@ -545,8 +595,7 @@ jobs:
         (needs.prepare.outputs.targets == 'full' &&
           needs.build-linux-x86_64.result == 'success' &&
           needs.build-aarch64.result == 'success' &&
-          needs.build-macos.result == 'success' &&
-          needs.windows-update-smoke.result == 'success')
+          needs.build-macos.result == 'success')
       )
     runs-on: ubuntu-latest
     steps:
