@@ -43,8 +43,11 @@ if [[ "$DMG_FROM_APP" -eq 0 ]]; then
   chmod +x "${APP}/Contents/MacOS/scalattice-agent"
 
   sed \
-    -e "/CFBundleShortVersionString/{n;s|<string>.*</string>|<string>${VERSION}</string>|;}" \
+    -e "s/<string>1\\.1\\.[0-9][0-9]*<\\/string>/<string>${VERSION}<\\/string>/" \
     "${ROOT}/installer/macos/Info.plist" > "${APP}/Contents/Info.plist"
+else
+  cp "${APP}/Contents/MacOS/scalattice-agent" "$BIN"
+  chmod +x "$BIN"
 fi
 STAGE="$(mktemp -d /tmp/scalattice-dmg.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -83,13 +86,8 @@ hdiutil_create() {
 
 hdiutil_create "$DMG"
 
-if [[ "$DMG_FROM_APP" -eq 0 ]]; then
-  # Unsigned / local tarball only. Release CI re-signs this Mach-O as a
-  # standalone CLI after the .app is signed; copying the nested-signed
-  # inner binary here breaks Gatekeeper (`invalid Info.plist`).
-  tar -czf "${DIST}/scalattice-agent-aarch64-apple-darwin.tar.gz" -C "$DIST" scalattice-agent
-  echo "==> ${DIST}/scalattice-agent-aarch64-apple-darwin.tar.gz"
-fi
+tar -czf "${DIST}/scalattice-agent-aarch64-apple-darwin.tar.gz" -C "$DIST" scalattice-agent
 
 echo "==> Packed ${APP_NAME} (v${VERSION})"
 echo "==> ${DMG}"
+echo "==> ${DIST}/scalattice-agent-aarch64-apple-darwin.tar.gz"

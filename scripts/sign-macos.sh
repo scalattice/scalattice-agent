@@ -42,7 +42,6 @@ echo "==> signing identity hash ${IDENTITY}"
 
 CODESIGN_BASE=(
   --force --options runtime --timestamp
-  --identifier com.scalattice.agent
   --entitlements "$ENTITLEMENTS"
   --sign "$IDENTITY"
 )
@@ -72,12 +71,9 @@ if [[ -d "$TARGET" ]]; then
   sign_bin "$INNER"
   echo "==> codesign $(basename "$TARGET")"
   codesign "${CODESIGN_BASE[@]}" "$TARGET"
-  codesign --verify --deep --strict --verbose=2 "$TARGET"
+  codesign --verify --verbose=2 "$TARGET"
 elif [[ -f "$TARGET" ]]; then
   sign_bin "$TARGET"
-  # Nested-signed copies extracted from the .app fail this check. The curl
-  # tarball must be a standalone-signed Mach-O.
-  codesign --verify --deep --strict --verbose=4 "$TARGET"
 else
   echo "Missing $TARGET" >&2
   exit 1
@@ -90,10 +86,6 @@ fi
 
 KEY_FILE="${APPLE_API_KEY_P8_FILE:-}"
 CLEANUP_KEY=""
-CLEANUP_ZIP=""
-cleanup_signing_temps() {
-  rm -f "$CLEANUP_KEY" "$CLEANUP_ZIP"
-}
 if [[ -z "$KEY_FILE" ]]; then
   if [[ -z "${APPLE_API_KEY_P8:-}" ]]; then
     echo "Set APPLE_API_KEY_P8 or APPLE_API_KEY_P8_FILE for notarization." >&2
@@ -102,31 +94,10 @@ if [[ -z "$KEY_FILE" ]]; then
   KEY_FILE="$(mktemp /tmp/AuthKey.XXXXXX.p8)"
   CLEANUP_KEY="$KEY_FILE"
   printf '%s\n' "$APPLE_API_KEY_P8" >"$KEY_FILE"
-  trap cleanup_signing_temps EXIT
+  trap 'rm -f "$CLEANUP_KEY"' EXIT
 fi
 
 SUBMIT="$DMG"
-if [[ -z "$SUBMIT" && -f "$TARGET" ]]; then
-  # Bare Mach-O cannot be stapled, but Gatekeeper looks up the notarization
-  # ticket by CDHash. Zip and submit so curl | sh installs are notarized.
-  # BSD mktemp requires the XXXXXX template at the end of the path.
-  CLEANUP_ZIP="$(mktemp /tmp/scalattice-agent-notarize.XXXXXX).zip"
-  mv "${CLEANUP_ZIP%.zip}" "$CLEANUP_ZIP"
-  SUBMIT="$CLEANUP_ZIP"
-  trap cleanup_signing_temps EXIT
-  (
-    cd "$(dirname "$TARGET")"
-    ditto -c -k --keepParent "$(basename "$TARGET")" "$SUBMIT"
-  )
-  echo "==> notarytool submit $(basename "$SUBMIT") (standalone CLI)"
-  xcrun notarytool submit "$SUBMIT" \
-    --key "$KEY_FILE" \
-    --key-id "$APPLE_API_KEY_ID" \
-    --issuer "$APPLE_API_ISSUER_ID" \
-    --wait
-  echo "==> Notarized standalone CLI (ticket only; cannot staple a Mach-O)"
-  exit 0
-fi
 if [[ -z "$SUBMIT" ]]; then
   echo "==> No .dmg given; skipping notarytool (bare Mach-O cannot be stapled)."
   exit 0

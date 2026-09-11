@@ -4,8 +4,6 @@ Metal llama.cpp is built on GitHub-hosted `macos-14` (Apple Silicon). Intel Macs
 
 CI produces `ScalatticeAgentSetup-aarch64.dmg` (drag the app to Applications) and the `aarch64-apple-darwin` tarball. The macOS job waits up to 4 hours for Apple notarization (`notarytool --wait`).
 
-The tarball is **not** a copy of `Scalattice Agent.app/Contents/MacOS/scalattice-agent`. That nested signature seals the bundle `Info.plist` / resource tree; extracting it to `~/.local/bin` fails `codesign --verify --strict` (`invalid Info.plist` / `invalid resource directory`) and macOS 26 AMFI SIGKILLs the process. After the app/DMG is signed and notarized, CI copies the inner binary, re-signs it as a standalone tool (`--identifier com.scalattice.agent`), notarizes that CDHash (zip submit; cannot staple a Mach-O), then tars it. The Mach-O `__TEXT,__info_plist` is generated from `CARGO_PKG_VERSION` so it matches the bundle plist.
-
 Put them on the repo: **Settings → Secrets and variables → Actions → New repository secret**.
 
 | Secret | Where it comes from |
