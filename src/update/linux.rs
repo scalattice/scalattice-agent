@@ -4,6 +4,7 @@ use crate::service;
 use anyhow::{bail, Context, Result};
 use std::cmp::Ordering;
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -256,11 +257,13 @@ fn apply_macos_dmg_update(dmg: &Path) -> Result<()> {
         }
         let _ = fs::remove_dir_all(&backup);
 
-        // Keep ~/.local/bin in sync for CLI / LaunchAgent paths that still point there.
+        // Keep ~/.local/bin in sync for CLI / LaunchAgent paths that still
+        // point there. Copying the nested-signed Mach-O out of the bundle
+        // breaks the seal (zsh: killed). Point at the app binary instead.
         let app_bin = dest.join("Contents/MacOS/scalattice-agent");
         if app_bin.is_file() {
             if let Ok(local) = crate::paths::install_dir().map(|d| d.join("scalattice-agent")) {
-                if let Err(err) = replace_unix_binary(&app_bin, &local) {
+                if let Err(err) = link_macos_cli_to_app_binary(&app_bin, &local) {
                     eprintln!(
                         "self-update: could not refresh {}: {err:#}",
                         local.display()
@@ -292,6 +295,27 @@ fn apply_macos_dmg_update(dmg: &Path) -> Result<()> {
     } else {
         service::restart_background_after_update()?;
     }
+    Ok(())
+}
+
+/// Point `~/.local/bin/scalattice-agent` at the sealed .app executable.
+///
+/// Copying that Mach-O out of the bundle invalidates the nested signature
+/// (`invalid Info.plist` / `zsh: killed` on macOS 26).
+#[cfg(any(target_os = "macos", test))]
+fn link_macos_cli_to_app_binary(app_bin: &Path, local: &Path) -> Result<()> {
+    if let Some(parent) = local.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create CLI install directory {}", parent.display()))?;
+    }
+    if let Ok(meta) = fs::symlink_metadata(local) {
+        if meta.file_type().is_symlink() && fs::read_link(local).ok().as_deref() == Some(app_bin) {
+            return Ok(());
+        }
+        fs::remove_file(local).with_context(|| format!("remove existing {}", local.display()))?;
+    }
+    std::os::unix::fs::symlink(app_bin, local)
+        .with_context(|| format!("symlink {} -> {}", local.display(), app_bin.display()))?;
     Ok(())
 }
 
@@ -459,7 +483,7 @@ fn apply_update(staging: &Path) -> Result<()> {
     }
 
     // Remote/website update runs inside `foreground` (the live agent). Stopping the
-    // systemd/launchd unit here kills this process before the binary is replaced  - 
+    // systemd/launchd unit here kills this process before the binary is replaced  -
     // that is why Linux force-update from the dashboard failed while Windows
     // (detached installer) worked. CLI `scalattice-agent update` is a separate
     // process and should still stop the service first: but only once we are
@@ -471,7 +495,7 @@ fn apply_update(staging: &Path) -> Result<()> {
     }
 
     // Linux: rename over ~/.local/bin is enough (systemd unit points there).
-    // macOS: launchd often execs the .app bundle binary, not ~/.local/bin  - 
+    // macOS: launchd often execs the .app bundle binary, not ~/.local/bin  -
     // replacing only install_dir left KeepAlive restarting the old image.
     let targets = unix_agent_install_targets().context("resolve install targets")?;
     let mut replaced = 0usize;
@@ -564,6 +588,7 @@ fn running_as_live_agent() -> bool {
     std::env::args().any(|arg| arg == "foreground")
 }
 
+#[cfg(target_os = "linux")]
 fn replace_unix_binary(source: &Path, dest: &Path) -> Result<()> {
     replace_unix_file_with_mode(source, dest, Some(0o755))
 }
@@ -579,6 +604,7 @@ fn replace_unix_file(source: &Path, dest: &Path) -> Result<()> {
     replace_unix_file_with_mode(source, dest, None)
 }
 
+#[cfg(target_os = "linux")]
 fn replace_unix_file_with_mode(source: &Path, dest: &Path, mode: Option<u32>) -> Result<()> {
     let parent = dest.parent().context("install parent directory")?;
     fs::create_dir_all(parent)
@@ -679,5 +705,40 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
         } else {
             stderr
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::link_macos_cli_to_app_binary;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn replaces_copied_binary_with_symlink() {
+        let root = std::env::temp_dir().join(format!("scalattice-link-cli-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let app_bin = root.join("app-bin");
+        let local = root.join("local-bin");
+        fs::write(&app_bin, b"agent").unwrap();
+        fs::write(&local, b"old-copy").unwrap();
+
+        link_macos_cli_to_app_binary(&app_bin, &local).unwrap();
+        assert!(local.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&local).unwrap(), app_bin);
+        assert_eq!(fs::read(&local).unwrap(), b"agent");
+
+        link_macos_cli_to_app_binary(&app_bin, &local).unwrap();
+        assert_eq!(fs::read_link(&local).unwrap(), app_bin);
+
+        let other = root.join("other-bin");
+        fs::write(&other, b"other").unwrap();
+        let _ = fs::remove_file(&local);
+        symlink(&other, &local).unwrap();
+        link_macos_cli_to_app_binary(&app_bin, &local).unwrap();
+        assert_eq!(fs::read_link(&local).unwrap(), app_bin);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

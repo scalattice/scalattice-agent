@@ -303,6 +303,15 @@ jobs:
           ./scripts/sign-macos.sh "dist/Scalattice Agent.app"
           ./scripts/package-macos.sh --dmg-from-app
           ./scripts/sign-macos.sh "dist/Scalattice Agent.app" dist/ScalatticeAgentSetup-aarch64.dmg
+          # The curl installer extracts this Mach-O to ~/.local/bin. A copy of
+          # the nested-signed app executable fails codesign --strict outside the
+          # bundle (zsh: killed on macOS 26). Re-sign as a standalone tool and
+          # notarize that CDHash before tarring.
+          cp "dist/Scalattice Agent.app/Contents/MacOS/scalattice-agent" dist/scalattice-agent
+          chmod +x dist/scalattice-agent
+          ./scripts/sign-macos.sh dist/scalattice-agent
+          codesign --verify --deep --strict --verbose=4 dist/scalattice-agent
+          tar -czf dist/scalattice-agent-aarch64-apple-darwin.tar.gz -C dist scalattice-agent
           security delete-keychain "$KEYCHAIN" || true
           rm -f "$P12" "$G2"
       - name: Package
