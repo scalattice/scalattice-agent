@@ -36,7 +36,11 @@ on:
 
 concurrency:
   group: release-production
-  cancel-in-progress: true
+  # Never cancel a running platform build. A later production push (even
+  # [skip release]) still starts this workflow and used to kill multi-hour
+  # Windows uploads. Two prepares cannot both own a new tag; explicit
+  # workflow_dispatch is the way to replace a release.
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -417,23 +421,6 @@ jobs:
             "dist\ScalatticeAgentSetup-x86_64.exe",
             "dist\scalattice-agent-x86_64-pc-windows-msvc.zip"
           )
-      # Already-compressed ~1.5GB blobs: store as two artifacts with no extra
-      # gzip. A single FinalizeArtifact of the pair previously ECONNRESET after
-      # hours. continue-on-error: GitHub release already has the files above.
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: windows-setup
-          compression-level: 0
-          if-no-files-found: error
-          path: dist/ScalatticeAgentSetup-x86_64.exe
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: windows-zip
-          compression-level: 0
-          if-no-files-found: error
-          path: dist/scalattice-agent-x86_64-pc-windows-msvc.zip
 
   build-windows-github-hosted:
     needs: prepare
@@ -501,20 +488,6 @@ jobs:
             "dist\ScalatticeAgentSetup-x86_64.exe",
             "dist\scalattice-agent-x86_64-pc-windows-msvc.zip"
           )
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: windows-setup
-          compression-level: 0
-          if-no-files-found: error
-          path: dist/ScalatticeAgentSetup-x86_64.exe
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: windows-zip
-          compression-level: 0
-          if-no-files-found: error
-          path: dist/scalattice-agent-x86_64-pc-windows-msvc.zip
 
   # CUDA-linked --version/status on the self-hosted GPU box deadlocks in nvcuda.dll
   # (production agent already holds the driver). Prove update on a clean hosted VM.
@@ -535,13 +508,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.tag }}
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          pattern: windows-*
-          merge-multiple: true
-          path: dist
-      - name: Place Windows assets in dist/
+      - name: Download Windows assets from GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -554,18 +521,10 @@ jobs:
             "ScalatticeAgentSetup-x86_64.exe",
             "scalattice-agent-x86_64-pc-windows-msvc.zip"
           )) {
-            $dest = Join-Path "dist" $name
-            if (Test-Path -LiteralPath $dest) { continue }
-            $hit = Get-ChildItem -Path . -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-            if ($hit) {
-              Write-Host "==> moving $($hit.FullName) -> $dest"
-              Copy-Item -Force $hit.FullName $dest
-              continue
-            }
-            Write-Host "==> artifact miss; downloading $name from $env:TAG"
+            Write-Host "==> gh release download $name from $env:TAG"
             gh release download $env:TAG -p $name -D dist -R $env:GH_REPO
-            if (-not (Test-Path -LiteralPath $dest)) { throw "$name not found after artifact/release download" }
+            $dest = Join-Path "dist" $name
+            if (-not (Test-Path -LiteralPath $dest)) { throw "$name missing from $env:TAG" }
           }
           Get-ChildItem dist | Format-Table Name, Length
       - name: Vet auto-update and remote restart
