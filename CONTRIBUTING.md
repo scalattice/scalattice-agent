@@ -41,6 +41,7 @@ Requirements:
 - Linux (x86_64 or aarch64) for GPU feature builds
 - macOS 14+ on **Apple Silicon** for Metal (`--features metal`)
 - NVIDIA driver and/or Vulkan stack when testing GPU inference locally
+- Python is auto-installed for image models into an isolated tree (`~/.cache/scalattice/runtimes/cpython-…`). The agent does not use or change the machine's PATH / conda / pyenv Python. When a provider enables an image SKU, the agent also creates a Diffusers venv (`diffusers-cuda`, `diffusers-rocm`, `diffusers-dml`, `diffusers-xpu`, or `diffusers-mps`) and downloads the HF snapshot. That runtime is removed when the last image SKU is disabled. `SCALATTICE_QWEN_IMAGE_STUB=1` returns a 1×1 PNG without that install.
 
 ```bash
 git clone https://github.com/scalattice/scalattice-agent.git

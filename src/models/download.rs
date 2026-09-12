@@ -407,6 +407,7 @@ pub async fn download_catalog_model(
     model: &CatalogModel,
     agent_token: &str,
     hf_token: Option<&str>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     let Some(weights) = model.weights.as_ref() else {
         return Ok(());
@@ -424,6 +425,9 @@ pub async fn download_catalog_model(
     }
     if crate::specs::disk_is_full() {
         anyhow::bail!("no space left on device");
+    }
+    if model.is_image_job() {
+        return crate::image::install_image_model(model, hf_token, cancel).await;
     }
     let runtime_model = if model.runtime_model.trim().is_empty() {
         model.model_id.as_str()

@@ -187,6 +187,9 @@ impl SessionState {
     }
 
     fn catalog_ready_on_disk(&self, model: &CatalogModel) -> bool {
+        if model.is_image_job() {
+            return crate::image::image_install_ready(model);
+        }
         if !self.disk_inventory_primed {
             // Unprimed: skip GGUF walks on the WS thread. Inventory fills this in
             // spawn_blocking; the agent re-registers once the scan lands.
@@ -254,6 +257,12 @@ impl SessionState {
             return None;
         }
         if should_skip_preload(runtime) {
+            return None;
+        }
+        if self.catalog.iter().any(|m| {
+            m.is_image_job()
+                && (m.runtime_model.trim() == runtime || m.model_id.trim() == runtime)
+        }) {
             return None;
         }
         if self.disk_inventory_primed && !self.disk_has_runtime(runtime) {
@@ -397,6 +406,7 @@ impl SessionState {
         self.model_policy = next;
         self.logged_download_blockers = false;
         self.prune_disabled_model_weights();
+        self.sync_image_runtime_presence();
 
         if let Some(downloading) = crate::state::downloading_model() {
             let still_enabled = self
@@ -427,6 +437,7 @@ impl SessionState {
         self.logged_download_blockers = false;
         self.last_sync_token = None;
         self.prune_disabled_model_weights();
+        self.sync_image_runtime_presence();
         if !same_ids {
             info!(
                 catalog_models = self.catalog.len(),
@@ -472,6 +483,9 @@ impl SessionState {
             model_id: model_id.to_string(),
             display_name: model_id.to_string(),
             runtime_model: runtime_hint.to_string(),
+            job_kind: String::new(),
+            usd_per_image: 0.0,
+            image_max_n: 0,
             max_context_tokens: 4096,
             regions: vec![],
             weight_size_gb: None,
@@ -572,10 +586,20 @@ impl SessionState {
         for model_id in model_ids {
             let runtime_model = self.runtime_for_model_id(model_id);
             info!("purging model weights for {model_id} ({runtime_model})");
+            if let Some(model) = self.catalog.iter().find(|m| m.model_id == *model_id) {
+                if model.is_image_job() {
+                    if let Some(repo) = crate::image::image_repo(model) {
+                        if let Some(path) = crate::image::stage_purge_image_snapshot(repo) {
+                            trash.push(path);
+                        }
+                    }
+                }
+            }
             if let Some(path) = stage_purge_model_weights(&runtime_model) {
                 trash.push(path);
             }
         }
+        self.sync_image_runtime_presence();
         trash
     }
 
@@ -588,6 +612,14 @@ impl SessionState {
             .find(|(id, _)| id == model_id)
             .map(|(_, enabled)| *enabled)
             .unwrap_or(false)
+    }
+
+    fn sync_image_runtime_presence(&self) {
+        let any_enabled_image = self
+            .catalog
+            .iter()
+            .any(|model| model.is_image_job() && self.is_model_enabled(&model.model_id));
+        crate::image::maybe_teardown_image_runtime(any_enabled_image);
     }
 
     fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
@@ -615,6 +647,10 @@ impl SessionState {
         let mut out: Vec<String> = Vec::new();
         for model in self.eligible_catalog_models() {
             if !self.catalog_ready_on_disk(&model) {
+                continue;
+            }
+            if model.is_image_job() {
+                out.push(model.model_id.clone());
                 continue;
             }
             if model.vision_model {
@@ -1931,7 +1967,7 @@ async fn respond_invoke(
     // Push the invoke line to live cloud logs immediately (don't wait for the 1s ticker).
     let _ = flush_live_logs(write).await;
 
-    let (supervisor, catalog_model, runtime_model, ram_gb, headroom, max_tokens, mut job_lease) = {
+    let (supervisor, catalog_model, runtime_model, ram_gb, headroom, max_tokens, hf_token, mut job_lease) = {
         let mut guard = state.lock().await;
         let max_jobs = guard.cached_max_jobs.max(1);
         if guard.active_job_count >= max_jobs {
@@ -1964,6 +2000,7 @@ async fn respond_invoke(
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let headroom = guard.cpu_ram_headroom_gb;
         let max_tokens = guard.effective_max_tokens(invoke.max_tokens);
+        let hf_token = guard.effective_hf_token(None);
         (
             supervisor,
             catalog_model,
@@ -1971,6 +2008,7 @@ async fn respond_invoke(
             ram_gb,
             headroom,
             max_tokens,
+            hf_token,
             lease,
         )
     };
@@ -2030,6 +2068,168 @@ async fn respond_invoke(
                 }
             }));
 
+        if let Some((code, detail)) = catalog_model.invoke_job_kind_error(&invoke.job_kind) {
+            let msg = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke_id.clone(),
+                error: code.to_string(),
+                detail: Some(detail.to_string()),
+            };
+            drop(delta_tx);
+            let _ = delta_writer.await;
+            let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+            return Ok(());
+        }
+
+        if catalog_model.is_image_job() {
+            if invoke.stream {
+                let msg = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke_id.clone(),
+                    error: "image_stream_unsupported".to_string(),
+                    detail: Some("Image generation does not stream.".to_string()),
+                };
+                drop(delta_tx);
+                let _ = delta_writer.await;
+                let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+                return Ok(());
+            }
+            let prompt = if !invoke.prompt.trim().is_empty() {
+                invoke.prompt.clone()
+            } else {
+                invoke
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default()
+            };
+            let repo = catalog_model
+                .weights
+                .as_ref()
+                .map(|w| w.repo.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
+            if repo.is_empty() {
+                let msg = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke_id.clone(),
+                    error: "model_load_failed".to_string(),
+                    detail: Some(
+                        "Catalog image models need a Hugging Face Diffusers repo.".to_string(),
+                    ),
+                };
+                drop(delta_tx);
+                let _ = delta_writer.await;
+                let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+                return Ok(());
+            }
+            let revision = catalog_model
+                .weights
+                .as_ref()
+                .map(|w| w.revision.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "main".to_string());
+            let n = if invoke.n == 0 {
+                1
+            } else {
+                invoke.n.min(catalog_model.image_max_n())
+            };
+            let input_images: Vec<_> = invoke
+                .input_images
+                .iter()
+                .take(4)
+                .filter(|img| !img.data.trim().is_empty())
+                .map(|img| crate::protocol::GeneratedImage {
+                    mime: img.mime.clone(),
+                    data: img.data.clone(),
+                })
+                .collect();
+            let (width, height) = crate::image::resolve_image_job_size(
+                &repo,
+                invoke.width,
+                invoke.height,
+                !input_images.is_empty(),
+            );
+            let job = crate::image::ImageJob {
+                prompt,
+                width,
+                height,
+                n,
+                seed: invoke.seed,
+                repo,
+                revision,
+                hf_token,
+                input_images,
+            };
+            let image_out = supervisor
+                .invoke_image(
+                    &invoke.id,
+                    &catalog_model,
+                    job,
+                    ram_gb,
+                    headroom,
+                    on_delta,
+                )
+                .await;
+            drop(delta_tx);
+            let _ = delta_writer.await;
+            match image_out {
+                Ok((images, timings, slot_id)) => {
+                    info!(slot = %slot_id, n = images.len(), "invoke {} image completed", invoke_id);
+                    let image_count = images.len() as u32;
+                    let result = InvokeResultMessage {
+                        kind: "invoke_result",
+                        id: invoke_id.clone(),
+                        content: String::new(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        images,
+                        image_count,
+                        timings: Some(timings),
+                        slot_id: Some(slot_id),
+                    };
+                    return ws_send_text(write, &serde_json::to_string(&result)?).await;
+                }
+                Err(err) => {
+                    let code = invoke_error_code(&err);
+                    if code == "agent_busy" || code == "insufficient_vram" {
+                        info!("invoke {} image capacity miss · {code}: {err:#}", invoke_id);
+                    } else if code == "request_canceled" {
+                        info!("image invoke canceled: {err:#}");
+                    } else {
+                        warn!("image invoke failed: {err:#}");
+                        state::record_inference_failure(code, &format!("{err:#}"));
+                    }
+                    let msg = InvokeErrorMessage {
+                        kind: "invoke_error",
+                        id: invoke_id.clone(),
+                        error: code.to_string(),
+                        detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+                    };
+                    let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+                    return Ok(());
+                }
+            }
+        }
+
+        if !invoke.input_images.is_empty() {
+            let msg = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke_id.clone(),
+                error: "chat_model_image_unsupported".to_string(),
+                detail: Some(
+                    "Chat and vision models do not accept image-generation reference pictures."
+                        .to_string(),
+                ),
+            };
+            drop(delta_tx);
+            let _ = delta_writer.await;
+            let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+            return Ok(());
+        }
+
         let invoke_out = supervisor
             .invoke(
                 &invoke.id,
@@ -2055,6 +2255,8 @@ async fn respond_invoke(
                     content,
                     prompt_tokens,
                     completion_tokens,
+                    images: Vec::new(),
+                    image_count: 0,
                     timings: Some(timings),
                     slot_id: Some(slot_id),
                 };
@@ -2114,6 +2316,25 @@ async fn respond_invoke_split(
         "invoke_split {} · segment {} · model {}",
         invoke.id, invoke.segment, invoke.model_id
     );
+
+    {
+        let catalog_model = {
+            let guard = state.lock().await;
+            guard
+                .resolve_invoke_catalog(&invoke.model_id, &invoke.runtime_model)
+                .0
+        };
+        if catalog_model.is_image_job() {
+            let err = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke.id.clone(),
+                error: "image_model_chat_unsupported".to_string(),
+                detail: Some("Image models do not support split inference.".to_string()),
+            };
+            ws_send_text(write, &serde_json::to_string(&err)?).await?;
+            return Ok(());
+        }
+    }
 
     {
         let mut guard = state.lock().await;
@@ -2325,6 +2546,23 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || detail.contains("bitmap creation returned null")
     {
         "invalid_image"
+    } else if detail.contains("image_accelerator_required")
+        || detail.contains("image_cuda_required")
+    {
+        "image_accelerator_required"
+    } else if detail.contains("image_runtime_missing") {
+        "image_runtime_missing"
+    } else if detail.contains("image_model_chat_unsupported") {
+        "image_model_chat_unsupported"
+    } else if detail.contains("chat_model_image_unsupported") {
+        "chat_model_image_unsupported"
+    } else if detail.contains("image_stream_unsupported") {
+        "image_stream_unsupported"
+    } else if detail.contains("diffusers load failed")
+        || detail.contains("qwen-image load failed")
+        || detail.contains("model_load_failed")
+    {
+        "model_load_failed"
     } else {
         "inference_failed"
     }

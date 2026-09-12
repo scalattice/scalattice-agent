@@ -1,7 +1,7 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use super::placement::{pick_placement, placement_miss_detail, Placement};
 use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot};
-use crate::protocol::{CatalogModel, ChatMessage, InvokeTimings};
+use crate::protocol::{CatalogModel, ChatMessage, GeneratedImage, InvokeTimings};
 use crate::specs::ComputeDevice;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -723,6 +723,124 @@ impl Supervisor {
 
         self.clear_job_cancel(job_id).await;
         Err(last_crash.unwrap_or_else(|| anyhow!("agent_busy: no remaining compute slot")))
+    }
+
+    pub async fn invoke_image(
+        &self,
+        job_id: &str,
+        model: &CatalogModel,
+        job: crate::image::ImageJob,
+        ram_gb: u32,
+        cpu_ram_headroom_gb: u32,
+        mut on_delta: Option<Box<dyn FnMut(String) + Send>>,
+    ) -> Result<(Vec<GeneratedImage>, InvokeTimings, String)> {
+        let cancel = self.register_job_cancel(job_id).await;
+        let started = Instant::now();
+        let placement = {
+            let mut workers = self.workers.lock().await;
+            let idle: Vec<String> = self
+                .plan
+                .slots
+                .iter()
+                .filter(|s| {
+                    workers
+                        .get(&s.id)
+                        .map(|w| w.healthy && !w.busy)
+                        .unwrap_or(false)
+                })
+                .map(|s| s.id.clone())
+                .collect();
+            let placement = match pick_placement(
+                &self.plan,
+                &idle,
+                model,
+                ram_gb,
+                cpu_ram_headroom_gb,
+                &self.devices,
+                false,
+            ) {
+                Some(p) => p,
+                None => {
+                    self.clear_job_cancel(job_id).await;
+                    let detail = placement_miss_detail(&self.plan, &idle, model, false);
+                    return Err(anyhow!(detail));
+                }
+            };
+            for sid in &placement.slot_ids {
+                let Some(worker) = workers.get_mut(sid) else {
+                    self.clear_job_cancel(job_id).await;
+                    return Err(anyhow!("slot worker {sid} missing"));
+                };
+                if worker.busy || !worker.healthy {
+                    self.clear_job_cancel(job_id).await;
+                    bail!("agent_busy: slot {sid} not available");
+                }
+                worker.busy = true;
+            }
+            placement
+        };
+        self.changed.notify_waiters();
+
+        let slot_id = placement
+            .slot_ids
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("empty placement"))?;
+        let image_device = crate::image::image_backend_for_card(&placement.card);
+        info!(slot = %slot_id, device = %image_device, job_id, "claimed slot for image job");
+
+        let mut worker = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .remove(&slot_id)
+                .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?
+        };
+        let pid = worker.child.id();
+        self.mark_checkout(&slot_id, job_id, pid).await;
+
+        // Evict llama.cpp so PyTorch can take the same GPU.
+        let _ = worker.child.kill().await;
+        let _ = worker.child.wait().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let mut on_progress = |phase: &str, pct: Option<f32>| {
+            if let Some(cb) = on_delta.as_mut() {
+                cb(format!("\u{1e}{}\u{1e}{}", phase, pct.unwrap_or(-1.0)));
+            }
+        };
+
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.notified() => {
+                Err(anyhow!("request_canceled"))
+            }
+            result = crate::image::run_qwen_image(
+                &job,
+                &placement.cuda_visible,
+                image_device,
+                &cancel,
+                &mut on_progress,
+            ) => result,
+        };
+
+        match spawn_worker(&worker.spec).await {
+            Ok(new_w) => worker = new_w,
+            Err(err) => {
+                warn!(slot = %slot_id, error = %err, "failed to respawn llama worker after image job");
+                worker.healthy = false;
+            }
+        }
+        self.return_worker(slot_id.clone(), worker).await;
+        self.clear_job_cancel(job_id).await;
+
+        let images = outcome?;
+        let timings = InvokeTimings {
+            model_load_ms: None,
+            prefill_ms: None,
+            decode_ms: None,
+            total_ms: Some(started.elapsed().as_millis() as u64),
+        };
+        Ok((images, timings, slot_id))
     }
 
     async fn invoke_single(

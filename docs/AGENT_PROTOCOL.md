@@ -118,6 +118,44 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 }
 ```
 
+Image catalog models (`jobKind: "image"`) use a second runtime. The invoke is **not** chat: no `stream`, no `messages` required. The catalog HF Diffusers repo is loaded with Python Diffusers (NVIDIA CUDA, AMD ROCm/DirectML, Intel Arc XPU, or Apple Silicon MPS). Generated PNGs are returned on `invoke_result.images` (not `content`, which is capped at 512 KiB). Isolation:
+
+- Image runtime runs only when **both** the catalog row and the invoke have `jobKind: "image"`. A chat/VL probe (missing or `chat` `jobKind`) on an image SKU returns `image_model_chat_unsupported` — it must not generate a picture.
+- `jobKind: "image"` on a chat/VL catalog row returns `chat_model_image_unsupported`.
+- Split inference (`invoke_split`) is chat-only. Image SKUs return `image_model_chat_unsupported`.
+- `inputImages` are edit references, not VL photos. Chat/VL jobs reject them. Vision photos stay on `messages[].images`.
+- `invoke_result` with `images` must keep `content` empty and token counts at 0.
+
+```json
+{
+  "type": "invoke",
+  "id": "request-uuid",
+  "modelId": "qwen-image",
+  "runtimeModel": "Qwen/Qwen-Image",
+  "jobKind": "image",
+  "prompt": "A red bicycle parked in morning fog",
+  "width": 1328,
+  "height": 1328,
+  "n": 1,
+  "seed": 42,
+  "inputImages": [{ "mime": "image/png", "data": "<base64>" }]
+}
+```
+
+```json
+{
+  "type": "invoke_result",
+  "id": "request-uuid",
+  "content": "",
+  "promptTokens": 0,
+  "completionTokens": 0,
+  "images": [{ "mime": "image/png", "data": "<base64>" }],
+  "imageCount": 1
+}
+```
+
+NVIDIA CUDA, AMD (ROCm on Linux, DirectML on Windows), Intel Arc (PyTorch XPU), or Apple Silicon (MPS). Enabling an image SKU downloads an isolated CPython (never the host's Python), a Diffusers venv (`~/.cache/scalattice/runtimes/diffusers-*`), and the HF snapshot. Disabling the last image SKU removes that runtime. The agent evicts the llama.cpp worker on that GPU for the job, then respawns it. The catalog row's HF repo is the checkpoint (Qwen-Image sizes/CFG apply only when the repo name contains `qwen-image`). Optional `inputImages` (1–4, `{ mime, data }`) are reference pictures for edit pipelines. Set `SCALATTICE_QWEN_IMAGE_STUB=1` to return a 1×1 PNG without PyTorch.
+
 6. **Client → server** while streaming: zero or more `invoke_delta`, then terminal `invoke_result` or `invoke_error`:
 
 ```json

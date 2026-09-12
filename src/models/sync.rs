@@ -53,7 +53,9 @@ pub fn spawn_catalog_sync(
                 crate::state::set_disk_full(true);
                 break;
             }
-            if !can_host_model(&model, &card, ram_gb, cpu_ram_headroom_gb) {
+            if !model.is_image_job()
+                && !can_host_model(&model, &card, ram_gb, cpu_ram_headroom_gb)
+            {
                 info!(
                     "skipping {}: needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM, headroom {} GB)",
                     model.model_id,
@@ -66,7 +68,8 @@ pub fn spawn_catalog_sync(
                 continue;
             }
             state::set_downloading_model(Some(&model.model_id));
-            let result = download_catalog_model(&model, &agent_token, hf_token.as_deref()).await;
+            let result =
+                download_catalog_model(&model, &agent_token, hf_token.as_deref(), &cancel).await;
             state::set_downloading_model(None);
             if cancel.load(Ordering::Relaxed) {
                 purge_incomplete_model_weights(runtime_model);

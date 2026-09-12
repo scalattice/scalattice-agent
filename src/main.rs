@@ -12,6 +12,7 @@ mod config;
 mod inference;
 mod llm;
 mod logging;
+mod image;
 mod models;
 mod paths;
 mod protocol;

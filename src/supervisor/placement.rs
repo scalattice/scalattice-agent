@@ -17,6 +17,58 @@ pub struct Placement {
     pub use_tp_worker: bool,
 }
 
+fn image_slot_backend_rank(slot: &ComputeSlot) -> u8 {
+    if matches!(slot.card.strategy, PoolStrategy::Single) && !slot.card.uses_vulkan {
+        0
+    } else if matches!(slot.card.strategy, PoolStrategy::Metal) {
+        1
+    } else if crate::image::is_amd_discrete_card(&slot.card) {
+        2
+    } else {
+        3
+    }
+}
+
+fn pick_image_placement(
+    plan: &ComputePlan,
+    idle: &std::collections::HashSet<&str>,
+    model: &CatalogModel,
+) -> Option<Placement> {
+    let min_vram = hosting_min_vram_gb(model);
+    let mut candidates: Vec<&ComputeSlot> = plan
+        .slots
+        .iter()
+        .filter(|s| idle.contains(s.id.as_str()))
+        .filter(|s| s.kind != "cpu" && crate::image::image_card_eligible(&s.card))
+        .filter(|s| min_vram == 0 || s.card.total_vram_gb >= min_vram)
+        .collect();
+    candidates.sort_by(|a, b| {
+        image_slot_backend_rank(a)
+            .cmp(&image_slot_backend_rank(b))
+            .then_with(|| a.card.total_vram_gb.cmp(&b.card.total_vram_gb))
+            .then_with(|| a.priority.cmp(&b.priority))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let slot = candidates.first()?;
+    let cuda_visible = if slot.cuda_visible.is_empty() {
+        if crate::image::is_amd_discrete_card(&slot.card) {
+            crate::image::amd_visible_index(&slot.card)
+        } else if crate::image::is_intel_arc_card(&slot.card) {
+            crate::image::intel_visible_index(&slot.card)
+        } else {
+            slot.cuda_visible.clone()
+        }
+    } else {
+        slot.cuda_visible.clone()
+    };
+    Some(Placement {
+        slot_ids: vec![slot.id.clone()],
+        card: slot.card.clone(),
+        cuda_visible,
+        use_tp_worker: false,
+    })
+}
+
 /// Prefer the smallest idle accelerator that can **fully** host the model
 /// (weights + KV headroom). If none are free, offload on the largest idle
 /// accelerator (text only). Image jobs never offload.
@@ -30,6 +82,10 @@ pub fn pick_placement(
     need_vision: bool,
 ) -> Option<Placement> {
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
+
+    if model.is_image_job() {
+        return pick_image_placement(plan, &idle, model);
+    }
 
     let min_vram = if need_vision {
         image_job_min_vram_gb(model)
@@ -298,6 +354,9 @@ mod tests {
             model_id: "m".into(),
             display_name: "m".into(),
             runtime_model: "m".into(),
+            job_kind: String::new(),
+            usd_per_image: 0.0,
+            image_max_n: 0,
             max_context_tokens: 4096,
             regions: vec![],
             weight_size_gb: Some(weight),
@@ -441,6 +500,160 @@ mod tests {
         let placement =
             pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+    }
+
+    fn image_model(min_vram: f64) -> CatalogModel {
+        CatalogModel {
+            model_id: "qwen-image".into(),
+            display_name: "Qwen Image".into(),
+            runtime_model: "Qwen/Qwen-Image".into(),
+            job_kind: "image".into(),
+            usd_per_image: 0.03,
+            image_max_n: 1,
+            max_context_tokens: 0,
+            regions: vec![],
+            weight_size_gb: Some(40.0),
+            min_vram_gb: Some(min_vram),
+            min_vram_gb_vision: None,
+            vision_model: false,
+            text_sibling_model_id: None,
+            min_ram_gb: Some(16.0),
+            mmproj_size_gb: None,
+            vision_max_images: None,
+            vision_max_image_side_px: None,
+            vision_max_image_pixels: None,
+            weights: None,
+        }
+    }
+
+    #[test]
+    fn image_job_uses_smallest_cuda_slot_that_meets_vram() {
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let placement =
+            pick_placement(&plan, &idle, &image_model(8.0), 64, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cuda-1".to_string()]);
+        assert!(!placement.use_tp_worker);
+    }
+
+    #[test]
+    fn image_job_skips_cpu_and_undersized_gpu() {
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        assert!(pick_placement(&plan, &idle, &image_model(24.0), 64, 2, &devices, false).is_none());
+    }
+
+    #[test]
+    fn image_job_places_on_metal_slot() {
+        use crate::compute_pool::{ComputePlan, ComputeSlot, PoolDevice, VirtualCard};
+        let card = VirtualCard {
+            devices: vec![PoolDevice {
+                id: "metal:0".into(),
+                kind: "metal".into(),
+                name: "Apple M4".into(),
+                vram_gb: 24,
+                cuda_index: None,
+            }],
+            strategy: PoolStrategy::Metal,
+            display_name: "Apple M4".into(),
+            total_vram_gb: 24,
+            tensor_split: vec![],
+            cuda_device_ids: vec![],
+            uses_vulkan: false,
+            gpu_layer_budget: 0,
+        };
+        let plan = ComputePlan {
+            slots: vec![ComputeSlot {
+                id: "metal-0".into(),
+                kind: "metal".into(),
+                priority: 15,
+                card,
+                cuda_visible: vec![],
+                tp_group: None,
+            }],
+            tp_groups: Default::default(),
+        };
+        let idle = vec!["metal-0".to_string()];
+        let placement =
+            pick_placement(&plan, &idle, &image_model(16.0), 32, 2, &[], false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["metal-0".to_string()]);
+        assert!(placement.cuda_visible.is_empty());
+    }
+
+    #[test]
+    fn image_job_places_on_amd_vulkan_slot() {
+        use crate::compute_pool::{ComputePlan, ComputeSlot, PoolDevice, VirtualCard};
+        let card = VirtualCard {
+            devices: vec![PoolDevice {
+                id: "amd:1".into(),
+                kind: "discrete".into(),
+                name: "AMD Radeon RX 7900 XTX".into(),
+                vram_gb: 24,
+                cuda_index: None,
+            }],
+            strategy: PoolStrategy::Vulkan,
+            display_name: "AMD Radeon RX 7900 XTX".into(),
+            total_vram_gb: 24,
+            tensor_split: vec![],
+            cuda_device_ids: vec![],
+            uses_vulkan: true,
+            gpu_layer_budget: 0,
+        };
+        let plan = ComputePlan {
+            slots: vec![ComputeSlot {
+                id: "vulkan-0".into(),
+                kind: "discrete_vulkan".into(),
+                priority: 20,
+                card,
+                cuda_visible: vec![],
+                tp_group: None,
+            }],
+            tp_groups: Default::default(),
+        };
+        let idle = vec!["vulkan-0".to_string()];
+        let placement =
+            pick_placement(&plan, &idle, &image_model(16.0), 32, 2, &[], false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["vulkan-0".to_string()]);
+        assert_eq!(placement.cuda_visible, vec![1]);
+    }
+
+    #[test]
+    fn image_job_places_on_intel_arc_slot() {
+        use crate::compute_pool::{ComputePlan, ComputeSlot, PoolDevice, VirtualCard};
+        let card = VirtualCard {
+            devices: vec![PoolDevice {
+                id: "pci-intel:0".into(),
+                kind: "discrete".into(),
+                name: "Intel Arc A770".into(),
+                vram_gb: 16,
+                cuda_index: None,
+            }],
+            strategy: PoolStrategy::Vulkan,
+            display_name: "Intel Arc A770".into(),
+            total_vram_gb: 16,
+            tensor_split: vec![],
+            cuda_device_ids: vec![],
+            uses_vulkan: true,
+            gpu_layer_budget: 0,
+        };
+        let plan = ComputePlan {
+            slots: vec![ComputeSlot {
+                id: "vulkan-0".into(),
+                kind: "discrete_vulkan".into(),
+                priority: 20,
+                card,
+                cuda_visible: vec![],
+                tp_group: None,
+            }],
+            tp_groups: Default::default(),
+        };
+        let idle = vec!["vulkan-0".to_string()];
+        let placement =
+            pick_placement(&plan, &idle, &image_model(12.0), 32, 2, &[], false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["vulkan-0".to_string()]);
+        assert_eq!(placement.cuda_visible, vec![0]);
     }
 
     fn mixed_1660_3080() -> [ComputeDevice; 3] {
