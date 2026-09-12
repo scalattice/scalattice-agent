@@ -31,14 +31,14 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 socket2 = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+flate2 = "1"
+tar = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-flate2 = "1"
-tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # No default features: omit Linux gtk/libappindicator from the lockfile (glib advisory).

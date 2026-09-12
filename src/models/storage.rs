@@ -255,6 +255,9 @@ pub fn model_weights_ready(runtime_model: &str) -> bool {
 /// True when weights are ready under the HF runtime id, a legacy modelId cache folder,
 /// or an existing GGUF whose catalog filename merely drifted.
 pub fn catalog_model_weights_ready(model: &crate::protocol::CatalogModel) -> bool {
+    if model.is_image_job() {
+        return crate::image::image_install_ready(model);
+    }
     let runtime = runtime_id_for_catalog(model);
     if model_weights_ready(runtime) {
         return true;

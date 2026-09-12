@@ -118,6 +118,23 @@ pub fn can_serve_vision_on_machine(
     false
 }
 
+fn can_host_image_model(model: &CatalogModel, card: &VirtualCard) -> bool {
+    if !crate::image::image_card_eligible(card) {
+        return false;
+    }
+    match card.strategy {
+        PoolStrategy::Metal if !crate::image::metal_image_available() => return false,
+        PoolStrategy::Single
+            if !card.uses_vulkan && !crate::image::nvidia_cuda_available() =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+    let min_vram = hosting_min_vram_gb(model);
+    min_vram == 0 || card.total_vram_gb >= min_vram
+}
+
 /// Whether this machine can download and serve a catalog model on its virtual compute card.
 /// `cpu_ram_headroom_gb` comes from the server (`ready.cpuRamHeadroomGb`).
 pub fn can_host_model(
@@ -126,6 +143,9 @@ pub fn can_host_model(
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
 ) -> bool {
+    if model.is_image_job() {
+        return can_host_image_model(model, card);
+    }
     let min_vram = hosting_min_vram_gb(model);
     let min_ram = gb_ceil(model.min_ram_gb);
     let weight_gb = gb_ceil(model.weight_size_gb);
@@ -221,6 +241,9 @@ mod tests {
             model_id: "qwen-3-8b".into(),
             display_name: "Qwen3 8B".into(),
             runtime_model: "Qwen/Qwen3-8B".into(),
+            job_kind: String::new(),
+            usd_per_image: 0.0,
+            image_max_n: 0,
             max_context_tokens: 4096,
             regions: vec![],
             weight_size_gb: Some(weight),
@@ -242,6 +265,9 @@ mod tests {
             model_id: "qwen-3-vl-8b".into(),
             display_name: "Qwen3 VL 8B".into(),
             runtime_model: "Qwen/Qwen3-VL-8B".into(),
+            job_kind: String::new(),
+            usd_per_image: 0.0,
+            image_max_n: 0,
             max_context_tokens: 8192,
             regions: vec![],
             weight_size_gb: Some(weight),
@@ -460,5 +486,82 @@ mod tests {
         let mut model = vl_catalog(8.0, 99.0, 4.7, 8.0);
         model.min_vram_gb_vision = None;
         assert_eq!(image_job_min_vram_gb(&model), 8);
+    }
+
+    fn image_catalog(min_vram: f64) -> CatalogModel {
+        CatalogModel {
+            model_id: "qwen-image".into(),
+            display_name: "Qwen Image".into(),
+            runtime_model: "Qwen/Qwen-Image".into(),
+            job_kind: "image".into(),
+            usd_per_image: 0.03,
+            image_max_n: 1,
+            max_context_tokens: 0,
+            regions: vec![],
+            weight_size_gb: Some(40.0),
+            min_vram_gb: Some(min_vram),
+            min_vram_gb_vision: None,
+            vision_model: false,
+            text_sibling_model_id: None,
+            min_ram_gb: Some(16.0),
+            mmproj_size_gb: None,
+            vision_max_images: None,
+            vision_max_image_side_px: None,
+            vision_max_image_pixels: None,
+            weights: None,
+        }
+    }
+
+    #[test]
+    fn amd_discrete_hosts_image_sku() {
+        if !vulkan_runtime_supported() {
+            return;
+        }
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "amd:0".into(),
+            kind: "discrete".into(),
+            name: "AMD Radeon RX 7900 XTX".into(),
+            vram_gb: Some(24),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(can_host_model(&image_catalog(16.0), &card, 32, 2));
+        assert!(!can_host_model(&image_catalog(48.0), &card, 32, 2));
+    }
+
+    #[test]
+    fn cpu_does_not_host_image_sku() {
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "cpu:0".into(),
+            kind: "cpu".into(),
+            name: "CPU".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(!can_host_model(&image_catalog(8.0), &card, 64, 2));
+    }
+
+    #[test]
+    fn intel_arc_hosts_image_sku() {
+        if !vulkan_runtime_supported() {
+            return;
+        }
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "pci-intel:0".into(),
+            kind: "discrete".into(),
+            name: "Intel Arc B580".into(),
+            vram_gb: Some(12),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(can_host_model(&image_catalog(8.0), &card, 32, 2));
+        assert!(!can_host_model(&image_catalog(24.0), &card, 32, 2));
     }
 }

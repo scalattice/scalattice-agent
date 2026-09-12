@@ -32,6 +32,12 @@ pub struct CatalogModel {
     pub display_name: String,
     #[serde(rename = "runtimeModel", default)]
     pub runtime_model: String,
+    #[serde(rename = "jobKind", default)]
+    pub job_kind: String,
+    #[serde(rename = "usdPerImage", default)]
+    pub usd_per_image: f64,
+    #[serde(rename = "imageMaxN", default)]
+    pub image_max_n: u32,
     #[serde(rename = "maxContextTokens", default)]
     pub max_context_tokens: u32,
     #[serde(default)]
@@ -59,6 +65,32 @@ pub struct CatalogModel {
     pub min_ram_gb: Option<f64>,
     #[serde(default)]
     pub weights: Option<ModelWeights>,
+}
+
+impl CatalogModel {
+    pub fn is_image_job(&self) -> bool {
+        matches!(
+            self.job_kind.trim().to_ascii_lowercase().as_str(),
+            "image" | "images" | "image_generation"
+        )
+    }
+
+    /// Image generation and chat/VL are separate runtimes. Both sides must agree.
+    pub fn invoke_job_kind_error(
+        &self,
+        invoke_job_kind: &str,
+    ) -> Option<(&'static str, &'static str)> {
+        invoke_job_kind_error(self.is_image_job(), invoke_job_kind)
+    }
+
+    pub fn image_max_n(&self) -> u32 {
+        let n = self.image_max_n;
+        if n == 0 {
+            1
+        } else {
+            n.min(4)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -209,11 +241,26 @@ pub struct InvokeMessage {
     pub model_id: String,
     #[serde(rename = "runtimeModel")]
     pub runtime_model: String,
+    #[serde(default)]
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default, rename = "maxTokens")]
     pub max_tokens: u32,
+    #[serde(default, rename = "jobKind")]
+    pub job_kind: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub n: u32,
+    #[serde(default)]
+    pub seed: Option<i64>,
+    #[serde(default, rename = "inputImages")]
+    pub input_images: Vec<ChatImage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +415,14 @@ pub fn messages_have_images(messages: &[ChatMessage]) -> bool {
     messages.iter().any(ChatMessage::has_images)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedImage {
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub data: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct InvokeResultMessage {
     #[serde(rename = "type")]
@@ -378,11 +433,19 @@ pub struct InvokeResultMessage {
     pub prompt_tokens: u32,
     #[serde(rename = "completionTokens")]
     pub completion_tokens: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<GeneratedImage>,
+    #[serde(rename = "imageCount", skip_serializing_if = "is_zero_u32")]
+    pub image_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<InvokeTimings>,
     /// Compute slot that ran the job (`cuda-0`, `tp:cuda-0+cuda-1`, …).
     #[serde(rename = "slotId", skip_serializing_if = "Option::is_none")]
     pub slot_id: Option<String>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -502,6 +565,26 @@ pub fn parse_error(data: &[u8]) -> anyhow::Result<Value> {
     Ok(serde_json::from_slice(data)?)
 }
 
+/// Catalog `jobKind: image` only runs when the invoke also says `jobKind: image`.
+/// Chat/VL probes (missing or `chat` jobKind) must never start Diffusers.
+pub fn invoke_job_kind_error(
+    catalog_image: bool,
+    invoke_job_kind: &str,
+) -> Option<(&'static str, &'static str)> {
+    let invoke_image = invoke_job_kind.trim().eq_ignore_ascii_case("image");
+    match (catalog_image, invoke_image) {
+        (true, false) => Some((
+            "image_model_chat_unsupported",
+            "This catalog model generates images, not chat. Use jobKind image.",
+        )),
+        (false, true) => Some((
+            "chat_model_image_unsupported",
+            "This catalog model does not generate images.",
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +620,22 @@ mod tests {
         let msg: ChatMessage = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.content, "look");
         assert_eq!(msg.images[0].data, "bbbb");
+    }
+
+    #[test]
+    fn image_catalog_rejects_chat_invoke() {
+        let (code, _) = invoke_job_kind_error(true, "").unwrap();
+        assert_eq!(code, "image_model_chat_unsupported");
+        let (code, _) = invoke_job_kind_error(true, "chat").unwrap();
+        assert_eq!(code, "image_model_chat_unsupported");
+        assert!(invoke_job_kind_error(true, "image").is_none());
+    }
+
+    #[test]
+    fn chat_catalog_rejects_image_invoke() {
+        let (code, _) = invoke_job_kind_error(false, "image").unwrap();
+        assert_eq!(code, "chat_model_image_unsupported");
+        assert!(invoke_job_kind_error(false, "").is_none());
+        assert!(invoke_job_kind_error(false, "chat").is_none());
     }
 }
