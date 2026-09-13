@@ -20,7 +20,9 @@ use tracing::{info, warn};
 
 const WORKER_PY: &str = include_str!("worker.py");
 const IMAGE_WALL_CLOCK: Duration = Duration::from_secs(45 * 60);
-const IMAGE_SILENCE: Duration = Duration::from_secs(90);
+/// Healthy image workers emit JSON at least every 12s. Allow one missed beat
+/// (GIL / import hiccup), then kill. This is not a load-time budget.
+const IMAGE_SILENCE: Duration = Duration::from_secs(30);
 const DEPS_MARKER: &str = ".deps_ok_v3";
 const HOST_PYTHON_UNSET: &[&str] = &[
     "PYTHONHOME",
@@ -974,6 +976,7 @@ mod tests {
         assert!(WORKER_PY.contains("snapshot_download"));
         assert!(WORKER_PY.contains("local_files_only"));
         assert!(WORKER_PY.contains("HF_HUB_DISABLE_XET"));
+        assert!(WORKER_PY.contains("quiet_hf_progress"));
         assert!(WORKER_PY.contains("snapshot_dir"));
         assert!(WORKER_PY.contains("image_accelerator_required"));
         assert!(WORKER_PY.contains(r#"want == "xpu""#));

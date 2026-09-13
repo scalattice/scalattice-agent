@@ -8,9 +8,53 @@ use base64::{engine::general_purpose, Engine};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{
-    mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
+    mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunk, MtmdInputText,
 };
 use std::path::Path;
+
+/// llama-cpp-2 0.1.154 stores the C pointer as the first field of these wrappers.
+unsafe fn c_ptr<T>(wrapper: &T) -> *mut std::ffi::c_void {
+    *(wrapper as *const T as *const *mut std::ffi::c_void)
+}
+
+unsafe extern "C" {
+    fn mtmd_helper_eval_chunk_single(
+        ctx: *mut std::ffi::c_void,
+        lctx: *mut std::ffi::c_void,
+        chunk: *const std::ffi::c_void,
+        n_past: i32,
+        seq_id: i32,
+        n_batch: i32,
+        logits_last: bool,
+        new_n_past: *mut i32,
+    ) -> i32;
+}
+
+fn eval_one_chunk(
+    mtmd: &MtmdContext,
+    llama_ctx: &LlamaContext<'_>,
+    chunk: &MtmdInputChunk,
+    n_past: i32,
+    logits_last: bool,
+) -> Result<i32> {
+    let mut new_n_past = n_past;
+    let rc = unsafe {
+        mtmd_helper_eval_chunk_single(
+            c_ptr(mtmd),
+            c_ptr(llama_ctx),
+            c_ptr(chunk),
+            n_past,
+            0,
+            64,
+            logits_last,
+            &mut new_n_past,
+        )
+    };
+    if rc != 0 {
+        anyhow::bail!("mtmd eval image/text chunk failed ({rc})");
+    }
+    Ok(new_n_past)
+}
 
 pub fn collect_images(messages: &[ChatMessage]) -> Vec<&ChatImage> {
     messages
@@ -59,8 +103,11 @@ pub fn init_mtmd_for_model(
     let mut params = MtmdContextParams::default();
     params.use_gpu = !matches!(pool.strategy, PoolStrategy::CpuOnly);
     params.print_timings = false;
-    MtmdContext::init_from_file(path_str, model, &params)
-        .with_context(|| format!("init mmproj {}", path.display()))
+    super::progress::report("load", 0.0);
+    let ctx = MtmdContext::init_from_file(path_str, model, &params)
+        .with_context(|| format!("init mmproj {}", path.display()))?;
+    super::progress::report("load", 1.0);
+    Ok(ctx)
 }
 
 fn decode_image_bytes(image: &ChatImage) -> Result<Vec<u8>> {
@@ -93,7 +140,11 @@ pub fn prefill_vision(
 
     let images = collect_images(messages);
     let mut bitmaps = Vec::with_capacity(images.len());
-    for image in &images {
+    for (i, image) in images.iter().enumerate() {
+        super::progress::report(
+            "prefill",
+            0.05 * (i as f32 / images.len().max(1) as f32),
+        );
         let bytes = decode_image_bytes(image)?;
         if bytes.len() > 12 * 1024 * 1024 {
             anyhow::bail!("image exceeds 12 MB decoded");
@@ -106,6 +157,7 @@ pub fn prefill_vision(
     }
     let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
 
+    super::progress::report("prefill", 0.1);
     let chunks = mtmd
         .tokenize(
             MtmdInputText {
@@ -130,10 +182,18 @@ pub fn prefill_vision(
         );
     }
 
-    super::progress::report("prefill", 0.0);
-    let n_past = chunks
-        .eval_chunks(mtmd, ctx, 0, 0, 64, true)
-        .context("mtmd eval image + text chunks")?;
+    let n_chunks = chunks.len();
+    if n_chunks == 0 {
+        anyhow::bail!("mtmd produced no chunks");
+    }
+    // One llama.cpp call per chunk (text decode or image encode). Ping between
+    // them so a Mac chewing photos is not silent for the whole prefill.
+    let mut n_past = 0i32;
+    for i in 0..n_chunks {
+        let chunk = chunks.get(i).context("mtmd chunk missing")?;
+        super::progress::report("prefill", 0.1 + 0.8 * (i as f32 / n_chunks as f32));
+        n_past = eval_one_chunk(mtmd, ctx, &chunk, n_past, i + 1 == n_chunks)?;
+    }
     super::progress::report("prefill", 1.0);
 
     let next_pos = if n_past > 0 { n_past } else { n_pos };

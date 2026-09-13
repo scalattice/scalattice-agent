@@ -54,10 +54,30 @@ def isolate_from_host_python() -> None:
     os.environ["PIP_USER"] = "0"
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-    # hf_xet reconstructs shards via a background writer. That path surfaces
-    # disk/CAS failures as "Background writer channel closed" and can re-run
-    # at invoke even when the snapshot is already on disk. HTTP + local files.
     os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+
+def quiet_hf_progress() -> None:
+    """from_pretrained tqdm can run for minutes on Qwen-Image and holds the GIL."""
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+
+        disable_progress_bars()
+    except Exception:
+        pass
+    try:
+        import transformers
+
+        transformers.utils.logging.disable_progress_bar()
+    except Exception:
+        pass
+    try:
+        import diffusers
+
+        diffusers.utils.logging.disable_progress_bar()
+    except Exception:
+        pass
 
 
 isolate_from_host_python()
@@ -149,8 +169,10 @@ def start_heartbeat(phase_holder: list[str]) -> threading.Event:
     stop = threading.Event()
 
     def beat() -> None:
-        while not stop.wait(12):
+        while True:
             progress(phase_holder[0] or "working")
+            if stop.wait(12):
+                return
 
     threading.Thread(target=beat, daemon=True).start()
     return stop
@@ -399,11 +421,13 @@ def generate(job: dict, phase_holder: list[str]) -> None:
         return
 
     phase_holder[0] = "load"
+    progress("load", 5)
     try:
         import torch
         from diffusers import DiffusionPipeline
     except Exception as err:
         fail("image_runtime_missing", f"PyTorch/Diffusers import failed: {err}")
+    quiet_hf_progress()
 
     input_images = decode_input_images(job)
     device, dtype = pick_torch_device(want_device)
