@@ -280,6 +280,35 @@ pub fn placement_miss_detail(
         return format!("agent_busy: no idle compute slot for {model_id}");
     }
 
+    if model.is_image_job() {
+        let min_vram = hosting_min_vram_gb(model);
+        let image_slots: Vec<&ComputeSlot> = plan
+            .slots
+            .iter()
+            .filter(|s| {
+                s.kind != "cpu"
+                    && crate::image::image_card_eligible(&s.card)
+                    && (min_vram == 0 || s.card.total_vram_gb >= min_vram)
+            })
+            .collect();
+        if image_slots.iter().any(|s| idle.contains(s.id.as_str())) {
+            return format!("agent_busy: no placeable idle slot for {model_id}");
+        }
+        if !image_slots.is_empty() {
+            return format!(
+                "agent_busy: waiting for a GPU that can host {model_id} (need {min_vram} GB)"
+            );
+        }
+        let max_idle = idle_accel
+            .iter()
+            .map(|s| s.card.total_vram_gb)
+            .max()
+            .unwrap_or(0);
+        return format!(
+            "insufficient_vram: need {min_vram} GB GPU for image job {model_id}; largest idle {max_idle} GB"
+        );
+    }
+
     let catalog_min = if need_vision {
         image_job_min_vram_gb(model)
     } else {
@@ -543,6 +572,30 @@ mod tests {
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
         assert!(pick_placement(&plan, &idle, &image_model(24.0), 64, 2, &devices, false).is_none());
+    }
+
+    #[test]
+    fn image_job_busy_fitting_gpu_reports_agent_busy() {
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        // 10 GB card busy; 6 GB idle cannot host an 8 GB picture floor.
+        let idle: Vec<String> = plan
+            .slots
+            .iter()
+            .filter(|s| s.id != "cuda-1")
+            .map(|s| s.id.clone())
+            .collect();
+        let model = image_model(8.0);
+        assert!(pick_placement(&plan, &idle, &model, 64, 2, &devices, false).is_none());
+        let detail = placement_miss_detail(&plan, &idle, &model, false);
+        assert!(
+            detail.starts_with("agent_busy:"),
+            "want capacity miss, got {detail}"
+        );
+        assert!(
+            detail.contains("waiting for a GPU"),
+            "want wait-for-fit, got {detail}"
+        );
     }
 
     #[test]
