@@ -20,7 +20,9 @@ use tracing::{info, warn};
 
 const WORKER_PY: &str = include_str!("worker.py");
 const IMAGE_WALL_CLOCK: Duration = Duration::from_secs(45 * 60);
-const IMAGE_SILENCE: Duration = Duration::from_secs(90);
+/// Healthy image workers emit JSON at least every 12s. Allow one missed beat
+/// (GIL / import hiccup), then kill. This is not a load-time budget.
+const IMAGE_SILENCE: Duration = Duration::from_secs(30);
 const DEPS_MARKER: &str = ".deps_ok_v3";
 const HOST_PYTHON_UNSET: &[&str] = &[
     "PYTHONHOME",
@@ -218,30 +220,60 @@ fn snapshot_components_ready(snap: &Path) -> bool {
     dir_has_weight_file(snap, 0)
 }
 
+fn snapshot_from_refs(root: &Path) -> Option<PathBuf> {
+    let snapshots = root.join("snapshots");
+    let refs = root.join("refs");
+    let Ok(entries) = std::fs::read_dir(&refs) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let Ok(hash) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let snap = snapshots.join(hash.trim());
+        if snapshot_components_ready(&snap) {
+            return Some(snap);
+        }
+    }
+    None
+}
+
+/// First complete snapshot directory under a Hugging Face hub repo cache.
+pub fn hf_ready_snapshot_path_in(root: &Path) -> Option<PathBuf> {
+    if let Some(snap) = snapshot_from_refs(root) {
+        return Some(snap);
+    }
+    let snapshots = root.join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&snapshots) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let snap = entry.path();
+        if snap.is_dir() && snapshot_components_ready(&snap) {
+            return Some(snap);
+        }
+    }
+    None
+}
+
 /// Complete Diffusers snapshot — `model_index.json` alone is not enough;
 /// Hugging Face writes that file first, then the multi-GB weight shards.
 /// Leftover `*.incomplete` blobs from an earlier attempt do not block a
 /// snapshot that already has its weight components.
 pub fn hf_snapshot_dir_ready(root: &Path) -> bool {
-    let snapshots = root.join("snapshots");
-    let Ok(entries) = std::fs::read_dir(&snapshots) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let snap = entry.path();
-        if snap.is_dir() && snapshot_components_ready(&snap) {
-            return true;
-        }
+    hf_ready_snapshot_path_in(root).is_some()
+}
+
+pub fn hf_ready_snapshot_path(repo: &str) -> Option<PathBuf> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return None;
     }
-    false
+    hf_ready_snapshot_path_in(&hub_repo_dir(repo))
 }
 
 pub fn hf_snapshot_ready(repo: &str) -> bool {
-    let repo = repo.trim();
-    if repo.is_empty() {
-        return false;
-    }
-    hf_snapshot_dir_ready(&hub_repo_dir(repo))
+    hf_ready_snapshot_path(repo).is_some()
 }
 
 pub fn image_repo(model: &CatalogModel) -> Option<&str> {
@@ -486,6 +518,9 @@ fn worker_payload(
         "torch_index": torch_index_for(device),
         "extra_pip": extra_pip,
     });
+    if let Some(snap) = hf_ready_snapshot_path(repo) {
+        payload["snapshot_dir"] = serde_json::json!(snap.display().to_string());
+    }
     if let Some(job) = job {
         payload["prompt"] = serde_json::json!(job.prompt);
         payload["width"] = serde_json::json!(job.width);
@@ -524,6 +559,11 @@ async fn run_image_worker(
         .env("PYTHONUNBUFFERED", "1")
         .env("HF_HUB_CACHE", &cache_dir)
         .env("HUGGINGFACE_HUB_CACHE", &cache_dir)
+        // hf_xet reconstructs shards in a background writer. On a 24 GB card
+        // that often dies as "Background writer channel closed" (disk full,
+        // half-written CAS, or the Hub being contacted again at invoke).
+        // HTTP downloads + local snapshot load are the supported path.
+        .env("HF_HUB_DISABLE_XET", "1")
         .env("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -934,6 +974,10 @@ mod tests {
         assert!(WORKER_PY.contains("torch_directml"));
         assert!(WORKER_PY.contains("isolate_from_host_python"));
         assert!(WORKER_PY.contains("snapshot_download"));
+        assert!(WORKER_PY.contains("local_files_only"));
+        assert!(WORKER_PY.contains("HF_HUB_DISABLE_XET"));
+        assert!(WORKER_PY.contains("quiet_hf_progress"));
+        assert!(WORKER_PY.contains("snapshot_dir"));
         assert!(WORKER_PY.contains("image_accelerator_required"));
         assert!(WORKER_PY.contains(r#"want == "xpu""#));
         assert!(WORKER_PY.contains("torch.xpu"));
@@ -1110,6 +1154,30 @@ mod tests {
         .unwrap();
         std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
         assert!(hf_snapshot_dir_ready(&root));
+        assert_eq!(hf_ready_snapshot_path_in(&root).as_deref(), Some(snap.as_path()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ready_snapshot_prefers_refs_revision() {
+        let root = std::env::temp_dir().join(format!("slt-hf-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for hash in ["aaa", "bbb"] {
+            let snap = root.join("snapshots").join(hash);
+            std::fs::create_dir_all(snap.join("transformer")).unwrap();
+            std::fs::write(
+                snap.join("model_index.json"),
+                r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
+            )
+            .unwrap();
+            std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
+        }
+        std::fs::create_dir_all(root.join("refs")).unwrap();
+        std::fs::write(root.join("refs").join("main"), b"bbb\n").unwrap();
+        assert_eq!(
+            hf_ready_snapshot_path_in(&root).unwrap().file_name().unwrap(),
+            "bbb"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

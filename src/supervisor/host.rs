@@ -99,10 +99,11 @@ pub struct Supervisor {
 }
 
 /// Give up only when the worker stops sending progress/token lines.
-/// Load / evict / context / prefill can sit in CUDA with no llama.cpp callback
-/// (graph compile, weight upload). Only token decode uses the short stall.
-const WORKER_DECODE_SILENCE: Duration = Duration::from_secs(120);
-const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(300);
+/// Load already has llama.cpp callbacks (~400ms). Decode reports every token
+/// (throttled to 400ms). VL photo encode pings once per mtmd chunk. 30s is a
+/// missed-beat kill, not a multi-minute nap.
+const WORKER_DECODE_SILENCE: Duration = Duration::from_secs(30);
+const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(30);
 /// Hard ceiling for any single invoke, even if the worker keeps dripping tokens.
 /// Prevents abandoned streams from holding a GPU forever under network load.
 const WORKER_INVOKE_WALL_CLOCK: Duration = Duration::from_secs(12 * 60);
