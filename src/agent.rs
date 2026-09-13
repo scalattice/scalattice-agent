@@ -349,6 +349,13 @@ impl SessionState {
         }
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
+        let max_gpu_gb = specs
+            .compute_devices
+            .iter()
+            .filter(|d| d.enabled)
+            .filter_map(|d| d.vram_gb)
+            .max()
+            .unwrap_or(0);
         for model in enabled {
             if self.catalog_ready_on_disk(model) {
                 continue;
@@ -360,10 +367,11 @@ impl SessionState {
                 self.cpu_ram_headroom_gb,
             ) {
                 warn!(
-                    "model {} cannot run on this machine (needs {} GB VRAM / {} GB RAM; machine has {} GB RAM)",
+                    "model {} cannot run on this machine (needs {} GB VRAM on one GPU / {} GB RAM; machine has {} GB max GPU VRAM / {} GB RAM)",
                     model.model_id,
                     model.min_vram_gb.unwrap_or(0.0),
                     model.min_ram_gb.unwrap_or(0.0),
+                    max_gpu_gb,
                     ram_gb
                 );
             }

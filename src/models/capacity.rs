@@ -67,7 +67,9 @@ pub fn vram_can_gpu_full(
     available_gb + 0.005 >= gpu_full_host_need_gb_for_job(model, need_vision)
 }
 
-/// GPU floor for image jobs: catalog `minVramGbVision` from the server.
+/// GPU floor for VL image attachments: catalog `minVramGbVision`.
+/// Diffusers picture SKUs use `hosting_min_vram_gb` (catalog `minVramGb`) via
+/// `can_host_image_model` — they are not VL.
 pub fn image_job_min_vram_gb(model: &CatalogModel) -> u32 {
     if !model_is_vision(model) {
         return hosting_min_vram_gb(model);
@@ -119,6 +121,12 @@ pub fn can_serve_vision_on_machine(
 }
 
 fn can_host_image_model(model: &CatalogModel, card: &VirtualCard) -> bool {
+    if matches!(
+        card.strategy,
+        PoolStrategy::TensorParallel | PoolStrategy::CpuOnly
+    ) {
+        return false;
+    }
     if !crate::image::image_card_eligible(card) {
         return false;
     }
@@ -196,6 +204,10 @@ pub fn can_host_on_machine(
         .any(|slot| can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb))
     {
         return true;
+    }
+    if model.is_image_job() {
+        // Diffusers never claims a llama.cpp TP group as one GPU.
+        return false;
     }
     for phys in plan.tp_groups.values() {
         if let Ok(tp) = build_tp_card_for_group(devices, phys) {
@@ -544,6 +556,58 @@ mod tests {
         }])
         .unwrap();
         assert!(!can_host_model(&image_catalog(8.0), &card, 64, 2));
+    }
+
+    fn dual_3090s() -> [ComputeDevice; 3] {
+        [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce RTX 3090".into(),
+                vram_gb: Some(24),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce RTX 3090".into(),
+                vram_gb: Some(24),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn dual_24gb_hosts_image_at_catalog_floor_not_gguf_inflate() {
+        std::env::set_var("SCALATTICE_QWEN_IMAGE_STUB", "1");
+        let devices = dual_3090s();
+        // Catalog 24 GB floor: one 3090 is enough. GGUF-style 45.3 (weight+KV)
+        // must not be treated as a single-GPU picture requirement via TP pooling.
+        assert!(can_host_on_machine(
+            &image_catalog(24.0),
+            &devices,
+            63,
+            2
+        ));
+        assert!(!can_host_on_machine(
+            &image_catalog(45.3),
+            &devices,
+            63,
+            2
+        ));
     }
 
     #[test]
