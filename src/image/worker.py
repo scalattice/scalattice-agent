@@ -52,6 +52,8 @@ def isolate_from_host_python() -> None:
         os.environ.pop(key, None)
     os.environ["PYTHONNOUSERSITE"] = "1"
     os.environ["PIP_USER"] = "0"
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 
 isolate_from_host_python()
@@ -60,6 +62,13 @@ isolate_from_host_python()
 def emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def hf_auth(hf_token: str | None):
+    """Public snapshots do not need a token. `False` is anonymous-on-purpose
+    (huggingface_hub will not nag for HF_TOKEN). A real token is only for gated repos."""
+    token = str(hf_token or "").strip()
+    return token if token else False
 
 
 def progress(phase: str, pct: float | None = None) -> None:
@@ -177,9 +186,7 @@ def prefetch_repo(job: dict) -> None:
         from huggingface_hub import snapshot_download
     except Exception as err:
         fail("image_runtime_missing", f"huggingface_hub import failed: {err}")
-    kwargs = {"repo_id": repo, "revision": revision}
-    if hf_token:
-        kwargs["token"] = hf_token
+    kwargs = {"repo_id": repo, "revision": revision, "token": hf_auth(hf_token)}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
     try:
@@ -354,11 +361,10 @@ def generate(job: dict, phase_holder: list[str]) -> None:
     progress("download", 40)
     kwargs = {
         "torch_dtype": dtype,
+        "token": hf_auth(hf_token),
     }
     if revision:
         kwargs["revision"] = revision
-    if hf_token:
-        kwargs["token"] = hf_token
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
     try:

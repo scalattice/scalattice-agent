@@ -480,9 +480,13 @@ async fn run_image_worker(
                     Ok(0) => break,
                     Ok(_) => {
                         let t = line.trim();
-                        if !t.is_empty() {
-                            info!(target: "qwen_image", "{t}");
+                        if t.is_empty() {
+                            continue;
                         }
+                        if t.contains("unauthenticated requests to the HF Hub") {
+                            continue;
+                        }
+                        info!(target: "qwen_image", "{t}");
                     }
                     Err(_) => break,
                 }
@@ -803,7 +807,16 @@ pub fn nvidia_cuda_available() -> bool {
     if image_stub_enabled() {
         return true;
     }
-    which_bin("nvidia-smi").is_ok()
+    if which_bin("nvidia-smi").is_ok() {
+        return true;
+    }
+    crate::specs::detect_all_compute_devices().iter().any(|d| {
+        d.enabled
+            && d.kind == "discrete"
+            && (d.id.starts_with("nvidia:")
+                || d.name.to_ascii_lowercase().contains("nvidia")
+                || d.name.to_ascii_lowercase().contains("geforce"))
+    })
 }
 
 pub fn metal_image_available() -> bool {

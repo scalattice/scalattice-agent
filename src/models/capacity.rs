@@ -132,11 +132,6 @@ fn can_host_image_model(model: &CatalogModel, card: &VirtualCard) -> bool {
     }
     match card.strategy {
         PoolStrategy::Metal if !crate::image::metal_image_available() => return false,
-        PoolStrategy::Single
-            if !card.uses_vulkan && !crate::image::nvidia_cuda_available() =>
-        {
-            return false;
-        }
         _ => {}
     }
     let min_vram = hosting_min_vram_gb(model);
@@ -592,7 +587,6 @@ mod tests {
 
     #[test]
     fn dual_24gb_hosts_image_at_catalog_floor_not_gguf_inflate() {
-        std::env::set_var("SCALATTICE_QWEN_IMAGE_STUB", "1");
         let devices = dual_3090s();
         // Catalog 24 GB floor: one 3090 is enough. GGUF-style 45.3 (weight+KV)
         // must not be treated as a single-GPU picture requirement via TP pooling.

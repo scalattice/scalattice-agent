@@ -366,14 +366,26 @@ impl SessionState {
                 ram_gb,
                 self.cpu_ram_headroom_gb,
             ) {
-                warn!(
-                    "model {} cannot run on this machine (needs {} GB VRAM on one GPU / {} GB RAM; machine has {} GB max GPU VRAM / {} GB RAM)",
-                    model.model_id,
-                    model.min_vram_gb.unwrap_or(0.0),
-                    model.min_ram_gb.unwrap_or(0.0),
-                    max_gpu_gb,
-                    ram_gb
-                );
+                let need = model.min_vram_gb.unwrap_or(0.0);
+                if model.is_image_job() && max_gpu_gb as f64 + 0.001 >= need && need > 0.0 {
+                    warn!(
+                        "model {} cannot run on this machine (needs {} GB VRAM on one GPU / {} GB RAM; machine has {} GB max GPU VRAM / {} GB RAM). Picture jobs need a CUDA, Metal, or ROCm GPU slot — CPU and tensor-parallel pools are skipped.",
+                        model.model_id,
+                        need,
+                        model.min_ram_gb.unwrap_or(0.0),
+                        max_gpu_gb,
+                        ram_gb
+                    );
+                } else {
+                    warn!(
+                        "model {} cannot run on this machine (needs {} GB VRAM on one GPU / {} GB RAM; machine has {} GB max GPU VRAM / {} GB RAM)",
+                        model.model_id,
+                        need,
+                        model.min_ram_gb.unwrap_or(0.0),
+                        max_gpu_gb,
+                        ram_gb
+                    );
+                }
             }
         }
     }
@@ -593,19 +605,24 @@ impl SessionState {
         let mut trash = Vec::new();
         for model_id in model_ids {
             let runtime_model = self.runtime_for_model_id(model_id);
-            info!("purging model weights for {model_id} ({runtime_model})");
+            let mut staged = Vec::new();
             if let Some(model) = self.catalog.iter().find(|m| m.model_id == *model_id) {
                 if model.is_image_job() {
                     if let Some(repo) = crate::image::image_repo(model) {
                         if let Some(path) = crate::image::stage_purge_image_snapshot(repo) {
-                            trash.push(path);
+                            staged.push(path);
                         }
                     }
                 }
             }
             if let Some(path) = stage_purge_model_weights(&runtime_model) {
-                trash.push(path);
+                staged.push(path);
             }
+            if staged.is_empty() {
+                continue;
+            }
+            info!("purging model weights for {model_id} ({runtime_model})");
+            trash.append(&mut staged);
         }
         self.sync_image_runtime_presence();
         trash
