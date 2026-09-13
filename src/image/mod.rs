@@ -142,26 +142,6 @@ pub fn resolve_image_job_size(
     )
 }
 
-fn path_has_incomplete(path: &Path, depth: u32) -> bool {
-    if depth > 8 {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".incomplete") {
-            return true;
-        }
-        if child.is_dir() && path_has_incomplete(&child, depth + 1) {
-            return true;
-        }
-    }
-    false
-}
-
 fn dir_has_weight_file(dir: &Path, depth: u32) -> bool {
     if depth > 6 {
         return false;
@@ -223,15 +203,13 @@ fn snapshot_components_ready(snap: &Path) -> bool {
         if key.starts_with('_') || !val.is_array() {
             continue;
         }
-        let folder = snap.join(key);
-        if !folder.is_dir() {
-            return false;
+        if !WEIGHT_COMPONENTS.iter().any(|name| *name == key.as_str()) {
+            continue;
         }
-        if WEIGHT_COMPONENTS.iter().any(|name| *name == key) {
-            saw_weight_component = true;
-            if !dir_has_weight_file(&folder, 0) {
-                return false;
-            }
+        saw_weight_component = true;
+        let folder = snap.join(key);
+        if !folder.is_dir() || !dir_has_weight_file(&folder, 0) {
+            return false;
         }
     }
     if saw_weight_component {
@@ -242,10 +220,9 @@ fn snapshot_components_ready(snap: &Path) -> bool {
 
 /// Complete Diffusers snapshot — `model_index.json` alone is not enough;
 /// Hugging Face writes that file first, then the multi-GB weight shards.
+/// Leftover `*.incomplete` blobs from an earlier attempt do not block a
+/// snapshot that already has its weight components.
 pub fn hf_snapshot_dir_ready(root: &Path) -> bool {
-    if path_has_incomplete(root, 0) {
-        return false;
-    }
     let snapshots = root.join("snapshots");
     let Ok(entries) = std::fs::read_dir(&snapshots) else {
         return false;
@@ -1137,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_incomplete_blob_is_not_ready() {
+    fn leftover_incomplete_blob_does_not_block_ready_snapshot() {
         let root = std::env::temp_dir().join(format!("slt-hf-inc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let snap = root.join("snapshots").join("abc");
@@ -1150,7 +1127,10 @@ mod tests {
         .unwrap();
         std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
         std::fs::write(root.join("blobs").join("shard.incomplete"), b"partial").unwrap();
-        assert!(!hf_snapshot_dir_ready(&root));
+        assert!(
+            hf_snapshot_dir_ready(&root),
+            "complete weight components must win over leftover .incomplete blobs"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

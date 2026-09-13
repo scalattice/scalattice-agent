@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::specs::ComputeDevice;
 
 static DISK_FULL: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 pub fn set_disk_full(full: bool) {
     DISK_FULL.store(full, Ordering::Relaxed);
@@ -14,6 +15,21 @@ pub fn set_disk_full(full: bool) {
 
 pub fn disk_full() -> bool {
     DISK_FULL.load(Ordering::Relaxed)
+}
+
+/// True if this process already accepted a remote update or restart.
+pub fn begin_lifecycle_control() -> bool {
+    LIFECYCLE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+pub fn lifecycle_control_in_flight() -> bool {
+    LIFECYCLE_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+pub fn end_lifecycle_control() {
+    LIFECYCLE_IN_FLIGHT.store(false, Ordering::SeqCst);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

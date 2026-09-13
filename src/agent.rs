@@ -1879,6 +1879,16 @@ async fn handle_remote_control(
             info!("remote control: cancel_jobs ({canceled})");
         }
         "restart" => {
+            if !crate::state::begin_lifecycle_control() {
+                let ack = ControlAckMessage {
+                    kind: "control_ack",
+                    action: "restart".to_string(),
+                    ok: true,
+                    detail: Some("Restart already in progress.".to_string()),
+                };
+                let _ = ws_send_text(write, &serde_json::to_string(&ack)?).await;
+                return Ok(());
+            }
             let ack = ControlAckMessage {
                 kind: "control_ack",
                 action: "restart".to_string(),
@@ -1900,15 +1910,27 @@ async fn handle_remote_control(
                         std::process::exit(0);
                     }
                     Ok(Err(err)) => {
+                        crate::state::end_lifecycle_control();
                         warn!("remote restart failed: {err:#}");
                     }
                     Err(err) => {
+                        crate::state::end_lifecycle_control();
                         warn!("remote restart task failed: {err:#}");
                     }
                 }
             });
         }
         "update" => {
+            if !crate::state::begin_lifecycle_control() {
+                let ack = ControlAckMessage {
+                    kind: "control_ack",
+                    action: "update".to_string(),
+                    ok: true,
+                    detail: Some("Update already in progress.".to_string()),
+                };
+                let _ = ws_send_text(write, &serde_json::to_string(&ack)?).await;
+                return Ok(());
+            }
             let ack = ControlAckMessage {
                 kind: "control_ack",
                 action: "update".to_string(),
@@ -1967,8 +1989,10 @@ async fn handle_remote_control(
                             }
                             std::process::exit(0);
                         }
+                        crate::state::end_lifecycle_control();
                     }
                     Err(err) => {
+                        crate::state::end_lifecycle_control();
                         warn!("remote update failed: {err:#}");
                         let ack = ControlAckMessage {
                             kind: "control_ack",

@@ -2,6 +2,7 @@ use crate::models::health::{
     is_purging_cache_key, read_weight_health, runtime_from_purging_cache_key,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -343,19 +344,59 @@ fn dir_size_gb(path: &Path) -> u32 {
     ((bytes as f64) / 1024.0 / 1024.0 / 1024.0).round() as u32
 }
 
+fn file_inode_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
 fn dir_size_bytes(path: &Path) -> u64 {
+    let mut seen = HashSet::new();
+    dir_size_bytes_seen(path, &mut seen)
+}
+
+/// Hugging Face stores each blob once and hardlinks/symlinks it from snapshots/.
+/// Counting the whole repo tree double- or triple-counts the same weights.
+fn hub_repo_size_bytes(path: &Path) -> u64 {
+    let blobs = path.join("blobs");
+    if blobs.is_dir() {
+        let n = dir_size_bytes(&blobs);
+        if n > 0 {
+            return n;
+        }
+    }
+    dir_size_bytes(path)
+}
+
+fn dir_size_bytes_seen(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
     let mut total = 0u64;
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
-            if let Ok(meta) = path.metadata() {
-                total = total.saturating_add(meta.len());
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_file() {
+            if let Some(key) = file_inode_key(&meta) {
+                if !seen.insert(key) {
+                    continue;
+                }
             }
-        } else if path.is_dir() {
-            total = total.saturating_add(dir_size_bytes(&path));
+            total = total.saturating_add(meta.len());
+        } else if meta.is_dir() {
+            total = total.saturating_add(dir_size_bytes_seen(&path, seen));
         }
     }
     total
@@ -511,7 +552,7 @@ fn list_image_hub_disk_status() -> Vec<(String, ModelDiskStatus)> {
         let Some(repo) = hub_cache_key_to_repo(&name) else {
             continue;
         };
-        let bytes = dir_size_bytes(&path);
+        let bytes = hub_repo_size_bytes(&path);
         if bytes == 0 {
             continue;
         }
