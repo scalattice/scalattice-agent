@@ -71,7 +71,12 @@ impl CatalogModel {
     pub fn is_image_job(&self) -> bool {
         matches!(
             self.job_kind.trim().to_ascii_lowercase().as_str(),
-            "image" | "images" | "image_generation"
+            "image"
+                | "images"
+                | "image_generation"
+                | "image_edit"
+                | "image-edit"
+                | "image_edits"
         )
     }
 
