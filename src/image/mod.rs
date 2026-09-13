@@ -151,7 +151,7 @@ fn path_has_incomplete(path: &Path, depth: u32) -> bool {
     };
     for entry in entries.flatten() {
         let child = entry.path();
-        let name = entry.file_name().to_string_lossy();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".incomplete") {
             return true;
         }
