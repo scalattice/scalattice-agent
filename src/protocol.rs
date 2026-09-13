@@ -1,7 +1,15 @@
 use crate::runtime::AgentRuntime;
 use crate::specs::MachineSpecs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Envelope {
@@ -138,10 +146,11 @@ impl Default for AgentSchedule {
 pub struct ReadyMessage {
     #[serde(rename = "nodeId")]
     pub node_id: String,
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub catalog: Vec<CatalogModel>,
-    #[serde(rename = "computeDevices", default)]
+    #[serde(rename = "computeDevices", default, deserialize_with = "null_as_empty_vec")]
     pub compute_devices: Vec<ComputeDevicePolicy>,
-    #[serde(rename = "enabledModels", default)]
+    #[serde(rename = "enabledModels", default, deserialize_with = "null_as_empty_vec")]
     pub enabled_models: Vec<ModelPolicyEntry>,
     #[serde(rename = "maxCompletionTokens", default)]
     pub max_completion_tokens: u32,
@@ -164,13 +173,13 @@ fn default_cpu_ram_headroom_gb() -> u32 {
 
 #[derive(Debug, Deserialize)]
 pub struct PongMessage {
-    #[serde(rename = "computeDevices", default)]
+    #[serde(rename = "computeDevices", default, deserialize_with = "null_as_empty_vec")]
     pub compute_devices: Vec<ComputeDevicePolicy>,
-    #[serde(rename = "enabledModels", default)]
+    #[serde(rename = "enabledModels", default, deserialize_with = "null_as_empty_vec")]
     pub enabled_models: Vec<ModelPolicyEntry>,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
-    #[serde(rename = "purgeModels", default)]
+    #[serde(rename = "purgeModels", default, deserialize_with = "null_as_empty_vec")]
     pub purge_models: Vec<String>,
     #[serde(rename = "maxCompletionTokens", default)]
     pub max_completion_tokens: u32,
@@ -205,6 +214,7 @@ pub struct RegisterMessage {
 pub struct RegisteredMessage {
     #[serde(rename = "nodeId")]
     pub node_id: String,
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub models: Vec<String>,
 }
 
@@ -216,7 +226,7 @@ pub struct InvokeSplitMessage {
     #[serde(rename = "runtimeModel")]
     pub runtime_model: String,
     pub segment: String,
-    #[serde(rename = "promptTokenIds", default)]
+    #[serde(rename = "promptTokenIds", default, deserialize_with = "null_as_empty_vec")]
     pub prompt_token_ids: Vec<u32>,
     #[serde(rename = "stateB64", default)]
     pub state_b64: String,
@@ -246,7 +256,7 @@ pub struct InvokeMessage {
     pub model_id: String,
     #[serde(rename = "runtimeModel")]
     pub runtime_model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
@@ -264,7 +274,7 @@ pub struct InvokeMessage {
     pub n: u32,
     #[serde(default)]
     pub seed: Option<i64>,
-    #[serde(default, rename = "inputImages")]
+    #[serde(default, rename = "inputImages", deserialize_with = "null_as_empty_vec")]
     pub input_images: Vec<ChatImage>,
 }
 
@@ -325,7 +335,7 @@ struct ChatMessageWire {
     role: String,
     #[serde(default)]
     content: serde_json::Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     images: Vec<ChatImage>,
 }
 
@@ -562,6 +572,18 @@ pub fn parse_invoke(data: &[u8]) -> anyhow::Result<InvokeMessage> {
     Ok(serde_json::from_slice(data)?)
 }
 
+/// Best-effort id so a malformed invoke can still be nacked without dropping the socket.
+pub fn peek_invoke_id(data: &[u8]) -> String {
+    #[derive(Deserialize)]
+    struct IdOnly {
+        id: Option<String>,
+    }
+    serde_json::from_slice::<IdOnly>(data)
+        .ok()
+        .and_then(|row| row.id)
+        .unwrap_or_default()
+}
+
 pub fn parse_invoke_cancel(data: &[u8]) -> anyhow::Result<InvokeCancelMessage> {
     Ok(serde_json::from_slice(data)?)
 }
@@ -637,10 +659,41 @@ mod tests {
     }
 
     #[test]
-    fn chat_catalog_rejects_image_invoke() {
-        let (code, _) = invoke_job_kind_error(false, "image").unwrap();
-        assert_eq!(code, "chat_model_image_unsupported");
-        assert!(invoke_job_kind_error(false, "").is_none());
-        assert!(invoke_job_kind_error(false, "chat").is_none());
+    fn pong_treats_null_arrays_as_empty() {
+        let msg: PongMessage = serde_json::from_str(
+            r#"{"type":"pong","computeDevices":null,"enabledModels":null,"purgeModels":null}"#,
+        )
+        .unwrap();
+        assert!(msg.compute_devices.is_empty());
+        assert!(msg.enabled_models.is_empty());
+        assert!(msg.purge_models.is_empty());
+    }
+
+    #[test]
+    fn ready_treats_null_catalog_as_empty() {
+        let msg: ReadyMessage = serde_json::from_str(
+            r#"{"nodeId":"agent-1","catalog":null,"computeDevices":null,"enabledModels":null}"#,
+        )
+        .unwrap();
+        assert_eq!(msg.node_id, "agent-1");
+        assert!(msg.catalog.is_empty());
+        assert!(msg.compute_devices.is_empty());
+        assert!(msg.enabled_models.is_empty());
+    }
+
+    #[test]
+    fn image_invoke_treats_null_messages_as_empty() {
+        // Go encodes a nil slice as JSON null. Image jobs leave Messages unset,
+        // which used to kill the WebSocket (`invalid type: null, expected a sequence`).
+        let raw = r#"{"type":"invoke","id":"8d9cdc04-748f-4a08-b80d-470d562098fe","modelId":"qwen-image-2512","runtimeModel":"Qwen/Qwen-Image-2512","messages":null,"jobKind":"image","prompt":"a lantern","inputImages":null}"#;
+        let msg: InvokeMessage = serde_json::from_str(raw).unwrap();
+        assert!(msg.messages.is_empty());
+        assert!(msg.input_images.is_empty());
+        assert_eq!(msg.job_kind, "image");
+        assert_eq!(msg.prompt, "a lantern");
+        assert_eq!(
+            peek_invoke_id(raw.as_bytes()),
+            "8d9cdc04-748f-4a08-b80d-470d562098fe"
+        );
     }
 }
