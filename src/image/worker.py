@@ -54,6 +54,10 @@ def isolate_from_host_python() -> None:
     os.environ["PIP_USER"] = "0"
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # hf_xet reconstructs shards via a background writer. That path surfaces
+    # disk/CAS failures as "Background writer channel closed" and can re-run
+    # at invoke even when the snapshot is already on disk. HTTP + local files.
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 
 isolate_from_host_python()
@@ -81,6 +85,52 @@ def progress(phase: str, pct: float | None = None) -> None:
 def fail(code: str, detail: str) -> None:
     emit({"type": "error", "error": code, "detail": detail[:400]})
     sys.exit(1)
+
+
+def explain_hf_err(err: BaseException) -> str:
+    msg = str(err).strip() or err.__class__.__name__
+    low = msg.lower()
+    if "background writer" in low or "file reconstruction" in low:
+        return (
+            f"{msg}. Hugging Face Xet reconstruction failed "
+            "(often a full disk or a half-written snapshot). "
+            "Free disk space and reinstall the image model."
+        )
+    return msg
+
+
+def hub_repo_cache_dir(cache_dir: str, repo: str) -> Path:
+    key = "models--" + repo.strip().replace("/", "--")
+    return Path(cache_dir) / key
+
+
+def local_snapshot_dir(cache_dir: str, repo: str, revision: str, hint: str = "") -> str:
+    if hint:
+        path = Path(hint)
+        if (path / "model_index.json").is_file():
+            return str(path)
+    if not cache_dir or not repo:
+        return ""
+    root = hub_repo_cache_dir(cache_dir, repo)
+    snapshots = root / "snapshots"
+    rev = (revision or "main").strip() or "main"
+    ref = root / "refs" / rev
+    try:
+        if ref.is_file():
+            hashed = ref.read_text(encoding="utf-8").strip()
+            snap = snapshots / hashed
+            if (snap / "model_index.json").is_file():
+                return str(snap)
+    except OSError:
+        pass
+    try:
+        if snapshots.is_dir():
+            for child in sorted(snapshots.iterdir()):
+                if child.is_dir() and (child / "model_index.json").is_file():
+                    return str(child)
+    except OSError:
+        pass
+    return ""
 
 
 def looks_cjk(text: str) -> bool:
@@ -192,7 +242,10 @@ def prefetch_repo(job: dict) -> None:
     try:
         snapshot_download(**kwargs)
     except Exception as err:
-        fail("model_load_failed", f"Diffusers snapshot download failed for {repo}: {err}")
+        fail(
+            "model_load_failed",
+            f"Diffusers snapshot download failed for {repo}: {explain_hf_err(err)}",
+        )
     progress("download", 100)
 
 
@@ -335,6 +388,7 @@ def generate(job: dict, phase_holder: list[str]) -> None:
         fail("model_load_failed", "Catalog image models need a Hugging Face Diffusers repo.")
     revision = str(job.get("revision") or "main").strip() or "main"
     cache_dir = str(job.get("cache_dir") or "").strip()
+    snapshot_hint = str(job.get("snapshot_dir") or "").strip()
     hf_token = str(job.get("hf_token") or "").strip() or None
     qwen = is_qwen_image_family(repo)
     want_device = str(job.get("device") or "").strip().lower()
@@ -344,7 +398,7 @@ def generate(job: dict, phase_holder: list[str]) -> None:
         stub_result(n)
         return
 
-    phase_holder[0] = "download"
+    phase_holder[0] = "load"
     try:
         import torch
         from diffusers import DiffusionPipeline
@@ -358,23 +412,32 @@ def generate(job: dict, phase_holder: list[str]) -> None:
         os.environ["HF_HUB_CACHE"] = cache_dir
         os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
 
-    progress("download", 40)
+    source = local_snapshot_dir(cache_dir, repo, revision, snapshot_hint)
+    if not source:
+        fail(
+            "model_load_failed",
+            f"Diffusers snapshot is not on disk for {repo}. Reinstall the image model.",
+        )
+
+    progress("load", 40)
     kwargs = {
-        "torch_dtype": dtype,
+        "local_files_only": True,
         "token": hf_auth(hf_token),
     }
-    if revision:
-        kwargs["revision"] = revision
-    if cache_dir:
-        kwargs["cache_dir"] = cache_dir
     try:
-        pipe = DiffusionPipeline.from_pretrained(repo, **kwargs)
+        try:
+            pipe = DiffusionPipeline.from_pretrained(source, dtype=dtype, **kwargs)
+        except TypeError:
+            pipe = DiffusionPipeline.from_pretrained(source, torch_dtype=dtype, **kwargs)
         pipe = pipe.to(device)
         maybe_enable_vram_helpers(pipe)
         if hasattr(pipe, "set_progress_bar_config"):
             pipe.set_progress_bar_config(disable=True)
     except Exception as err:
-        fail("model_load_failed", f"Diffusers load failed for {repo}: {err}")
+        fail(
+            "model_load_failed",
+            f"Diffusers load failed for {repo}: {explain_hf_err(err)}",
+        )
 
     params = pipeline_params(pipe)
     if input_images and "image" not in params and "images" not in params:
