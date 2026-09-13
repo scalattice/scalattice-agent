@@ -385,6 +385,10 @@ pub fn list_model_disk_status() -> Vec<(String, ModelDiskStatus)> {
             continue;
         };
 
+        if cache_key == "hub" || cache_key.starts_with('.') {
+            continue;
+        }
+
         if is_purging_cache_key(&cache_key) {
             let Some(runtime_model) = runtime_from_purging_cache_key(&cache_key) else {
                 continue;
@@ -451,7 +455,82 @@ pub fn list_model_disk_status() -> Vec<(String, ModelDiskStatus)> {
         }
         deduped.push((runtime, status));
     }
+    for (runtime, status) in list_image_hub_disk_status() {
+        let key = runtime.to_ascii_lowercase();
+        if let Some(slot) = deduped
+            .iter_mut()
+            .find(|(runtime, _)| runtime.to_ascii_lowercase() == key)
+        {
+            let replace = status.complete && !slot.1.complete
+                || (status.complete == slot.1.complete && status.bytes > slot.1.bytes);
+            if replace {
+                *slot = (runtime, status);
+            }
+            continue;
+        }
+        deduped.push((runtime, status));
+    }
     deduped
+}
+
+fn hub_cache_key_to_repo(cache_key: &str) -> Option<String> {
+    let rest = cache_key.strip_prefix("models--")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.replace("--", "/"))
+}
+
+fn list_image_hub_disk_status() -> Vec<(String, ModelDiskStatus)> {
+    let hub = crate::image::hf_hub_cache_dir();
+    let Ok(entries) = std::fs::read_dir(&hub) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with(".purging-") {
+            let bytes = dir_size_bytes(&path).max(1);
+            out.push((
+                name,
+                ModelDiskStatus {
+                    bytes,
+                    complete: false,
+                    state: "removing".to_string(),
+                    error: Some("Removing Diffusers snapshot from disk.".to_string()),
+                },
+            ));
+            continue;
+        }
+        let Some(repo) = hub_cache_key_to_repo(&name) else {
+            continue;
+        };
+        let bytes = dir_size_bytes(&path);
+        if bytes == 0 {
+            continue;
+        }
+        let complete = crate::image::hf_snapshot_ready(&repo);
+        out.push((
+            repo,
+            ModelDiskStatus {
+                bytes,
+                complete,
+                state: if complete {
+                    "ok".to_string()
+                } else {
+                    "incomplete".to_string()
+                },
+                error: None,
+            },
+        ));
+    }
+    out
 }
 
 pub fn list_cached_runtime_models() -> Vec<String> {
@@ -467,6 +546,9 @@ pub fn list_cached_runtime_models() -> Vec<String> {
         let Ok(cache_key) = entry.file_name().into_string() else {
             continue;
         };
+        if cache_key == "hub" || cache_key.starts_with('.') {
+            continue;
+        }
         let runtime_model = cache_key.replace("__", "/");
         if !model_weights_ready(&runtime_model) {
             continue;
@@ -479,6 +561,19 @@ pub fn list_cached_runtime_models() -> Vec<String> {
             continue;
         }
         out.push(runtime_model);
+    }
+    for (repo, status) in list_image_hub_disk_status() {
+        if !status.complete {
+            continue;
+        }
+        let key = repo.to_ascii_lowercase();
+        if out
+            .iter()
+            .any(|existing| existing.to_ascii_lowercase() == key)
+        {
+            continue;
+        }
+        out.push(repo);
     }
     out
 }

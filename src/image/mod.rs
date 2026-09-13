@@ -142,22 +142,129 @@ pub fn resolve_image_job_size(
     )
 }
 
+fn path_has_incomplete(path: &Path, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        let name = entry.file_name().to_string_lossy();
+        if name.ends_with(".incomplete") {
+            return true;
+        }
+        if child.is_dir() && path_has_incomplete(&child, depth + 1) {
+            return true;
+        }
+    }
+    false
+}
+
+fn dir_has_weight_file(dir: &Path, depth: u32) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            if dir_has_weight_file(&child, depth + 1) {
+                return true;
+            }
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.ends_with(".incomplete") {
+            continue;
+        }
+        if !(name.ends_with(".safetensors")
+            || name.ends_with(".bin")
+            || name.ends_with(".pt")
+            || name.ends_with(".ckpt")
+            || name.ends_with(".gguf"))
+        {
+            continue;
+        }
+        if child.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+const WEIGHT_COMPONENTS: &[&str] = &[
+    "transformer",
+    "unet",
+    "vae",
+    "text_encoder",
+    "text_encoder_2",
+    "text_encoder_3",
+    "image_encoder",
+    "visual",
+];
+
+fn snapshot_components_ready(snap: &Path) -> bool {
+    let index_path = snap.join("model_index.json");
+    let Ok(raw) = std::fs::read_to_string(&index_path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let mut saw_weight_component = false;
+    for (key, val) in obj {
+        if key.starts_with('_') || !val.is_array() {
+            continue;
+        }
+        let folder = snap.join(key);
+        if !folder.is_dir() {
+            return false;
+        }
+        if WEIGHT_COMPONENTS.iter().any(|name| *name == key) {
+            saw_weight_component = true;
+            if !dir_has_weight_file(&folder, 0) {
+                return false;
+            }
+        }
+    }
+    if saw_weight_component {
+        return true;
+    }
+    dir_has_weight_file(snap, 0)
+}
+
+/// Complete Diffusers snapshot — `model_index.json` alone is not enough;
+/// Hugging Face writes that file first, then the multi-GB weight shards.
+pub fn hf_snapshot_dir_ready(root: &Path) -> bool {
+    if path_has_incomplete(root, 0) {
+        return false;
+    }
+    let snapshots = root.join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&snapshots) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let snap = entry.path();
+        if snap.is_dir() && snapshot_components_ready(&snap) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn hf_snapshot_ready(repo: &str) -> bool {
     let repo = repo.trim();
     if repo.is_empty() {
         return false;
     }
-    let snapshots = hub_repo_dir(repo).join("snapshots");
-    let Ok(entries) = std::fs::read_dir(&snapshots) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let index = entry.path().join("model_index.json");
-        if index.is_file() {
-            return true;
-        }
-    }
-    false
+    hf_snapshot_dir_ready(&hub_repo_dir(repo))
 }
 
 pub fn image_repo(model: &CatalogModel) -> Option<&str> {
@@ -993,5 +1100,57 @@ mod tests {
             Some(v) => std::env::set_var("SCALATTICE_RUNTIMES_DIR", v),
             None => std::env::remove_var("SCALATTICE_RUNTIMES_DIR"),
         }
+    }
+
+    #[test]
+    fn snapshot_index_alone_is_not_ready() {
+        let root = std::env::temp_dir().join(format!("slt-hf-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let snap = root.join("snapshots").join("abc");
+        std::fs::create_dir_all(snap.join("transformer")).unwrap();
+        std::fs::write(
+            snap.join("model_index.json"),
+            r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
+        )
+        .unwrap();
+        assert!(
+            !hf_snapshot_dir_ready(&root),
+            "model_index.json without weights must not advertise"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_ready_when_transformer_weights_exist() {
+        let root = std::env::temp_dir().join(format!("slt-hf-ready-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let snap = root.join("snapshots").join("abc");
+        std::fs::create_dir_all(snap.join("transformer")).unwrap();
+        std::fs::write(
+            snap.join("model_index.json"),
+            r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
+        )
+        .unwrap();
+        std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
+        assert!(hf_snapshot_dir_ready(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_incomplete_blob_is_not_ready() {
+        let root = std::env::temp_dir().join(format!("slt-hf-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let snap = root.join("snapshots").join("abc");
+        std::fs::create_dir_all(snap.join("transformer")).unwrap();
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::write(
+            snap.join("model_index.json"),
+            r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
+        )
+        .unwrap();
+        std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
+        std::fs::write(root.join("blobs").join("shard.incomplete"), b"partial").unwrap();
+        assert!(!hf_snapshot_dir_ready(&root));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

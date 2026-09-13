@@ -666,12 +666,28 @@ impl SessionState {
             .collect()
     }
 
+    fn model_download_in_flight(model: &CatalogModel) -> bool {
+        let Some(id) = crate::state::downloading_model() else {
+            return false;
+        };
+        if id.eq_ignore_ascii_case(&model.model_id)
+            || (!model.runtime_model.trim().is_empty()
+                && id.eq_ignore_ascii_case(model.runtime_model.trim()))
+        {
+            return true;
+        }
+        crate::image::image_repo(model).is_some_and(|repo| id.eq_ignore_ascii_case(repo))
+    }
+
     fn register_model_ids(&self) -> Vec<String> {
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let mut out: Vec<String> = Vec::new();
         for model in self.eligible_catalog_models() {
             if !self.catalog_ready_on_disk(&model) {
+                continue;
+            }
+            if Self::model_download_in_flight(&model) {
                 continue;
             }
             if model.is_image_job() {
