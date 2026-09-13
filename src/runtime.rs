@@ -164,6 +164,36 @@ pub fn serialize_model_disk(
         .collect()
 }
 
+/// Heartbeat inventory is keyed by HF repo (`Qwen/Qwen-Image-2512`). Also
+/// publish the catalog SKU (`qwen-image-2512`) so the cloud can match it.
+pub fn serialize_model_disk_for_catalog(
+    entries: &[(String, crate::models::ModelDiskStatus)],
+    catalog: &[crate::protocol::CatalogModel],
+) -> HashMap<String, SerializedModelDiskStatus> {
+    let mut map = serialize_model_disk(entries);
+    for model in catalog {
+        if !model.is_image_job() {
+            continue;
+        }
+        let Some(repo) = crate::image::image_repo(model) else {
+            continue;
+        };
+        let Some(status) = map
+            .get(repo)
+            .cloned()
+            .or_else(|| {
+                map.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(repo))
+                    .map(|(_, status)| status.clone())
+            })
+        else {
+            continue;
+        };
+        map.entry(model.model_id.clone()).or_insert(status);
+    }
+    map
+}
+
 fn status_label(
     ready: bool,
     job_state: JobState,
@@ -214,4 +244,61 @@ fn status_label(
         return format!("Waiting for model weights ({enabled_compute_devices} devices)");
     }
     "Waiting for model weights".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{CatalogModel, ModelWeights};
+
+    fn image_model() -> CatalogModel {
+        CatalogModel {
+            model_id: "qwen-image-2512".into(),
+            display_name: "Qwen Image".into(),
+            runtime_model: "qwen-image-2512".into(),
+            job_kind: "image".into(),
+            usd_per_image: 0.03,
+            image_max_n: 1,
+            max_context_tokens: 0,
+            regions: vec![],
+            weight_size_gb: Some(40.0),
+            min_vram_gb: Some(16.0),
+            min_vram_gb_vision: None,
+            vision_model: false,
+            text_sibling_model_id: None,
+            min_ram_gb: Some(16.0),
+            mmproj_size_gb: None,
+            vision_max_images: None,
+            vision_max_image_side_px: None,
+            vision_max_image_pixels: None,
+            weights: Some(ModelWeights {
+                source: "huggingface".into(),
+                repo: "Qwen/Qwen-Image-2512".into(),
+                filename: String::new(),
+                companion_filenames: vec![],
+                revision: "main".into(),
+                download_via: None,
+                mirror_url: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn image_disk_also_keys_catalog_id() {
+        let entries = vec![(
+            "Qwen/Qwen-Image-2512".into(),
+            crate::models::ModelDiskStatus {
+                bytes: 40 * 1024 * 1024 * 1024,
+                complete: true,
+                state: "ok".into(),
+                error: None,
+            },
+        )];
+        let map = serialize_model_disk_for_catalog(&entries, &[image_model()]);
+        assert_eq!(map.get("qwen-image-2512").map(|s| s.complete), Some(true));
+        assert_eq!(
+            map.get("Qwen/Qwen-Image-2512").map(|s| s.complete),
+            Some(true)
+        );
+    }
 }

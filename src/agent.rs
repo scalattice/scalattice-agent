@@ -640,6 +640,11 @@ impl SessionState {
     }
 
     fn sync_image_runtime_presence(&self) {
+        // Empty catalog means policy/catalog has not landed yet (reconnect). Do
+        // not tear down CPython/venv just because we have not applied SKUs.
+        if self.catalog.is_empty() {
+            return;
+        }
         let any_enabled_image = self
             .catalog
             .iter()
@@ -851,13 +856,30 @@ impl SessionState {
         // Always report disk-cached weights here. VRAM-resident models live on
         // slot status; substituting them made the dashboard flicker to "only the
         // running model is installed" under load.
-        let loaded_models = if self.disk_inventory_primed {
+        let mut loaded_models = if self.disk_inventory_primed {
             self.cached_disk_ready.clone()
         } else {
             // Never walk GGUFs on the WS/heartbeat path; inventory refreshes in the
             // background. Empty until the first off-thread scan completes.
             Vec::new()
         };
+        // Image SKUs are Diffusers snapshots, not GGUF folders. Report them as
+        // soon as the isolated runtime + hub snapshot are ready so the cloud
+        // does not 409 model_not_installed while advertising the SKU.
+        for model in &self.catalog {
+            if !model.is_image_job() || !crate::image::image_install_ready(model) {
+                continue;
+            }
+            let repo = crate::image::image_repo(model).unwrap_or(model.model_id.as_str());
+            for id in [model.model_id.as_str(), repo] {
+                if !loaded_models
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(id))
+                {
+                    loaded_models.push(id.to_string());
+                }
+            }
+        }
         let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
         let downloading = crate::state::downloading_model();
         let blocked_models = if downloading.is_some() || !loaded_models.is_empty() {
@@ -877,7 +899,10 @@ impl SessionState {
             downloading.as_deref(),
             blocked_models,
             self.cached_disk_gb,
-            crate::runtime::serialize_model_disk(&self.cached_model_disk),
+            crate::runtime::serialize_model_disk_for_catalog(
+                &self.cached_model_disk,
+                &self.catalog,
+            ),
             self.cached_slots.clone(),
             self.cached_max_jobs.max(1),
             self.cached_idle_slots,
@@ -1605,10 +1630,13 @@ async fn handle_server_message(
                         let mut guard = state.lock().await;
                         guard.node_id = Some(ready.node_id.clone());
                         guard.apply_compute_devices(&ready.compute_devices);
-                        guard.apply_model_policy(&ready.enabled_models);
                         guard.apply_max_completion_tokens(ready.max_completion_tokens);
                         guard.cpu_ram_headroom_gb = ready.cpu_ram_headroom_gb;
+                        // Catalog before policy: image teardown looks at enabled
+                        // image SKUs in catalog. An empty catalog on reconnect
+                        // used to delete CPython/venv and then re-download them.
                         guard.catalog = ready.catalog.clone();
+                        guard.apply_model_policy(&ready.enabled_models);
                         guard.warm_runtime_model = ready
                             .warm_runtime_model
                             .as_deref()
@@ -1658,7 +1686,23 @@ async fn handle_server_message(
                     );
                 }
                 "invoke" => {
-                    let invoke = parse_invoke(data)?;
+                    let invoke = match parse_invoke(data) {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            warn!("malformed invoke (keeping socket): {err:#}");
+                            let id = crate::protocol::peek_invoke_id(data);
+                            if !id.is_empty() {
+                                let msg = InvokeErrorMessage {
+                                    kind: "invoke_error",
+                                    id,
+                                    error: "invalid_invoke".into(),
+                                    detail: Some(err.to_string()),
+                                };
+                                let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+                            }
+                            return Ok(());
+                        }
+                    };
                     let state = state.clone();
                     let write = write.clone();
                     tokio::spawn(async move {
@@ -1687,7 +1731,23 @@ async fn handle_server_message(
                     }
                 }
                 "invoke_split" => {
-                    let invoke = parse_invoke_split(data)?;
+                    let invoke = match parse_invoke_split(data) {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            warn!("malformed invoke_split (keeping socket): {err:#}");
+                            let id = crate::protocol::peek_invoke_id(data);
+                            if !id.is_empty() {
+                                let msg = InvokeErrorMessage {
+                                    kind: "invoke_error",
+                                    id,
+                                    error: "invalid_invoke".into(),
+                                    detail: Some(err.to_string()),
+                                };
+                                let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+                            }
+                            return Ok(());
+                        }
+                    };
                     let state = state.clone();
                     let write = write.clone();
                     tokio::spawn(async move {
@@ -1707,11 +1767,11 @@ async fn handle_server_message(
                         let (transition, trash) = {
                             let mut guard = state.lock().await;
                             guard.apply_compute_devices(&pong.compute_devices);
-                            guard.apply_model_policy(&pong.enabled_models);
-                            guard.apply_max_completion_tokens(pong.max_completion_tokens);
                             if let Some(catalog) = pong.catalog.clone() {
                                 guard.apply_catalog(catalog, pong.cpu_ram_headroom_gb);
                             }
+                            guard.apply_model_policy(&pong.enabled_models);
+                            guard.apply_max_completion_tokens(pong.max_completion_tokens);
                             let trash = guard.apply_purge_models(&pong.purge_models);
                             if let Some(raw) = pong.warm_runtime_model.as_deref() {
                                 let trimmed = raw.trim();
