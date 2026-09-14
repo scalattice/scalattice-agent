@@ -9,6 +9,7 @@ use crate::compute_pool::{PoolStrategy, VirtualCard};
 use crate::protocol::{CatalogModel, GeneratedImage};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -144,38 +145,118 @@ pub fn resolve_image_job_size(
     )
 }
 
-fn dir_has_weight_file(dir: &Path, depth: u32) -> bool {
-    if depth > 6 {
+fn is_real_weight_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && meta.len() > 0
+}
+
+fn is_weight_filename(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name.ends_with(".incomplete") || name.ends_with(".index.json") {
         return false;
     }
+    name.ends_with(".safetensors")
+        || name.ends_with(".bin")
+        || name.ends_with(".pt")
+        || name.ends_with(".ckpt")
+        || name.ends_with(".gguf")
+}
+
+/// `model-00001-of-00004.safetensors` → (prefix, idx, n)
+fn parse_shard_name(name: &str) -> Option<(&str, u32, u32)> {
+    let stem = name
+        .strip_suffix(".safetensors")
+        .or_else(|| name.strip_suffix(".bin"))
+        .or_else(|| name.strip_suffix(".pt"))?;
+    let of = stem.rfind("-of-")?;
+    let n: u32 = stem[of + 4..].parse().ok()?;
+    let rest = &stem[..of];
+    let dash = rest.rfind('-')?;
+    let idx: u32 = rest[dash + 1..].parse().ok()?;
+    if idx == 0 || n == 0 || idx > n {
+        return None;
+    }
+    Some((&rest[..dash], idx, n))
+}
+
+fn index_listed_shards(dir: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        if !fname.ends_with(".index.json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(map) = value.get("weight_map").and_then(|m| m.as_object()) else {
+            continue;
+        };
+        for file in map.values().filter_map(|v| v.as_str()) {
+            if let Some(base) = Path::new(file).file_name() {
+                names.insert(base.to_string_lossy().into_owned());
+            }
+        }
+    }
+    names
+}
+
+fn component_weights_complete(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let listed = index_listed_shards(dir);
+    if !listed.is_empty() {
+        return listed
+            .iter()
+            .all(|name| is_real_weight_file(&dir.join(name)));
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
+    let mut groups: BTreeMap<(String, u32), BTreeSet<u32>> = BTreeMap::new();
+    let mut any_weight = false;
+    let mut subdirs = Vec::new();
     for entry in entries.flatten() {
         let child = entry.path();
         if child.is_dir() {
-            if dir_has_weight_file(&child, depth + 1) {
-                return true;
-            }
+            subdirs.push(child);
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if name.ends_with(".incomplete") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_weight_filename(&name) {
             continue;
         }
-        if !(name.ends_with(".safetensors")
-            || name.ends_with(".bin")
-            || name.ends_with(".pt")
-            || name.ends_with(".ckpt")
-            || name.ends_with(".gguf"))
-        {
+        if !is_real_weight_file(&child) {
             continue;
         }
-        if child.is_file() {
-            return true;
+        any_weight = true;
+        if let Some((prefix, idx, n)) = parse_shard_name(&name) {
+            groups
+                .entry((prefix.to_string(), n))
+                .or_default()
+                .insert(idx);
         }
     }
-    false
+    if !groups.is_empty() {
+        return groups
+            .iter()
+            .all(|((_, n), have)| (1..=*n).all(|i| have.contains(&i)));
+    }
+    if any_weight {
+        return true;
+    }
+    subdirs.iter().any(|child| component_weights_complete(child))
 }
 
 const WEIGHT_COMPONENTS: &[&str] = &[
@@ -210,14 +291,14 @@ fn snapshot_components_ready(snap: &Path) -> bool {
         }
         saw_weight_component = true;
         let folder = snap.join(key);
-        if !folder.is_dir() || !dir_has_weight_file(&folder, 0) {
+        if !component_weights_complete(&folder) {
             return false;
         }
     }
     if saw_weight_component {
         return true;
     }
-    dir_has_weight_file(snap, 0)
+    component_weights_complete(snap)
 }
 
 fn snapshot_from_refs(root: &Path) -> Option<PathBuf> {
@@ -977,7 +1058,11 @@ mod tests {
         assert!(WORKER_PY.contains("local_files_only"));
         assert!(WORKER_PY.contains("HF_HUB_DISABLE_XET"));
         assert!(WORKER_PY.contains("quiet_hf_progress"));
+        assert!(WORKER_PY.contains("model_not_installed"));
+        assert!(WORKER_PY.contains("snapshot_weights_complete"));
         assert!(WORKER_PY.contains("snapshot_dir"));
+        assert!(WORKER_PY.contains("place_pipeline"));
+        assert!(WORKER_PY.contains("enable_model_cpu_offload"));
         assert!(WORKER_PY.contains("image_accelerator_required"));
         assert!(WORKER_PY.contains(r#"want == "xpu""#));
         assert!(WORKER_PY.contains("torch.xpu"));
@@ -1199,6 +1284,39 @@ mod tests {
             hf_snapshot_dir_ready(&root),
             "complete weight components must win over leftover .incomplete blobs"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sharded_text_encoder_needs_every_piece() {
+        let root = std::env::temp_dir().join(format!("slt-hf-shards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let snap = root.join("snapshots").join("abc");
+        let te = snap.join("text_encoder");
+        std::fs::create_dir_all(&te).unwrap();
+        std::fs::write(
+            snap.join("model_index.json"),
+            r#"{"_class_name":"X","text_encoder":["transformers","T"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            te.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001-of-00004.safetensors","b":"model-00002-of-00004.safetensors","c":"model-00003-of-00004.safetensors","d":"model-00004-of-00004.safetensors"}}"#,
+        )
+        .unwrap();
+        for i in 2..=4 {
+            std::fs::write(
+                te.join(format!("model-0000{i}-of-00004.safetensors")),
+                b"weights",
+            )
+            .unwrap();
+        }
+        assert!(
+            !hf_snapshot_dir_ready(&root),
+            "missing shard 1 of 4 must not advertise ready"
+        );
+        std::fs::write(te.join("model-00001-of-00004.safetensors"), b"weights").unwrap();
+        assert!(hf_snapshot_dir_ready(&root));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
