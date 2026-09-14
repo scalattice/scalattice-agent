@@ -55,6 +55,10 @@ def isolate_from_host_python() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    # 0.0 disables the MPS cap and lets macOS jetsam SIGKILL the process
+    # (Qwen-Image ~58 GB fp16). Keep a cap so PyTorch can raise OOM instead.
+    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.8")
 
 
 def quiet_hf_progress() -> None:
@@ -330,7 +334,7 @@ def ensure_venv_and_deps(venv_dir: Path, torch_index: str, extra_pip: list[str])
     if not venv_python.is_file():
         fail("image_runtime_missing", "Could not create a Python venv for Diffusers.")
 
-    marker = venv_dir / ".deps_ok_v3"
+    marker = venv_dir / ".deps_ok_v4"
     if marker.is_file():
         return venv_python
 
@@ -361,6 +365,14 @@ def ensure_venv_and_deps(venv_dir: Path, torch_index: str, extra_pip: list[str])
         "einops",
     ]
     subprocess.check_call(pkgs, stdout=subprocess.DEVNULL, env=env)
+    try:
+        subprocess.check_call(
+            [str(venv_python), "-m", "pip", "install", "optimum-quanto"],
+            stdout=subprocess.DEVNULL,
+            env=env,
+        )
+    except Exception:
+        pass
     extras = [str(p).strip() for p in extra_pip if str(p).strip()]
     if extras:
         progress("install", 50)
@@ -472,7 +484,7 @@ def is_qwen_image_t2i(repo: str) -> bool:
 
 
 def maybe_enable_vram_helpers(pipe) -> None:
-    for name in ("enable_vae_slicing", "enable_attention_slicing"):
+    for name in ("enable_vae_slicing", "enable_vae_tiling", "enable_attention_slicing"):
         fn = getattr(pipe, name, None)
         if callable(fn):
             try:
@@ -481,10 +493,97 @@ def maybe_enable_vram_helpers(pipe) -> None:
                 pass
 
 
+def is_mps_device(device: str) -> bool:
+    return str(device).strip().lower().startswith("mps")
+
+
+def tight_memory_quant_configs(device: str) -> list:
+    """Quantize the heavy modules while loading so Qwen-Image (~58 GB fp16)
+    can fit Apple unified memory. CPU offload does not shrink that pool.
+    Prefer int4 so a 36 GB M-series Mac can actually place the graph."""
+    try:
+        from diffusers.quantizers import PipelineQuantizationConfig
+    except Exception:
+        return []
+    specs = []
+    if is_mps_device(device):
+        specs.extend(
+            (
+                {
+                    "quant_backend": "quanto",
+                    "quant_kwargs": {"weights_dtype": "int4"},
+                    "components_to_quantize": ["transformer", "text_encoder"],
+                },
+                {
+                    "quant_backend": "quanto",
+                    "quant_kwargs": {"weights_dtype": "int8"},
+                    "components_to_quantize": ["transformer", "text_encoder"],
+                },
+                {
+                    "quant_backend": "quanto",
+                    "quant_kwargs": {"weights_dtype": "int8"},
+                    "components_to_quantize": ["transformer"],
+                },
+                {
+                    "quant_backend": "torchao",
+                    "quant_kwargs": {"quant_type": "int8_weight_only"},
+                    "components_to_quantize": ["transformer"],
+                },
+            )
+        )
+    out = []
+    for spec in specs:
+        try:
+            out.append(PipelineQuantizationConfig(**spec))
+        except Exception:
+            continue
+    return out
+
+
+def try_group_offload(pipe, device: str) -> bool:
+    """Leaf/block offload with low_cpu_mem_usage writes inactive params to disk.
+    On unified memory that is the offload that actually lowers RSS."""
+    onload = device
+    ok = False
+    for name in ("transformer", "text_encoder", "text_encoder_2", "unet", "vae"):
+        mod = getattr(pipe, name, None)
+        fn = getattr(mod, "enable_group_offload", None) if mod is not None else None
+        if not callable(fn):
+            continue
+        for kwargs in (
+            {
+                "onload_device": onload,
+                "offload_type": "leaf_level",
+                "low_cpu_mem_usage": True,
+                "use_stream": False,
+            },
+            {
+                "onload_device": onload,
+                "offload_type": "block_level",
+                "low_cpu_mem_usage": True,
+            },
+            {"onload_device": onload, "low_cpu_mem_usage": True},
+        ):
+            try:
+                fn(**kwargs)
+                ok = True
+                break
+            except TypeError:
+                continue
+            except Exception:
+                continue
+    return ok
+
+
 def try_cpu_offload(pipe, device: str) -> bool:
-    """Keep inactive modules on CPU. Full `.to(mps)` of Qwen-Image needs ~42 GB
-    and OOMs a 48 GB Mac at the MPS watermark; 24 GB NVIDIA needs this too."""
-    for name in ("enable_model_cpu_offload", "enable_sequential_cpu_offload"):
+    """Keep inactive modules on CPU. Helps discrete GPUs (24 GB NVIDIA). On
+    Apple Silicon this does not reduce unified-memory RSS; group offload +
+    int8 load is the Mac path. Never rely on a full `.to(mps)` of Qwen-Image
+    (~58 GB)."""
+    names = ("enable_sequential_cpu_offload", "enable_model_cpu_offload")
+    if not is_mps_device(device):
+        names = ("enable_model_cpu_offload", "enable_sequential_cpu_offload")
+    for name in names:
         fn = getattr(pipe, name, None)
         if not callable(fn):
             continue
@@ -501,6 +600,16 @@ def try_cpu_offload(pipe, device: str) -> bool:
 
 def place_pipeline(pipe, device: str):
     maybe_enable_vram_helpers(pipe)
+    if is_mps_device(device):
+        if try_group_offload(pipe, device):
+            return pipe
+        if try_cpu_offload(pipe, device):
+            return pipe
+        fail(
+            "insufficient_vram",
+            "Not enough unified memory to place this image model on Apple GPU. "
+            "Qwen-Image needs quantization + offload; a full MPS copy is ~58 GB.",
+        )
     if try_cpu_offload(pipe, device):
         return pipe
     return pipe.to(device)
@@ -513,6 +622,7 @@ def looks_oom(err: BaseException) -> bool:
         or "out of device memory" in msg
         or "high_watermark" in msg
         or "mps backend out of memory" in msg
+        or isinstance(err, MemoryError)
     )
 
 
@@ -613,20 +723,83 @@ def generate(job: dict, phase_holder: list[str]) -> None:
 
     def open_pipe(src: str):
         base = {"local_files_only": True, "token": hf_auth(hf_token)}
-        attempts = (
-            {"dtype": dtype, "low_cpu_mem_usage": True},
-            {"torch_dtype": dtype, "low_cpu_mem_usage": True},
-            {"torch_dtype": dtype},
+        quant_configs = tight_memory_quant_configs(device) if qwen else []
+        offload_dir = str(
+            Path(str(job.get("venv_dir") or ".")).expanduser() / "hf-offload"
         )
-        last_type = None
+        try:
+            Path(offload_dir).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            offload_dir = ""
+        attempts: list[dict] = []
+        for quant in quant_configs:
+            attempts.append(
+                {
+                    "dtype": dtype,
+                    "low_cpu_mem_usage": True,
+                    "quantization_config": quant,
+                }
+            )
+            attempts.append(
+                {
+                    "torch_dtype": dtype,
+                    "low_cpu_mem_usage": True,
+                    "quantization_config": quant,
+                }
+            )
+        if offload_dir:
+            attempts.append(
+                {
+                    "dtype": dtype,
+                    "low_cpu_mem_usage": True,
+                    "offload_state_dict": True,
+                    "offload_folder": offload_dir,
+                }
+            )
+            attempts.append(
+                {
+                    "torch_dtype": dtype,
+                    "low_cpu_mem_usage": True,
+                    "offload_state_dict": True,
+                    "offload_folder": offload_dir,
+                }
+            )
+        attempts.extend(
+            [
+                {"dtype": dtype, "low_cpu_mem_usage": True},
+                {"torch_dtype": dtype, "low_cpu_mem_usage": True},
+                {"torch_dtype": dtype},
+            ]
+        )
+        last_err = None
+        skip_full = is_mps_device(str(device)) and qwen
+        if skip_full:
+            attempts = [
+                a
+                for a in attempts
+                if "quantization_config" in a or a.get("offload_state_dict")
+            ]
+            if not attempts:
+                fail(
+                    "insufficient_vram",
+                    "Qwen-Image cannot load full precision into Apple unified memory (~58 GB). "
+                    "Install optimum-quanto in the image venv so weights can load as int8.",
+                )
         for extra in attempts:
             try:
                 return DiffusionPipeline.from_pretrained(src, **base, **extra)
             except TypeError as err:
-                last_type = err
+                last_err = err
                 continue
-        if last_type is not None:
-            raise last_type
+            except Exception as err:
+                if looks_missing_weight(err):
+                    raise
+                if looks_oom(err) and not skip_full:
+                    raise
+                last_err = err
+                continue
+        if last_err is not None:
+            raise last_err
         return DiffusionPipeline.from_pretrained(src, torch_dtype=dtype, **base)
 
     try:
@@ -673,9 +846,10 @@ def generate(job: dict, phase_holder: list[str]) -> None:
             prompt = prompt.rstrip() + magic
 
     generator = None
+    gen_device = "cpu" if is_mps_device(str(device)) else device
     if seed is not None:
         try:
-            generator = torch.Generator(device=device).manual_seed(int(seed) & 0xFFFFFFFF)
+            generator = torch.Generator(device=gen_device).manual_seed(int(seed) & 0xFFFFFFFF)
         except Exception:
             try:
                 generator = torch.Generator().manual_seed(int(seed) & 0xFFFFFFFF)
@@ -712,7 +886,7 @@ def generate(job: dict, phase_holder: list[str]) -> None:
             xpu_oom = getattr(oom, "OutOfMemoryError", ()) if oom is not None else ()
             if xpu_oom and isinstance(err, xpu_oom):
                 fail("insufficient_vram", f"{repo} ran out of GPU memory.")
-            if "out of memory" in str(err).lower():
+            if looks_oom(err):
                 fail("insufficient_vram", f"{repo} ran out of GPU memory.")
             if isinstance(err, TypeError) and input_images:
                 fail(
@@ -735,7 +909,7 @@ def generate(job: dict, phase_holder: list[str]) -> None:
         )
         if generator is not None:
             try:
-                generator = torch.Generator(device=device).manual_seed(
+                generator = torch.Generator(device=gen_device).manual_seed(
                     ((int(seed) & 0xFFFFFFFF) + i + 1) & 0xFFFFFFFF
                 )
             except Exception:

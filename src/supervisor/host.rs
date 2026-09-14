@@ -802,7 +802,14 @@ impl Supervisor {
         // Evict llama.cpp so PyTorch can take the same GPU.
         let _ = worker.child.kill().await;
         let _ = worker.child.wait().await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Metal residency sets can linger after SIGKILL; give the OS a beat
+        // before the Diffusers process maps the same unified memory.
+        let drain = if cfg!(target_os = "macos") {
+            Duration::from_millis(1500)
+        } else {
+            Duration::from_millis(400)
+        };
+        tokio::time::sleep(drain).await;
 
         let mut on_progress = |phase: &str, pct: Option<f32>| {
             if let Some(cb) = on_delta.as_mut() {
