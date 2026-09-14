@@ -116,12 +116,143 @@ def explain_hf_err(err: BaseException) -> str:
             "(often a full disk or a half-written snapshot). "
             "Free disk space and reinstall the image model."
         )
+    if looks_missing_weight(err):
+        return (
+            f"{msg}. The on-disk snapshot is missing a weight shard. "
+            "Reinstall the image model."
+        )
     return msg
 
 
 def hub_repo_cache_dir(cache_dir: str, repo: str) -> Path:
     key = "models--" + repo.strip().replace("/", "--")
     return Path(cache_dir) / key
+
+
+WEIGHT_COMPONENTS = (
+    "transformer",
+    "unet",
+    "vae",
+    "text_encoder",
+    "text_encoder_2",
+    "text_encoder_3",
+    "image_encoder",
+    "visual",
+)
+
+
+def _real_weight(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _index_listed_shards(folder: Path) -> list[str]:
+    names: set[str] = set()
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return []
+    for child in entries:
+        if not child.name.endswith(".index.json"):
+            continue
+        try:
+            payload = json.loads(child.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+        if not isinstance(weight_map, dict):
+            continue
+        for rel in weight_map.values():
+            if isinstance(rel, str) and rel.strip():
+                names.add(Path(rel).name)
+    return sorted(names)
+
+
+def _shard_group_complete(folder: Path) -> bool | None:
+    """True/False when `*-of-N` shards are present; None if the folder is unsharded."""
+    groups: dict[tuple[str, int], set[int]] = {}
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return False
+    for child in entries:
+        if child.is_dir() or not _real_weight(child):
+            continue
+        name = child.name
+        lower = name.lower()
+        if not lower.endswith((".safetensors", ".bin", ".pt")):
+            continue
+        stem = name.rsplit(".", 1)[0]
+        if "-of-" not in stem:
+            continue
+        prefix, _, total_s = stem.rpartition("-of-")
+        head, _, idx_s = prefix.rpartition("-")
+        try:
+            idx = int(idx_s)
+            total = int(total_s)
+        except ValueError:
+            continue
+        if idx < 1 or total < 1 or idx > total or not head:
+            continue
+        groups.setdefault((head, total), set()).add(idx)
+    if not groups:
+        return None
+    return all(set(range(1, total + 1)) <= have for (_, total), have in groups.items())
+
+
+def component_weights_complete(folder: Path) -> bool:
+    listed = _index_listed_shards(folder)
+    if listed:
+        return all(_real_weight(folder / name) for name in listed)
+    grouped = _shard_group_complete(folder)
+    if grouped is not None:
+        return grouped
+    try:
+        for child in folder.iterdir():
+            if child.is_dir() and component_weights_complete(child):
+                return True
+            name = child.name.lower()
+            if name.endswith((".safetensors", ".bin", ".pt", ".ckpt", ".gguf")) and _real_weight(
+                child
+            ):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def snapshot_weights_complete(snap: Path) -> bool:
+    index_path = snap / "model_index.json"
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    saw = False
+    for key, val in payload.items():
+        if not key or key.startswith("_") or not isinstance(val, list):
+            continue
+        if key not in WEIGHT_COMPONENTS:
+            continue
+        saw = True
+        if not component_weights_complete(snap / key):
+            return False
+    if saw:
+        return True
+    return component_weights_complete(snap)
+
+
+def looks_missing_weight(err: BaseException) -> bool:
+    msg = str(err).lower()
+    return (
+        "no such file" in msg
+        or "filenotfound" in msg
+        or "couldn't find" in msg
+        or "does not exist" in msg
+    )
 
 
 def local_snapshot_dir(cache_dir: str, repo: str, revision: str, hint: str = "") -> str:
@@ -350,6 +481,41 @@ def maybe_enable_vram_helpers(pipe) -> None:
                 pass
 
 
+def try_cpu_offload(pipe, device: str) -> bool:
+    """Keep inactive modules on CPU. Full `.to(mps)` of Qwen-Image needs ~42 GB
+    and OOMs a 48 GB Mac at the MPS watermark; 24 GB NVIDIA needs this too."""
+    for name in ("enable_model_cpu_offload", "enable_sequential_cpu_offload"):
+        fn = getattr(pipe, name, None)
+        if not callable(fn):
+            continue
+        for kwargs in ({"device": device}, {}):
+            try:
+                fn(**kwargs)
+                return True
+            except TypeError:
+                continue
+            except Exception:
+                continue
+    return False
+
+
+def place_pipeline(pipe, device: str):
+    maybe_enable_vram_helpers(pipe)
+    if try_cpu_offload(pipe, device):
+        return pipe
+    return pipe.to(device)
+
+
+def looks_oom(err: BaseException) -> bool:
+    msg = str(err).lower()
+    return (
+        "out of memory" in msg
+        or "out of device memory" in msg
+        or "high_watermark" in msg
+        or "mps backend out of memory" in msg
+    )
+
+
 def pick_torch_device(want: str):
     import torch
 
@@ -420,6 +586,17 @@ def generate(job: dict, phase_holder: list[str]) -> None:
         stub_result(n)
         return
 
+    if cache_dir:
+        os.environ["HF_HUB_CACHE"] = cache_dir
+        os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
+
+    source = local_snapshot_dir(cache_dir, repo, revision, snapshot_hint)
+    if not source or not snapshot_weights_complete(Path(source)):
+        fail(
+            "model_not_installed",
+            f"Diffusers snapshot is incomplete for {repo}. This machine will fill missing files.",
+        )
+
     phase_holder[0] = "load"
     progress("load", 5)
     try:
@@ -432,32 +609,42 @@ def generate(job: dict, phase_holder: list[str]) -> None:
     input_images = decode_input_images(job)
     device, dtype = pick_torch_device(want_device)
 
-    if cache_dir:
-        os.environ["HF_HUB_CACHE"] = cache_dir
-        os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
-
-    source = local_snapshot_dir(cache_dir, repo, revision, snapshot_hint)
-    if not source:
-        fail(
-            "model_load_failed",
-            f"Diffusers snapshot is not on disk for {repo}. Reinstall the image model.",
-        )
-
     progress("load", 40)
-    kwargs = {
-        "local_files_only": True,
-        "token": hf_auth(hf_token),
-    }
+
+    def open_pipe(src: str):
+        base = {"local_files_only": True, "token": hf_auth(hf_token)}
+        attempts = (
+            {"dtype": dtype, "low_cpu_mem_usage": True},
+            {"torch_dtype": dtype, "low_cpu_mem_usage": True},
+            {"torch_dtype": dtype},
+        )
+        last_type = None
+        for extra in attempts:
+            try:
+                return DiffusionPipeline.from_pretrained(src, **base, **extra)
+            except TypeError as err:
+                last_type = err
+                continue
+        if last_type is not None:
+            raise last_type
+        return DiffusionPipeline.from_pretrained(src, torch_dtype=dtype, **base)
+
     try:
-        try:
-            pipe = DiffusionPipeline.from_pretrained(source, dtype=dtype, **kwargs)
-        except TypeError:
-            pipe = DiffusionPipeline.from_pretrained(source, torch_dtype=dtype, **kwargs)
-        pipe = pipe.to(device)
-        maybe_enable_vram_helpers(pipe)
+        pipe = open_pipe(source)
+        pipe = place_pipeline(pipe, device)
         if hasattr(pipe, "set_progress_bar_config"):
             pipe.set_progress_bar_config(disable=True)
     except Exception as err:
+        if looks_missing_weight(err):
+            fail(
+                "model_not_installed",
+                f"Diffusers snapshot is incomplete for {repo}: {explain_hf_err(err)}",
+            )
+        if looks_oom(err):
+            fail(
+                "insufficient_vram",
+                f"Not enough GPU memory to load {repo}: {explain_hf_err(err)}",
+            )
         fail(
             "model_load_failed",
             f"Diffusers load failed for {repo}: {explain_hf_err(err)}",
@@ -656,7 +843,7 @@ def main() -> None:
             maybe_unlink_job_file(job_path)
             return
         maybe_unlink_job_file(job_path)
-        phase_holder[0] = "download"
+        phase_holder[0] = "load"
         generate(job, phase_holder)
     except SystemExit:
         raise

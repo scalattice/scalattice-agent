@@ -1535,6 +1535,30 @@ async fn send_register_message(
     Ok(())
 }
 
+/// Snapshot has a hole: drop the SKU from offering and resume Hub download.
+/// The current generate job must fail so the router can try another machine.
+async fn withdraw_incomplete_image_snapshot(
+    state: &Arc<Mutex<SessionState>>,
+    write: &SharedWsWrite,
+    model: &CatalogModel,
+) {
+    info!(
+        model = %model.model_id,
+        "image snapshot incomplete; stopping offer and resuming download"
+    );
+    let token = crate::config::read_saved_agent_token().unwrap_or_default();
+    {
+        let mut guard = state.lock().await;
+        crate::state::set_downloading_model(Some(&model.model_id));
+        let hf = guard.hf_token.clone();
+        guard.sync_model_weights(hf, &token);
+        guard.persist_local_state();
+    }
+    if let Err(err) = send_register_message(state, write).await {
+        warn!("re-register after incomplete image snapshot failed: {err:#}");
+    }
+}
+
 async fn send_heartbeat(state: &Arc<Mutex<SessionState>>, write: &SharedWsWrite) -> Result<()> {
     // Intentionally light: keepalive must not await supervisor/warm work.
     let (specs, runtime) = {
@@ -2250,6 +2274,21 @@ async fn respond_invoke(
                 let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
                 return Ok(());
             }
+            if !crate::image::image_install_ready(&catalog_model) {
+                withdraw_incomplete_image_snapshot(state, write, &catalog_model).await;
+                let msg = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke_id.clone(),
+                    error: "model_not_installed".to_string(),
+                    detail: Some(format!(
+                        "Diffusers snapshot is incomplete for {repo}. This machine will fill missing files."
+                    )),
+                };
+                drop(delta_tx);
+                let _ = delta_writer.await;
+                let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+                return Ok(());
+            }
             let revision = catalog_model
                 .weights
                 .as_ref()
@@ -2319,7 +2358,11 @@ async fn respond_invoke(
                 }
                 Err(err) => {
                     let code = invoke_error_code(&err);
-                    if code == "agent_busy" || code == "insufficient_vram" {
+                    if code == "model_not_installed" {
+                        withdraw_incomplete_image_snapshot(state, write, &catalog_model).await;
+                    }
+                    if code == "agent_busy" || code == "insufficient_vram" || code == "model_not_installed"
+                    {
                         info!("invoke {} image capacity miss · {code}: {err:#}", invoke_id);
                     } else if code == "request_canceled" {
                         info!("image invoke canceled: {err:#}");
@@ -2635,10 +2678,21 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || (detail.contains("gguf") && detail.contains("not found"))
     {
         "model_load_failed"
+    } else if detail.contains("model_not_installed")
+        || detail.contains("snapshot is incomplete")
+        || detail.contains("snapshot is not on disk")
+        || detail.contains("missing a weight shard")
+        || detail.contains("missing a weight file")
+        || (detail.contains("no such file") && detail.contains("safetensors"))
+    {
+        "model_not_installed"
     } else if detail.contains("insufficient_vram")
         || detail.contains("no_vision_capacity")
         || (detail.contains("need") && detail.contains("vision job") && detail.contains("gb"))
         || detail.contains("create llama context")
+        || detail.contains("mps backend out of memory")
+        || detail.contains("pytorch_mps")
+        || detail.contains("high_watermark")
     {
         // Idle slots exist but none meet the image-job VRAM floor: not "busy".
         // Context OOM after packing weights (GLM 4.7 Flash on a 48 GB Turing card
@@ -2734,6 +2788,30 @@ mod invoke_error_code_tests {
     #[test]
     fn llama_context_oom_is_insufficient_vram_not_busy() {
         let err = anyhow::anyhow!("create llama context: null reference from llama.cpp");
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+    }
+
+    #[test]
+    fn incomplete_image_snapshot_is_model_not_installed() {
+        let err = anyhow::anyhow!(
+            "model_not_installed: Diffusers snapshot is incomplete for Qwen/Qwen-Image-2512. This machine will fill missing files."
+        );
+        assert_eq!(invoke_error_code(&err), "model_not_installed");
+        let err = anyhow::anyhow!(
+            "Diffusers load failed for Qwen/Qwen-Image-2512: No such file or directory: text_encoder/model-00001-of-00004.safetensors"
+        );
+        assert_eq!(invoke_error_code(&err), "model_not_installed");
+    }
+
+    #[test]
+    fn mps_image_oom_is_insufficient_vram() {
+        let err = anyhow::anyhow!(
+            "insufficient_vram: Not enough GPU memory to load Qwen/Qwen-Image-2512: MPS backend out of memory (MPS allocated: 42.38 GiB, max allowed: 42.43 GiB). Tried to allocate 72.00 MiB on shared pool. Use PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0"
+        );
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+        let err = anyhow::anyhow!(
+            "model_load_failed: Diffusers load failed for Qwen/Qwen-Image-2512: MPS backend out of memory (MPS allocated: 42.38 GiB, other allocations: 384.00 KiB, max allowed: 42.43 GiB)"
+        );
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }
 }
