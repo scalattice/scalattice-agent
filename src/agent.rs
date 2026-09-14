@@ -2693,6 +2693,9 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         || detail.contains("mps backend out of memory")
         || detail.contains("pytorch_mps")
         || detail.contains("high_watermark")
+        || detail.contains("sigkill")
+        || detail.contains("signal: 9")
+        || (detail.contains("image worker") && detail.contains("ran out of memory"))
     {
         // Idle slots exist but none meet the image-job VRAM floor: not "busy".
         // Context OOM after packing weights (GLM 4.7 Flash on a 48 GB Turing card
@@ -2812,6 +2815,12 @@ mod invoke_error_code_tests {
         let err = anyhow::anyhow!(
             "model_load_failed: Diffusers load failed for Qwen/Qwen-Image-2512: MPS backend out of memory (MPS allocated: 42.38 GiB, other allocations: 384.00 KiB, max allowed: 42.43 GiB)"
         );
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+        let err = anyhow::anyhow!(
+            "insufficient_vram: image worker ran out of memory (killed by the OS)"
+        );
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+        let err = anyhow::anyhow!("inference_failed: image worker exited signal: 9 (SIGKILL)");
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }
 }

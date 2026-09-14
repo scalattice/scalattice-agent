@@ -24,7 +24,7 @@ const IMAGE_WALL_CLOCK: Duration = Duration::from_secs(45 * 60);
 /// Healthy image workers emit JSON at least every 12s. Allow one missed beat
 /// (GIL / import hiccup), then kill. This is not a load-time budget.
 const IMAGE_SILENCE: Duration = Duration::from_secs(30);
-const DEPS_MARKER: &str = ".deps_ok_v3";
+const DEPS_MARKER: &str = ".deps_ok_v4";
 const HOST_PYTHON_UNSET: &[&str] = &[
     "PYTHONHOME",
     "PYTHONPATH",
@@ -646,6 +646,8 @@ async fn run_image_worker(
         // HTTP downloads + local snapshot load are the supported path.
         .env("HF_HUB_DISABLE_XET", "1")
         .env("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        // 0.0 disables the limiter and macOS jetsam SIGKILLs the Python worker.
+        .env("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -800,6 +802,10 @@ async fn run_image_worker(
     let images = images.ok_or_else(|| {
         if status.success() {
             anyhow!("inference_failed: image worker returned no images")
+        } else if image_worker_oom_killed(&status) {
+            anyhow!(
+                "insufficient_vram: image worker ran out of memory (killed by the OS)"
+            )
         } else {
             anyhow!("inference_failed: image worker exited {}", status)
         }
@@ -808,6 +814,19 @@ async fn run_image_worker(
         bail!("inference_failed: image worker produced no images");
     }
     Ok(images)
+}
+
+fn image_worker_oom_killed(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        matches!(status.signal(), Some(9))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        false
+    }
 }
 
 /// Install isolated CPython, Diffusers venv, and the HF snapshot for this SKU.
@@ -1063,6 +1082,11 @@ mod tests {
         assert!(WORKER_PY.contains("snapshot_dir"));
         assert!(WORKER_PY.contains("place_pipeline"));
         assert!(WORKER_PY.contains("enable_model_cpu_offload"));
+        assert!(WORKER_PY.contains("enable_group_offload"));
+        assert!(WORKER_PY.contains("quantization_config"));
+        assert!(WORKER_PY.contains("tight_memory_quant_configs"));
+        assert!(WORKER_PY.contains("optimum-quanto"));
+        assert!(WORKER_PY.contains("PYTORCH_MPS_HIGH_WATERMARK_RATIO"));
         assert!(WORKER_PY.contains("image_accelerator_required"));
         assert!(WORKER_PY.contains(r#"want == "xpu""#));
         assert!(WORKER_PY.contains("torch.xpu"));
@@ -1187,7 +1211,7 @@ mod tests {
         {
             let v = dir.join(name);
             std::fs::create_dir_all(&v).unwrap();
-            std::fs::write(v.join(".deps_ok_v3"), b"ok").unwrap();
+            std::fs::write(v.join(".deps_ok_v4"), b"ok").unwrap();
         }
         teardown_image_runtime();
         assert!(!py.exists());
