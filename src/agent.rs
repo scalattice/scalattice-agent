@@ -1736,6 +1736,7 @@ async fn handle_server_message(
                             if code != "agent_busy"
                                 && code != "request_canceled"
                                 && code != "insufficient_vram"
+                                && code != "disk_full"
                             {
                                 state::record_inference_failure(code, &format!("{err:#}"));
                             }
@@ -2361,7 +2362,10 @@ async fn respond_invoke(
                     if code == "model_not_installed" {
                         withdraw_incomplete_image_snapshot(state, write, &catalog_model).await;
                     }
-                    if code == "agent_busy" || code == "insufficient_vram" || code == "model_not_installed"
+                    if code == "agent_busy"
+                        || code == "insufficient_vram"
+                        || code == "model_not_installed"
+                        || code == "disk_full"
                     {
                         info!("invoke {} image capacity miss · {code}: {err:#}", invoke_id);
                     } else if code == "request_canceled" {
@@ -2432,7 +2436,7 @@ async fn respond_invoke(
             }
             Err(err) => {
                 let code = invoke_error_code(&err);
-                if code == "agent_busy" || code == "insufficient_vram" {
+                if code == "agent_busy" || code == "insufficient_vram" || code == "disk_full" {
                     // INFO so live/cloud logs show why an invoke vanished after the
                     // start line (placement miss never claims a slot / runs llama).
                     info!("invoke {} capacity miss · {code}: {err:#}", invoke_id);
@@ -2740,6 +2744,8 @@ fn invoke_error_code(err: &anyhow::Error) -> &'static str {
         "chat_model_image_unsupported"
     } else if detail.contains("image_stream_unsupported") {
         "image_stream_unsupported"
+    } else if crate::models::is_no_space_error(err) || detail.contains("disk_full") {
+        "disk_full"
     } else if detail.contains("diffusers load failed")
         || detail.contains("qwen-image load failed")
         || detail.contains("model_load_failed")
@@ -2828,6 +2834,18 @@ mod invoke_error_code_tests {
     fn vision_worker_stdout_close_is_inference_failed_not_busy() {
         let err = anyhow::anyhow!("worker closed stdout during invoke");
         assert_eq!(invoke_error_code(&err), "inference_failed");
+    }
+
+    #[test]
+    fn enospc_job_json_is_disk_full() {
+        let err = anyhow::anyhow!(
+            "write ~/.cache/scalattice/runtimes/diffusers-mps/job-41999.json: No space left on device (os error 28)"
+        );
+        assert_eq!(invoke_error_code(&err), "disk_full");
+        let err = anyhow::anyhow!(
+            "disk_full: this machine has no free disk space for image jobs"
+        );
+        assert_eq!(invoke_error_code(&err), "disk_full");
     }
 }
 
