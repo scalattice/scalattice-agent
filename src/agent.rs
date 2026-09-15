@@ -2823,6 +2823,12 @@ mod invoke_error_code_tests {
         let err = anyhow::anyhow!("inference_failed: image worker exited signal: 9 (SIGKILL)");
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }
+
+    #[test]
+    fn vision_worker_stdout_close_is_inference_failed_not_busy() {
+        let err = anyhow::anyhow!("worker closed stdout during invoke");
+        assert_eq!(invoke_error_code(&err), "inference_failed");
+    }
 }
 
 #[cfg(test)]
