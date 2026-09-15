@@ -12,6 +12,7 @@ pub use capacity::{
     gpu_full_host_need_gb_for_job, hosting_min_vram_gb, image_job_min_vram_gb,
     preferred_download_card, vram_can_gpu_full, DEFAULT_CPU_RAM_HEADROOM_GB,
 };
+pub use download::is_no_space_error;
 pub use gguf_arch::gguf_shape;
 pub use gguf_check::gguf_payload_in_bounds;
 pub use health::{

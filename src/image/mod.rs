@@ -392,13 +392,47 @@ pub fn image_install_ready(model: &CatalogModel) -> bool {
 }
 
 fn ensure_worker_script(venv_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(venv_dir).with_context(|| format!("create {}", venv_dir.display()))?;
+    std::fs::create_dir_all(venv_dir).map_err(|err| map_image_io_error(err, venv_dir))?;
     let dest = venv_dir.join("worker.py");
     let existing = std::fs::read_to_string(&dest).unwrap_or_default();
     if existing != WORKER_PY {
-        std::fs::write(&dest, WORKER_PY).with_context(|| format!("write {}", dest.display()))?;
+        write_runtime_bytes(&dest, WORKER_PY.as_bytes())?;
     }
     Ok(dest)
+}
+
+/// Image jobs write job JSON, worker.py, and PyTorch scratch. Refuse before
+/// claiming a GPU when the model cache volume is already full.
+pub fn refuse_if_disk_full() -> Result<()> {
+    if crate::specs::disk_is_full() || crate::state::disk_full() {
+        crate::state::set_disk_full(true);
+        bail!("disk_full: this machine has no free disk space for image jobs");
+    }
+    Ok(())
+}
+
+fn io_is_no_space(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(28) | Some(112)) || {
+        let text = err.to_string().to_ascii_lowercase();
+        text.contains("no space left") || text.contains("not enough space")
+    }
+}
+
+fn map_image_io_error(err: std::io::Error, path: &Path) -> anyhow::Error {
+    if io_is_no_space(&err) {
+        crate::state::set_disk_full(true);
+        anyhow!("disk_full: this machine has no free disk space for image jobs")
+    } else {
+        anyhow::Error::new(err).context(format!("write {}", path.display()))
+    }
+}
+
+fn write_runtime_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).map_err(|err| map_image_io_error(err, path))
+}
+
+fn write_runtime_json(path: &Path, payload: &serde_json::Value) -> Result<()> {
+    write_runtime_bytes(path, &serde_json::to_vec_pretty(payload)?)
 }
 
 fn which_bin(name: &str) -> Result<PathBuf> {
@@ -838,6 +872,7 @@ pub async fn install_image_model(
     if image_stub_enabled() {
         return Ok(());
     }
+    refuse_if_disk_full()?;
     let repo = image_repo(model).context(
         "image_runtime_missing: catalog image models need a Hugging Face Diffusers repo",
     )?;
@@ -878,8 +913,7 @@ pub async fn install_image_model(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let job_path = venv_dir.join(format!("setup-{}-{nonce}.json", std::process::id()));
-    std::fs::write(&job_path, serde_json::to_vec_pretty(&payload)?)
-        .with_context(|| format!("write {}", job_path.display()))?;
+    write_runtime_json(&job_path, &payload)?;
     struct JobFileGuard(PathBuf);
     impl Drop for JobFileGuard {
         fn drop(&mut self) {
@@ -972,6 +1006,7 @@ pub async fn run_qwen_image(
     cancel: &Notify,
     mut on_progress: impl FnMut(&str, Option<f32>),
 ) -> Result<Vec<GeneratedImage>> {
+    refuse_if_disk_full()?;
     let venv_dir = diffusers_venv_dir(device);
     let script = ensure_worker_script(&venv_dir)?;
     let python = python::ensure_image_python(&mut on_progress).await?;
@@ -994,8 +1029,7 @@ pub async fn run_qwen_image(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let job_path = venv_dir.join(format!("job-{}-{nonce}.json", std::process::id()));
-    std::fs::write(&job_path, serde_json::to_vec_pretty(&payload)?)
-        .with_context(|| format!("write {}", job_path.display()))?;
+    write_runtime_json(&job_path, &payload)?;
     struct JobFileGuard(PathBuf);
     impl Drop for JobFileGuard {
         fn drop(&mut self) {
@@ -1122,6 +1156,13 @@ mod tests {
             resolve_image_job_size("some-org/edit-pipe", 0, 0, true),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn enospc_io_error_maps_to_disk_full() {
+        let err = std::io::Error::from_raw_os_error(28);
+        let mapped = map_image_io_error(err, Path::new("job.json"));
+        assert!(format!("{mapped:#}").starts_with("disk_full:"));
     }
 
     fn card(id: &str, kind: &str, name: &str, strategy: PoolStrategy, vulkan: bool) -> VirtualCard {

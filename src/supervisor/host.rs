@@ -735,6 +735,8 @@ impl Supervisor {
         cpu_ram_headroom_gb: u32,
         mut on_delta: Option<Box<dyn FnMut(String) + Send>>,
     ) -> Result<(Vec<GeneratedImage>, InvokeTimings, String)> {
+        // Before claiming a GPU / killing llama.cpp: image jobs cannot run on a full disk.
+        crate::image::refuse_if_disk_full()?;
         let cancel = self.register_job_cancel(job_id).await;
         let started = Instant::now();
         let placement = {
