@@ -137,6 +137,8 @@ fn handle_request(
             messages,
             max_tokens,
             stream,
+            n_ctx,
+            offload_kqv,
         } => {
             busy.store(true, Ordering::Relaxed);
             let result = run_invoke(
@@ -147,6 +149,8 @@ fn handle_request(
                 messages,
                 max_tokens,
                 stream,
+                n_ctx,
+                offload_kqv.unwrap_or(true),
                 stdout,
             );
             busy.store(false, Ordering::Relaxed);
@@ -163,6 +167,8 @@ fn run_invoke(
     messages: Vec<crate::protocol::ChatMessage>,
     max_tokens: u32,
     stream: bool,
+    n_ctx: u32,
+    offload_kqv: bool,
     stdout: &mut impl Write,
 ) -> Result<()> {
     let job_id = id.to_string();
@@ -198,12 +204,23 @@ fn run_invoke(
                 "worker resolved gguf"
             );
             crate::llm::report_work_progress("resolve", 1.0);
+            let n_ctx = if n_ctx == 0 {
+                if crate::protocol::messages_have_images(&messages) {
+                    8192
+                } else {
+                    4096
+                }
+            } else {
+                n_ctx
+            };
             let config = GenerateConfig {
                 model_path,
                 pool: boot.card.clone(),
                 messages,
                 max_tokens: max_tokens.max(1).min(8192),
                 model_id: model_id.to_string(),
+                n_ctx,
+                offload_kqv,
             };
             crate::llm::report_work_progress("start", 0.0);
             generate_with_callback(&config, |piece| {

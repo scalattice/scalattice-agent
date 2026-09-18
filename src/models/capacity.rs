@@ -4,6 +4,10 @@ use crate::compute_pool::{
 use crate::protocol::CatalogModel;
 use crate::specs::ComputeDevice;
 
+use super::vram_plan::{
+    extras_without_kv_gb, gpu_weights_need_gb, job_n_ctx, kv_gb,
+};
+
 fn gb_ceil(v: Option<f64>) -> u32 {
     let n = v.unwrap_or(0.0);
     if n <= 0.0 {
@@ -24,9 +28,8 @@ pub fn hosting_min_vram_gb(model: &CatalogModel) -> u32 {
     gb_ceil(model.min_vram_gb)
 }
 
-pub fn gpu_full_host_need_gb_for_job(model: &CatalogModel, need_vision: bool) -> f64 {
-    let n_ctx = super::vram_plan::job_n_ctx(model, need_vision);
-    let weight = model
+fn llama_weight_gb(model: &CatalogModel) -> f64 {
+    model
         .weight_size_gb
         .filter(|w| *w > 0.05)
         .or_else(|| {
@@ -36,21 +39,109 @@ pub fn gpu_full_host_need_gb_for_job(model: &CatalogModel, need_vision: bool) ->
                     .map(|m| m.len() as f64 / (1024.0 * 1024.0 * 1024.0))
             })
         })
-        .unwrap_or(0.0);
-    let shape = super::storage::resolve_model_gguf(&model.runtime_model)
-        .and_then(|path| super::gguf_arch::gguf_shape(&path));
-    let mut need = super::vram_plan::full_host_need_gb(weight, shape, n_ctx);
+        .unwrap_or(0.0)
+}
+
+fn llama_shape(model: &CatalogModel) -> Option<super::gguf_arch::GgufShape> {
+    super::storage::resolve_model_gguf(&model.runtime_model)
+        .and_then(|path| super::gguf_arch::gguf_shape(&path))
+}
+
+fn mmproj_gb(model: &CatalogModel, need_vision: bool) -> f64 {
     if need_vision {
-        if let Some(mm) = model.mmproj_size_gb.filter(|v| *v > 0.0) {
-            need += mm;
+        model.mmproj_size_gb.filter(|v| *v > 0.0).unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn llama_job_parts(model: &CatalogModel, need_vision: bool) -> (u32, f64, f64, f64, f64) {
+    let n_ctx = job_n_ctx(model, need_vision);
+    let weight = llama_weight_gb(model);
+    let shape = llama_shape(model);
+    let kv = kv_gb(weight, shape, n_ctx);
+    let extras = extras_without_kv_gb(weight, shape, n_ctx);
+    (n_ctx, weight, kv, extras, mmproj_gb(model, need_vision))
+}
+
+pub fn gpu_full_host_need_gb_for_job(model: &CatalogModel, need_vision: bool) -> f64 {
+    if !need_vision {
+        if let Some(v) = model.catalog_gpu_full_vram_gb() {
+            return v.max(f64::from(hosting_min_vram_gb(model)));
         }
     }
+    let (_n_ctx, weight, kv, extras, mmproj) = llama_job_parts(model, need_vision);
+    let need = weight + kv + extras + mmproj;
     let catalog_floor = if need_vision {
         f64::from(image_job_min_vram_gb(model))
     } else {
         f64::from(hosting_min_vram_gb(model))
     };
     need.max(catalog_floor)
+}
+
+fn gpu_weights_need_gb_for_job(model: &CatalogModel, need_vision: bool) -> f64 {
+    if !need_vision {
+        if let Some(v) = model.catalog_gpu_weights_vram_gb() {
+            return v;
+        }
+    }
+    let n_ctx = job_n_ctx(model, need_vision);
+    let weight = llama_weight_gb(model);
+    gpu_weights_need_gb(weight, llama_shape(model), n_ctx) + mmproj_gb(model, need_vision)
+}
+
+fn job_kv_gb(model: &CatalogModel, need_vision: bool) -> f64 {
+    if !need_vision {
+        if let Some(v) = model.catalog_kv_cache_gb() {
+            return v;
+        }
+    }
+    llama_job_parts(model, need_vision).2
+}
+
+fn kv_ram_need_gb(model: &CatalogModel, need_vision: bool, cpu_ram_headroom_gb: u32) -> u32 {
+    let kv = job_kv_gb(model, need_vision);
+    let min_ram = gb_ceil(model.min_ram_gb);
+    gb_ceil(Some(kv)).saturating_add(cpu_ram_headroom_gb).max(min_ram).max(1)
+}
+
+fn weight_plus_kv_ram_need_gb(model: &CatalogModel, need_vision: bool, cpu_ram_headroom_gb: u32) -> u32 {
+    let weight = llama_weight_gb(model);
+    let kv = job_kv_gb(model, need_vision);
+    let min_ram = gb_ceil(model.min_ram_gb);
+    gb_ceil(Some(weight + kv))
+        .saturating_add(cpu_ram_headroom_gb)
+        .max(min_ram)
+}
+
+fn unified_pool_gb(card: &VirtualCard, ram_gb: u32) -> f64 {
+    f64::from(card.total_vram_gb.max(ram_gb))
+}
+
+/// True when leftover VRAM can hold the catalog KV (llama.cpp offload_kqv=true).
+pub fn kv_fits_on_gpu(
+    available_gb: f64,
+    model: &CatalogModel,
+    need_vision: bool,
+) -> bool {
+    available_gb + 0.005 >= gpu_full_host_need_gb_for_job(model, need_vision)
+}
+
+/// Catalog window + whether llama.cpp should keep KV on the GPU.
+/// `offload_kqv=false` puts KV in system RAM when leftover VRAM cannot hold it.
+pub fn llama_context_plan(
+    model: &CatalogModel,
+    card: &VirtualCard,
+    need_vision: bool,
+) -> (u32, bool) {
+    let n_ctx = job_n_ctx(model, need_vision).max(1);
+    let offload_kqv = match card.strategy {
+        PoolStrategy::CpuOnly => false,
+        PoolStrategy::Metal => true,
+        _ => kv_fits_on_gpu(f64::from(card.total_vram_gb), model, need_vision),
+    };
+    (n_ctx, offload_kqv)
 }
 
 /// True when `available_gb` (live free, else advertised) can take weights + KV
@@ -139,6 +230,8 @@ fn can_host_image_model(model: &CatalogModel, card: &VirtualCard) -> bool {
 }
 
 /// Whether this machine can download and serve a catalog model on its virtual compute card.
+/// Chat/VL: catalog n_ctx KV must fit in leftover VRAM **or** system RAM (counted, not assumed).
+/// Image-gen: one GPU ≥ catalog minVram, no token KV.
 /// `cpu_ram_headroom_gb` comes from the server (`ready.cpuRamHeadroomGb`).
 pub fn can_host_model(
     model: &CatalogModel,
@@ -149,17 +242,19 @@ pub fn can_host_model(
     if model.is_image_job() {
         return can_host_image_model(model, card);
     }
-    let min_vram = hosting_min_vram_gb(model);
-    let min_ram = gb_ceil(model.min_ram_gb);
-    let weight_gb = gb_ceil(model.weight_size_gb);
-    let ram_needed = weight_gb.saturating_add(cpu_ram_headroom_gb).max(min_ram);
-
-    // Fits entirely on pooled accelerator VRAM (CUDA and/or Vulkan estimate).
-    if min_vram > 0 && card.total_vram_gb >= min_vram {
-        return ram_gb >= min_ram;
+    let need_vision = false;
+    let unified = matches!(card.strategy, PoolStrategy::Metal);
+    if unified {
+        let need = gpu_full_host_need_gb_for_job(model, need_vision);
+        let min_ram = gb_ceil(model.min_ram_gb);
+        return unified_pool_gb(card, ram_gb) + 0.005 >= need.max(f64::from(min_ram));
     }
 
-    // Partial accelerator VRAM: full-GPU may OOM, but offload cascade can still serve.
+    let vram = f64::from(card.total_vram_gb);
+    if kv_fits_on_gpu(vram, model, need_vision) && ram_gb >= gb_ceil(model.min_ram_gb) {
+        return true;
+    }
+
     let has_accelerator = matches!(
         card.strategy,
         PoolStrategy::Single
@@ -167,15 +262,19 @@ pub fn can_host_model(
             | PoolStrategy::Vulkan
             | PoolStrategy::Metal
     );
+    let weights_need = gpu_weights_need_gb_for_job(model, need_vision);
+    if has_accelerator && vram + 0.005 >= weights_need {
+        return ram_gb >= kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
+    }
+
     if has_accelerator
         && (card.total_vram_gb >= 4 || card.uses_vulkan || card.strategy == PoolStrategy::Metal)
     {
-        return ram_gb >= ram_needed;
+        return ram_gb >= weight_plus_kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
     }
 
-    // CPU-only inference.
     if card.strategy == PoolStrategy::CpuOnly {
-        return ram_gb >= ram_needed;
+        return ram_gb >= weight_plus_kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
     }
 
     false
@@ -259,6 +358,9 @@ mod tests {
             vision_model: false,
             text_sibling_model_id: None,
             min_ram_gb: Some(min_ram),
+            kv_cache_gb: None,
+            gpu_full_vram_gb: None,
+            gpu_weights_vram_gb: None,
             mmproj_size_gb: None,
             vision_max_images: None,
             vision_max_image_side_px: None,
@@ -283,6 +385,9 @@ mod tests {
             vision_model: true,
             text_sibling_model_id: Some("qwen-3-8b".into()),
             min_ram_gb: Some(min_ram),
+            kv_cache_gb: None,
+            gpu_full_vram_gb: None,
+            gpu_weights_vram_gb: None,
             mmproj_size_gb: None,
             vision_max_images: None,
             vision_max_image_side_px: None,
@@ -301,6 +406,32 @@ mod tests {
         assert!(vram_can_gpu_full(10.0, &qwen, 4, false));
         let eight_gb_ok = catalog(8.0, 5.0, 8.0);
         assert!(vram_can_gpu_full(8.0, &eight_gb_ok, 8, false));
+    }
+
+    #[test]
+    fn catalog_fit_numbers_override_local_plan() {
+        let mut m = catalog(4.0, 4.68, 8.0);
+        m.max_context_tokens = 32768;
+        m.gpu_full_vram_gb = Some(10.0);
+        m.gpu_weights_vram_gb = Some(5.5);
+        m.kv_cache_gb = Some(4.5);
+        assert!((gpu_full_host_need_gb_for_job(&m, false) - 10.0).abs() < 0.01);
+        assert!(!vram_can_gpu_full(8.0, &m, 4, false));
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "RTX 4060".into(),
+            vram_gb: Some(8),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(can_host_model(&m, &card, 16, 2));
+        assert!(!can_host_model(&m, &card, 6, 2));
+        let (n_ctx, offload_kqv) = llama_context_plan(&m, &card, false);
+        assert_eq!(n_ctx, 32768);
+        assert!(!offload_kqv);
     }
 
     #[test]
@@ -511,6 +642,9 @@ mod tests {
             vision_model: false,
             text_sibling_model_id: None,
             min_ram_gb: Some(16.0),
+            kv_cache_gb: None,
+            gpu_full_vram_gb: None,
+            gpu_weights_vram_gb: None,
             mmproj_size_gb: None,
             vision_max_images: None,
             vision_max_image_side_px: None,

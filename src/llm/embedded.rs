@@ -62,6 +62,10 @@ pub struct GenerateConfig {
     pub messages: Vec<ChatMessage>,
     pub max_tokens: u32,
     pub model_id: String,
+    /// Catalog window. Server owns the number; agent just allocates it.
+    pub n_ctx: u32,
+    /// llama.cpp `offload_kqv`. False keeps KV in system RAM.
+    pub offload_kqv: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,10 +185,12 @@ pub fn generate_with_callback(
         &config.pool,
         need_vision,
         |model, mtmd| {
-            let ctx_tokens = if need_vision { 8192 } else { 4096 };
-            let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(
-                NonZeroU32::new(ctx_tokens).context("invalid default context size")?,
-            ));
+            let ctx_tokens = config.n_ctx.max(1);
+            let mut ctx_params = LlamaContextParams::default()
+                .with_n_ctx(Some(
+                    NonZeroU32::new(ctx_tokens).context("invalid default context size")?,
+                ))
+                .with_offload_kqv(config.offload_kqv);
             if should_disable_flash_attn(&config.pool) {
                 ctx_params = with_flash_attn_disabled(ctx_params);
                 tracing::info!("flash attention disabled (pre-Ampere GPU; llama.cpp FA abort()s)");
@@ -196,6 +202,8 @@ pub fn generate_with_callback(
                 .context("create llama context")?;
             tracing::info!(
                 elapsed_ms = context_start.elapsed().as_millis() as u64,
+                n_ctx = ctx_tokens,
+                offload_kqv = config.offload_kqv,
                 vision = need_vision,
                 "llama context ready"
             );

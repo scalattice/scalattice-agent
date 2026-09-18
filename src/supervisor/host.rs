@@ -676,6 +676,7 @@ impl Supervisor {
                     runtime_model,
                     messages,
                     max_tokens,
+                    model,
                     on_delta.as_mut(),
                     &cancel,
                 )
@@ -688,6 +689,7 @@ impl Supervisor {
                     runtime_model,
                     messages,
                     max_tokens,
+                    model,
                     on_delta.as_mut(),
                     &cancel,
                 )
@@ -861,6 +863,7 @@ impl Supervisor {
         runtime_model: &str,
         messages: &[ChatMessage],
         max_tokens: u32,
+        model: &CatalogModel,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
         cancel: &Notify,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
@@ -888,6 +891,9 @@ impl Supervisor {
 
         let req_id = next_req_id();
         let stream = on_delta.is_some();
+        let need_vision = crate::protocol::messages_have_images(messages);
+        let (n_ctx, offload_kqv) =
+            crate::models::llama_context_plan(model, &placement.card, need_vision);
         let outcome = worker_rpc_invoke_cancellable(
             &mut worker,
             WorkerRequest::Invoke {
@@ -898,6 +904,8 @@ impl Supervisor {
                 messages: messages.to_vec(),
                 max_tokens,
                 stream,
+                n_ctx,
+                offload_kqv: Some(offload_kqv),
             },
             on_delta,
             cancel,
@@ -931,6 +939,7 @@ impl Supervisor {
         runtime_model: &str,
         messages: &[ChatMessage],
         max_tokens: u32,
+        model: &CatalogModel,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
         cancel: &Notify,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
@@ -1001,6 +1010,9 @@ impl Supervisor {
 
         let req_id = next_req_id();
         let stream = on_delta.is_some();
+        let need_vision = crate::protocol::messages_have_images(messages);
+        let (n_ctx, offload_kqv) =
+            crate::models::llama_context_plan(model, &placement.card, need_vision);
         let outcome = worker_rpc_invoke_cancellable(
             &mut tp_worker,
             WorkerRequest::Invoke {
@@ -1011,6 +1023,8 @@ impl Supervisor {
                 messages: messages.to_vec(),
                 max_tokens,
                 stream,
+                n_ctx,
+                offload_kqv: Some(offload_kqv),
             },
             on_delta,
             cancel,
