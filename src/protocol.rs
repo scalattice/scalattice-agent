@@ -32,7 +32,7 @@ pub struct ModelWeights {
     pub mirror_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct CatalogModel {
     #[serde(rename = "modelId")]
     pub model_id: String,
@@ -71,6 +71,15 @@ pub struct CatalogModel {
     pub vision_max_image_pixels: Option<u32>,
     #[serde(rename = "minRamGb", default)]
     pub min_ram_gb: Option<f64>,
+    /// Server-computed KV at catalog n_ctx. Agent must not re-derive this.
+    #[serde(rename = "kvCacheGb", default)]
+    pub kv_cache_gb: Option<f64>,
+    /// Server-computed GPU-full (weights + KV + scratch).
+    #[serde(rename = "gpuFullVramGb", default)]
+    pub gpu_full_vram_gb: Option<f64>,
+    /// Server-computed GPU weights+scratch (KV elsewhere).
+    #[serde(rename = "gpuWeightsVramGb", default)]
+    pub gpu_weights_vram_gb: Option<f64>,
     #[serde(default)]
     pub weights: Option<ModelWeights>,
 }
@@ -103,6 +112,18 @@ impl CatalogModel {
         } else {
             n.min(4)
         }
+    }
+
+    pub fn catalog_kv_cache_gb(&self) -> Option<f64> {
+        self.kv_cache_gb.filter(|v| *v > 0.0)
+    }
+
+    pub fn catalog_gpu_full_vram_gb(&self) -> Option<f64> {
+        self.gpu_full_vram_gb.filter(|v| *v > 0.0)
+    }
+
+    pub fn catalog_gpu_weights_vram_gb(&self) -> Option<f64> {
+        self.gpu_weights_vram_gb.filter(|v| *v > 0.0)
     }
 }
 

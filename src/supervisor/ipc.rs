@@ -27,6 +27,10 @@ pub enum WorkerRequest {
         messages: Vec<ChatMessage>,
         max_tokens: u32,
         stream: bool,
+        #[serde(default)]
+        n_ctx: u32,
+        #[serde(default)]
+        offload_kqv: Option<bool>,
     },
     Evict {
         id: String,
