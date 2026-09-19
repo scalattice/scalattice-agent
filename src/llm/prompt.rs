@@ -35,10 +35,19 @@ pub fn build_chat_prompt(
     model_id: &str,
 ) -> Result<String> {
     let mut prepared = prepare_messages(messages);
-    if let Ok(tmpl) = model.chat_template(None) {
-        if let Ok(s) = tmpl.to_str() {
-            suppress_short_completion_thinking(s, &mut prepared, max_tokens, n_ctx, model_id);
-        }
+    // Official Qwen3-Coder GGUF jinja uses {% macro %}, tools, tojson — llama.cpp minja
+    // often fails or emits a non-ChatML string. Plaintext "User:" fallback then
+    // collapses decode to vocab token 0 (`!`). Instruct Coder is ChatML-only.
+    if model_forces_no_think(model_id) {
+        strip_user_think_tags(&mut prepared);
+        return Ok(chatml_prompt(&prepared, true));
+    }
+    let baked = match model.chat_template(None) {
+        Ok(tmpl) => tmpl.to_str().ok().map(|s| s.to_string()),
+        Err(_) => None,
+    };
+    if let Some(s) = baked.as_deref() {
+        suppress_short_completion_thinking(s, &mut prepared, max_tokens, n_ctx, model_id);
     }
     let llama_messages: Vec<LlamaChatMessage> = prepared
         .iter()
@@ -52,13 +61,22 @@ pub fn build_chat_prompt(
 
     match model.chat_template(None) {
         Ok(tmpl) => match model.apply_chat_template(&tmpl, &llama_messages, true) {
-            Ok(prompt) => Ok(prompt),
+            Ok(prompt) => {
+                if baked.as_deref().is_some_and(template_is_chatml) && !prompt_is_chatml(&prompt) {
+                    tracing::warn!(
+                        model_id,
+                        "chat template apply omitted ChatML markers; using ChatML"
+                    );
+                    return Ok(chatml_prompt(&prepared, true));
+                }
+                Ok(prompt)
+            }
             Err(err) => {
-                tracing::warn!(error = %err, "chat template apply failed; using plaintext fallback");
-                Ok(messages_to_prompt_fallback(&prepared))
+                tracing::warn!(error = %err, model_id, "chat template apply failed");
+                Ok(fallback_prompt(model_id, baked.as_deref(), &prepared))
             }
         },
-        Err(_) => Ok(messages_to_prompt_fallback(&prepared)),
+        Err(_) => Ok(fallback_prompt(model_id, baked.as_deref(), &prepared)),
     }
 }
 
@@ -81,6 +99,59 @@ pub(crate) fn model_forces_no_think(model_id: &str) -> bool {
     model_id
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|part| part.eq_ignore_ascii_case("coder"))
+}
+
+fn template_is_chatml(template: &str) -> bool {
+    template.contains("<|im_start|>") || template.contains("im_start")
+}
+
+fn prompt_is_chatml(prompt: &str) -> bool {
+    prompt.contains("<|im_start|>")
+}
+
+fn strip_user_think_tags(messages: &mut [ChatMessage]) {
+    for m in messages.iter_mut() {
+        if m.role != "user" {
+            continue;
+        }
+        let stripped = m
+            .content
+            .replace(NO_THINK_TAG, "")
+            .replace(THINK_TAG, "")
+            .trim()
+            .to_string();
+        if !stripped.is_empty() {
+            m.content = stripped;
+        }
+    }
+}
+
+pub(crate) fn chatml_prompt(messages: &[ChatMessage], add_generation: bool) -> String {
+    let mut out = String::new();
+    for message in messages {
+        let role = normalize_role(&message.role);
+        out.push_str("<|im_start|>");
+        out.push_str(&role);
+        out.push('\n');
+        out.push_str(&super::vision::content_with_media_markers(message));
+        out.push_str("<|im_end|>\n");
+    }
+    if add_generation {
+        out.push_str("<|im_start|>assistant\n");
+    }
+    out
+}
+
+fn fallback_prompt(
+    model_id: &str,
+    baked_template: Option<&str>,
+    messages: &[ChatMessage],
+) -> String {
+    if model_forces_no_think(model_id) || baked_template.is_some_and(template_is_chatml) {
+        chatml_prompt(messages, true)
+    } else {
+        messages_to_prompt_fallback(messages)
+    }
 }
 
 fn set_last_user_think_tag(messages: &mut [ChatMessage], tag: &str) {
@@ -270,5 +341,33 @@ mod tests {
         suppress_short_completion_thinking(tmpl, &mut msgs, 1024, 4096, "qwen-3-8b");
         assert!(msgs[1].content.contains("/think"));
         assert!(!msgs[1].content.contains("/no_think"));
+    }
+
+    #[test]
+    fn coder_prompt_is_chatml_and_drops_think_tags() {
+        let mut msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "test\n/think".into(),
+            images: Vec::new(),
+        }]);
+        strip_user_think_tags(&mut msgs);
+        let prompt = chatml_prompt(&msgs, true);
+        assert!(prompt.contains("<|im_start|>user\ntest<|im_end|>"));
+        assert!(!prompt.contains("/think"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+        assert!(!prompt.contains("User:"));
+    }
+
+    #[test]
+    fn chatml_template_apply_failure_does_not_use_plaintext_roles() {
+        let msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            images: Vec::new(),
+        }]);
+        // Non-coder id: ChatML fallback must come from the baked template, not the coder SKU check.
+        let prompt = fallback_prompt("any-chat-model", Some("<|im_start|>{{ content }}"), &msgs);
+        assert!(prompt.contains("<|im_start|>user\nhi<|im_end|>"));
+        assert!(!prompt.contains("User:"));
     }
 }
