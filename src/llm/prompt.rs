@@ -4,9 +4,6 @@ use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
-/// Completion must cover this many slices of `n_ctx` or thinking eats the probe.
-/// 48 tokens at 4096 ctx is a debug/health completion, not a reasoned reply.
-const THINK_COMPLETION_CTX_SLICES: u32 = 32;
 const NO_THINK_TAG: &str = "/no_think";
 const THINK_TAG: &str = "/think";
 
@@ -35,11 +32,12 @@ pub fn build_chat_prompt(
     messages: &[ChatMessage],
     max_tokens: u32,
     n_ctx: u32,
+    model_id: &str,
 ) -> Result<String> {
     let mut prepared = prepare_messages(messages);
     if let Ok(tmpl) = model.chat_template(None) {
         if let Ok(s) = tmpl.to_str() {
-            suppress_short_completion_thinking(s, &mut prepared, max_tokens, n_ctx);
+            suppress_short_completion_thinking(s, &mut prepared, max_tokens, n_ctx, model_id);
         }
     }
     let llama_messages: Vec<LlamaChatMessage> = prepared
@@ -70,38 +68,57 @@ pub(crate) fn template_has_thinking_switch(template: &str) -> bool {
         || template.contains("/think")
 }
 
-/// True when `max_tokens` is a large enough slice of the context window to
-/// hold chain-of-thought and still emit an answer.
+/// True when `max_tokens` can hold chain-of-thought and still emit an answer.
+/// Debug 48-token probes stay off. Bracket's default 1024 is enough on 4k/8k
+/// windows, but at catalog 32k it is a tiny slice — Qwen3 spends the budget
+/// inside `<think>` or collapses to vocab token 0 (`!`).
 pub(crate) fn completion_can_afford_thinking(max_tokens: u32, n_ctx: u32) -> bool {
-    max_tokens.saturating_mul(THINK_COMPLETION_CTX_SLICES) >= n_ctx.max(1)
+    max_tokens >= 256 && max_tokens.saturating_mul(8) >= n_ctx.max(1)
+}
+
+/// Qwen3-Coder is instruct-only. `/think` on those SKUs emits `!` (token 0).
+pub(crate) fn model_forces_no_think(model_id: &str) -> bool {
+    model_id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case("coder"))
+}
+
+fn set_last_user_think_tag(messages: &mut [ChatMessage], tag: &str) {
+    let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") else {
+        return;
+    };
+    let stripped = last_user
+        .content
+        .replace(NO_THINK_TAG, "")
+        .replace(THINK_TAG, "")
+        .trim_end()
+        .to_string();
+    last_user.content = if stripped.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{stripped}\n{tag}")
+    };
 }
 
 /// Qwen3-family Jinja looks for `/no_think` on the last user turn when
 /// `enable_thinking` is not passed through llama-cpp-2's apply_chat_template.
+/// Client `/think` cannot override a completion that cannot afford CoT.
 pub(crate) fn suppress_short_completion_thinking(
     template: &str,
     messages: &mut [ChatMessage],
     max_tokens: u32,
     n_ctx: u32,
+    model_id: &str,
 ) {
-    if completion_can_afford_thinking(max_tokens, n_ctx) {
+    let force_off =
+        model_forces_no_think(model_id) || !completion_can_afford_thinking(max_tokens, n_ctx);
+    if !force_off {
         return;
     }
     if !template_has_thinking_switch(template) {
         return;
     }
-    let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") else {
-        return;
-    };
-    if last_user.content.contains(NO_THINK_TAG) || last_user.content.contains(THINK_TAG) {
-        return;
-    }
-    if last_user.content.is_empty() {
-        last_user.content = NO_THINK_TAG.to_string();
-    } else {
-        last_user.content.push('\n');
-        last_user.content.push_str(NO_THINK_TAG);
-    }
+    set_last_user_think_tag(messages, NO_THINK_TAG);
 }
 
 /// Trim only: do not strip model-specific reasoning markers.
@@ -186,7 +203,7 @@ mod tests {
             content: "Say ok.".into(),
             images: Vec::new(),
         }]);
-        suppress_short_completion_thinking(tmpl, &mut msgs, 48, 4096);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 48, 4096, "qwen-3-8b");
         assert!(msgs
             .iter()
             .any(|m| m.role == "user" && m.content.contains("/no_think")));
@@ -200,7 +217,7 @@ mod tests {
             content: "Write an essay.".into(),
             images: Vec::new(),
         }]);
-        suppress_short_completion_thinking(tmpl, &mut msgs, 1024, 4096);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 1024, 4096, "qwen-3-8b");
         assert!(!msgs.iter().any(|m| m.content.contains("/no_think")));
     }
 
@@ -208,19 +225,50 @@ mod tests {
     fn thinking_cutoff_scales_with_context_window() {
         assert!(!completion_can_afford_thinking(48, 4096));
         assert!(!completion_can_afford_thinking(48, 8192));
-        assert!(completion_can_afford_thinking(128, 4096));
+        assert!(!completion_can_afford_thinking(128, 4096));
+        assert!(completion_can_afford_thinking(1024, 4096));
         assert!(completion_can_afford_thinking(1024, 8192));
+        assert!(!completion_can_afford_thinking(1024, 32768));
+        assert!(completion_can_afford_thinking(4096, 32768));
     }
 
     #[test]
-    fn does_not_override_explicit_think_tag() {
+    fn overrides_think_when_completion_cannot_afford_cot() {
         let tmpl = "enable_thinking";
         let mut msgs = prepare_messages(&[ChatMessage {
             role: "user".into(),
             content: "Plan this /think".into(),
             images: Vec::new(),
         }]);
-        suppress_short_completion_thinking(tmpl, &mut msgs, 48, 4096);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 48, 4096, "qwen-3-8b");
+        assert!(msgs[1].content.contains("/no_think"));
+        assert!(!msgs[1].content.contains("/think\n") && !msgs[1].content.ends_with("/think"));
+    }
+
+    #[test]
+    fn coder_models_force_no_think_even_on_long_completions() {
+        assert!(model_forces_no_think("qwen-3-coder-30b-a3b"));
+        assert!(!model_forces_no_think("qwen-3-8b"));
+        let tmpl = "enable_thinking";
+        let mut msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "test /think".into(),
+            images: Vec::new(),
+        }]);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 4096, 32768, "qwen-3-coder-30b-a3b");
+        assert!(msgs[1].content.contains("/no_think"));
+    }
+
+    #[test]
+    fn keeps_think_when_completion_fits_the_window() {
+        let tmpl = "enable_thinking";
+        let mut msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "Plan this /think".into(),
+            images: Vec::new(),
+        }]);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 1024, 4096, "qwen-3-8b");
+        assert!(msgs[1].content.contains("/think"));
         assert!(!msgs[1].content.contains("/no_think"));
     }
 }
