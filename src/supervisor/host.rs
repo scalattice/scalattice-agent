@@ -104,6 +104,9 @@ pub struct Supervisor {
 /// missed-beat kill, not a multi-minute nap.
 const WORKER_DECODE_SILENCE: Duration = Duration::from_secs(30);
 const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(30);
+/// CPU-heavy offload of a 17 GB GGUF can spend >30s in one llama decode of
+/// the prompt. Prefill reports only between chunks; 30s killed Coder on 8 GB.
+const WORKER_PREFILL_SILENCE: Duration = Duration::from_secs(180);
 /// Hard ceiling for any single invoke, even if the worker keeps dripping tokens.
 /// Prevents abandoned streams from holding a GPU forever under network load.
 const WORKER_INVOKE_WALL_CLOCK: Duration = Duration::from_secs(12 * 60);
@@ -111,10 +114,10 @@ const WORKER_INVOKE_WALL_CLOCK: Duration = Duration::from_secs(12 * 60);
 const STUCK_CHECKOUT: Duration = Duration::from_secs(13 * 60);
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
-    if phase.eq_ignore_ascii_case("decode") {
-        WORKER_DECODE_SILENCE
-    } else {
-        WORKER_LOAD_SILENCE
+    match phase.to_ascii_lowercase().as_str() {
+        "decode" => WORKER_DECODE_SILENCE,
+        "prefill" | "context" | "load" => WORKER_PREFILL_SILENCE,
+        _ => WORKER_LOAD_SILENCE,
     }
 }
 
@@ -906,6 +909,8 @@ impl Supervisor {
                 stream,
                 n_ctx,
                 offload_kqv: Some(offload_kqv),
+                chat_template: model.chat_template.clone(),
+                thinking: model.thinking.clone(),
             },
             on_delta,
             cancel,
@@ -1025,6 +1030,8 @@ impl Supervisor {
                 stream,
                 n_ctx,
                 offload_kqv: Some(offload_kqv),
+                chat_template: model.chat_template.clone(),
+                thinking: model.thinking.clone(),
             },
             on_delta,
             cancel,

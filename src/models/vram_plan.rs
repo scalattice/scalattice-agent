@@ -172,6 +172,8 @@ mod tests {
             display_name: String::new(),
             runtime_model: String::new(),
             job_kind: String::new(),
+            chat_template: String::new(),
+            thinking: String::new(),
             usd_per_image: 0.0,
             image_max_n: 0,
             max_context_tokens: 32768,

@@ -139,6 +139,8 @@ fn handle_request(
             stream,
             n_ctx,
             offload_kqv,
+            chat_template,
+            thinking,
         } => {
             busy.store(true, Ordering::Relaxed);
             let result = run_invoke(
@@ -151,6 +153,8 @@ fn handle_request(
                 stream,
                 n_ctx,
                 offload_kqv.unwrap_or(true),
+                chat_template,
+                thinking,
                 stdout,
             );
             busy.store(false, Ordering::Relaxed);
@@ -169,6 +173,8 @@ fn run_invoke(
     stream: bool,
     n_ctx: u32,
     offload_kqv: bool,
+    chat_template: String,
+    thinking: String,
     stdout: &mut impl Write,
 ) -> Result<()> {
     let job_id = id.to_string();
@@ -221,6 +227,8 @@ fn run_invoke(
                 model_id: model_id.to_string(),
                 n_ctx,
                 offload_kqv,
+                chat_template,
+                thinking,
             };
             crate::llm::report_work_progress("start", 0.0);
             generate_with_callback(&config, |piece| {
