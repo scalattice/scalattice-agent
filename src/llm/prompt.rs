@@ -32,13 +32,16 @@ pub fn prepare_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 pub struct PromptPolicy {
     pub chatml: bool,
     pub thinking_none: bool,
+    pub thinking_always: bool,
 }
 
 impl PromptPolicy {
     pub fn from_catalog_fields(chat_template: &str, thinking: &str) -> Self {
+        let think = thinking.trim();
         Self {
             chatml: chat_template.trim().eq_ignore_ascii_case("chatml"),
-            thinking_none: thinking.trim().eq_ignore_ascii_case("none"),
+            thinking_none: think.eq_ignore_ascii_case("none"),
+            thinking_always: think.eq_ignore_ascii_case("always"),
         }
     }
 }
@@ -58,7 +61,7 @@ pub fn build_chat_prompt(
     if policy.chatml {
         if policy.thinking_none {
             strip_user_think_tags(&mut prepared);
-        } else {
+        } else if !policy.thinking_always {
             suppress_short_completion_thinking(
                 "<|im_start|> enable_thinking",
                 &mut prepared,
@@ -74,7 +77,9 @@ pub fn build_chat_prompt(
         Err(_) => None,
     };
     if let Some(s) = baked.as_deref() {
-        suppress_short_completion_thinking(s, &mut prepared, max_tokens, n_ctx, policy);
+        if !policy.thinking_always {
+            suppress_short_completion_thinking(s, &mut prepared, max_tokens, n_ctx, policy);
+        }
     }
     let llama_messages: Vec<LlamaChatMessage> = prepared
         .iter()
@@ -201,6 +206,9 @@ pub(crate) fn suppress_short_completion_thinking(
     n_ctx: u32,
     policy: PromptPolicy,
 ) {
+    if policy.thinking_always {
+        return;
+    }
     let force_off = policy.thinking_none || !completion_can_afford_thinking(max_tokens, n_ctx);
     if !force_off {
         return;
@@ -288,14 +296,22 @@ mod tests {
     const AUTO: PromptPolicy = PromptPolicy {
         chatml: false,
         thinking_none: false,
+        thinking_always: false,
     };
     const CHATML: PromptPolicy = PromptPolicy {
         chatml: true,
         thinking_none: false,
+        thinking_always: false,
     };
     const CHATML_NO_THINK: PromptPolicy = PromptPolicy {
         chatml: true,
         thinking_none: true,
+        thinking_always: false,
+    };
+    const ALWAYS: PromptPolicy = PromptPolicy {
+        chatml: false,
+        thinking_none: false,
+        thinking_always: true,
     };
 
     #[test]
@@ -361,6 +377,19 @@ mod tests {
         assert!(!PromptPolicy::from_catalog_fields("gguf", "auto").thinking_none);
         assert!(PromptPolicy::from_catalog_fields("chatml", "none").thinking_none);
         assert!(PromptPolicy::from_catalog_fields("chatml", "none").chatml);
+        assert!(PromptPolicy::from_catalog_fields("gguf", "always").thinking_always);
+    }
+
+    #[test]
+    fn catalog_thinking_always_does_not_inject_no_think() {
+        let tmpl = "enable_thinking";
+        let mut msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "Say ok.".into(),
+            images: Vec::new(),
+        }]);
+        suppress_short_completion_thinking(tmpl, &mut msgs, 48, 32768, ALWAYS);
+        assert!(!msgs.iter().any(|m| m.content.contains("/no_think")));
     }
 
     #[test]

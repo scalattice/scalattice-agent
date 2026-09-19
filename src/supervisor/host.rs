@@ -107,17 +107,26 @@ const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(30);
 /// CPU-heavy offload of a 17 GB GGUF can spend >30s in one llama decode of
 /// the prompt. Prefill reports only between chunks; 30s killed Coder on 8 GB.
 const WORKER_PREFILL_SILENCE: Duration = Duration::from_secs(180);
-/// Hard ceiling for any single invoke, even if the worker keeps dripping tokens.
-/// Prevents abandoned streams from holding a GPU forever under network load.
-const WORKER_INVOKE_WALL_CLOCK: Duration = Duration::from_secs(12 * 60);
-/// Checked-out slot with no progress path for this long → force reclaim.
-const STUCK_CHECKOUT: Duration = Duration::from_secs(13 * 60);
+/// Decode / idle invoke ceiling. Measured from when decode starts, not invoke
+/// start — a 32k CPU offload prefill can already be 45 minutes.
+const WORKER_DECODE_WALL: Duration = Duration::from_secs(12 * 60);
+const WORKER_PREFILL_WALL: Duration = Duration::from_secs(45 * 60);
+/// Must exceed prefill wall + decode wall or Full Debug reclaim kills mid-decode.
+const STUCK_CHECKOUT: Duration = Duration::from_secs(60 * 60);
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_SILENCE,
         "prefill" | "context" | "load" => WORKER_PREFILL_SILENCE,
         _ => WORKER_LOAD_SILENCE,
+    }
+}
+
+fn worker_wall_for_phase(phase: &str) -> Duration {
+    match phase.to_ascii_lowercase().as_str() {
+        "decode" => WORKER_DECODE_WALL,
+        // start / load / prefill / context — until the first token
+        _ => WORKER_PREFILL_WALL,
     }
 }
 
@@ -1216,14 +1225,14 @@ async fn worker_rpc_invoke_cancellable(
     let mut buf = String::new();
     let mut silence = WORKER_LOAD_SILENCE;
     let mut last_phase = String::from("start");
-    let started = Instant::now();
+    let mut phase_started = Instant::now();
     let mut last_progress = Instant::now();
     loop {
-        if started.elapsed() >= WORKER_INVOKE_WALL_CLOCK {
+        if phase_started.elapsed() >= worker_wall_for_phase(&last_phase) {
             warn!(
                 slot = %worker.spec.id,
                 phase = %last_phase,
-                wall_s = started.elapsed().as_secs(),
+                wall_s = phase_started.elapsed().as_secs(),
                 "killing worker; invoke exceeded wall-clock limit"
             );
             let _ = worker.child.kill().await;
@@ -1235,8 +1244,8 @@ async fn worker_rpc_invoke_cancellable(
         let silence_left = silence
             .checked_sub(last_progress.elapsed())
             .unwrap_or(Duration::ZERO);
-        let wall_left = WORKER_INVOKE_WALL_CLOCK
-            .checked_sub(started.elapsed())
+        let wall_left = worker_wall_for_phase(&last_phase)
+            .checked_sub(phase_started.elapsed())
             .unwrap_or(Duration::from_millis(1));
         let wait = silence_left.min(wall_left).max(Duration::from_millis(50));
         tokio::select! {
@@ -1264,7 +1273,10 @@ async fn worker_rpc_invoke_cancellable(
                 };
                 match resp {
                     WorkerResponse::Progress { id, phase, pct } if id == expect_id => {
-                        last_phase = phase.clone();
+                        if last_phase != phase {
+                            last_phase = phase.clone();
+                            phase_started = Instant::now();
+                        }
                         silence = worker_silence_for_phase(&phase);
                         last_progress = Instant::now();
                         if let Some(cb) = on_delta.as_mut() {
@@ -1276,7 +1288,10 @@ async fn worker_rpc_invoke_cancellable(
                         }
                     }
                     WorkerResponse::Delta { id, text } if id == expect_id => {
-                        last_phase = "decode".to_string();
+                        if last_phase != "decode" {
+                            last_phase = "decode".to_string();
+                            phase_started = Instant::now();
+                        }
                         silence = WORKER_DECODE_SILENCE;
                         last_progress = Instant::now();
                         if let Some(cb) = on_delta.as_mut() {
@@ -1359,7 +1374,7 @@ fn worker_crash_retryable(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::worker_crash_retryable;
+    use super::{worker_crash_retryable, worker_wall_for_phase, WORKER_DECODE_WALL, WORKER_PREFILL_WALL};
 
     #[test]
     fn stdout_close_retries_on_another_slot() {
@@ -1375,5 +1390,13 @@ mod tests {
         assert!(!worker_crash_retryable(&anyhow::anyhow!(
             "agent_busy: no idle compute slot"
         )));
+    }
+
+    #[test]
+    fn prefill_wall_is_longer_than_decode_and_covers_start() {
+        assert_eq!(worker_wall_for_phase("decode"), WORKER_DECODE_WALL);
+        assert_eq!(worker_wall_for_phase("prefill"), WORKER_PREFILL_WALL);
+        assert_eq!(worker_wall_for_phase("start"), WORKER_PREFILL_WALL);
+        assert!(WORKER_PREFILL_WALL > WORKER_DECODE_WALL);
     }
 }

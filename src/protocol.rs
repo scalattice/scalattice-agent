@@ -45,7 +45,7 @@ pub struct CatalogModel {
     /// Catalog: `gguf` (default) or `chatml`. Empty deserializes as gguf.
     #[serde(rename = "chatTemplate", default)]
     pub chat_template: String,
-    /// Catalog: `auto` (default) or `none`. Empty deserializes as auto.
+    /// Catalog: `auto` (default), `none`, or `always`. Empty deserializes as auto.
     #[serde(rename = "thinking", default)]
     pub thinking: String,
     #[serde(rename = "usdPerImage", default)]
@@ -132,6 +132,11 @@ impl CatalogModel {
     /// Catalog `thinking=none`: instruct-only, never CoT.
     pub fn thinking_none(&self) -> bool {
         self.thinking.trim().eq_ignore_ascii_case("none")
+    }
+
+    /// Catalog `thinking=always`: cannot disable CoT (R1 / Ornith).
+    pub fn thinking_always(&self) -> bool {
+        self.thinking.trim().eq_ignore_ascii_case("always")
     }
 
     pub fn catalog_gpu_full_vram_gb(&self) -> Option<f64> {
@@ -707,6 +712,10 @@ mod tests {
         m.thinking = "none".into();
         assert!(m.uses_chatml());
         assert!(m.thinking_none());
+        assert!(!m.thinking_always());
+        m.thinking = "always".into();
+        assert!(m.thinking_always());
+        assert!(!m.thinking_none());
         let wired: CatalogModel = serde_json::from_str(
             r#"{"modelId":"x","chatTemplate":"chatml","thinking":"none"}"#,
         )
