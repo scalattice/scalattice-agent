@@ -210,7 +210,13 @@ pub fn generate_with_callback(
             super::progress::report("context", 1.0);
 
             let prefill_start = Instant::now();
-            let prompt = build_chat_prompt(model, &config.messages, config.max_tokens, ctx_tokens)?;
+            let prompt = build_chat_prompt(
+                model,
+                &config.messages,
+                config.max_tokens,
+                ctx_tokens,
+                &config.model_id,
+            )?;
             let max_tokens = config.max_tokens.max(1).min(8192) as usize;
 
             let (prompt_token_count, mut position, mut sample_idx) = if need_vision {
