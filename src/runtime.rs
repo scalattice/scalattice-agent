@@ -257,6 +257,8 @@ mod tests {
             display_name: "Qwen Image".into(),
             runtime_model: "qwen-image-2512".into(),
             job_kind: "image".into(),
+            chat_template: String::new(),
+            thinking: String::new(),
             usd_per_image: 0.03,
             image_max_n: 1,
             max_context_tokens: 0,

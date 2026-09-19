@@ -31,6 +31,10 @@ pub enum WorkerRequest {
         n_ctx: u32,
         #[serde(default)]
         offload_kqv: Option<bool>,
+        #[serde(default)]
+        chat_template: String,
+        #[serde(default)]
+        thinking: String,
     },
     Evict {
         id: String,

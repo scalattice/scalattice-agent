@@ -66,6 +66,10 @@ pub struct GenerateConfig {
     pub n_ctx: u32,
     /// llama.cpp `offload_kqv`. False keeps KV in system RAM.
     pub offload_kqv: bool,
+    /// Catalog `chatTemplate`: `gguf` or `chatml`.
+    pub chat_template: String,
+    /// Catalog `thinking`: `auto` or `none`.
+    pub thinking: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,6 +233,10 @@ pub fn generate_with_callback(
                 config.max_tokens,
                 ctx_tokens,
                 &config.model_id,
+                super::prompt::PromptPolicy::from_catalog_fields(
+                    &config.chat_template,
+                    &config.thinking,
+                ),
             )?;
             let max_tokens = config.max_tokens.max(1).min(8192) as usize;
 

@@ -42,6 +42,12 @@ pub struct CatalogModel {
     pub runtime_model: String,
     #[serde(rename = "jobKind", default)]
     pub job_kind: String,
+    /// Catalog: `gguf` (default) or `chatml`. Empty deserializes as gguf.
+    #[serde(rename = "chatTemplate", default)]
+    pub chat_template: String,
+    /// Catalog: `auto` (default) or `none`. Empty deserializes as auto.
+    #[serde(rename = "thinking", default)]
+    pub thinking: String,
     #[serde(rename = "usdPerImage", default)]
     pub usd_per_image: f64,
     #[serde(rename = "imageMaxN", default)]
@@ -116,6 +122,16 @@ impl CatalogModel {
 
     pub fn catalog_kv_cache_gb(&self) -> Option<f64> {
         self.kv_cache_gb.filter(|v| *v > 0.0)
+    }
+
+    /// Catalog `chatTemplate=chatml`: skip GGUF jinja and render ChatML.
+    pub fn uses_chatml(&self) -> bool {
+        self.chat_template.trim().eq_ignore_ascii_case("chatml")
+    }
+
+    /// Catalog `thinking=none`: instruct-only, never CoT.
+    pub fn thinking_none(&self) -> bool {
+        self.thinking.trim().eq_ignore_ascii_case("none")
     }
 
     pub fn catalog_gpu_full_vram_gb(&self) -> Option<f64> {
@@ -677,6 +693,26 @@ mod tests {
         let (code, _) = invoke_job_kind_error(true, "chat").unwrap();
         assert_eq!(code, "image_model_chat_unsupported");
         assert!(invoke_job_kind_error(true, "image").is_none());
+    }
+
+    #[test]
+    fn catalog_chat_serving_comes_from_fields_not_model_id() {
+        let mut m = CatalogModel {
+            model_id: "anything".into(),
+            ..CatalogModel::default()
+        };
+        assert!(!m.uses_chatml());
+        assert!(!m.thinking_none());
+        m.chat_template = "chatml".into();
+        m.thinking = "none".into();
+        assert!(m.uses_chatml());
+        assert!(m.thinking_none());
+        let wired: CatalogModel = serde_json::from_str(
+            r#"{"modelId":"x","chatTemplate":"chatml","thinking":"none"}"#,
+        )
+        .unwrap();
+        assert!(wired.uses_chatml());
+        assert!(wired.thinking_none());
     }
 
     #[test]

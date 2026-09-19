@@ -504,6 +504,8 @@ impl SessionState {
             display_name: model_id.to_string(),
             runtime_model: runtime_hint.to_string(),
             job_kind: String::new(),
+            chat_template: String::new(),
+            thinking: String::new(),
             usd_per_image: 0.0,
             image_max_n: 0,
             max_context_tokens: 4096,
