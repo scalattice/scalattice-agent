@@ -1,6 +1,6 @@
 [package]
 name = "scalattice-agent"
-version = "1.1.106"
+version = "1.1.107"
 edition = "2021"
 description = "Open-source GPU machine agent for the Scalattice inference network"
 license = "MIT"
