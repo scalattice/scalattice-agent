@@ -161,6 +161,19 @@ pub(crate) fn decode_token(model: &LlamaModel, token: LlamaToken) -> Result<Stri
         .context("decode generated token")
 }
 
+/// Qwen vocab[0] is `!`. Metal/Vulkan/starved-offload faults emit it for the
+/// whole completion. Hold a short run so we can fail closed instead of streaming
+/// a wall of bangs.
+pub(crate) fn bump_vocab_zero_run(token: LlamaToken, piece: &str, run: &mut u32) -> bool {
+    let collapsed = token.0 == 0 || (!piece.is_empty() && piece.chars().all(|c| c == '!'));
+    if collapsed {
+        *run = run.saturating_add(1);
+    } else {
+        *run = 0;
+    }
+    *run >= 8
+}
+
 pub(crate) fn backend() -> Result<&'static LlamaBackend> {
     if BACKEND.get().is_none() {
         init_backend()?;
@@ -252,13 +265,14 @@ pub fn generate_with_callback(
                 let prompt_token_count = prompt_tokens.len() as u32;
                 let tokens = prompt_tokens;
                 let n = tokens.len();
-                const PREFILL_CHUNK: usize = 256;
+                const PREFILL_CHUNK: usize = 64;
                 let mut batch = LlamaBatch::new(PREFILL_CHUNK.max(1), 1);
                 let mut i = 0usize;
                 super::progress::report("prefill", 0.0);
                 while i < n {
                     batch.clear();
                     let end = (i + PREFILL_CHUNK).min(n);
+                    super::progress::report("prefill", i as f32 / n.max(1) as f32);
                     for pos in i..end {
                         let want_logits = pos + 1 == n;
                         batch
@@ -284,6 +298,8 @@ pub fn generate_with_callback(
             let mut decode_ms = 0u64;
             let mut first_token = true;
             let mut batch = LlamaBatch::new(1, 1);
+            let mut vocab_zero_run = 0u32;
+            let mut vocab_zero_pending = String::new();
 
             while generated < max_tokens as u32 {
                 let token = sampler.sample(&ctx, sample_idx);
@@ -298,9 +314,21 @@ pub fn generate_with_callback(
                     prefill_ms = prefill_start.elapsed().as_millis() as u64;
                     first_token = false;
                 }
+                if bump_vocab_zero_run(token, &piece, &mut vocab_zero_run) {
+                    anyhow::bail!("vocab_zero_collapse");
+                }
                 let decode_piece_start = Instant::now();
-                content.push_str(&piece);
-                on_token(&piece);
+                if vocab_zero_run > 0 {
+                    vocab_zero_pending.push_str(&piece);
+                } else {
+                    if !vocab_zero_pending.is_empty() {
+                        content.push_str(&vocab_zero_pending);
+                        on_token(&vocab_zero_pending);
+                        vocab_zero_pending.clear();
+                    }
+                    content.push_str(&piece);
+                    on_token(&piece);
+                }
                 super::progress::report(
                     "decode",
                     generated as f32 / (max_tokens as u32).max(1) as f32,
@@ -315,6 +343,11 @@ pub fn generate_with_callback(
                 position += 1;
                 sample_idx = batch.n_tokens() - 1;
                 generated += 1;
+            }
+
+            if !vocab_zero_pending.is_empty() {
+                content.push_str(&vocab_zero_pending);
+                on_token(&vocab_zero_pending);
             }
 
             if first_token {
@@ -996,6 +1029,19 @@ mod tests {
     use super::*;
     use crate::compute_pool::{build_virtual_card, vulkan_runtime_supported};
     use crate::specs::ComputeDevice;
+
+    #[test]
+    fn vocab_zero_run_trips_after_eight_bangs() {
+        let mut run = 0u32;
+        for _ in 0..7 {
+            assert!(!bump_vocab_zero_run(LlamaToken(0), "!", &mut run));
+        }
+        assert!(bump_vocab_zero_run(LlamaToken(0), "!", &mut run));
+        run = 0;
+        assert!(!bump_vocab_zero_run(LlamaToken(0), "!", &mut run));
+        assert!(!bump_vocab_zero_run(LlamaToken(42), "Hi", &mut run));
+        assert_eq!(run, 0);
+    }
 
     fn gpu_and_cpu(vram_gb: u32) -> VirtualCard {
         build_virtual_card(&[

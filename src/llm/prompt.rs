@@ -147,11 +147,20 @@ fn fallback_prompt(
     baked_template: Option<&str>,
     messages: &[ChatMessage],
 ) -> String {
-    if model_forces_no_think(model_id) || baked_template.is_some_and(template_is_chatml) {
+    if model_forces_no_think(model_id)
+        || baked_template.is_some_and(template_is_chatml)
+        || model_id_looks_like_qwen(model_id)
+    {
         chatml_prompt(messages, true)
     } else {
         messages_to_prompt_fallback(messages)
     }
+}
+
+fn model_id_looks_like_qwen(model_id: &str) -> bool {
+    model_id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case("qwen"))
 }
 
 fn set_last_user_think_tag(messages: &mut [ChatMessage], tag: &str) {
@@ -367,6 +376,18 @@ mod tests {
         }]);
         // Non-coder id: ChatML fallback must come from the baked template, not the coder SKU check.
         let prompt = fallback_prompt("any-chat-model", Some("<|im_start|>{{ content }}"), &msgs);
+        assert!(prompt.contains("<|im_start|>user\nhi<|im_end|>"));
+        assert!(!prompt.contains("User:"));
+    }
+
+    #[test]
+    fn qwen38_fallback_is_chatml_not_plaintext_user() {
+        let msgs = prepare_messages(&[ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            images: Vec::new(),
+        }]);
+        let prompt = fallback_prompt("qwen-3.8-27b", None, &msgs);
         assert!(prompt.contains("<|im_start|>user\nhi<|im_end|>"));
         assert!(!prompt.contains("User:"));
     }

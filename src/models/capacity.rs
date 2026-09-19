@@ -267,8 +267,11 @@ pub fn can_host_model(
         return ram_gb >= kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
     }
 
+    // RAM offload is for real GPUs (≥4 GB). `uses_vulkan` must not skip that
+    // floor: a 1 GB iGPU/Vulkan alias would advertise Coder-sized GGUFs and
+    // decode vocab token 0 (`!`).
     if has_accelerator
-        && (card.total_vram_gb >= 4 || card.uses_vulkan || card.strategy == PoolStrategy::Metal)
+        && (card.total_vram_gb >= 4 || card.strategy == PoolStrategy::Metal)
     {
         return ram_gb >= weight_plus_kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
     }
@@ -450,6 +453,21 @@ mod tests {
         }])
         .unwrap();
         assert!(can_host_model(&catalog(4.0, 5.0, 8.0), &card, 32, 2));
+    }
+
+    #[test]
+    fn tiny_vulkan_slot_does_not_host_coder_sized_weights() {
+        let card = VirtualCard {
+            devices: vec![],
+            strategy: PoolStrategy::Vulkan,
+            display_name: "1 GB Vulkan".into(),
+            total_vram_gb: 1,
+            tensor_split: vec![],
+            cuda_device_ids: vec![],
+            uses_vulkan: true,
+            gpu_layer_budget: 0,
+        };
+        assert!(!can_host_model(&catalog(8.0, 17.0, 16.0), &card, 32, 2));
     }
 
     #[test]
