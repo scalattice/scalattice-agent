@@ -412,12 +412,13 @@ fn wsl_nvidia_lib_dir() -> Option<&'static str> {
     }
 }
 
-/// Physical CUDA indices from `CUDA_VISIBLE_DEVICES` (worker pin). Empty if unset.
+/// Physical CUDA indices from `CUDA_VISIBLE_DEVICES` (worker pin).
+/// Empty if unset, blank, or `-1` (hide all devices).
 fn cuda_visible_physical_indices() -> Vec<u32> {
     let Ok(raw) = std::env::var("CUDA_VISIBLE_DEVICES") else {
         return Vec::new();
     };
-    if raw.trim().is_empty() {
+    if raw.trim().is_empty() || raw.trim() == "-1" {
         return Vec::new();
     }
     raw.split(',')
@@ -427,7 +428,7 @@ fn cuda_visible_physical_indices() -> Vec<u32> {
 
 /// Live free VRAM (GiB) for this process's pinned NVIDIA GPU(s).
 ///
-/// Only queries when `CUDA_VISIBLE_DEVICES` is set (per-slot workers).
+/// Only queries when `CUDA_VISIBLE_DEVICES` pins real device indices.
 /// Returns the **minimum** free across visible devices.
 pub fn live_cuda_free_vram_gb() -> Option<f64> {
     #[cfg(target_os = "macos")]

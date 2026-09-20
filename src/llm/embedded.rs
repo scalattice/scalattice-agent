@@ -581,9 +581,10 @@ fn prefault_gguf_pages(path: &Path) -> Result<u64> {
 ///
 /// Small / memory-constrained pools frequently OOM inside llama.cpp during load,
 /// which surfaces as a null model pointer. Rather than fail the job, retry with
-/// progressively less GPU offload and finally a CPU-only floor that loads whenever
-/// system RAM allows. Detailed failures are logged locally only; the caller must
-/// keep provider-specific detail (paths, device names) out of anything sent upstream.
+/// progressively less GPU offload. CPU-only is only for CpuOnly pools — a GPU
+/// slot must not silently run 0 layers and then hit the decode wall. Detailed
+/// failures are logged locally only; the caller must keep provider-specific
+/// detail (paths, device names) out of anything sent upstream.
 ///
 /// Returns `(model, candidate_index)` so the cache can skip already-failed tiers
 /// when context/KV allocation OOMs after a successful weight load.
@@ -687,6 +688,11 @@ pub(crate) fn gguf_weight_gb(path: &Path) -> Option<f64> {
 }
 
 fn live_placement_vram_gb(advertised_gb: u32) -> u32 {
+    #[cfg(test)]
+    {
+        return advertised_gb;
+    }
+    #[cfg(not(test))]
     match crate::specs::live_cuda_free_vram_gb() {
         Some(free) if free.is_finite() && free >= 0.0 => {
             let free_u = free.floor() as u32;
@@ -940,8 +946,11 @@ fn load_param_candidates_with_plan(
         PoolStrategy::TensorParallel => {
             // Prefer largest single GPU whenever the model fits there. TP on mixed
             // consumer cards (and on tiny models that already fit one GPU) has been
-            // aborting the process via ggml-cuda.cu.
-            if gpu_full_fits_available(available, weight_gb) {
+            // aborting the process via ggml-cuda.cu. Pooled VRAM must not make a
+            // 2×4 GB box attempt gpu-full on one 4 GB card.
+            if gpu_full_fits_available(available, weight_gb)
+                && should_attempt_single_gpu_full(pool, weight_gb)
+            {
                 if let Some(primary) = primary_cuda_device(pool) {
                     info!(
                         weight_gb = weight_gb.unwrap_or(-1.0),
@@ -951,7 +960,9 @@ fn load_param_candidates_with_plan(
                     );
                     candidates.push(("gpu-full", single_gpu_full_params(primary as usize)?));
                 }
-            } else if should_attempt_tensor_parallel(pool, weight_gb) {
+            } else if gpu_full_fits_available(available, weight_gb)
+                && should_attempt_tensor_parallel(pool, weight_gb)
+            {
                 info!(
                     weight_gb = weight_gb.unwrap_or(-1.0),
                     gpus = pool.cuda_device_ids.len(),
@@ -1023,12 +1034,11 @@ fn load_param_candidates_with_plan(
         }
     }
 
-    candidates.push((
-        "cpu-only",
-        LlamaModelParams::default()
-            .with_use_mmap(true)
-            .with_n_gpu_layers(0),
-    ));
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "insufficient_vram: GPU slot has no placeable offload (live free VRAM too small)"
+        );
+    }
 
     Ok(candidates)
 }
@@ -1119,7 +1129,7 @@ mod tests {
             assert_eq!(pool.strategy, PoolStrategy::Single);
             assert_eq!(
                 cascade_labels(&pool, Some(4.0)),
-                vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
+                vec!["gpu-full", "gpu-offload", "gpu-offload-reduced"]
             );
         }
     }
@@ -1131,7 +1141,7 @@ mod tests {
         // ~5GB Q4 8B on 4GB card: must not attempt gpu-full (CUDA abort risk).
         assert_eq!(
             cascade_labels(&pool, Some(4.7)),
-            vec!["gpu-offload", "gpu-offload-reduced", "cpu-only"]
+            vec!["gpu-offload", "gpu-offload-reduced"]
         );
         assert!(!should_attempt_gpu_full(&pool, Some(4.7)));
     }
@@ -1142,7 +1152,7 @@ mod tests {
         assert!(should_attempt_gpu_full(&pool, Some(4.68)));
         assert_eq!(
             cascade_labels(&pool, Some(4.68)),
-            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced"]
         );
     }
 
@@ -1156,7 +1166,7 @@ mod tests {
         assert!(!should_attempt_single_gpu_full(&pool, Some(4.7)));
         assert_eq!(
             cascade_labels(&pool, Some(4.7)),
-            vec!["gpu-offload", "gpu-offload-reduced", "cpu-only"]
+            vec!["gpu-offload", "gpu-offload-reduced"]
         );
     }
 
@@ -1171,7 +1181,7 @@ mod tests {
         assert!(should_attempt_single_gpu_full(&pool, Some(1.2)));
         assert_eq!(
             cascade_labels(&pool, Some(1.2)),
-            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced"]
         );
     }
 
@@ -1183,7 +1193,7 @@ mod tests {
         assert!(!should_attempt_tensor_parallel(&pool, Some(20.0)));
         assert_eq!(
             cascade_labels(&pool, Some(20.0)),
-            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced"]
         );
     }
 
@@ -1195,7 +1205,7 @@ mod tests {
         assert!(should_attempt_tensor_parallel(&pool, Some(30.0)));
         assert_eq!(
             cascade_labels(&pool, Some(30.0)),
-            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced"]
         );
     }
 
@@ -1207,7 +1217,7 @@ mod tests {
         assert!(!should_attempt_single_gpu_full(&pool, Some(14.0)));
         assert_eq!(
             cascade_labels(&pool, Some(14.0)),
-            vec!["gpu-offload", "gpu-offload-reduced", "cpu-only"]
+            vec!["gpu-offload", "gpu-offload-reduced"]
         );
     }
 
@@ -1217,7 +1227,7 @@ mod tests {
         assert_eq!(pool.strategy, PoolStrategy::TensorParallel);
         assert_eq!(
             cascade_labels(&pool, Some(4.0)),
-            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced"]
         );
         assert!(!should_attempt_tensor_parallel(&pool, Some(4.0)));
         assert!(should_attempt_single_gpu_full(&pool, Some(4.0)));
@@ -1289,7 +1299,7 @@ mod tests {
         assert_eq!(pool.strategy, PoolStrategy::Vulkan);
         assert_eq!(
             cascade_labels(&pool, Some(4.0)),
-            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only",]
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced"]
         );
     }
 
@@ -1316,5 +1326,30 @@ mod tests {
         );
         assert!(estimated_n_layer(19.77) < 47);
         assert_eq!(estimated_n_layer(4.7), 9);
+    }
+
+    #[test]
+    fn cpu_only_pool_uses_cpu_only_candidate() {
+        let pool = build_virtual_card(&[ComputeDevice {
+            id: "cpu:0".into(),
+            kind: "cpu".into(),
+            name: "CPU".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert_eq!(pool.strategy, PoolStrategy::CpuOnly);
+        assert_eq!(cascade_labels(&pool, Some(4.0)), vec!["cpu-only"]);
+    }
+
+    #[test]
+    fn starved_gpu_slot_fails_instead_of_cpu_only() {
+        let pool = gpu_and_cpu(1);
+        assert_eq!(pool.strategy, PoolStrategy::Single);
+        let err = load_param_candidates_with_weight(&pool, Some(4.7)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("insufficient_vram"), "{msg}");
     }
 }
