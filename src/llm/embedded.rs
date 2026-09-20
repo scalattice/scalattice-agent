@@ -12,6 +12,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::logit_bias::LlamaLogitBias;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::LogOptions;
 use std::io::Read;
@@ -166,8 +167,9 @@ pub(crate) fn decode_token(model: &LlamaModel, token: LlamaToken) -> Result<Stri
 }
 
 /// Qwen vocab[0] is `!`. Metal/Vulkan/starved-offload faults emit it for the
-/// whole completion. Hold a short run so we can fail closed instead of streaming
-/// a wall of bangs.
+/// whole completion. Hold a short run so decode can stop like EOS instead of
+/// streaming a wall of bangs (and instead of failing the job, which one-strikes
+/// healthy Macs).
 pub(crate) fn bump_vocab_zero_run(token: LlamaToken, piece: &str, run: &mut u32) -> bool {
     let collapsed = token.0 == 0 || (!piece.is_empty() && piece.chars().all(|c| c == '!'));
     if collapsed {
@@ -176,6 +178,22 @@ pub(crate) fn bump_vocab_zero_run(token: LlamaToken, piece: &str, run: &mut u32)
         *run = 0;
     }
     *run >= 8
+}
+
+/// Greedy argmax on broken Metal logits always picks token 0 (`!` on Qwen).
+/// Mask it so decode can continue; a bang-run still stops as EOS below.
+fn sampler_for_model(model: &LlamaModel) -> LlamaSampler {
+    let mut stages = Vec::with_capacity(2);
+    if let Ok(piece) = decode_token(model, LlamaToken(0)) {
+        if !piece.is_empty() && piece.chars().all(|c| c == '!') {
+            stages.push(LlamaSampler::logit_bias(
+                model.n_vocab(),
+                &[LlamaLogitBias::new(LlamaToken(0), -1.0e9)],
+            ));
+        }
+    }
+    stages.push(LlamaSampler::greedy());
+    LlamaSampler::chain_simple(stages)
 }
 
 pub(crate) fn backend() -> Result<&'static LlamaBackend> {
@@ -210,7 +228,9 @@ pub fn generate_with_callback(
                 .with_offload_kqv(config.offload_kqv);
             if should_disable_flash_attn(&config.pool) {
                 ctx_params = with_flash_attn_disabled(ctx_params);
-                tracing::info!("flash attention disabled (pre-Ampere GPU; llama.cpp FA abort()s)");
+                tracing::info!(
+                    "flash attention disabled (pre-Ampere CUDA abort, or Apple M5 Metal decode)"
+                );
             }
             super::progress::report("context", 0.0);
             let context_start = Instant::now();
@@ -296,10 +316,7 @@ pub fn generate_with_callback(
                 (prompt_token_count, n as i32, sample_idx)
             };
 
-            let mut sampler = LlamaSampler::chain_simple([
-                LlamaSampler::dist(0x5CA1A7CE),
-                LlamaSampler::greedy(),
-            ]);
+            let mut sampler = sampler_for_model(model);
 
             let mut content = String::new();
             let mut generated = 0u32;
@@ -324,7 +341,12 @@ pub fn generate_with_callback(
                     first_token = false;
                 }
                 if bump_vocab_zero_run(token, &piece, &mut vocab_zero_run) {
-                    anyhow::bail!("vocab_zero_collapse");
+                    warn!(
+                        generated,
+                        "stopping decode after vocab[0] bang run; returning text so far"
+                    );
+                    vocab_zero_pending.clear();
+                    break;
                 }
                 let decode_piece_start = Instant::now();
                 if vocab_zero_run > 0 {
@@ -792,10 +814,19 @@ pub(crate) fn should_attempt_tensor_parallel(pool: &VirtualCard, weight_gb: Opti
 
 /// llama.cpp CUDA Flash Attention abort()s on pre-Ampere (Turing GTX 16 / RTX 20,
 /// Pascal GTX 10, Tesla T4). The worker then dies with "closed stdout during invoke".
+///
+/// Apple M5 (MTLGPUFamilyApple10 / Metal 4) fails ggml tensor-shader compile and
+/// greedy-decodes Qwen vocab[0] (`!`) with FA enabled.
 fn should_disable_flash_attn(pool: &VirtualCard) -> bool {
     match pool.strategy {
         PoolStrategy::Single | PoolStrategy::TensorParallel => {}
-        PoolStrategy::Vulkan | PoolStrategy::Metal | PoolStrategy::CpuOnly => return false,
+        PoolStrategy::Metal => {
+            return pool
+                .devices
+                .iter()
+                .any(|d| metal_gpu_needs_flash_attn_disabled(&d.name));
+        }
+        PoolStrategy::Vulkan | PoolStrategy::CpuOnly => return false,
     }
     if let Some(cap) = crate::specs::live_cuda_compute_cap() {
         return cap < 80;
@@ -803,6 +834,13 @@ fn should_disable_flash_attn(pool: &VirtualCard) -> bool {
     pool.devices
         .iter()
         .any(|d| crate::specs::nvidia_name_is_pre_ampere(&d.name))
+}
+
+/// `Apple M5 Max` / `M5 Pro` — not `M1` / `M4`.
+fn metal_gpu_needs_flash_attn_disabled(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == "m5")
 }
 
 /// llama.h `LLAMA_FLASH_ATTN_TYPE_DISABLED = 0`.
@@ -1279,6 +1317,14 @@ mod tests {
         .unwrap();
         assert!(should_disable_flash_attn(&turing));
         assert!(!should_disable_flash_attn(&ampere));
+    }
+
+    #[test]
+    fn flash_attn_disabled_on_apple_m5_not_m1() {
+        assert!(metal_gpu_needs_flash_attn_disabled("Apple M5 Max"));
+        assert!(metal_gpu_needs_flash_attn_disabled("MTL0 (Apple M5)"));
+        assert!(!metal_gpu_needs_flash_attn_disabled("Apple M1 Max GPU"));
+        assert!(!metal_gpu_needs_flash_attn_disabled("Apple M4"));
     }
 
     #[test]
