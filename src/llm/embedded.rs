@@ -18,6 +18,7 @@ use llama_cpp_2::LogOptions;
 use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -166,10 +167,25 @@ pub(crate) fn decode_token(model: &LlamaModel, token: LlamaToken) -> Result<Stri
         .context("decode generated token")
 }
 
-/// Qwen vocab[0] is `!`. Metal/Vulkan/starved-offload faults emit it for the
-/// whole completion. Hold a short run so decode can stop like EOS instead of
-/// streaming a wall of bangs (and instead of failing the job, which one-strikes
-/// healthy Macs).
+/// Qwen vocab[0] is `!`. Broken GPU kernels (wrong Metal metallib, starved
+/// offload) emit it for the whole completion. The generate loop treats a
+/// trip as a failed placement tier so the cache can walk to the next one.
+pub(crate) const VOCAB_ZERO_COLLAPSE: &str = "vocab_zero_collapse";
+
+/// Set when Metal GPU layers produce garbage logits. Later loads on this
+/// worker skip GPU tiers — unified RAM still hosts the model on CPU.
+static METAL_GPU_DECODE_UNRELIABLE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn is_cpu_load_label(label: &str) -> bool {
+    matches!(label, "cpu-only" | "cpu-metal")
+}
+
+pub(crate) fn is_vocab_zero_collapse(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_ascii_lowercase()
+        .contains(VOCAB_ZERO_COLLAPSE)
+}
+
 pub(crate) fn bump_vocab_zero_run(token: LlamaToken, piece: &str, run: &mut u32) -> bool {
     let collapsed = token.0 == 0 || (!piece.is_empty() && piece.chars().all(|c| c == '!'));
     if collapsed {
@@ -228,9 +244,7 @@ pub fn generate_with_callback(
                 .with_offload_kqv(config.offload_kqv);
             if should_disable_flash_attn(&config.pool) {
                 ctx_params = with_flash_attn_disabled(ctx_params);
-                tracing::info!(
-                    "flash attention disabled (pre-Ampere CUDA abort, or Apple M5 Metal decode)"
-                );
+                tracing::info!("flash attention disabled (pre-Ampere CUDA abort)");
             }
             super::progress::report("context", 0.0);
             let context_start = Instant::now();
@@ -341,12 +355,16 @@ pub fn generate_with_callback(
                     first_token = false;
                 }
                 if bump_vocab_zero_run(token, &piece, &mut vocab_zero_run) {
+                    if matches!(config.pool.strategy, PoolStrategy::Metal) {
+                        METAL_GPU_DECODE_UNRELIABLE.store(true, Ordering::Relaxed);
+                    }
                     warn!(
                         generated,
-                        "stopping decode after vocab[0] bang run; returning text so far"
+                        "GPU decode collapsed to vocab[0]; failing this placement tier"
                     );
-                    vocab_zero_pending.clear();
-                    break;
+                    anyhow::bail!(
+                        "{VOCAB_ZERO_COLLAPSE}: repeated vocab[0] pieces; trying next placement tier"
+                    );
                 }
                 let decode_piece_start = Instant::now();
                 if vocab_zero_run > 0 {
@@ -603,10 +621,11 @@ fn prefault_gguf_pages(path: &Path) -> Result<u64> {
 ///
 /// Small / memory-constrained pools frequently OOM inside llama.cpp during load,
 /// which surfaces as a null model pointer. Rather than fail the job, retry with
-/// progressively less GPU offload. CPU-only is only for CpuOnly pools — a GPU
-/// slot must not silently run 0 layers and then hit the decode wall. Detailed
-/// failures are logged locally only; the caller must keep provider-specific
-/// detail (paths, device names) out of anything sent upstream.
+/// progressively less GPU offload. Discrete CUDA/Vulkan slots must not silently
+/// run 0 layers. Metal may end on `cpu-metal` because unified RAM can host the
+/// GGUF if GPU kernels decode garbage. Detailed failures are logged locally
+/// only; the caller must keep provider-specific detail (paths, device names)
+/// out of anything sent upstream.
 ///
 /// Returns `(model, candidate_index)` so the cache can skip already-failed tiers
 /// when context/KV allocation OOMs after a successful weight load.
@@ -634,7 +653,7 @@ pub(crate) fn load_model_for_pool_starting_at(
     let mut skip_gpu = false;
 
     for (idx, (label, params)) in candidates.into_iter().enumerate().skip(start_at) {
-        if skip_gpu && label != "cpu-only" {
+        if skip_gpu && !is_cpu_load_label(label) {
             continue;
         }
         super::progress::report("load", 0.0);
@@ -656,7 +675,7 @@ pub(crate) fn load_model_for_pool_starting_at(
                     wrapped = wrapped
                         .context("corrupted or incomplete GGUF (tensor payloads exceed file size)");
                 }
-                let gpu_oom = label != "cpu-only" && is_gpu_alloc_failure(&wrapped);
+                let gpu_oom = !is_cpu_load_label(label) && is_gpu_alloc_failure(&wrapped);
                 last_err = Some(wrapped);
                 if gpu_oom {
                     warn!("GPU load '{label}' hit VRAM/CUDA failure; skipping remaining GPU tiers");
@@ -814,19 +833,10 @@ pub(crate) fn should_attempt_tensor_parallel(pool: &VirtualCard, weight_gb: Opti
 
 /// llama.cpp CUDA Flash Attention abort()s on pre-Ampere (Turing GTX 16 / RTX 20,
 /// Pascal GTX 10, Tesla T4). The worker then dies with "closed stdout during invoke".
-///
-/// Apple M5 (MTLGPUFamilyApple10 / Metal 4) fails ggml tensor-shader compile and
-/// greedy-decodes Qwen vocab[0] (`!`) with FA enabled.
 fn should_disable_flash_attn(pool: &VirtualCard) -> bool {
     match pool.strategy {
         PoolStrategy::Single | PoolStrategy::TensorParallel => {}
-        PoolStrategy::Metal => {
-            return pool
-                .devices
-                .iter()
-                .any(|d| metal_gpu_needs_flash_attn_disabled(&d.name));
-        }
-        PoolStrategy::Vulkan | PoolStrategy::CpuOnly => return false,
+        PoolStrategy::Metal | PoolStrategy::Vulkan | PoolStrategy::CpuOnly => return false,
     }
     if let Some(cap) = crate::specs::live_cuda_compute_cap() {
         return cap < 80;
@@ -834,13 +844,6 @@ fn should_disable_flash_attn(pool: &VirtualCard) -> bool {
     pool.devices
         .iter()
         .any(|d| crate::specs::nvidia_name_is_pre_ampere(&d.name))
-}
-
-/// `Apple M5 Max` / `M5 Pro` — not `M1` / `M4`.
-fn metal_gpu_needs_flash_attn_disabled(name: &str) -> bool {
-    name.to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|part| part == "m5")
 }
 
 /// llama.h `LLAMA_FLASH_ATTN_TYPE_DISABLED = 0`.
@@ -977,6 +980,21 @@ fn load_param_candidates_with_plan(
         return Ok(candidates);
     }
 
+    if matches!(pool.strategy, PoolStrategy::Metal)
+        && METAL_GPU_DECODE_UNRELIABLE.load(Ordering::Relaxed)
+    {
+        info!(
+            "Metal GPU decode previously collapsed; loading n_gpu_layers=0 (unified memory)"
+        );
+        candidates.push((
+            "cpu-metal",
+            LlamaModelParams::default()
+                .with_use_mmap(true)
+                .with_n_gpu_layers(0),
+        ));
+        return Ok(candidates);
+    }
+
     let advertised = full_placement_vram_gb(pool);
     let available = live_placement_vram_gb(advertised);
 
@@ -1072,6 +1090,20 @@ fn load_param_candidates_with_plan(
         }
     }
 
+    // Apple Silicon unified memory can host the GGUF on CPU if GPU kernels
+    // decode garbage (or GPU tiers OOM). Discrete CUDA/Vulkan slots must not
+    // silently fall through to 0 layers.
+    if matches!(pool.strategy, PoolStrategy::Metal)
+        && !candidates.iter().any(|(label, _)| *label == "cpu-metal")
+    {
+        candidates.push((
+            "cpu-metal",
+            LlamaModelParams::default()
+                .with_use_mmap(true)
+                .with_n_gpu_layers(0),
+        ));
+    }
+
     if candidates.is_empty() {
         anyhow::bail!(
             "insufficient_vram: GPU slot has no placeable offload (live free VRAM too small)"
@@ -1084,7 +1116,9 @@ fn load_param_candidates_with_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compute_pool::{build_virtual_card, vulkan_runtime_supported};
+    use crate::compute_pool::{
+        build_virtual_card, offload_layer_budget, vulkan_runtime_supported, PoolDevice,
+    };
     use crate::specs::ComputeDevice;
 
     #[test]
@@ -1098,6 +1132,11 @@ mod tests {
         assert!(!bump_vocab_zero_run(LlamaToken(0), "!", &mut run));
         assert!(!bump_vocab_zero_run(LlamaToken(42), "Hi", &mut run));
         assert_eq!(run, 0);
+        assert!(is_cpu_load_label("cpu-metal"));
+        assert!(is_cpu_load_label("cpu-only"));
+        assert!(!is_cpu_load_label("gpu-full"));
+        assert!(is_vocab_zero_collapse(&anyhow!("{VOCAB_ZERO_COLLAPSE}: repeated")));
+        assert!(!is_vocab_zero_collapse(&anyhow!("out of memory")));
     }
 
     fn gpu_and_cpu(vram_gb: u32) -> VirtualCard {
@@ -1319,12 +1358,38 @@ mod tests {
         assert!(!should_disable_flash_attn(&ampere));
     }
 
+    fn metal_card(name: &str, vram_gb: u32) -> VirtualCard {
+        VirtualCard {
+            devices: vec![PoolDevice {
+                id: "metal:0".into(),
+                kind: "metal".into(),
+                name: name.into(),
+                vram_gb,
+                cuda_index: None,
+            }],
+            strategy: PoolStrategy::Metal,
+            display_name: name.into(),
+            total_vram_gb: vram_gb,
+            tensor_split: vec![],
+            cuda_device_ids: vec![],
+            uses_vulkan: false,
+            gpu_layer_budget: offload_layer_budget(vram_gb),
+        }
+    }
+
     #[test]
-    fn flash_attn_disabled_on_apple_m5_not_m1() {
-        assert!(metal_gpu_needs_flash_attn_disabled("Apple M5 Max"));
-        assert!(metal_gpu_needs_flash_attn_disabled("MTL0 (Apple M5)"));
-        assert!(!metal_gpu_needs_flash_attn_disabled("Apple M1 Max GPU"));
-        assert!(!metal_gpu_needs_flash_attn_disabled("Apple M4"));
+    fn metal_pool_keeps_gpu_cascade_and_ends_with_cpu() {
+        let pool = metal_card("Apple M4", 16);
+        assert!(!should_disable_flash_attn(&pool));
+        assert_eq!(
+            cascade_labels(&pool, Some(4.0)),
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-metal"]
+        );
+        let big = metal_card("Apple M1 Max GPU", 64);
+        assert_eq!(
+            cascade_labels(&big, Some(16.0)),
+            vec!["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-metal"]
+        );
     }
 
     #[test]

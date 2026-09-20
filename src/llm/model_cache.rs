@@ -9,6 +9,9 @@
 //! context/KV alloc OOMs *and returns an error*, we walk:
 //!   [gpu-full if it fits] → gpu-offload → gpu-offload-reduced
 //!
+//! Metal adds `cpu-metal` as a last tier: unified RAM can host the GGUF if GPU
+//! kernels decode garbage. Discrete CUDA/Vulkan slots do not get that floor.
+//!
 //! CPU-only is a CpuOnly-pool load, not a GPU-slot floor. `gpu-full` is skipped
 //! when on-disk weights + headroom exceed available VRAM — llama.cpp CUDA often
 //! abort()s on OOM (kills the agent) instead of returning Err.
@@ -25,9 +28,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::embedded::{
-    backend, estimated_n_layer, gguf_weight_gb, load_candidate_label, load_candidate_labels,
-    load_cpu_mmap_model, load_model_for_pool, load_model_for_pool_starting_at,
-    offload_layers_for_available,
+    backend, estimated_n_layer, gguf_weight_gb, is_cpu_load_label, is_vocab_zero_collapse,
+    load_candidate_label, load_candidate_labels, load_cpu_mmap_model, load_model_for_pool,
+    load_model_for_pool_starting_at, offload_layers_for_available,
 };
 use super::vision::init_mtmd_for_model;
 
@@ -552,6 +555,35 @@ pub fn with_loaded_weights<R>(
 
         match out {
             Ok(result) => return Ok((result, model_load_ms)),
+            Err(err) if is_vocab_zero_collapse(&err) => {
+                oom_hops += 1;
+                let failed = labels.get(load_tier).copied().unwrap_or("gpu-full");
+                warn!(
+                    failed_tier = failed,
+                    hop = oom_hops,
+                    error = %err,
+                    "GPU decode collapsed; dropping resident and skipping remaining GPU tiers"
+                );
+                guard.gpu.clear();
+                if oom_hops > 4 {
+                    return Err(err);
+                }
+                let new_labels = load_candidate_labels(pool, model_path)?;
+                let start = next_cpu_cascade_index(&new_labels);
+                if start >= new_labels.len() {
+                    return Err(err);
+                }
+                let label = new_labels.get(start).copied().unwrap_or("next");
+                warn!("GPU decode collapsed; reloading via '{label}'");
+                let (ms, new_tier) =
+                    ensure_loaded(&mut guard, backend, model_path, pool, &key, start)?;
+                model_load_ms = model_load_ms.saturating_add(ms);
+                load_tier = new_tier;
+                labels = new_labels;
+                if need_vision {
+                    ensure_mtmd(&mut guard, model_path, pool, &key)?;
+                }
+            }
             Err(err) if is_vram_pressure(&err) => {
                 oom_hops += 1;
                 let failed = labels.get(load_tier).copied().unwrap_or("gpu-full");
@@ -648,6 +680,15 @@ pub(crate) fn next_cascade_index(new_labels: &[&str], failed: &str) -> usize {
         .unwrap_or(new_labels.len())
 }
 
+/// After GPU kernels produce garbage logits, skip remaining GPU tiers.
+/// Discrete CUDA/Vulkan lists have no CPU label → exhausted (job fails).
+pub(crate) fn next_cpu_cascade_index(labels: &[&str]) -> usize {
+    labels
+        .iter()
+        .position(|l| is_cpu_load_label(l))
+        .unwrap_or(labels.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +746,13 @@ mod tests {
         let tight = ["gpu-offload", "gpu-offload-reduced"];
         assert_eq!(next_cascade_index(&tight, "gpu-offload"), 1);
         assert_eq!(next_cascade_index(&tight, "gpu-offload-reduced"), 2);
+    }
+
+    #[test]
+    fn decode_collapse_jumps_to_cpu_metal_not_more_gpu() {
+        let metal = ["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-metal"];
+        assert_eq!(next_cpu_cascade_index(&metal), 3);
+        let cuda = ["gpu-full", "gpu-offload", "gpu-offload-reduced"];
+        assert_eq!(next_cpu_cascade_index(&cuda), 3);
     }
 }

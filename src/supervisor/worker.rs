@@ -1,5 +1,5 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
-use crate::compute_pool::apply_slot_backend_visibility;
+use crate::compute_pool::{apply_slot_backend_visibility, PoolStrategy};
 use crate::llm::{evict_all, generate_with_callback, init_backend, preload_model, GenerateConfig};
 use crate::models::{list_cached_runtime_models, resolve_model_gguf};
 use crate::protocol::InvokeTimings;
@@ -15,6 +15,12 @@ pub fn run_worker(config_json: &str) -> Result<()> {
     let boot: WorkerBootConfig =
         serde_json::from_str(config_json).context("parse worker boot config")?;
     apply_slot_backend_visibility(boot.card.strategy, &boot.cuda_visible);
+    if matches!(boot.card.strategy, PoolStrategy::Metal) {
+        // llama.cpp Metal 4 tensor kernels are still experimental: a failed
+        // compile + embedded metallib mismatch yields inf MUL_MAT. Disable the
+        // tensor fast-path on every Metal worker, not a single chip name.
+        std::env::set_var("GGML_METAL_TENSOR_DISABLE", "1");
+    }
     info!(
         slot = %boot.slot_id,
         strategy = ?boot.card.strategy,
