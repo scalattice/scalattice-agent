@@ -108,7 +108,7 @@ pub fn split_upper(config: &SplitUpperConfig) -> Result<GenerateOutput> {
             anyhow::bail!("split upper segment received empty restored context");
         }
 
-        let max_tokens = config.max_tokens.max(1).min(8192);
+        let max_tokens = config.max_tokens.max(1).min(crate::protocol::ABSOLUTE_MAX_COMPLETION_TOKENS);
         let last = *restored
             .last()
             .context("restored context missing last token")?;

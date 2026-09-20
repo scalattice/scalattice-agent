@@ -3,6 +3,9 @@ use crate::specs::MachineSpecs;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+/// Software ceiling for max_tokens. Live generate is still prompt + completion ≤ n_ctx.
+pub const ABSOLUTE_MAX_COMPLETION_TOKENS: u32 = 131_072;
+
 fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,

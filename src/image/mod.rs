@@ -391,6 +391,60 @@ pub fn image_install_ready(model: &CatalogModel) -> bool {
     image_runtime_ready() && hf_snapshot_ready(repo)
 }
 
+fn image_repo_on_disk(repo: &str) -> bool {
+    let dir = hub_repo_dir(repo);
+    dir.is_dir()
+}
+
+/// Keep CPython + Diffusers venv while any other image SKU is still enabled
+/// or still has a Hub snapshot on disk (including a partial install).
+pub fn keep_image_runtime(
+    catalog: &[CatalogModel],
+    skip_model_ids: &[String],
+    mut is_enabled: impl FnMut(&str) -> bool,
+) -> bool {
+    catalog.iter().any(|model| {
+        if !model.is_image_job() {
+            return false;
+        }
+        if skip_model_ids.iter().any(|id| id == &model.model_id) {
+            return false;
+        }
+        if is_enabled(&model.model_id) {
+            return true;
+        }
+        image_repo(model).is_some_and(image_repo_on_disk)
+    })
+}
+
+/// Keep this Hub snapshot when another remaining image SKU still uses the repo.
+pub fn keep_image_repo(
+    catalog: &[CatalogModel],
+    repo: &str,
+    skip_model_ids: &[String],
+    mut is_enabled: impl FnMut(&str) -> bool,
+) -> bool {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return false;
+    }
+    catalog.iter().any(|model| {
+        if !model.is_image_job() {
+            return false;
+        }
+        if skip_model_ids.iter().any(|id| id == &model.model_id) {
+            return false;
+        }
+        let Some(other) = image_repo(model) else {
+            return false;
+        };
+        if !other.eq_ignore_ascii_case(repo) {
+            return false;
+        }
+        is_enabled(&model.model_id) || image_repo_on_disk(other)
+    })
+}
+
 fn ensure_worker_script(venv_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(venv_dir).map_err(|err| map_image_io_error(err, venv_dir))?;
     let dest = venv_dir.join("worker.py");
@@ -686,6 +740,11 @@ async fn run_image_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Own process group so pip / huggingface_hub children die with the worker.
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
     apply_isolated_python_env_tokio(&mut cmd);
     cmd.env_remove("CUDA_VISIBLE_DEVICES");
     cmd.env_remove("HIP_VISIBLE_DEVICES");
@@ -745,11 +804,11 @@ async fn run_image_worker(
 
     loop {
         if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            let _ = child.kill().await;
+            kill_image_child(&mut child).await;
             bail!("request_canceled");
         }
         if started.elapsed() >= IMAGE_WALL_CLOCK {
-            let _ = child.kill().await;
+            kill_image_child(&mut child).await;
             bail!("invoke_timeout: image job exceeded wall-clock limit");
         }
         let silence_left = IMAGE_SILENCE
@@ -759,6 +818,12 @@ async fn run_image_worker(
             .checked_sub(started.elapsed())
             .unwrap_or(Duration::from_millis(1));
         let wait = silence_left.min(wall_left).max(Duration::from_millis(50));
+        // Setup cancel is an AtomicBool; poll it instead of waiting on silence.
+        let wait = if cancel_flag.is_some() {
+            wait.min(Duration::from_millis(250))
+        } else {
+            wait
+        };
         tokio::select! {
             biased;
             _ = async {
@@ -768,7 +833,7 @@ async fn run_image_worker(
                     std::future::pending::<()>().await;
                 }
             } => {
-                let _ = child.kill().await;
+                kill_image_child(&mut child).await;
                 bail!("request_canceled");
             }
             n = reader.read_line(&mut buf) => {
@@ -803,7 +868,7 @@ async fn run_image_worker(
                         images = Some(parsed.images);
                     }
                     "error" => {
-                        let _ = child.kill().await;
+                        kill_image_child(&mut child).await;
                         let code = if parsed.error.is_empty() {
                             "inference_failed".to_string()
                         } else {
@@ -818,8 +883,12 @@ async fn run_image_worker(
                 }
             }
             _ = tokio::time::sleep(wait) => {
+                if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
+                    kill_image_child(&mut child).await;
+                    bail!("request_canceled");
+                }
                 if last_progress.elapsed() >= IMAGE_SILENCE {
-                    let _ = child.kill().await;
+                    kill_image_child(&mut child).await;
                     bail!("agent invoke timeout");
                 }
             }
@@ -863,6 +932,28 @@ fn image_worker_oom_killed(status: &std::process::ExitStatus) -> bool {
     }
 }
 
+async fn kill_image_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // Negative pid = process group we created with process_group(0).
+            let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(pid) = child.id() {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+    }
+    let _ = child.start_kill();
+}
+
 /// Install isolated CPython, Diffusers venv, and the HF snapshot for this SKU.
 pub async fn install_image_model(
     model: &CatalogModel,
@@ -876,6 +967,9 @@ pub async fn install_image_model(
     let repo = image_repo(model).context(
         "image_runtime_missing: catalog image models need a Hugging Face Diffusers repo",
     )?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("request_canceled");
+    }
     if image_install_ready(model) {
         return Ok(());
     }
@@ -890,7 +984,10 @@ pub async fn install_image_model(
             "image runtime setup"
         );
     };
-    let python = python::ensure_image_python(&mut on_progress).await?;
+    let python = python::ensure_image_python(&mut on_progress, Some(cancel)).await?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("request_canceled");
+    }
     let cache_dir = hf_hub_cache_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
     let revision = model
@@ -956,8 +1053,8 @@ pub fn teardown_image_runtime() {
     }
 }
 
-pub fn maybe_teardown_image_runtime(any_enabled_image: bool) {
-    if any_enabled_image {
+pub fn maybe_teardown_image_runtime(keep_runtime: bool) {
+    if keep_runtime {
         return;
     }
     if !python::portable_python_ready()
@@ -965,7 +1062,7 @@ pub fn maybe_teardown_image_runtime(any_enabled_image: bool) {
     {
         return;
     }
-    info!("no image models remain enabled; removing isolated Diffusers runtime");
+    info!("no image models remain installed; removing isolated Diffusers runtime");
     teardown_image_runtime();
 }
 
@@ -999,6 +1096,30 @@ pub fn stage_purge_image_snapshot(repo: &str) -> Option<PathBuf> {
     }
 }
 
+/// Best-effort cleanup of leftover Hub `.purging-*` dirs from a previous run.
+pub fn sweep_staged_image_purge_dirs() {
+    let Ok(entries) = std::fs::read_dir(hf_hub_cache_dir()) else {
+        return;
+    };
+    let mut trash = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.starts_with(".purging-") {
+            trash.push(path);
+        }
+    }
+    if !trash.is_empty() {
+        crate::models::spawn_delete_staged_dirs(trash);
+    }
+}
+
 pub async fn run_qwen_image(
     job: &ImageJob,
     cuda_visible: &[u32],
@@ -1009,7 +1130,7 @@ pub async fn run_qwen_image(
     refuse_if_disk_full()?;
     let venv_dir = diffusers_venv_dir(device);
     let script = ensure_worker_script(&venv_dir)?;
-    let python = python::ensure_image_python(&mut on_progress).await?;
+    let python = python::ensure_image_python(&mut on_progress, None).await?;
     let cache_dir = hf_hub_cache_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
 
@@ -1094,6 +1215,24 @@ fn image_stub_enabled() -> bool {
 mod tests {
     use super::*;
     use crate::compute_pool::{PoolDevice, VirtualCard};
+    use crate::protocol::{CatalogModel, ModelWeights};
+
+    fn image_sku(id: &str, repo: &str) -> CatalogModel {
+        CatalogModel {
+            model_id: id.into(),
+            job_kind: "image".into(),
+            weights: Some(ModelWeights {
+                source: "huggingface".into(),
+                repo: repo.into(),
+                filename: String::new(),
+                companion_filenames: vec![],
+                revision: "main".into(),
+                download_via: None,
+                mirror_url: None,
+            }),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn worker_script_embeds() {
@@ -1271,6 +1410,66 @@ mod tests {
             Some(v) => std::env::set_var("SCALATTICE_RUNTIMES_DIR", v),
             None => std::env::remove_var("SCALATTICE_RUNTIMES_DIR"),
         }
+    }
+
+    #[test]
+    fn keep_runtime_while_another_image_sku_is_enabled() {
+        let catalog = vec![
+            image_sku("img-a", "org/a"),
+            image_sku("img-b", "org/b"),
+        ];
+        let skip = vec!["img-a".to_string()];
+        assert!(keep_image_runtime(&catalog, &skip, |id| id == "img-b"));
+        assert!(!keep_image_runtime(&catalog, &skip, |_| false));
+    }
+
+    #[test]
+    fn keep_runtime_while_another_image_snapshot_is_on_disk() {
+        let models = std::env::temp_dir().join(format!(
+            "scalattice-image-keep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&models);
+        let prev = std::env::var("SCALATTICE_MODELS_DIR").ok();
+        std::env::set_var("SCALATTICE_MODELS_DIR", &models);
+        let repo = "org/kept-image";
+        std::fs::create_dir_all(hub_repo_dir(repo)).unwrap();
+        let catalog = vec![
+            image_sku("img-a", "org/purged-image"),
+            image_sku("img-b", repo),
+        ];
+        let skip = vec!["img-a".to_string()];
+        assert!(keep_image_runtime(&catalog, &skip, |_| false));
+        assert!(keep_image_repo(&catalog, repo, &skip, |_| false));
+        assert!(!keep_image_repo(
+            &catalog,
+            "org/purged-image",
+            &skip,
+            |_| false
+        ));
+        let _ = std::fs::remove_dir_all(&models);
+        match prev {
+            Some(v) => std::env::set_var("SCALATTICE_MODELS_DIR", v),
+            None => std::env::remove_var("SCALATTICE_MODELS_DIR"),
+        }
+    }
+
+    #[test]
+    fn last_image_sku_does_not_keep_runtime_or_repo() {
+        let catalog = vec![image_sku("img-a", "org/a")];
+        let skip = vec!["img-a".to_string()];
+        assert!(!keep_image_runtime(&catalog, &skip, |_| false));
+        assert!(!keep_image_repo(&catalog, "org/a", &skip, |_| false));
+    }
+
+    #[test]
+    fn shared_repo_is_kept_for_sibling_image_sku() {
+        let catalog = vec![
+            image_sku("img-a", "org/shared"),
+            image_sku("img-b", "org/shared"),
+        ];
+        let skip = vec!["img-a".to_string()];
+        assert!(keep_image_repo(&catalog, "org/shared", &skip, |id| id == "img-b"));
     }
 
     #[test]
