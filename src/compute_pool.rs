@@ -15,7 +15,8 @@ pub struct PoolDevice {
 
 /// How the pool prefers to run when accelerators allow a full fit.
 ///
-/// Partial GPU↔CPU offload is a cascade fallback (see `load_param_candidates`).
+/// Partial GPU layer offload is a cascade fallback (see `load_param_candidates`).
+/// CPU-only is its own pool, not a silent floor on a GPU slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolStrategy {
     /// One NVIDIA CUDA device; try all layers on GPU first.
@@ -516,39 +517,52 @@ pub fn build_tp_card_for_group(
     ))
 }
 
+/// NVIDIA CUDA treats this as "no GPUs". Empty string still enumerates devices
+/// on Windows (`ggml_cuda_init` sees the display GPU).
+const CUDA_VISIBLE_NONE: &str = "-1";
+
+pub(crate) fn cuda_visible_devices_for_slot(
+    strategy: PoolStrategy,
+    cuda_visible: &[u32],
+) -> String {
+    match strategy {
+        PoolStrategy::Vulkan | PoolStrategy::CpuOnly => CUDA_VISIBLE_NONE.to_string(),
+        PoolStrategy::Metal => String::new(),
+        PoolStrategy::Single | PoolStrategy::TensorParallel => {
+            if cuda_visible.is_empty() {
+                String::new()
+            } else {
+                cuda_visible
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        }
+    }
+}
+
 /// Apply CUDA_VISIBLE_DEVICES / GGML_VK_VISIBLE_DEVICES for a worker before llama init.
 ///
 /// CpuOnly workers must hide **both** CUDA and Vulkan. Hiding only CUDA still lets
 /// ggml-vulkan see NVIDIA devices and allocate VRAM: under concurrent CUDA offload
 /// that OOMs (`ErrorOutOfDeviceMemory`) and damages the machine.
 pub fn apply_slot_backend_visibility(strategy: PoolStrategy, cuda_visible: &[u32]) {
+    std::env::set_var(
+        "CUDA_VISIBLE_DEVICES",
+        cuda_visible_devices_for_slot(strategy, cuda_visible),
+    );
     match strategy {
         PoolStrategy::Vulkan => {
             // Vulkan slot: no CUDA; leave VK devices visible for ggml.
-            std::env::set_var("CUDA_VISIBLE_DEVICES", "");
             std::env::remove_var("GGML_VK_VISIBLE_DEVICES");
         }
-        PoolStrategy::Metal => {
-            std::env::set_var("CUDA_VISIBLE_DEVICES", "");
-            std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
-        }
-        PoolStrategy::CpuOnly => {
-            std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+        PoolStrategy::Metal | PoolStrategy::CpuOnly => {
             // Empty = no Vulkan devices (same convention as CUDA_VISIBLE_DEVICES).
             std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
         }
         PoolStrategy::Single | PoolStrategy::TensorParallel => {
             pin_cuda_indices_to_pci_bus();
-            if cuda_visible.is_empty() {
-                std::env::set_var("CUDA_VISIBLE_DEVICES", "");
-            } else {
-                let joined = cuda_visible
-                    .iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                std::env::set_var("CUDA_VISIBLE_DEVICES", joined);
-            }
             // CUDA workers must not also bind Vulkan (dual-backend VRAM fights).
             std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
         }
@@ -1284,14 +1298,39 @@ mod tests {
 
     #[test]
     fn cuda_slot_visibility_uses_pci_bus_order() {
-        apply_slot_backend_visibility(PoolStrategy::Single, &[1]);
+        assert_eq!(
+            cuda_visible_devices_for_slot(PoolStrategy::Single, &[1]),
+            "1"
+        );
+        assert_eq!(
+            cuda_visible_devices_for_slot(PoolStrategy::TensorParallel, &[0, 1]),
+            "0,1"
+        );
+        let prev_order = std::env::var("CUDA_DEVICE_ORDER").ok();
+        pin_cuda_indices_to_pci_bus();
         assert_eq!(
             std::env::var("CUDA_DEVICE_ORDER").ok().as_deref(),
             Some("PCI_BUS_ID")
         );
+        match prev_order {
+            Some(v) => std::env::set_var("CUDA_DEVICE_ORDER", v),
+            None => std::env::remove_var("CUDA_DEVICE_ORDER"),
+        }
+    }
+
+    #[test]
+    fn vulkan_and_cpu_hide_cuda_with_minus_one() {
         assert_eq!(
-            std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(),
-            Some("1")
+            cuda_visible_devices_for_slot(PoolStrategy::Vulkan, &[]),
+            "-1"
+        );
+        assert_eq!(
+            cuda_visible_devices_for_slot(PoolStrategy::CpuOnly, &[]),
+            "-1"
+        );
+        assert_eq!(
+            cuda_visible_devices_for_slot(PoolStrategy::Metal, &[]),
+            ""
         );
     }
 }

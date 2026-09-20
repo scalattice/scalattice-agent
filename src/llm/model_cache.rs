@@ -7,10 +7,11 @@
 //!
 //! Every CUDA / Vulkan pool tries the safest placement first. If weight load or
 //! context/KV alloc OOMs *and returns an error*, we walk:
-//!   [gpu-full if it fits] → gpu-offload → gpu-offload-reduced → cpu-only
+//!   [gpu-full if it fits] → gpu-offload → gpu-offload-reduced
 //!
-//! `gpu-full` is skipped when on-disk weights + headroom exceed available VRAM  - 
-//! llama.cpp CUDA often abort()s on OOM (kills the agent) instead of returning Err.
+//! CPU-only is a CpuOnly-pool load, not a GPU-slot floor. `gpu-full` is skipped
+//! when on-disk weights + headroom exceed available VRAM — llama.cpp CUDA often
+//! abort()s on OOM (kills the agent) instead of returning Err.
 
 use crate::compute_pool::VirtualCard;
 use crate::specs::{detect_ram_gb, detect_ram_used_gb};
@@ -694,16 +695,15 @@ mod tests {
 
     #[test]
     fn cascade_retries_gpu_full_after_offload_oom_once_vram_recovers() {
-        let recovered = ["gpu-full", "gpu-offload", "gpu-offload-reduced", "cpu-only"];
+        let recovered = ["gpu-full", "gpu-offload", "gpu-offload-reduced"];
         assert_eq!(next_cascade_index(&recovered, "gpu-offload"), 0);
         assert_eq!(next_cascade_index(&recovered, "gpu-full"), 1);
     }
 
     #[test]
     fn cascade_advances_when_live_vram_still_tight() {
-        let tight = ["gpu-offload", "gpu-offload-reduced", "cpu-only"];
+        let tight = ["gpu-offload", "gpu-offload-reduced"];
         assert_eq!(next_cascade_index(&tight, "gpu-offload"), 1);
         assert_eq!(next_cascade_index(&tight, "gpu-offload-reduced"), 2);
-        assert_eq!(next_cascade_index(&tight, "cpu-only"), 3);
     }
 }
