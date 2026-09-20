@@ -223,7 +223,7 @@ fn run_invoke(
                 model_path,
                 pool: boot.card.clone(),
                 messages,
-                max_tokens: max_tokens.max(1).min(8192),
+                max_tokens: max_tokens.max(1).min(crate::protocol::ABSOLUTE_MAX_COMPLETION_TOKENS),
                 model_id: model_id.to_string(),
                 n_ctx,
                 offload_kqv,

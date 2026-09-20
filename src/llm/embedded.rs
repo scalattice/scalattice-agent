@@ -238,7 +238,8 @@ pub fn generate_with_callback(
                     &config.thinking,
                 ),
             )?;
-            let max_tokens = config.max_tokens.max(1).min(8192) as usize;
+            let max_tokens = config.max_tokens.max(1).min(crate::protocol::ABSOLUTE_MAX_COMPLETION_TOKENS)
+                as usize;
 
             let (prompt_token_count, mut position, mut sample_idx) = if need_vision {
                 let mtmd = mtmd.ok_or_else(|| {

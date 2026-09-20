@@ -220,7 +220,11 @@ impl SessionState {
     }
 
     fn apply_max_completion_tokens(&mut self, raw: u32) {
-        let next = if raw == 0 { 1024 } else { raw.clamp(16, 8192) };
+        let next = if raw == 0 {
+            1024
+        } else {
+            raw.clamp(16, crate::protocol::ABSOLUTE_MAX_COMPLETION_TOKENS)
+        };
         if self.max_completion_tokens != next {
             info!(
                 max_completion_tokens = next,
@@ -232,7 +236,8 @@ impl SessionState {
 
     fn effective_max_tokens(&self, requested: u32) -> u32 {
         let req = if requested == 0 { 1024 } else { requested };
-        req.min(self.max_completion_tokens).clamp(1, 8192)
+        req.min(self.max_completion_tokens)
+            .clamp(1, crate::protocol::ABSOLUTE_MAX_COMPLETION_TOKENS)
     }
 
     fn apply_schedule(&mut self, schedule: AgentSchedule) -> ScheduleTransition {
@@ -393,8 +398,28 @@ impl SessionState {
     fn cancel_active_downloads(&mut self) {
         self.download_cancel.store(true, Ordering::Relaxed);
         self.download_cancel = Arc::new(AtomicBool::new(false));
-        self.sync_in_flight.store(false, Ordering::Relaxed);
+        // Leave sync_in_flight set until the catalog-sync task actually exits
+        // so a later sync_model_weights cannot start a second install on top
+        // of CPython / pip / huggingface_hub children that are still dying.
         state::set_downloading_model(None);
+    }
+
+    fn cancel_installs_for_purge(&mut self, model_ids: &[String]) -> bool {
+        if model_ids.is_empty() || !self.sync_in_flight.load(Ordering::Relaxed) {
+            return false;
+        }
+        let downloading = crate::state::downloading_model();
+        let should_stop = model_ids.iter().any(|id| {
+            downloading.as_deref() == Some(id.as_str())
+                || self.catalog.iter().any(|model| {
+                    &model.model_id == id && !self.catalog_ready_on_disk(model)
+                })
+        });
+        if !should_stop {
+            return false;
+        }
+        self.cancel_active_downloads();
+        true
     }
 
     fn prune_disabled_model_weights(&self) {
@@ -411,23 +436,23 @@ impl SessionState {
         }
     }
 
-    fn apply_model_policy(&mut self, models: &[ModelPolicyEntry]) {
+    fn apply_model_policy(&mut self, models: &[ModelPolicyEntry]) -> bool {
         if models.is_empty() {
-            return;
+            return false;
         }
         let next: Vec<(String, bool)> = models
             .iter()
             .map(|model| (model.model_id.clone(), model.enabled))
             .collect();
         if self.model_policy == next {
-            return;
+            return false;
         }
 
         self.model_policy = next;
         self.logged_download_blockers = false;
         self.prune_disabled_model_weights();
-        self.sync_image_runtime_presence();
 
+        let mut cancelled = false;
         if let Some(downloading) = crate::state::downloading_model() {
             let still_enabled = self
                 .model_policy
@@ -435,8 +460,13 @@ impl SessionState {
                 .any(|(id, enabled)| id == &downloading && *enabled);
             if !still_enabled {
                 self.cancel_active_downloads();
+                cancelled = true;
             }
         }
+        if !self.sync_in_flight.load(Ordering::Relaxed) {
+            self.sync_image_runtime_presence();
+        }
+        cancelled
     }
 
     /// Replace the in-memory catalog from a live policy/catalog push (no reconnect).
@@ -457,7 +487,9 @@ impl SessionState {
         self.logged_download_blockers = false;
         self.last_sync_token = None;
         self.prune_disabled_model_weights();
-        self.sync_image_runtime_presence();
+        if !self.sync_in_flight.load(Ordering::Relaxed) {
+            self.sync_image_runtime_presence();
+        }
         if !same_ids {
             info!(
                 catalog_models = self.catalog.len(),
@@ -602,11 +634,6 @@ impl SessionState {
         if model_ids.is_empty() {
             return Vec::new();
         }
-        if let Some(downloading) = crate::state::downloading_model() {
-            if model_ids.iter().any(|id| id == &downloading) {
-                self.cancel_active_downloads();
-            }
-        }
         let mut trash = Vec::new();
         for model_id in model_ids {
             let runtime_model = self.runtime_for_model_id(model_id);
@@ -614,7 +641,18 @@ impl SessionState {
             if let Some(model) = self.catalog.iter().find(|m| m.model_id == *model_id) {
                 if model.is_image_job() {
                     if let Some(repo) = crate::image::image_repo(model) {
-                        if let Some(path) = crate::image::stage_purge_image_snapshot(repo) {
+                        if crate::image::keep_image_repo(
+                            &self.catalog,
+                            repo,
+                            model_ids,
+                            |id| self.is_model_enabled(id),
+                        ) {
+                            info!(
+                                repo,
+                                model_id,
+                                "keeping Diffusers snapshot; another image SKU still uses it"
+                            );
+                        } else if let Some(path) = crate::image::stage_purge_image_snapshot(repo) {
                             staged.push(path);
                         }
                     }
@@ -629,7 +667,7 @@ impl SessionState {
             info!("purging model weights for {model_id} ({runtime_model})");
             trash.append(&mut staged);
         }
-        self.sync_image_runtime_presence();
+        self.sync_image_runtime_presence_except(model_ids);
         trash
     }
 
@@ -645,16 +683,21 @@ impl SessionState {
     }
 
     fn sync_image_runtime_presence(&self) {
+        self.sync_image_runtime_presence_except(&[]);
+    }
+
+    fn sync_image_runtime_presence_except(&self, skip_model_ids: &[String]) {
         // Empty catalog means policy/catalog has not landed yet (reconnect). Do
         // not tear down CPython/venv just because we have not applied SKUs.
         if self.catalog.is_empty() {
             return;
         }
-        let any_enabled_image = self
-            .catalog
-            .iter()
-            .any(|model| model.is_image_job() && self.is_model_enabled(&model.model_id));
-        crate::image::maybe_teardown_image_runtime(any_enabled_image);
+        let keep = crate::image::keep_image_runtime(
+            &self.catalog,
+            skip_model_ids,
+            |id| self.is_model_enabled(id),
+        );
+        crate::image::maybe_teardown_image_runtime(keep);
     }
 
     fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
@@ -952,12 +995,25 @@ const ALREADY_CONNECTED_DELAY: Duration = Duration::from_secs(8);
 /// If the async loop stops ticking this long, exit so systemd / the Windows
 /// tray watchdog can spawn a fresh process (native DNS can ignore cancellation).
 const EVENT_LOOP_WEDGE_AFTER: Duration = Duration::from_secs(180);
+const CATALOG_SYNC_CANCEL_WAIT: Duration = Duration::from_secs(90);
+
+async fn wait_for_catalog_sync_idle(flag: &AtomicBool) {
+    let deadline = Instant::now() + CATALOG_SYNC_CANCEL_WAIT;
+    while flag.load(Ordering::Relaxed) {
+        if Instant::now() >= deadline {
+            warn!("timed out waiting for catalog install to stop after cancel");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     // Supervisor never touches CUDA: per-slot workers set CUDA_VISIBLE_DEVICES themselves.
     let specs = detect_machine_specs();
     info!("{}", crate::specs::status_line(&specs));
     sweep_staged_purge_dirs();
+    crate::image::sweep_staged_image_purge_dirs();
 
     let supervisor = match Supervisor::start(&specs.compute_devices).await {
         Ok(supervisor) => supervisor,
@@ -1655,7 +1711,8 @@ async fn handle_server_message(
                             0
                         }
                     };
-                    {
+                    let hf_token = ready.hugging_face_token.clone();
+                    let cancelled_install = {
                         let mut guard = state.lock().await;
                         guard.node_id = Some(ready.node_id.clone());
                         guard.apply_compute_devices(&ready.compute_devices);
@@ -1665,7 +1722,7 @@ async fn handle_server_message(
                         // image SKUs in catalog. An empty catalog on reconnect
                         // used to delete CPython/venv and then re-download them.
                         guard.catalog = ready.catalog.clone();
-                        guard.apply_model_policy(&ready.enabled_models);
+                        let cancelled = guard.apply_model_policy(&ready.enabled_models);
                         guard.warm_runtime_model = ready
                             .warm_runtime_model
                             .as_deref()
@@ -1674,7 +1731,20 @@ async fn handle_server_message(
                             .map(|s| s.to_string());
                         guard.last_sync_token = None;
                         guard.apply_schedule(ready.schedule.clone());
-                        guard.sync_model_weights(ready.hugging_face_token.clone(), &config.token);
+                        let wait_flag = if cancelled {
+                            Some(guard.sync_in_flight.clone())
+                        } else {
+                            None
+                        };
+                        wait_flag
+                    };
+                    if let Some(flag) = cancelled_install {
+                        wait_for_catalog_sync_idle(&flag).await;
+                    }
+                    {
+                        let mut guard = state.lock().await;
+                        guard.sync_image_runtime_presence();
+                        guard.sync_model_weights(hf_token, &config.token);
                         guard.persist_local_state();
                     }
                     // Register immediately so the session stays alive; restart workers
@@ -1794,15 +1864,17 @@ async fn handle_server_message(
                     if let Ok(pong) = parse_pong(data) {
                         let purge_requested = !pong.purge_models.is_empty();
                         let catalog_updated = pong.catalog.is_some();
-                        let (transition, trash) = {
+                        let hf_token = pong.hugging_face_token.clone();
+                        let (transition, wait_sync) = {
                             let mut guard = state.lock().await;
                             guard.apply_compute_devices(&pong.compute_devices);
                             if let Some(catalog) = pong.catalog.clone() {
                                 guard.apply_catalog(catalog, pong.cpu_ram_headroom_gb);
                             }
-                            guard.apply_model_policy(&pong.enabled_models);
+                            let cancelled_policy = guard.apply_model_policy(&pong.enabled_models);
+                            let cancelled_purge =
+                                guard.cancel_installs_for_purge(&pong.purge_models);
                             guard.apply_max_completion_tokens(pong.max_completion_tokens);
-                            let trash = guard.apply_purge_models(&pong.purge_models);
                             if let Some(raw) = pong.warm_runtime_model.as_deref() {
                                 let trimmed = raw.trim();
                                 guard.warm_runtime_model = if trimmed.is_empty() {
@@ -1812,11 +1884,24 @@ async fn handle_server_message(
                                 };
                             }
                             let transition = guard.apply_schedule(pong.schedule.clone());
-                            guard
-                                .sync_model_weights(pong.hugging_face_token.clone(), &config.token);
+                            let wait_sync = if cancelled_policy || cancelled_purge {
+                                Some(guard.sync_in_flight.clone())
+                            } else {
+                                None
+                            };
+                            (transition, wait_sync)
+                        };
+                        if let Some(flag) = wait_sync {
+                            wait_for_catalog_sync_idle(&flag).await;
+                        }
+                        let trash = {
+                            let mut guard = state.lock().await;
+                            let trash = guard.apply_purge_models(&pong.purge_models);
+                            guard.sync_image_runtime_presence();
+                            guard.sync_model_weights(hf_token, &config.token);
                             guard.tick_vram_lifecycle();
                             guard.persist_local_state();
-                            (transition, trash)
+                            trash
                         };
                         spawn_delete_staged_dirs(trash);
                         if transition.entered_earning {
@@ -2912,5 +2997,87 @@ mod reconnect_tests {
     fn cloud_link_stale_detects_wall_clock_jump() {
         // Sleep/wake: last activity is hours ago on the wall clock.
         assert!(cloud_link_is_stale(1_000, 1_000 + 8 * 60 * 60 * 1000));
+    }
+}
+
+#[cfg(test)]
+mod image_purge_tests {
+    use super::SessionState;
+    use crate::protocol::{CatalogModel, ModelWeights};
+
+    fn image_sku(id: &str, repo: &str) -> CatalogModel {
+        CatalogModel {
+            model_id: id.into(),
+            job_kind: "image".into(),
+            weights: Some(ModelWeights {
+                source: "huggingface".into(),
+                repo: repo.into(),
+                filename: String::new(),
+                companion_filenames: vec![],
+                revision: "main".into(),
+                download_via: None,
+                mirror_url: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn purge_keeps_shared_runtime_when_another_image_sku_remains() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "scalattice-purge-keep-{}-{nonce}",
+            std::process::id()
+        ));
+        let models = root.join("models");
+        let runtimes = root.join("runtimes");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&runtimes).unwrap();
+        let prev_models = std::env::var("SCALATTICE_MODELS_DIR").ok();
+        let prev_runtimes = std::env::var("SCALATTICE_RUNTIMES_DIR").ok();
+        std::env::set_var("SCALATTICE_MODELS_DIR", &models);
+        std::env::set_var("SCALATTICE_RUNTIMES_DIR", &runtimes);
+
+        std::fs::create_dir_all(crate::image::hub_repo_dir("org/a")).unwrap();
+        std::fs::create_dir_all(crate::image::hub_repo_dir("org/b")).unwrap();
+        let venv = crate::image::diffusers_venv_dir("cuda");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(venv.join(".deps_ok_v4"), b"ok").unwrap();
+
+        let mut session = SessionState::new();
+        session.catalog = vec![image_sku("img-a", "org/a"), image_sku("img-b", "org/b")];
+        session.model_policy = vec![("img-a".into(), false), ("img-b".into(), true)];
+        session.apply_purge_models(&["img-a".to_string()]);
+
+        assert!(
+            !crate::image::hub_repo_dir("org/a").exists(),
+            "purged image snapshot should be staged away"
+        );
+        assert!(
+            crate::image::hub_repo_dir("org/b").exists(),
+            "remaining image snapshot must stay"
+        );
+        assert!(venv.exists(), "Diffusers venv must stay for the other SKU");
+
+        session.model_policy = vec![("img-a".into(), false), ("img-b".into(), false)];
+        session.apply_purge_models(&["img-b".to_string()]);
+        assert!(!crate::image::hub_repo_dir("org/b").exists());
+        assert!(
+            !venv.exists(),
+            "last image SKU purge should remove the Diffusers venv"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match prev_models {
+            Some(v) => std::env::set_var("SCALATTICE_MODELS_DIR", v),
+            None => std::env::remove_var("SCALATTICE_MODELS_DIR"),
+        }
+        match prev_runtimes {
+            Some(v) => std::env::set_var("SCALATTICE_RUNTIMES_DIR", v),
+            None => std::env::remove_var("SCALATTICE_RUNTIMES_DIR"),
+        }
     }
 }

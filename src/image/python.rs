@@ -9,8 +9,13 @@ use futures_util::StreamExt;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tar::Archive;
 use tracing::info;
+
+fn canceled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
 
 const PYTHON_TAG: &str = "20260901";
 const PYTHON_VERSION: &str = "3.12.14";
@@ -103,14 +108,18 @@ pub fn portable_python_ready() -> bool {
 /// Never falls back to a PATH / conda / pyenv interpreter.
 pub async fn ensure_image_python(
     mut on_progress: impl FnMut(&str, Option<f32>),
+    cancel: Option<&AtomicBool>,
 ) -> Result<PathBuf> {
+    if canceled(cancel) {
+        bail!("request_canceled");
+    }
     let bin = portable_python_bin();
     if python_runs(&bin) {
         return Ok(bin);
     }
 
     on_progress("python", Some(2.0));
-    install_portable_python(&mut on_progress)
+    install_portable_python(&mut on_progress, cancel)
         .await
         .context("image_runtime_missing: could not install isolated Python from GitHub")
 }
@@ -131,7 +140,11 @@ pub fn teardown_portable_python() {
 
 async fn install_portable_python(
     on_progress: &mut impl FnMut(&str, Option<f32>),
+    cancel: Option<&AtomicBool>,
 ) -> Result<PathBuf> {
+    if canceled(cancel) {
+        bail!("request_canceled");
+    }
     let artifact = standalone_artifact().context(
         "image_runtime_missing: no portable CPython build for this OS/arch",
     )?;
@@ -142,7 +155,11 @@ async fn install_portable_python(
     let url = format!("{PYTHON_BASE}/{}", artifact.filename);
     let archive = root.join(artifact.filename);
     info!(url = %url, dest = %archive.display(), "downloading isolated CPython");
-    download_file(&url, &archive, on_progress).await?;
+    download_file(&url, &archive, on_progress, cancel).await?;
+    if canceled(cancel) {
+        let _ = fs::remove_dir_all(&root);
+        bail!("request_canceled");
+    }
     on_progress("python", Some(85.0));
 
     let archive_clone = archive.clone();
@@ -150,6 +167,10 @@ async fn install_portable_python(
     tokio::task::spawn_blocking(move || extract_tarball(&archive_clone, &root_clone))
         .await
         .context("join python extract")??;
+    if canceled(cancel) {
+        let _ = fs::remove_dir_all(&root);
+        bail!("request_canceled");
+    }
     let _ = fs::remove_file(&archive);
 
     let bin = python_bin_in(&root);
@@ -168,6 +189,7 @@ async fn download_file(
     url: &str,
     dest: &Path,
     on_progress: &mut impl FnMut(&str, Option<f32>),
+    cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("scalattice-agent")
@@ -190,6 +212,11 @@ async fn download_file(
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
+        if canceled(cancel) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            bail!("request_canceled");
+        }
         let chunk = chunk.context("read python download")?;
         file.write_all(&chunk)
             .with_context(|| format!("write {}", tmp.display()))?;
@@ -201,6 +228,10 @@ async fn download_file(
     }
     file.flush().ok();
     drop(file);
+    if canceled(cancel) {
+        let _ = fs::remove_file(&tmp);
+        bail!("request_canceled");
+    }
     fs::rename(&tmp, dest).with_context(|| format!("rename {}", dest.display()))?;
     Ok(())
 }
