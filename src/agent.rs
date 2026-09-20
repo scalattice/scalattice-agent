@@ -700,21 +700,14 @@ impl SessionState {
         crate::image::maybe_teardown_image_runtime(keep);
     }
 
+    /// Advertise every policy-enabled catalog SKU. Fit is owned by Cloud
+    /// (`modelFitsEnabledCompute` on heartbeat prune and on routing). Local
+    /// `can_host_on_machine` still gates llama.cpp placement so an undersized
+    /// GPU is never loaded if a job is somehow assigned.
     fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
-        let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
-
         self.catalog
             .iter()
             .filter(|model| self.is_model_enabled(&model.model_id))
-            .filter(|model| {
-                can_host_on_machine(
-                    model,
-                    &specs.compute_devices,
-                    ram_gb,
-                    self.cpu_ram_headroom_gb,
-                )
-            })
             .cloned()
             .collect()
     }

@@ -70,8 +70,10 @@ fn pick_image_placement(
 }
 
 /// Prefer the smallest idle accelerator that can **fully** host the model
-/// (weights + KV headroom). If none are free, offload on the largest idle
-/// accelerator (text only). Image jobs never offload.
+/// (weights + KV headroom). If none are free, place on the largest idle
+/// accelerator that can still hold the weights (KV may live in RAM), or
+/// layer-offload when the GPU still holds at least half the weights.
+/// Image jobs never offload. Majority-CPU offload (30B on 8 GB) is not a placement.
 pub fn pick_placement(
     plan: &ComputePlan,
     idle_slot_ids: &[String],
@@ -567,6 +569,69 @@ mod tests {
         let placement =
             pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+    }
+
+    #[test]
+    fn eight_gb_does_not_place_coder_30b() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "RTX 5050".into(),
+                vram_gb: Some(8),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        assert!(
+            pick_placement(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false).is_none(),
+            "8 GB card must not RAM-offload a 19 GB coder GGUF"
+        );
+    }
+
+    #[test]
+    fn four_gb_places_eight_b_with_ram_offload() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1650 SUPER".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let placement =
+            pick_placement(&plan, &idle, &model(10.7, 5.0), 16, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+        assert!(
+            pick_placement(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false).is_none(),
+            "4 GB card must not layer-offload a 14B GGUF"
+        );
     }
 
     fn image_model(min_vram: f64) -> CatalogModel {
