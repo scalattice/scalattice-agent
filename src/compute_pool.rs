@@ -58,7 +58,6 @@ fn cuda_visibility_remapped_to_zero(physical: u32) -> bool {
     parts.len() == 1 && parts[0].parse::<u32>().ok() == Some(physical)
 }
 
-/// Normalize NVIDIA marketing names so "NVIDIA GeForce RTX 4090" == "rtx 4090" family match.
 pub fn normalize_cuda_sku(name: &str) -> String {
     let mut s = name.trim().to_ascii_lowercase();
     for prefix in ["nvidia ", "geforce ", "tesla ", "quadro ", "rtx ", "gtx "] {
