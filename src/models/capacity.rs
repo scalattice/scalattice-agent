@@ -267,20 +267,49 @@ pub fn can_host_model(
         return ram_gb >= kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
     }
 
-    // RAM offload is for real GPUs (≥4 GB). `uses_vulkan` must not skip that
-    // floor: a 1 GB iGPU/Vulkan alias would advertise Coder-sized GGUFs and
-    // decode vocab token 0 (`!`).
+    // Layer offload: GPU keeps the majority of weights. 8B/9B on 4 GB + RAM
+    // completes; 30B weights on 8 GB hangs the invoke timeout.
     if has_accelerator
-        && (card.total_vram_gb >= 4 || card.strategy == PoolStrategy::Metal)
+        && layer_offload_fits(
+            vram,
+            weights_need,
+            model,
+            need_vision,
+            ram_gb,
+            cpu_ram_headroom_gb,
+        )
     {
-        return ram_gb >= weight_plus_kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
+        return true;
     }
-
     if card.strategy == PoolStrategy::CpuOnly {
         return ram_gb >= weight_plus_kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb);
     }
 
     false
+}
+
+/// GPU must hold at least half the weights or CPU decode stalls.
+const LAYER_OFFLOAD_MIN_GPU_FRACTION: f64 = 0.5;
+
+fn layer_offload_fits(
+    vram: f64,
+    weights_need: f64,
+    model: &CatalogModel,
+    need_vision: bool,
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+) -> bool {
+    if vram <= 0.0 || weights_need <= 0.0 {
+        return false;
+    }
+    if vram + 0.005 < weights_need * LAYER_OFFLOAD_MIN_GPU_FRACTION {
+        return false;
+    }
+    let spilled = (weights_need - vram).max(0.0);
+    let ram_need = gb_ceil(Some(spilled + job_kv_gb(model, need_vision)))
+        .saturating_add(cpu_ram_headroom_gb)
+        .max(gb_ceil(model.min_ram_gb));
+    ram_gb >= ram_need
 }
 
 /// True if any independent slot or homogeneous TP group can host the model.
@@ -295,11 +324,13 @@ pub fn can_host_on_machine(
             .map(|card| can_host_model(model, &card, ram_gb, cpu_ram_headroom_gb))
             .unwrap_or(false);
     };
-    if plan
-        .slots
-        .iter()
-        .any(|slot| can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb))
-    {
+    let has_accel = plan.slots.iter().any(|slot| slot.kind != "cpu");
+    if plan.slots.iter().any(|slot| {
+        if has_accel && slot.kind == "cpu" {
+            return false;
+        }
+        can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+    }) {
         return true;
     }
     if model.is_image_job() {
@@ -530,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_2gb_tp_uses_pooled_card_for_download_and_ram_offload() {
+    fn dual_2gb_tp_does_not_host_coder_via_ram_offload() {
         let devices = [
             ComputeDevice {
                 id: "nvidia:0".into(),
@@ -553,9 +584,8 @@ mod tests {
         ];
         let card = preferred_download_card(&devices).unwrap();
         assert_eq!(card.total_vram_gb, 4);
-        // 12 GB catalog minVram still hosts via TP + system RAM offload.
-        assert!(can_host_model(&catalog(12.0, 11.7, 16.0), &card, 16, 2));
-        assert!(can_host_on_machine(
+        assert!(!can_host_model(&catalog(12.0, 11.7, 16.0), &card, 16, 2));
+        assert!(!can_host_on_machine(
             &catalog(12.0, 11.7, 16.0),
             &devices,
             16,
@@ -564,7 +594,79 @@ mod tests {
     }
 
     #[test]
-    fn vl_text_can_offload_but_images_need_vision_vram() {
+    fn eight_gb_gpu_does_not_host_coder_sized_weights() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce RTX 5050".into(),
+                vram_gb: Some(8),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let gpu = [ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "NVIDIA GeForce RTX 5050".into(),
+            vram_gb: Some(8),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }];
+        let card = build_virtual_card(&gpu).unwrap();
+        let coder = catalog(22.5, 19.0, 24.0);
+        assert!(!can_host_model(&coder, &card, 31, 2));
+        assert!(!can_host_on_machine(&coder, &devices, 31, 2));
+    }
+
+    #[test]
+    fn four_gb_hosts_eight_b_when_ram_covers_spilled_layers() {
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "GTX 1650 SUPER".into(),
+            vram_gb: Some(4),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        let eight_b = catalog(10.7, 5.0, 8.0);
+        assert!(can_host_model(&eight_b, &card, 16, 2));
+        assert!(!can_host_model(&eight_b, &card, 6, 2));
+        let fourteen_b = catalog(13.2, 9.0, 12.0);
+        assert!(!can_host_model(&fourteen_b, &card, 16, 2));
+    }
+
+    #[test]
+    fn eight_gb_hosts_fourteen_b_offload_but_not_coder() {
+        let card = build_virtual_card(&[ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "RTX 5050".into(),
+            vram_gb: Some(8),
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        assert!(can_host_model(&catalog(13.2, 9.0, 12.0), &card, 31, 2));
+        assert!(!can_host_model(&catalog(22.5, 19.0, 24.0), &card, 31, 2));
+    }
+
+    #[test]
+    fn vl_text_can_offload_on_four_gb_images_need_vision_vram() {
         let card = build_virtual_card(&[ComputeDevice {
             id: "nvidia:0".into(),
             kind: "discrete".into(),
