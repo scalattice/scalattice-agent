@@ -444,8 +444,8 @@ impl Supervisor {
 
     pub async fn max_concurrent_jobs(&self) -> u32 {
         // Advertise accelerator parallelism only. Counting CPU made the router
-        // claim 3-wide on dual-4GB boxes; overflow onto cpu-0 then OOMs / damages
-        // under 8B offload fanout. CPU remains a placement fallback when claimed.
+        // claim 3-wide on dual-4GB boxes. CPU is not a placement fallback while
+        // accelerators exist — overflow onto cpu-0 OOMs / disconnects the box.
         let workers = self.workers.lock().await;
         let accel = self
             .plan
@@ -620,11 +620,13 @@ impl Supervisor {
         for attempt in 0..accel_slots {
             let placement = {
                 let mut workers = self.workers.lock().await;
+                let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
                 let idle: Vec<String> = self
                     .plan
                     .slots
                     .iter()
                     .filter(|s| !skip.contains(&s.id))
+                    .filter(|s| !has_accel || s.kind != "cpu")
                     .filter(|s| {
                         workers
                             .get(&s.id)
@@ -1374,7 +1376,9 @@ fn worker_crash_retryable(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{worker_crash_retryable, worker_wall_for_phase, WORKER_DECODE_WALL, WORKER_PREFILL_WALL};
+    use super::{
+        worker_crash_retryable, worker_wall_for_phase, WORKER_DECODE_WALL, WORKER_PREFILL_WALL,
+    };
 
     #[test]
     fn stdout_close_retries_on_another_slot() {

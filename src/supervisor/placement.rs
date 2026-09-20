@@ -196,13 +196,17 @@ pub fn pick_placement(
             .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
             .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
         {
-            debug!(slot = %slot.id, "placement: cpu overflow");
-            return Some(Placement {
-                slot_ids: vec![slot.id.clone()],
-                card: slot.card.clone(),
-                cuda_visible: slot.cuda_visible.clone(),
-                use_tp_worker: false,
-            });
+            if plan.slots.iter().any(|s| s.kind != "cpu") {
+                debug!(slot = %slot.id, "placement: skip cpu overflow; accelerators exist");
+            } else {
+                debug!(slot = %slot.id, "placement: cpu overflow");
+                return Some(Placement {
+                    slot_ids: vec![slot.id.clone()],
+                    card: slot.card.clone(),
+                    cuda_visible: slot.cuda_visible.clone(),
+                    use_tp_worker: false,
+                });
+            }
         }
     }
 
@@ -505,6 +509,35 @@ mod tests {
             pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
         assert!(!placement.use_tp_worker);
+    }
+
+    #[test]
+    fn qwen8b_does_not_cpu_overflow_when_gpus_exist() {
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle = vec!["cpu-0".to_string()];
+        assert!(
+            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).is_none(),
+            "crash-retry must not land 8B on cpu-0 while accelerators are in the plan"
+        );
+    }
+
+    #[test]
+    fn cpu_only_machine_still_places_on_cpu() {
+        let devices = [ComputeDevice {
+            id: "cpu:0".into(),
+            kind: "cpu".into(),
+            name: "CPU".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let placement =
+            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
     }
 
     #[test]
