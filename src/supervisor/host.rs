@@ -1,6 +1,9 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use super::placement::{pick_placement, placement_miss_detail, Placement};
 use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot};
+use crate::gpu_occupancy::{
+    smallest_advertised_need_gb, slot_live_free_gb, OccupancyWatch, SlotOccupancyView,
+};
 use crate::protocol::{CatalogModel, ChatMessage, GeneratedImage, InvokeTimings};
 use crate::specs::ComputeDevice;
 use anyhow::{anyhow, bail, Context, Result};
@@ -65,6 +68,9 @@ pub struct SlotStatus {
     pub device_ids: Vec<String>,
     #[serde(rename = "tpGroup", skip_serializing_if = "Option::is_none")]
     pub tp_group: Option<String>,
+    /// Foreign / leftover VRAM is using this idle GPU; not a Scalattice job.
+    #[serde(rename = "occupiedExternal", skip_serializing_if = "std::ops::Not::not")]
+    pub occupied_external: bool,
 }
 
 struct SlotWorker {
@@ -96,6 +102,7 @@ pub struct Supervisor {
     ram_gb: u32,
     /// On tight RAM, two concurrent GGUF mmaps OOM the box and drop the WebSocket.
     mmap_gate: Mutex<()>,
+    occupancy: Mutex<OccupancyWatch>,
 }
 
 /// Give up only when the worker stops sending progress/token lines.
@@ -163,6 +170,7 @@ impl Supervisor {
             checkouts: Mutex::new(HashMap::new()),
             ram_gb,
             mmap_gate: Mutex::new(()),
+            occupancy: Mutex::new(OccupancyWatch::new()),
         }))
     }
 
@@ -397,6 +405,7 @@ impl Supervisor {
     }
 
     pub async fn slot_statuses(&self) -> Vec<SlotStatus> {
+        let occupied = self.occupancy.lock().await.latched_ids();
         let workers = self.workers.lock().await;
         self.plan
             .slots
@@ -418,6 +427,7 @@ impl Supervisor {
                     loaded_models: loaded,
                     device_ids: spec.card.devices.iter().map(|d| d.id.clone()).collect(),
                     tp_group: spec.tp_group.clone(),
+                    occupied_external: occupied.contains(&spec.id),
                 }
             })
             .collect()
@@ -438,8 +448,103 @@ impl Supervisor {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub async fn idle_slot_count(&self) -> u32 {
         self.idle_slot_ids().await.len() as u32
+    }
+
+    fn slot_is_cpu(&self, id: &str) -> bool {
+        self.plan
+            .slots
+            .iter()
+            .any(|s| s.id == id && s.kind == "cpu")
+    }
+
+    pub async fn occupied_slot_ids(&self) -> HashSet<String> {
+        self.occupancy.lock().await.latched_ids()
+    }
+
+    /// Idle accelerator slots that still have room for our advertised models.
+    /// CPU is not a routing slot while GPUs exist.
+    pub async fn routing_idle_slot_ids(&self) -> Vec<String> {
+        let occupied = self.occupied_slot_ids().await;
+        let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
+        self.idle_slot_ids()
+            .await
+            .into_iter()
+            .filter(|id| {
+                if occupied.contains(id) {
+                    return false;
+                }
+                if has_accel && self.slot_is_cpu(id) {
+                    return false;
+                }
+                true
+            })
+            .collect()
+    }
+
+    pub async fn routing_idle_slot_count(&self) -> u32 {
+        self.routing_idle_slot_ids().await.len() as u32
+    }
+
+    /// Every placeable GPU is taken by leftover / foreign VRAM — not our job.
+    pub async fn gpus_occupied(&self) -> bool {
+        if self.occupied_slot_ids().await.is_empty() {
+            return false;
+        }
+        self.routing_idle_slot_count().await == 0
+    }
+
+    pub async fn note_our_vram_activity(&self) {
+        self.occupancy.lock().await.note_our_vram(Instant::now());
+    }
+
+    pub async fn refresh_gpu_occupancy(
+        &self,
+        catalog: &[CatalogModel],
+        advertised: &[String],
+        ram_gb: u32,
+        cpu_ram_headroom_gb: u32,
+        live_cuda: HashMap<u32, f64>,
+    ) {
+        let views: Vec<SlotOccupancyView> = {
+            let workers = self.workers.lock().await;
+            self.plan
+                .slots
+                .iter()
+                .map(|slot| {
+                    let worker = workers.get(&slot.id);
+                    SlotOccupancyView {
+                        slot_id: slot.id.clone(),
+                        kind: slot.kind.clone(),
+                        strategy: slot.card.strategy,
+                        worker_busy: worker.map(|w| w.busy).unwrap_or(true),
+                        loaded_models: worker
+                            .map(|w| w.loaded_models.clone())
+                            .unwrap_or_default(),
+                        live_free_gb: slot_live_free_gb(slot, &live_cuda),
+                        min_need_gb: smallest_advertised_need_gb(
+                            &slot.card,
+                            catalog,
+                            advertised,
+                            ram_gb,
+                            cpu_ram_headroom_gb,
+                        ),
+                    }
+                })
+                .collect()
+        };
+        let mut occ = self.occupancy.lock().await;
+        let before = occ.latched_ids();
+        let after = occ.update(Instant::now(), &views);
+        drop(occ);
+        for id in after.difference(&before) {
+            info!(slot = %id, "GPU occupied by other software; skipping until enough VRAM is free");
+        }
+        for id in before.difference(&after) {
+            info!(slot = %id, "GPU occupancy cleared; slot is placeable again");
+        }
     }
 
     pub async fn max_concurrent_jobs(&self) -> u32 {
@@ -477,6 +582,8 @@ impl Supervisor {
             }
             worker.loaded_models.clear();
         }
+        drop(workers);
+        self.note_our_vram_activity().await;
     }
 
     /// Preload only the runtime the Go hypervisor named. Empty = stay empty.
@@ -485,10 +592,12 @@ impl Supervisor {
             return Ok(false);
         }
         let idle = self.idle_slot_ids().await;
+        let occupied = self.occupied_slot_ids().await;
         let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
         // Never fall back to warming cpu-0 while GPUs exist but are busy.
         let targets: Vec<String> = idle
             .into_iter()
+            .filter(|id| !occupied.contains(id))
             .filter(|id| {
                 if id.starts_with("cpu-") {
                     !has_accel
@@ -619,6 +728,7 @@ impl Supervisor {
 
         for attempt in 0..accel_slots {
             let placement = {
+                let occupied = self.occupied_slot_ids().await;
                 let mut workers = self.workers.lock().await;
                 let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
                 let idle: Vec<String> = self
@@ -626,6 +736,7 @@ impl Supervisor {
                     .slots
                     .iter()
                     .filter(|s| !skip.contains(&s.id))
+                    .filter(|s| !occupied.contains(&s.id))
                     .filter(|s| !has_accel || s.kind != "cpu")
                     .filter(|s| {
                         workers
@@ -756,11 +867,13 @@ impl Supervisor {
         let cancel = self.register_job_cancel(job_id).await;
         let started = Instant::now();
         let placement = {
+            let occupied = self.occupied_slot_ids().await;
             let mut workers = self.workers.lock().await;
             let idle: Vec<String> = self
                 .plan
                 .slots
                 .iter()
+                .filter(|s| !occupied.contains(&s.id))
                 .filter(|s| {
                     workers
                         .get(&s.id)

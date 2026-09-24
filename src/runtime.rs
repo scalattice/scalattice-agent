@@ -53,6 +53,9 @@ pub struct AgentRuntime {
     /// Idle healthy slots available for new work.
     #[serde(rename = "idleSlots", skip_serializing_if = "Option::is_none")]
     pub idle_slots: Option<u32>,
+    /// Foreign VRAM is using every placeable GPU. Not a Scalattice job.
+    #[serde(rename = "gpuOccupied", skip_serializing_if = "std::ops::Not::not")]
+    pub gpu_occupied: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,6 +82,7 @@ pub fn build_runtime(
     slots: Vec<SlotStatus>,
     max_concurrent_jobs: u32,
     idle_slots: u32,
+    gpu_occupied: bool,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
     // Report real busyness for dashboards. Routing uses claim slots / idleSlots,
@@ -91,6 +95,8 @@ pub fn build_runtime(
         JobState::Busy
     } else if idle_slots == 0 && max_concurrent_jobs > 0 && active_job_id.is_some() {
         JobState::Busy
+    } else if gpu_occupied {
+        JobState::Idle
     } else if idle_slots == 0 && max_concurrent_jobs > 0 {
         // Transient: slot map empty/busy during checkout. Heartbeat reconcile heals lies.
         JobState::Busy
@@ -106,6 +112,7 @@ pub fn build_runtime(
         blocked_enabled_models,
         idle_slots,
         slots.len() as u32,
+        gpu_occupied,
     );
     let disk_full = crate::state::disk_full();
     if disk_full && downloading_model.is_none() && reported_state != JobState::Busy {
@@ -140,6 +147,7 @@ pub fn build_runtime(
         slots,
         max_concurrent_jobs: Some(max_concurrent_jobs.max(1)),
         idle_slots: Some(idle_slots),
+        gpu_occupied,
     }
 }
 
@@ -203,6 +211,7 @@ fn status_label(
     blocked_enabled_models: usize,
     idle_slots: u32,
     total_slots: u32,
+    gpu_occupied: bool,
 ) -> String {
     if job_state == JobState::Busy {
         let model = active_model_id.unwrap_or("inference");
@@ -217,6 +226,9 @@ fn status_label(
             return format!("Running {model}");
         }
         return format!("Running {model}");
+    }
+    if gpu_occupied {
+        return "GPUs in use".to_string();
     }
     if idle_slots > 0 && idle_slots < total_slots && total_slots > 1 {
         let model = active_model_id.unwrap_or("inference");
@@ -305,5 +317,28 @@ mod tests {
             map.get("Qwen/Qwen-Image-2512").map(|s| s.complete),
             Some(true)
         );
+    }
+
+    #[test]
+    fn occupancy_reports_idle_gpus_in_use() {
+        let runtime = build_runtime(
+            JobState::Idle,
+            None,
+            None,
+            &["qwen-3.8-27b".into()],
+            2,
+            None,
+            0,
+            16,
+            HashMap::new(),
+            vec![],
+            2,
+            0,
+            true,
+        );
+        assert_eq!(runtime.job_state, "idle");
+        assert_eq!(runtime.status_label, "GPUs in use");
+        assert!(runtime.gpu_occupied);
+        assert_eq!(runtime.idle_slots, Some(0));
     }
 }

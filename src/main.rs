@@ -8,6 +8,7 @@ compile_error!(
 mod agent;
 mod cloud_log;
 mod compute_pool;
+mod gpu_occupancy;
 mod config;
 mod inference;
 mod llm;

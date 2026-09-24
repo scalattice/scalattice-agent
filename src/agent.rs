@@ -112,6 +112,7 @@ struct SessionState {
     supervisor: Option<Arc<Supervisor>>,
     cached_slots: Vec<SlotStatus>,
     cached_idle_slots: u32,
+    cached_gpu_occupied: bool,
     cached_max_jobs: u32,
     cached_loaded_models: Vec<String>,
     pending_supervisor_restart: bool,
@@ -153,6 +154,7 @@ impl SessionState {
             supervisor: None,
             cached_slots: Vec::new(),
             cached_idle_slots: 0,
+            cached_gpu_occupied: false,
             cached_max_jobs: 1,
             cached_loaded_models: Vec::new(),
             pending_supervisor_restart: false,
@@ -947,6 +949,7 @@ impl SessionState {
             self.cached_slots.clone(),
             self.cached_max_jobs.max(1),
             self.cached_idle_slots,
+            self.cached_gpu_occupied,
         )
     }
 
@@ -1481,14 +1484,41 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
     if recovered > 0 {
         info!(recovered, "supervisor reclaimed stuck compute slot(s)");
     }
+    let (catalog, advertised, ram_gb, headroom) = {
+        let guard = state.lock().await;
+        let advertised = if guard.advertised_models.is_empty() {
+            guard
+                .model_policy
+                .iter()
+                .filter(|(_, enabled)| *enabled)
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            guard.advertised_models.clone()
+        };
+        (
+            guard.catalog.clone(),
+            advertised,
+            guard.live_specs().ram_gb.unwrap_or(16),
+            guard.cpu_ram_headroom_gb,
+        )
+    };
+    let live_cuda = tokio::task::spawn_blocking(crate::specs::live_cuda_free_vram_by_index)
+        .await
+        .unwrap_or_default();
+    supervisor
+        .refresh_gpu_occupancy(&catalog, &advertised, ram_gb, headroom, live_cuda)
+        .await;
     let slots = supervisor.slot_statuses().await;
-    let idle = supervisor.idle_slot_count().await;
+    let idle = supervisor.routing_idle_slot_count().await;
+    let gpu_occupied = supervisor.gpus_occupied().await;
     let max = supervisor.max_concurrent_jobs().await;
     let loaded = supervisor.loaded_models_union().await;
     let in_flight = supervisor.has_in_flight_work().await;
     let mut guard = state.lock().await;
     guard.cached_slots = slots;
     guard.cached_idle_slots = idle;
+    guard.cached_gpu_occupied = gpu_occupied;
     guard.cached_max_jobs = max;
     guard.cached_loaded_models = loaded;
     // Heal lied-about busy: counter says jobs remain but supervisor has nothing
