@@ -291,6 +291,19 @@ pub fn can_host_model(
 /// GPU must hold at least half the weights or CPU decode stalls.
 const LAYER_OFFLOAD_MIN_GPU_FRACTION: f64 = 0.5;
 
+/// Live free VRAM that still lets this SKU place (layer-offload floor, or
+/// image catalog min). Leftover usage above this is not occupancy.
+pub fn occupancy_min_vram_gb(model: &CatalogModel) -> f64 {
+    if model.is_image_job() {
+        return f64::from(hosting_min_vram_gb(model)).max(1.0);
+    }
+    let weights = gpu_weights_need_gb_for_job(model, false);
+    if weights <= 0.0 {
+        return f64::from(hosting_min_vram_gb(model)).max(1.0);
+    }
+    (weights * LAYER_OFFLOAD_MIN_GPU_FRACTION).max(1.0)
+}
+
 fn layer_offload_fits(
     vram: f64,
     weights_need: f64,
@@ -748,6 +761,14 @@ mod tests {
         let mut model = vl_catalog(8.0, 99.0, 4.7, 8.0);
         model.min_vram_gb_vision = None;
         assert_eq!(image_job_min_vram_gb(&model), 8);
+    }
+
+    #[test]
+    fn occupancy_floor_is_half_weights_not_the_full_card() {
+        let mut model = catalog(24.0, 16.0, 16.0);
+        model.gpu_weights_vram_gb = Some(16.0);
+        assert!((occupancy_min_vram_gb(&model) - 8.0).abs() < 0.01);
+        assert_eq!(occupancy_min_vram_gb(&image_catalog(16.0)), 16.0);
     }
 
     fn image_catalog(min_vram: f64) -> CatalogModel {
