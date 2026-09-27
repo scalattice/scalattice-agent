@@ -10,8 +10,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = if ($env:GH_REPO) { $env:GH_REPO } else { "scalattice/scalattice-agent" }
-# ~2.4 Mbit/s. Slow on purpose. Override with SCALATTICE_RELEASE_UPLOAD_RATE (curl syntax, e.g. 800K).
+# Default is the home-PC cap (~2.4 Mbit/s). The GitHub-hosted job sets
+# SCALATTICE_RELEASE_UPLOAD_RATE=0, which means no curl rate limit.
 $rate = if ($env:SCALATTICE_RELEASE_UPLOAD_RATE) { $env:SCALATTICE_RELEASE_UPLOAD_RATE } else { "300K" }
+$unlimited = $rate -eq "0" -or $rate -eq "unlimited" -or $rate -eq "none"
 
 if (-not $env:GH_TOKEN) {
     throw "GH_TOKEN is required"
@@ -42,14 +44,24 @@ function Upload-One([int64]$ReleaseId, [string]$Path) {
     }
 
     $url = "https://uploads.github.com/repos/$repo/releases/$ReleaseId/assets?name=$([uri]::EscapeDataString($name))"
-    Write-Host "==> uploading $name ($bytes bytes) at $rate"
-    & curl.exe --http1.1 --fail-with-body --show-error --silent --limit-rate $rate --connect-timeout 30 --max-time 10800 `
-        -X POST `
-        -H "Authorization: Bearer $($env:GH_TOKEN)" `
-        -H "Accept: application/vnd.github+json" `
-        -H "Content-Type: application/octet-stream" `
-        -T $Path `
+    $pace = if ($unlimited) { "full speed" } else { $rate }
+    Write-Host "==> uploading $name ($bytes bytes) at $pace"
+    $curlArgs = @(
+        "--http1.1", "--fail-with-body", "--show-error", "--silent",
+        "--connect-timeout", "30", "--max-time", "10800"
+    )
+    if (-not $unlimited) {
+        $curlArgs += @("--limit-rate", $rate)
+    }
+    $curlArgs += @(
+        "-X", "POST",
+        "-H", "Authorization: Bearer $($env:GH_TOKEN)",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "Content-Type: application/octet-stream",
+        "-T", $Path,
         $url
+    )
+    & curl.exe @curlArgs
     if ($LASTEXITCODE -ne 0) {
         throw "upload failed for $name (curl exit $LASTEXITCODE)"
     }
@@ -71,4 +83,5 @@ foreach ($f in $Files) {
     }
 }
 
-Write-Host "==> attached $($Files.Count) asset(s) to $Tag at $rate"
+$pace = if ($unlimited) { "full speed" } else { $rate }
+Write-Host "==> attached $($Files.Count) asset(s) to $Tag at $pace"

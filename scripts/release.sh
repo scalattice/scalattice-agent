@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# One-command release: x86_64 Linux local + Windows on self-hosted runner + optional aarch64/macOS CI.
+# One-command release: x86_64 Linux local + Windows on GitHub-hosted runners + optional aarch64/macOS CI.
 #
 # Preferred: merge development → production so CI builds every platform.
 #
 # Usage:
-#   ./scripts/release.sh --dev      # x86_64 Linux here + Windows on self-hosted runner
+#   ./scripts/release.sh --dev      # x86_64 Linux here + Windows on GitHub-hosted runners
 #   ./scripts/release.sh            # above + aarch64 on GitHub ARM runners
 #
 # First-time Windows setup (once, on a Windows PC, Admin PowerShell):
@@ -22,7 +22,7 @@ EXPLICIT_VERSION=""
 SKIP_BUILD="false"
 DEV_RELEASE="false"
 LOCAL_WINDOWS="false"
-GITHUB_HOSTED_WINDOWS="false"
+SELF_HOSTED_WINDOWS="false"
 NO_PUSH="false"
 WORKFLOW_FILE=".github/workflows/release.yml"
 WIN_INSTALLER="dist/ScalatticeAgentSetup-x86_64.exe"
@@ -35,10 +35,10 @@ Usage: ./scripts/release.sh [options]
   ./scripts/release.sh --dev
     1. Build x86_64 Linux locally
     2. Push + create GitHub Release
-    3. Build Windows on your self-hosted runner (fast, warm cache)
+    3. Build Windows on a GitHub-hosted runner
     4. Upload .exe + zip to the release
 
-  One-time Windows machine setup (Admin PowerShell):
+  One-time Windows machine setup (Admin PowerShell), only if using --self-hosted-windows:
     .\scripts\setup-windows-build.ps1
     .\scripts\install-windows-runner.ps1
 
@@ -47,7 +47,8 @@ Options:
   --skip-build            Reuse existing dist/ Linux tarball
   --skip-aarch64          Same as --dev
   --local-windows         Use dist/*.exe from disk; skip Windows CI
-  --github-hosted-windows Slow fallback (~1h); use GitHub windows-2022 runner
+  --self-hosted-windows   Build Windows on the home PC runner (upload stays slow)
+  --github-hosted-windows Default. Kept so older commands still work.
   --version X.Y.Z         Explicit version
   --minor                 Bump minor instead of patch
   --no-push               Dry run (no push/release)
@@ -63,7 +64,8 @@ while [[ $# -gt 0 ]]; do
     --skip-build) SKIP_BUILD="true"; shift ;;
     --skip-aarch64) DEV_RELEASE="true"; shift ;;
     --local-windows) LOCAL_WINDOWS="true"; shift ;;
-    --github-hosted-windows) GITHUB_HOSTED_WINDOWS="true"; shift ;;
+    --self-hosted-windows) SELF_HOSTED_WINDOWS="true"; shift ;;
+    --github-hosted-windows) SELF_HOSTED_WINDOWS="false"; shift ;;
     --no-push) NO_PUSH="true"; shift ;;
     --minor) BUMP="minor"; shift ;;
     --patch) BUMP="patch"; shift ;;
@@ -159,10 +161,10 @@ resolve_ci_targets() {
 }
 
 windows_runner_input() {
-  if [[ "$GITHUB_HOSTED_WINDOWS" == "true" ]]; then
-    echo "github-hosted"
-  else
+  if [[ "$SELF_HOSTED_WINDOWS" == "true" ]]; then
     echo "self-hosted"
+  else
+    echo "github-hosted"
   fi
 }
 
@@ -275,13 +277,13 @@ if [[ "$LOCAL_WINDOWS" == "true" ]]; then
     exit 1
   }
   echo "==> Windows: uploading local dist/ (skipping CI)"
-elif [[ "$GITHUB_HOSTED_WINDOWS" == "true" ]]; then
-  echo "==> Windows: GitHub-hosted runner (slow)"
-else
+elif [[ "$SELF_HOSTED_WINDOWS" == "true" ]]; then
   echo "==> Windows: self-hosted runner"
   # shellcheck source=scripts/check-windows-runner.sh
   source "$(dirname "$0")/check-windows-runner.sh"
   require_windows_runner
+else
+  echo "==> Windows: GitHub-hosted runner"
 fi
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
