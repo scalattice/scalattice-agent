@@ -257,7 +257,8 @@ fn card_for_devices(
 /// - Each discrete NVIDIA GPU → its own Single slot (CVD pin in the worker).
 /// - Homogeneous NVIDIA siblings share a `tp_group` so large models can claim them together.
 /// - Each AMD/Intel discrete / iGPU → Vulkan slot (when feature enabled).
-/// - CPU → always present as overflow.
+/// - CPU → system-RAM slot when that device is on (or when no CPU row exists).
+///   A dashboard-disabled CPU is not a slot. Metal does not get a second CPU process.
 pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
     let enabled: Vec<&ComputeDevice> = devices.iter().filter(|d| d.enabled).collect();
     if enabled.is_empty() {
@@ -433,7 +434,10 @@ pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
     // Unified memory: cpu-0 also calls LlamaBackend::init(), which brings Metal
     // up in a second process and fights metal-0 for the same RAM. Keep CPU as a
     // slot only when there is no Metal GPU (CPU-only Mac / Metal disabled).
-    if !(metal_runtime_supported() && !metal.is_empty()) {
+    // A CPU row with enabled=false is the dashboard system-RAM switch: do not
+    // invent a slot after the provider turned it off.
+    let cpu_turned_off = devices.iter().any(|d| d.kind == "cpu" && !d.enabled);
+    if !(metal_runtime_supported() && !metal.is_empty()) && !cpu_turned_off {
         let cpu_device = cpu.cloned().unwrap_or_else(|| ComputeDevice {
             id: "cpu:0".into(),
             kind: "cpu".into(),
@@ -1293,6 +1297,36 @@ mod tests {
                 "cpu-0 beside Metal fights unified memory"
             );
         }
+    }
+
+    #[test]
+    fn disabled_cpu_is_not_a_slot() {
+        let plan = build_compute_slots(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA T400".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: false,
+            },
+        ])
+        .unwrap();
+        assert!(plan.slots.iter().any(|s| s.id == "cuda-0"));
+        assert!(
+            !plan.slots.iter().any(|s| s.kind == "cpu"),
+            "dashboard system-RAM switch off must not leave a CPU slot"
+        );
     }
 
     #[test]

@@ -317,7 +317,21 @@ impl SessionState {
         }
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
-        let card = match preferred_download_card(&specs.compute_devices) {
+        let headroom = self.cpu_ram_headroom_gb;
+        let devices = specs.compute_devices.clone();
+        // Download only what placement can start. A tensor-parallel pool must
+        // hold the whole model; offload is judged per card inside can_host_on_machine.
+        let pending: Vec<_> = pending
+            .into_iter()
+            .filter(|model| {
+                model.is_image_job()
+                    || can_host_on_machine(model, &devices, ram_gb, headroom)
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let card = match preferred_download_card(&devices) {
             Ok(card) => card,
             Err(err) => {
                 warn!("model downloads skipped: {err:#}");
@@ -702,10 +716,10 @@ impl SessionState {
         crate::image::maybe_teardown_image_runtime(keep);
     }
 
-    /// Advertise every policy-enabled catalog SKU. Fit is owned by Cloud
-    /// (`modelFitsEnabledCompute` on heartbeat prune and on routing). Local
-    /// `can_host_on_machine` still gates llama.cpp placement so an undersized
-    /// GPU is never loaded if a job is somehow assigned.
+    /// Policy-enabled catalog SKUs the machine can actually start.
+    /// Cloud fit decides what is enabled. Local `can_host_on_machine` still
+    /// refuses a download or advertisement when the only "fit" is treating a
+    /// tensor-parallel pool as one bigger offload card.
     fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
         self.catalog
             .iter()
@@ -742,23 +756,32 @@ impl SessionState {
                 out.push(model.model_id.clone());
                 continue;
             }
+            let hostable = can_host_on_machine(
+                &model,
+                &specs.compute_devices,
+                ram_gb,
+                self.cpu_ram_headroom_gb,
+            );
             if model.vision_model {
                 // Only advertise the VL id when this machine can actually run image jobs.
-                if can_serve_vision_on_machine(&model, &specs.compute_devices, ram_gb) {
+                if hostable && can_serve_vision_on_machine(&model, &specs.compute_devices, ram_gb)
+                {
                     out.push(model.model_id.clone());
                 }
                 // VL weights still serve text via the sibling SKU (bill/route as text).
-                if let Some(sib) = model
-                    .text_sibling_model_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    if !out.iter().any(|id| id == sib) {
-                        out.push(sib.to_string());
+                if hostable {
+                    if let Some(sib) = model
+                        .text_sibling_model_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !out.iter().any(|id| id == sib) {
+                            out.push(sib.to_string());
+                        }
                     }
                 }
-            } else {
+            } else if hostable {
                 out.push(model.model_id.clone());
             }
         }

@@ -548,9 +548,9 @@ impl Supervisor {
     }
 
     pub async fn max_concurrent_jobs(&self) -> u32 {
-        // Advertise accelerator parallelism only. Counting CPU made the router
-        // claim 3-wide on dual-4GB boxes. CPU is not a placement fallback while
-        // accelerators exist — overflow onto cpu-0 OOMs / disconnects the box.
+        // Advertise accelerator parallelism only. The CPU slot can run one job
+        // when no accelerator can host it, but it is not an extra lane: a
+        // second job would load another copy of the weights and OOM the box.
         let workers = self.workers.lock().await;
         let accel = self
             .plan
@@ -730,14 +730,27 @@ impl Supervisor {
             let placement = {
                 let occupied = self.occupied_slot_ids().await;
                 let mut workers = self.workers.lock().await;
+                let accel_can_host = self.plan.slots.iter().any(|s| {
+                    s.kind != "cpu"
+                        && crate::models::can_host_model(
+                            model,
+                            &s.card,
+                            ram_gb,
+                            cpu_ram_headroom_gb,
+                        )
+                });
                 let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
+                let used_ram = crate::specs::detect_ram_used_gb().unwrap_or(0);
+                let cpu_free = ram_gb.saturating_sub(used_ram);
+                let cpu_ram_ok = !has_accel
+                    || crate::models::cpu_fallback_fits(model, cpu_free, cpu_ram_headroom_gb);
                 let idle: Vec<String> = self
                     .plan
                     .slots
                     .iter()
                     .filter(|s| !skip.contains(&s.id))
                     .filter(|s| !occupied.contains(&s.id))
-                    .filter(|s| !has_accel || s.kind != "cpu")
+                    .filter(|s| s.kind != "cpu" || (!accel_can_host && cpu_ram_ok))
                     .filter(|s| {
                         workers
                             .get(&s.id)
