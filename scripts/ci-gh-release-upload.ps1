@@ -30,22 +30,29 @@ if (-not $release.id) {
     throw "Release $Tag not found on $repo"
 }
 
-function Upload-One([int64]$ReleaseId, [string]$Path) {
-    $name = [IO.Path]::GetFileName($Path)
-    $bytes = (Get-Item -LiteralPath $Path).Length
-    $existing = gh api "repos/$repo/releases/$ReleaseId/assets" --jq ".[] | select(.name==`"$name`") | .id"
-    foreach ($id in @($existing)) {
-        if (-not $id) { continue }
-        Write-Host "==> replacing existing asset $name ($id)"
-        gh api --method DELETE "repos/$repo/releases/assets/$id" | Out-Null
+function Remove-ExistingAsset([int64]$ReleaseId, [string]$Name) {
+    # Do not filter names with jq. PowerShell strips the quotes, and a name
+    # like ScalatticeAgentSetup-x86_64.exe is then parsed as a function call.
+    $raw = gh api "repos/$repo/releases/$ReleaseId/assets?per_page=100"
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to list assets on release $ReleaseId"
+    }
+    $assets = @()
+    if ($raw) {
+        $parsed = $raw | ConvertFrom-Json
+        if ($null -ne $parsed) { $assets = @($parsed) }
+    }
+    foreach ($asset in $assets) {
+        if ($asset.name -ne $Name) { continue }
+        Write-Host "==> replacing existing asset $Name ($($asset.id))"
+        gh api --method DELETE "repos/$repo/releases/assets/$($asset.id)" | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            throw "failed to delete existing asset $name"
+            throw "failed to delete existing asset $Name"
         }
     }
+}
 
-    $url = "https://uploads.github.com/repos/$repo/releases/$ReleaseId/assets?name=$([uri]::EscapeDataString($name))"
-    $pace = if ($unlimited) { "full speed" } else { $rate }
-    Write-Host "==> uploading $name ($bytes bytes) at $pace"
+function Invoke-AssetUpload([string]$Url, [string]$Path) {
     $curlArgs = @(
         "--http1.1", "--fail-with-body", "--show-error", "--silent",
         "--connect-timeout", "30", "--max-time", "10800"
@@ -59,11 +66,29 @@ function Upload-One([int64]$ReleaseId, [string]$Path) {
         "-H", "Accept: application/vnd.github+json",
         "-H", "Content-Type: application/octet-stream",
         "-T", $Path,
-        $url
+        $Url
     )
-    & curl.exe @curlArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "upload failed for $name (curl exit $LASTEXITCODE)"
+    $out = & curl.exe @curlArgs 2>&1 | Out-String
+    if ($out) { Write-Host $out }
+    return @{ Exit = $LASTEXITCODE; Body = $out }
+}
+
+function Upload-One([int64]$ReleaseId, [string]$Path) {
+    $name = [IO.Path]::GetFileName($Path)
+    $bytes = (Get-Item -LiteralPath $Path).Length
+    Remove-ExistingAsset -ReleaseId $ReleaseId -Name $name
+
+    $url = "https://uploads.github.com/repos/$repo/releases/$ReleaseId/assets?name=$([uri]::EscapeDataString($name))"
+    $pace = if ($unlimited) { "full speed" } else { $rate }
+    Write-Host "==> uploading $name ($bytes bytes) at $pace"
+    $result = Invoke-AssetUpload -Url $url -Path $Path
+    if ($result.Exit -ne 0 -and $result.Body -match "already_exists") {
+        Write-Host "==> $name still on the release; deleting it and uploading once more"
+        Remove-ExistingAsset -ReleaseId $ReleaseId -Name $name
+        $result = Invoke-AssetUpload -Url $url -Path $Path
+    }
+    if ($result.Exit -ne 0) {
+        throw "upload failed for $name (curl exit $($result.Exit))"
     }
     Write-Host "==> uploaded $name"
 }
