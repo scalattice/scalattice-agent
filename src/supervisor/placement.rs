@@ -1,7 +1,7 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
 use crate::models::{
-    can_host_model, can_serve_vision_on_card, gpu_full_host_need_gb_for_job, hosting_min_vram_gb,
-    image_job_min_vram_gb, vram_can_gpu_full,
+    can_host_model, can_serve_vision_on_card, cpu_fallback_fits, gpu_full_host_need_gb_for_job,
+    hosting_min_vram_gb, image_job_min_vram_gb, vram_can_gpu_full,
 };
 use crate::protocol::CatalogModel;
 use tracing::debug;
@@ -73,7 +73,9 @@ fn pick_image_placement(
 /// (weights + KV headroom). If none are free, place on the largest idle
 /// accelerator that can still hold the weights (KV may live in RAM), or
 /// layer-offload when the GPU still holds at least half the weights.
-/// Image jobs never offload. Majority-CPU offload (30B on 8 GB) is not a placement.
+/// When no accelerator can host, place on the CPU slot if system RAM covers
+/// weights + KV + headroom. Image jobs never use the CPU. A busy accelerator
+/// that could host the model is not replaced by the CPU.
 pub fn pick_placement(
     plan: &ComputePlan,
     idle_slot_ids: &[String],
@@ -198,10 +200,17 @@ pub fn pick_placement(
             .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
             .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
         {
-            if plan.slots.iter().any(|s| s.kind != "cpu") {
-                debug!(slot = %slot.id, "placement: skip cpu overflow; accelerators exist");
+            let accel_can_host = plan.slots.iter().any(|s| {
+                s.kind != "cpu" && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+            });
+            if accel_can_host {
+                debug!(slot = %slot.id, "placement: skip cpu; an accelerator can host this model");
+            } else if plan.slots.iter().any(|s| s.kind != "cpu")
+                && !cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb)
+            {
+                debug!(slot = %slot.id, "placement: skip cpu; RAM does not cover weights and KV");
             } else {
-                debug!(slot = %slot.id, "placement: cpu overflow");
+                debug!(slot = %slot.id, "placement: cpu slot");
                 return Some(Placement {
                     slot_ids: vec![slot.id.clone()],
                     card: slot.card.clone(),
@@ -520,7 +529,49 @@ mod tests {
         let idle = vec!["cpu-0".to_string()];
         assert!(
             pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).is_none(),
-            "crash-retry must not land 8B on cpu-0 while accelerators are in the plan"
+            "crash-retry must not land 8B on cpu-0 while a GPU can still host it"
+        );
+    }
+
+    #[test]
+    fn dual_2gb_places_eight_b_on_cpu_when_ram_covers_it() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA T400".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA T400".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let placement =
+            pick_placement(&plan, &idle, &model(12.1, 5.0), 16, 2, &devices, false).unwrap();
+        assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
+        assert!(
+            pick_placement(&plan, &idle, &model(12.1, 5.0), 6, 2, &devices, false).is_none(),
+            "6 GB RAM must not start an 8B beside a 2 GB card"
         );
     }
 
@@ -595,9 +646,12 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let on_cpu =
+            pick_placement(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false).unwrap();
+        assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
         assert!(
-            pick_placement(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false).is_none(),
-            "8 GB card must not RAM-offload a 19 GB coder GGUF"
+            pick_placement(&plan, &idle, &model(22.5, 19.0), 20, 2, &devices, false).is_none(),
+            "20 GB RAM must not start a 19 GB coder"
         );
     }
 
@@ -628,9 +682,16 @@ mod tests {
         let placement =
             pick_placement(&plan, &idle, &model(10.7, 5.0), 16, 2, &devices, false).unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+        let fourteen =
+            pick_placement(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false).unwrap();
+        assert_eq!(
+            fourteen.slot_ids,
+            vec!["cpu-0".to_string()],
+            "4 GB card must not layer-offload a 14B; RAM can still run it"
+        );
         assert!(
-            pick_placement(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false).is_none(),
-            "4 GB card must not layer-offload a 14B GGUF"
+            pick_placement(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false).is_none(),
+            "8 GB RAM must not start a 14B"
         );
     }
 

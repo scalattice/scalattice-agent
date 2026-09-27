@@ -115,6 +115,16 @@ fn weight_plus_kv_ram_need_gb(model: &CatalogModel, need_vision: bool, cpu_ram_h
         .max(min_ram)
 }
 
+/// System RAM can hold this chat model on the CPU slot: weights + KV + the
+/// same headroom a CPU-only machine already uses. Image jobs stay on a GPU.
+/// `free_gb` is installed RAM, or installed minus RAM already in use.
+pub fn cpu_fallback_fits(model: &CatalogModel, free_gb: u32, cpu_ram_headroom_gb: u32) -> bool {
+    if model.is_image_job() || llama_weight_gb(model) <= 0.05 {
+        return false;
+    }
+    free_gb >= weight_plus_kv_ram_need_gb(model, false, cpu_ram_headroom_gb)
+}
+
 fn unified_pool_gb(card: &VirtualCard, ram_gb: u32) -> f64 {
     f64::from(card.total_vram_gb.max(ram_gb))
 }
@@ -325,7 +335,10 @@ fn layer_offload_fits(
     ram_gb >= ram_need
 }
 
-/// True if any independent slot or homogeneous TP group can host the model.
+/// True if any independent slot can host the model, a homogeneous TP group
+/// can hold it entirely, or system RAM can hold it on the CPU slot.
+/// Layer-offload does not run across the pool: two 2 GB cards are not a 4 GB
+/// offload target. A GPU that cannot host does not block the CPU slot.
 pub fn can_host_on_machine(
     model: &CatalogModel,
     devices: &[ComputeDevice],
@@ -337,27 +350,34 @@ pub fn can_host_on_machine(
             .map(|card| can_host_model(model, &card, ram_gb, cpu_ram_headroom_gb))
             .unwrap_or(false);
     };
-    let has_accel = plan.slots.iter().any(|slot| slot.kind != "cpu");
     if plan.slots.iter().any(|slot| {
-        if has_accel && slot.kind == "cpu" {
-            return false;
-        }
-        can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+        slot.kind != "cpu" && can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
     }) {
         return true;
     }
     if model.is_image_job() {
-        // Diffusers never claims a llama.cpp TP group as one GPU.
+        // Diffusers never claims a llama.cpp TP group or the CPU as one GPU.
         return false;
     }
     for phys in plan.tp_groups.values() {
         if let Ok(tp) = build_tp_card_for_group(devices, phys) {
+            let min_vram = hosting_min_vram_gb(model);
+            if !vram_can_gpu_full(f64::from(tp.total_vram_gb), model, min_vram, false) {
+                continue;
+            }
             if can_host_model(model, &tp, ram_gb, cpu_ram_headroom_gb) {
                 return true;
             }
         }
     }
-    false
+    let has_accel = plan.slots.iter().any(|slot| slot.kind != "cpu");
+    if !has_accel {
+        return plan.slots.iter().any(|slot| {
+            slot.kind == "cpu" && can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+        });
+    }
+    plan.slots.iter().any(|slot| slot.kind == "cpu")
+        && cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb)
 }
 
 /// Best card for weight download sizing: largest single slot, else homogeneous TP pool.
@@ -598,12 +618,66 @@ mod tests {
         let card = preferred_download_card(&devices).unwrap();
         assert_eq!(card.total_vram_gb, 4);
         assert!(!can_host_model(&catalog(12.0, 11.7, 16.0), &card, 16, 2));
-        assert!(!can_host_on_machine(
+        // 16 GB meets the catalog RAM floor on the CPU slot. 12 GB does not.
+        assert!(can_host_on_machine(
             &catalog(12.0, 11.7, 16.0),
             &devices,
             16,
             2
         ));
+        assert!(!can_host_on_machine(
+            &catalog(12.0, 11.7, 16.0),
+            &devices,
+            12,
+            2
+        ));
+    }
+
+    #[test]
+    fn dual_2gb_tp_does_not_host_eight_b_via_offload() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA T400".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA T400".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let card = preferred_download_card(&devices).unwrap();
+        assert_eq!(card.total_vram_gb, 4);
+        let eight_b = catalog(12.1, 5.0, 8.0);
+        // The virtual 4 GB pool looks big enough to spill layers. Placement
+        // does not offload onto that pool; 16 GB RAM can still hold the model
+        // on the CPU slot. 6 GB RAM cannot, so the weights are not installed.
+        assert!(can_host_model(&eight_b, &card, 16, 2));
+        assert!(can_host_on_machine(&eight_b, &devices, 16, 2));
+        assert!(!can_host_on_machine(&eight_b, &devices, 6, 2));
+        let mut cpu_off = devices.to_vec();
+        cpu_off.push(ComputeDevice {
+            id: "cpu:0".into(),
+            kind: "cpu".into(),
+            name: "CPU".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: false,
+        });
+        assert!(
+            !can_host_on_machine(&eight_b, &cpu_off, 16, 2),
+            "system RAM switch off must not install a CPU-only model"
+        );
     }
 
     #[test]
@@ -640,7 +714,9 @@ mod tests {
         let card = build_virtual_card(&gpu).unwrap();
         let coder = catalog(22.5, 19.0, 24.0);
         assert!(!can_host_model(&coder, &card, 31, 2));
-        assert!(!can_host_on_machine(&coder, &devices, 31, 2));
+        // 31 GB covers weights + KV + headroom on the CPU slot. 20 GB does not.
+        assert!(can_host_on_machine(&coder, &devices, 31, 2));
+        assert!(!can_host_on_machine(&coder, &devices, 20, 2));
     }
 
     #[test]
