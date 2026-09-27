@@ -124,7 +124,7 @@ Verify from Linux:
 
 ```bash
 gh workflow run release.yml -R scalattice/scalattice-agent \
-  -f tag=v1.0.0 -f targets=windows-only -f windows_runner=self-hosted
+  -f tag=v1.0.0 -f targets=windows-only -f windows_runner=github-hosted
 gh run watch
 ```
 

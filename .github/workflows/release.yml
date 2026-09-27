@@ -2,8 +2,8 @@ name: Release
 
 # production: a merge (or push) onto this branch tags a release and builds every platform.
 # Linux x86_64 CUDA is built here (no local build host required).
-# Windows ALWAYS defaults to the self-hosted scalattice-release runner on production pushes.
-# workflow_dispatch may override to github-hosted only as an explicit fallback.
+# Windows defaults to a GitHub-hosted windows-2022 runner (full-speed upload).
+# workflow_dispatch may override to the self-hosted home PC (scalattice-release).
 # macOS is GitHub-hosted macos-14 (Apple Silicon). Unsigned if Apple secrets are missing.
 on:
   workflow_dispatch:
@@ -26,10 +26,10 @@ on:
         description: 'Windows build host'
         required: true
         type: choice
-        default: self-hosted
+        default: github-hosted
         options:
-          - self-hosted
           - github-hosted
+          - self-hosted
   # One event per merge: a GitHub PR into production always produces this push.
   push:
     branches: [production]
@@ -84,7 +84,7 @@ jobs:
             echo "windows_runner=${{ github.event.inputs.windows_runner }}" >> "$GITHUB_OUTPUT"
           else
             echo "targets=full" >> "$GITHUB_OUTPUT"
-            echo "windows_runner=self-hosted" >> "$GITHUB_OUTPUT"
+            echo "windows_runner=github-hosted" >> "$GITHUB_OUTPUT"
           fi
 
   build-linux-x86_64:
@@ -489,12 +489,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # GitHub's network, not the home link. 0 means no curl rate cap.
+          SCALATTICE_RELEASE_UPLOAD_RATE: "0"
           UPLOADER_SHA: ${{ github.sha }}
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           git fetch --depth 1 origin $env:UPLOADER_SHA
-          if ($LASTEXITCODE -ne 0) { throw "could not fetch the rate-limited uploader" }
+          if ($LASTEXITCODE -ne 0) { throw "could not fetch the release uploader" }
           git checkout FETCH_HEAD -- scripts/ci-gh-release-upload.ps1
           .\scripts\ci-gh-release-upload.ps1 -Tag "${{ needs.prepare.outputs.tag }}" -Files @(
             "dist\ScalatticeAgentSetup-x86_64.exe",
