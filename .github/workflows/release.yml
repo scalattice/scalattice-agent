@@ -415,8 +415,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # Home-PC runner. Full-speed upload of the 1.2 GB zip reboots the router.
+          SCALATTICE_RELEASE_UPLOAD_RATE: 300K
+          UPLOADER_SHA: ${{ github.sha }}
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+          git fetch --depth 1 origin $env:UPLOADER_SHA
+          if ($LASTEXITCODE -ne 0) { throw "could not fetch the rate-limited uploader" }
+          git checkout FETCH_HEAD -- scripts/ci-gh-release-upload.ps1
           .\scripts\ci-gh-release-upload.ps1 -Tag "${{ needs.prepare.outputs.tag }}" -Files @(
             "dist\ScalatticeAgentSetup-x86_64.exe",
             "dist\scalattice-agent-x86_64-pc-windows-msvc.zip"
@@ -482,8 +489,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          UPLOADER_SHA: ${{ github.sha }}
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+          git fetch --depth 1 origin $env:UPLOADER_SHA
+          if ($LASTEXITCODE -ne 0) { throw "could not fetch the rate-limited uploader" }
+          git checkout FETCH_HEAD -- scripts/ci-gh-release-upload.ps1
           .\scripts\ci-gh-release-upload.ps1 -Tag "${{ needs.prepare.outputs.tag }}" -Files @(
             "dist\ScalatticeAgentSetup-x86_64.exe",
             "dist\scalattice-agent-x86_64-pc-windows-msvc.zip"
