@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_os = "macos"))]
 use std::collections::HashSet;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// On Windows, console tools (`nvidia-smi`, `powershell`, `where`) briefly flash a
@@ -2277,6 +2278,78 @@ pub fn detect_driver_version() -> Option<String> {
     None
 }
 
+/// CUDA runtime linked into this binary. Bump these when the build's toolkit
+/// changes. They are not a product rule of their own: a driver that cannot run
+/// this runtime means the agent is not compatible with the graphics cards.
+pub const BUNDLED_CUDA_MAJOR: u32 = 12;
+pub const BUNDLED_CUDA_MINOR: u32 = 6;
+
+static ACCEL_COMPAT_WATCH: AtomicBool = AtomicBool::new(false);
+static ACCEL_INCOMPATIBLE: AtomicBool = AtomicBool::new(false);
+
+pub fn accelerator_incompatible_message() -> &'static str {
+    "This agent isn't compatible with the graphics driver. Update the driver so the graphics cards can run jobs."
+}
+
+/// GPU workers call this before backend init. The processor slot must not,
+/// because llama.cpp probes CUDA there too.
+pub fn arm_accelerator_compat_watch() {
+    ACCEL_COMPAT_WATCH.store(true, Ordering::Relaxed);
+}
+
+pub fn mark_accelerator_incompatible() {
+    ACCEL_INCOMPATIBLE.store(true, Ordering::Relaxed);
+}
+
+pub fn accelerator_runtime_incompatible() -> bool {
+    ACCEL_INCOMPATIBLE.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn reset_accelerator_compat_for_test() {
+    ACCEL_COMPAT_WATCH.store(false, Ordering::Relaxed);
+    ACCEL_INCOMPATIBLE.store(false, Ordering::Relaxed);
+}
+
+/// True when a graphics worker's own log says its backend cannot run.
+pub fn note_accelerator_log_line(msg: &str) {
+    if !ACCEL_COMPAT_WATCH.load(Ordering::Relaxed) {
+        return;
+    }
+    let lower = msg.to_ascii_lowercase();
+    let incompatible = lower.contains("driver version is insufficient")
+        || lower.contains("failed to initialize cuda")
+        || lower.contains("failed to initialize vulkan")
+        || lower.contains("failed to initialize metal");
+    if incompatible {
+        mark_accelerator_incompatible();
+    }
+}
+
+pub fn parse_cuda_major_minor(raw: &str) -> Option<(u32, u32)> {
+    let nums: Vec<u32> = raw
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .take(2)
+        .collect();
+    let major = *nums.first()?;
+    let minor = nums.get(1).copied().unwrap_or(0);
+    Some((major, minor))
+}
+
+/// True only when the driver reported a CUDA version older than the runtime
+/// linked into this binary. Missing or unreadable versions are not a fault.
+pub fn nvidia_driver_too_old(cuda_version: Option<&str>) -> bool {
+    let Some(raw) = cuda_version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(found) = parse_cuda_major_minor(raw) else {
+        return false;
+    };
+    found < (BUNDLED_CUDA_MAJOR, BUNDLED_CUDA_MINOR)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn mb_to_gb(mb: f32) -> Option<u32> {
     if mb <= 0.0 {
@@ -2288,6 +2361,33 @@ fn mb_to_gb(mb: f32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphics_backend_log_marks_the_agent_incompatible() {
+        reset_accelerator_compat_for_test();
+        assert!(!accelerator_runtime_incompatible());
+        note_accelerator_log_line("failed to initialize CUDA: CUDA driver version is insufficient");
+        assert!(!accelerator_runtime_incompatible());
+        arm_accelerator_compat_watch();
+        note_accelerator_log_line("llama.cpp backend ready");
+        assert!(!accelerator_runtime_incompatible());
+        note_accelerator_log_line(
+            "failed to initialize CUDA: CUDA driver version is insufficient for CUDA runtime version",
+        );
+        assert!(accelerator_runtime_incompatible());
+        reset_accelerator_compat_for_test();
+    }
+
+    #[test]
+    fn older_nvidia_cuda_is_too_old_for_this_agent() {
+        assert!(nvidia_driver_too_old(Some("12.2")));
+        assert!(nvidia_driver_too_old(Some("11.8")));
+        assert!(!nvidia_driver_too_old(Some("12.6")));
+        assert!(!nvidia_driver_too_old(Some("12.6.3")));
+        assert!(!nvidia_driver_too_old(Some("13.0")));
+        assert!(!nvidia_driver_too_old(None));
+        assert!(!nvidia_driver_too_old(Some("")));
+    }
 
     #[test]
     fn integrated_pci_names_are_detected() {

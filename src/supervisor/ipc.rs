@@ -52,6 +52,9 @@ pub enum WorkerRequest {
 pub enum WorkerResponse {
     Pong {
         id: String,
+        /// This slot's backend cannot run on the installed driver.
+        #[serde(default)]
+        incompatible: bool,
     },
     Ok {
         id: String,
