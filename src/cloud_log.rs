@@ -194,6 +194,7 @@ pub fn ingest_log_chunk(buf: &[u8]) {
         if msg.is_empty() {
             continue;
         }
+        crate::specs::note_accelerator_log_line(&msg);
         let line = CloudLogLine {
             ts_ms: now_ms(),
             level,

@@ -29,8 +29,20 @@ pub fn run_worker(config_json: &str) -> Result<()> {
         "compute worker starting"
     );
 
+    let watches_accelerator = matches!(
+        boot.card.strategy,
+        PoolStrategy::Single | PoolStrategy::TensorParallel | PoolStrategy::Vulkan | PoolStrategy::Metal
+    );
+    if watches_accelerator {
+        crate::specs::arm_accelerator_compat_watch();
+    }
     if let Err(err) = init_backend() {
         warn!(slot = %boot.slot_id, error = %err, "worker llama backend init failed");
+        // Metal's first start compiles shaders and can time out while still being fine.
+        let retry_later = format!("{err:#}").to_ascii_lowercase().contains("will keep trying");
+        if watches_accelerator && !retry_later {
+            crate::specs::mark_accelerator_incompatible();
+        }
     }
 
     let busy = Arc::new(AtomicBool::new(false));
@@ -96,7 +108,13 @@ fn handle_request(
     stdout: &mut impl Write,
 ) -> Result<()> {
     match req {
-        WorkerRequest::Ping { id } => write_response(stdout, &WorkerResponse::Pong { id }),
+        WorkerRequest::Ping { id } => write_response(
+            stdout,
+            &WorkerResponse::Pong {
+                id,
+                incompatible: crate::specs::accelerator_runtime_incompatible(),
+            },
+        ),
         WorkerRequest::Shutdown { id } => {
             evict_all();
             write_response(stdout, &WorkerResponse::Ok { id })
@@ -109,7 +127,7 @@ fn handle_request(
             stdout,
             &WorkerResponse::Health {
                 id,
-                ready: true,
+                ready: !crate::specs::accelerator_runtime_incompatible(),
                 loaded_models: list_cached_runtime_models(),
                 busy: busy.load(Ordering::Relaxed),
             },

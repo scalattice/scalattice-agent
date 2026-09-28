@@ -103,6 +103,8 @@ pub struct Supervisor {
     /// On tight RAM, two concurrent GGUF mmaps OOM the box and drop the WebSocket.
     mmap_gate: Mutex<()>,
     occupancy: Mutex<OccupancyWatch>,
+    /// NVIDIA slots we refused to start because the driver cannot run this CUDA.
+    unusable_slots: HashSet<String>,
 }
 
 /// Give up only when the worker stops sending progress/token lines.
@@ -129,6 +131,10 @@ fn worker_silence_for_phase(phase: &str) -> Duration {
     }
 }
 
+fn slot_requires_nvidia_cuda(slot: &ComputeSlot) -> bool {
+    matches!(slot.card.strategy.as_str(), "single" | "tensor_parallel")
+}
+
 fn worker_wall_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_WALL,
@@ -145,11 +151,38 @@ impl Supervisor {
             tp_groups = plan.tp_groups.len(),
             "compute supervisor partitioning slots"
         );
+        let cuda_version = crate::specs::detect_cuda_version();
+        let block_nvidia = crate::specs::nvidia_driver_too_old(cuda_version.as_deref());
+        if block_nvidia {
+            warn!(
+                cuda = cuda_version.as_deref().unwrap_or(""),
+                "{}",
+                crate::specs::accelerator_incompatible_message()
+            );
+        }
         let mut workers = HashMap::new();
+        let mut unusable_slots = HashSet::new();
         for slot in &plan.slots {
+            if block_nvidia && slot_requires_nvidia_cuda(slot) {
+                warn!(
+                    slot = %slot.id,
+                    "graphics slot not started; NVIDIA driver cannot run this agent"
+                );
+                unusable_slots.insert(slot.id.clone());
+                continue;
+            }
             match spawn_worker(slot).await {
                 Ok(w) => {
-                    info!(slot = %slot.id, kind = %slot.kind, "slot worker ready");
+                    if w.healthy {
+                        info!(slot = %slot.id, kind = %slot.kind, "slot worker ready");
+                    } else {
+                        warn!(
+                            slot = %slot.id,
+                            "{}",
+                            crate::specs::accelerator_incompatible_message()
+                        );
+                        unusable_slots.insert(slot.id.clone());
+                    }
                     workers.insert(slot.id.clone(), w);
                 }
                 Err(err) => {
@@ -157,7 +190,7 @@ impl Supervisor {
                 }
             }
         }
-        if workers.is_empty() {
+        if workers.is_empty() && unusable_slots.is_empty() {
             bail!("no compute slot workers started");
         }
         let ram_gb = crate::specs::detect_ram_gb().unwrap_or(16);
@@ -171,6 +204,7 @@ impl Supervisor {
             ram_gb,
             mmap_gate: Mutex::new(()),
             occupancy: Mutex::new(OccupancyWatch::new()),
+            unusable_slots,
         }))
     }
 
@@ -412,10 +446,14 @@ impl Supervisor {
             .iter()
             .map(|spec| {
                 // Missing from the map = temporarily checked out for an in-flight invoke.
-                let (busy, healthy, loaded) = workers
-                    .get(&spec.id)
-                    .map(|w| (w.busy, w.healthy, w.loaded_models.clone()))
-                    .unwrap_or((true, true, Vec::new()));
+                let (busy, healthy, loaded) = if self.unusable_slots.contains(&spec.id) {
+                    (false, false, Vec::new())
+                } else {
+                    workers
+                        .get(&spec.id)
+                        .map(|w| (w.busy, w.healthy, w.loaded_models.clone()))
+                        .unwrap_or((true, true, Vec::new()))
+                };
                 SlotStatus {
                     id: spec.id.clone(),
                     kind: spec.kind.clone(),
@@ -464,19 +502,29 @@ impl Supervisor {
         self.occupancy.lock().await.latched_ids()
     }
 
-    /// Idle accelerator slots that still have room for our advertised models.
-    /// CPU is not a routing slot while GPUs exist.
+    pub fn accelerator_incompatible(&self) -> bool {
+        !self.unusable_slots.is_empty()
+    }
+
+    /// Idle slots the router may fill. CPU is hidden while a healthy graphics
+    /// worker exists, including when that worker is busy. A graphics slot that
+    /// never started (driver too old) is not healthy, so the processor slot
+    /// stays available.
     pub async fn routing_idle_slot_ids(&self) -> Vec<String> {
         let occupied = self.occupied_slot_ids().await;
-        let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
-        self.idle_slot_ids()
-            .await
-            .into_iter()
+        let idle = self.idle_slot_ids().await;
+        let healthy_accel = {
+            let workers = self.workers.lock().await;
+            self.plan.slots.iter().any(|slot| {
+                slot.kind != "cpu" && workers.get(&slot.id).is_some_and(|worker| worker.healthy)
+            })
+        };
+        idle.into_iter()
             .filter(|id| {
                 if occupied.contains(id) {
                     return false;
                 }
-                if has_accel && self.slot_is_cpu(id) {
+                if healthy_accel && self.slot_is_cpu(id) {
                     return false;
                 }
                 true
@@ -557,6 +605,7 @@ impl Supervisor {
             .slots
             .iter()
             .filter(|s| s.kind != "cpu")
+            .filter(|s| !self.unusable_slots.contains(&s.id))
             .filter(|s| workers.get(&s.id).map(|w| w.healthy).unwrap_or(true))
             .count();
         accel.max(1) as u32
@@ -1272,7 +1321,12 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
     // Handshake
     let req_id = next_req_id();
     match worker_rpc(&mut worker, WorkerRequest::Ping { id: req_id }).await {
-        Ok(WorkerResponse::Pong { .. }) => Ok(worker),
+        Ok(WorkerResponse::Pong { incompatible, .. }) => {
+            if incompatible {
+                worker.healthy = false;
+            }
+            Ok(worker)
+        }
         Ok(other) => {
             let _ = worker.child.kill().await;
             bail!("unexpected ping response: {other:?}");
@@ -1325,7 +1379,7 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
         };
         match &resp {
             WorkerResponse::Delta { .. } | WorkerResponse::Progress { .. } => continue,
-            WorkerResponse::Pong { id }
+            WorkerResponse::Pong { id, .. }
             | WorkerResponse::Ok { id }
             | WorkerResponse::Result { id, .. }
             | WorkerResponse::Health { id, .. }

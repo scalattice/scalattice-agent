@@ -946,7 +946,18 @@ impl SessionState {
                 }
             }
         }
-        let enabled_count = specs.compute_devices.iter().filter(|d| d.enabled).count();
+        let driver_fault = (self
+            .supervisor
+            .as_ref()
+            .is_some_and(|supervisor| supervisor.accelerator_incompatible())
+            || crate::specs::nvidia_driver_too_old(specs.cuda_version.as_deref()))
+        .then(crate::specs::accelerator_incompatible_message);
+        let enabled_count = specs
+            .compute_devices
+            .iter()
+            .filter(|device| device.enabled)
+            .filter(|device| driver_fault.is_none() || device.kind != "discrete")
+            .count();
         let downloading = crate::state::downloading_model();
         let blocked_models = if downloading.is_some() || !loaded_models.is_empty() {
             0
@@ -973,6 +984,7 @@ impl SessionState {
             self.cached_max_jobs.max(1),
             self.cached_idle_slots,
             self.cached_gpu_occupied,
+            driver_fault,
         )
     }
 

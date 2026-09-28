@@ -56,6 +56,9 @@ pub struct AgentRuntime {
     /// Foreign VRAM is using every placeable GPU. Not a Scalattice job.
     #[serde(rename = "gpuOccupied", skip_serializing_if = "std::ops::Not::not")]
     pub gpu_occupied: bool,
+    /// Graphics cards are installed but cannot run this agent (driver too old).
+    #[serde(rename = "acceleratorFault", skip_serializing_if = "Option::is_none")]
+    pub accelerator_fault: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,8 +86,12 @@ pub fn build_runtime(
     max_concurrent_jobs: u32,
     idle_slots: u32,
     gpu_occupied: bool,
+    accelerator_fault: Option<&str>,
 ) -> AgentRuntime {
     let ready = enabled_compute_devices > 0 && !loaded_models.is_empty();
+    let fault = accelerator_fault
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     // Report real busyness for dashboards. Routing uses claim slots / idleSlots,
     // not this flag: forcing Idle whenever any slot (often cpu-0) was free hid
     // active GPU jobs as "in the inference pool".
@@ -97,8 +104,9 @@ pub fn build_runtime(
         JobState::Busy
     } else if gpu_occupied {
         JobState::Idle
-    } else if idle_slots == 0 && max_concurrent_jobs > 0 {
+    } else if idle_slots == 0 && max_concurrent_jobs > 0 && fault.is_none() {
         // Transient: slot map empty/busy during checkout. Heartbeat reconcile heals lies.
+        // A driver fault with no workers is not a job.
         JobState::Busy
     } else {
         JobState::Idle
@@ -117,6 +125,11 @@ pub fn build_runtime(
     let disk_full = crate::state::disk_full();
     if disk_full && downloading_model.is_none() && reported_state != JobState::Busy {
         status_label = "Disk full: paused model downloads".to_string();
+    }
+    if let Some(fault) = fault {
+        if reported_state != JobState::Busy {
+            status_label = fault.to_string();
+        }
     }
 
     AgentRuntime {
@@ -148,6 +161,7 @@ pub fn build_runtime(
         max_concurrent_jobs: Some(max_concurrent_jobs.max(1)),
         idle_slots: Some(idle_slots),
         gpu_occupied,
+        accelerator_fault: fault.map(str::to_string),
     }
 }
 
@@ -335,6 +349,7 @@ mod tests {
             2,
             0,
             true,
+            None,
         );
         assert_eq!(runtime.job_state, "idle");
         assert_eq!(runtime.status_label, "GPUs in use");
