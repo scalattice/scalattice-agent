@@ -1,7 +1,7 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
 use crate::models::{
     can_host_model, can_serve_vision_on_card, cpu_fallback_fits, gpu_full_host_need_gb_for_job,
-    hosting_min_vram_gb, image_job_min_vram_gb, vram_can_gpu_full,
+    hosting_min_vram_gb, image_job_min_vram_gb, occupancy_min_vram_gb, vram_can_gpu_full,
 };
 use crate::protocol::CatalogModel;
 use tracing::debug;
@@ -176,6 +176,7 @@ pub fn pick_placement(
             .slots
             .iter()
             .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
+            .filter(|s| accelerator_live_can_place(s, &live_cuda, model))
             .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
             .collect();
         offload.sort_by(|a, b| {
@@ -200,10 +201,14 @@ pub fn pick_placement(
             .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
             .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
         {
-            let accel_can_host = plan.slots.iter().any(|s| {
-                s.kind != "cpu" && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+            // A busy card that could host keeps the job off the CPU. An idle card
+            // with no free VRAM does not: the processor slot can run it.
+            let busy_accel_could_host = plan.slots.iter().any(|s| {
+                s.kind != "cpu"
+                    && !idle.contains(s.id.as_str())
+                    && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
             });
-            if accel_can_host {
+            if busy_accel_could_host {
                 debug!(slot = %slot.id, "placement: skip cpu; an accelerator can host this model");
             } else if plan.slots.iter().any(|s| s.kind != "cpu")
                 && !cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb)
@@ -222,6 +227,20 @@ pub fn pick_placement(
     }
 
     None
+}
+
+/// Live free VRAM can still hold at least half the weights. Nameplate size is
+/// not enough: a full 6 GB card was being given the job, then the load failed.
+pub(crate) fn accelerator_live_can_place(
+    slot: &ComputeSlot,
+    live_cuda: &std::collections::HashMap<u32, f64>,
+    model: &CatalogModel,
+) -> bool {
+    if slot.kind == "cpu" {
+        return false;
+    }
+    let available = slot_available_gb(slot, live_cuda);
+    available + 0.005 >= occupancy_min_vram_gb(model)
 }
 
 fn slot_available_gb(slot: &ComputeSlot, live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {

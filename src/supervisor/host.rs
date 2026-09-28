@@ -1,5 +1,7 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
-use super::placement::{pick_placement, placement_miss_detail, Placement};
+use super::placement::{
+    accelerator_live_can_place, pick_placement, placement_miss_detail, Placement,
+};
 use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot};
 use crate::gpu_occupancy::{
     smallest_advertised_need_gb, slot_live_free_gb, OccupancyWatch, SlotOccupancyView,
@@ -108,25 +110,25 @@ pub struct Supervisor {
 }
 
 /// Give up only when the worker stops sending progress/token lines.
-/// Load already has llama.cpp callbacks (~400ms). Decode reports every token
-/// (throttled to 400ms). VL photo encode pings once per mtmd chunk. 30s is a
-/// missed-beat kill, not a multi-minute nap.
+/// Decode reports every token (throttled to 400ms). 30s is a missed-beat kill
+/// once tokens are flowing, not a limit on opening a large model file.
 const WORKER_DECODE_SILENCE: Duration = Duration::from_secs(30);
 const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(30);
-/// CPU-heavy offload of a 17 GB GGUF can spend >30s in one llama decode of
-/// the prompt. Prefill reports only between chunks; 30s killed Coder on 8 GB.
+/// Cold open of a large GGUF, and CPU-heavy prefill, can sit quiet for more
+/// than 30s before the next progress line. 30s killed a 27B load and Coder on 8 GB.
 const WORKER_PREFILL_SILENCE: Duration = Duration::from_secs(180);
-/// Decode / idle invoke ceiling. Measured from when decode starts, not invoke
-/// start — a 32k CPU offload prefill can already be 45 minutes.
-const WORKER_DECODE_WALL: Duration = Duration::from_secs(12 * 60);
+/// Decode ceiling, measured from the first token. Slow cards with the cache in
+/// system RAM were still generating when 12 minutes cut them off.
+const WORKER_DECODE_WALL: Duration = Duration::from_secs(20 * 60);
 const WORKER_PREFILL_WALL: Duration = Duration::from_secs(45 * 60);
 /// Must exceed prefill wall + decode wall or Full Debug reclaim kills mid-decode.
-const STUCK_CHECKOUT: Duration = Duration::from_secs(60 * 60);
+const STUCK_CHECKOUT: Duration = Duration::from_secs(70 * 60);
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_SILENCE,
-        "prefill" | "context" | "load" => WORKER_PREFILL_SILENCE,
+        // "start" is the gap before the first llama progress line (opening the file).
+        "prefill" | "context" | "load" | "start" => WORKER_PREFILL_SILENCE,
         _ => WORKER_LOAD_SILENCE,
     }
 }
@@ -779,8 +781,21 @@ impl Supervisor {
             let placement = {
                 let occupied = self.occupied_slot_ids().await;
                 let mut workers = self.workers.lock().await;
-                let accel_can_host = self.plan.slots.iter().any(|s| {
+                let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+                let idle_gpu_can_place = self.plan.slots.iter().any(|s| {
+                    !skip.contains(&s.id)
+                        && !occupied.contains(&s.id)
+                        && accelerator_live_can_place(s, &live_cuda, model)
+                        && crate::models::can_host_model(
+                            model,
+                            &s.card,
+                            ram_gb,
+                            cpu_ram_headroom_gb,
+                        )
+                });
+                let busy_gpu_could_host = self.plan.slots.iter().any(|s| {
                     s.kind != "cpu"
+                        && occupied.contains(&s.id)
                         && crate::models::can_host_model(
                             model,
                             &s.card,
@@ -799,7 +814,10 @@ impl Supervisor {
                     .iter()
                     .filter(|s| !skip.contains(&s.id))
                     .filter(|s| !occupied.contains(&s.id))
-                    .filter(|s| s.kind != "cpu" || (!accel_can_host && cpu_ram_ok))
+                    .filter(|s| {
+                        s.kind != "cpu"
+                            || (!idle_gpu_can_place && !busy_gpu_could_host && cpu_ram_ok)
+                    })
                     .filter(|s| {
                         workers
                             .get(&s.id)
@@ -1083,6 +1101,23 @@ impl Supervisor {
         let need_vision = crate::protocol::messages_have_images(messages);
         let (n_ctx, offload_kqv) =
             crate::models::llama_context_plan(model, &placement.card, need_vision);
+        if !offload_kqv
+            && !matches!(
+                placement.card.strategy,
+                crate::compute_pool::PoolStrategy::CpuOnly
+            )
+        {
+            let used = crate::specs::detect_ram_used_gb().unwrap_or(0);
+            let free = self.ram_gb.saturating_sub(used);
+            let need = crate::models::kv_offload_ram_gb(model, need_vision);
+            if free < need {
+                self.return_worker(slot_id.clone(), worker).await;
+                self.clear_checkout(&slot_id).await;
+                bail!(
+                    "insufficient_vram: not enough free system RAM to hold the context (need {need} GB, {free} GB free)"
+                );
+            }
+        }
         let outcome = worker_rpc_invoke_cancellable(
             &mut worker,
             WorkerRequest::Invoke {
@@ -1405,8 +1440,8 @@ async fn worker_rpc_invoke_cancellable(
     worker.stdin.flush().await?;
 
     let mut buf = String::new();
-    let mut silence = WORKER_LOAD_SILENCE;
     let mut last_phase = String::from("start");
+    let mut silence = worker_silence_for_phase(&last_phase);
     let mut phase_started = Instant::now();
     let mut last_progress = Instant::now();
     loop {
@@ -1557,7 +1592,9 @@ fn worker_crash_retryable(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        worker_crash_retryable, worker_wall_for_phase, WORKER_DECODE_WALL, WORKER_PREFILL_WALL,
+        worker_crash_retryable, worker_silence_for_phase, worker_wall_for_phase,
+        STUCK_CHECKOUT, WORKER_DECODE_SILENCE, WORKER_DECODE_WALL, WORKER_PREFILL_SILENCE,
+        WORKER_PREFILL_WALL,
     };
 
     #[test]
@@ -1582,5 +1619,13 @@ mod tests {
         assert_eq!(worker_wall_for_phase("prefill"), WORKER_PREFILL_WALL);
         assert_eq!(worker_wall_for_phase("start"), WORKER_PREFILL_WALL);
         assert!(WORKER_PREFILL_WALL > WORKER_DECODE_WALL);
+        assert!(STUCK_CHECKOUT > WORKER_PREFILL_WALL + WORKER_DECODE_WALL);
+    }
+
+    #[test]
+    fn cold_load_is_not_killed_at_the_decode_missed_beat() {
+        assert_eq!(worker_silence_for_phase("start"), WORKER_PREFILL_SILENCE);
+        assert_eq!(worker_silence_for_phase("load"), WORKER_PREFILL_SILENCE);
+        assert_eq!(worker_silence_for_phase("decode"), WORKER_DECODE_SILENCE);
     }
 }
