@@ -100,6 +100,11 @@ fn job_kv_gb(model: &CatalogModel, need_vision: bool) -> f64 {
     llama_job_parts(model, need_vision).2
 }
 
+/// GiB of system RAM the KV cache needs when llama.cpp is not keeping it on the GPU.
+pub fn kv_offload_ram_gb(model: &CatalogModel, need_vision: bool) -> u32 {
+    gb_ceil(Some(job_kv_gb(model, need_vision))).max(1)
+}
+
 fn kv_ram_need_gb(model: &CatalogModel, need_vision: bool, cpu_ram_headroom_gb: u32) -> u32 {
     let kv = job_kv_gb(model, need_vision);
     let min_ram = gb_ceil(model.min_ram_gb);
