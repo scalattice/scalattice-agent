@@ -24,10 +24,6 @@ pub fn begin_lifecycle_control() -> bool {
         .is_ok()
 }
 
-pub fn lifecycle_control_in_flight() -> bool {
-    LIFECYCLE_IN_FLIGHT.load(Ordering::SeqCst)
-}
-
 pub fn end_lifecycle_control() {
     LIFECYCLE_IN_FLIGHT.store(false, Ordering::SeqCst);
 }
