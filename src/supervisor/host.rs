@@ -780,11 +780,40 @@ impl Supervisor {
         for attempt in 0..accel_slots {
             let placement = {
                 let occupied = self.occupied_slot_ids().await;
+                let inflight_gpu = match self.checkouts.try_lock() {
+                    Ok(guard) => guard
+                        .keys()
+                        .filter(|id| {
+                            self.plan.slots.iter().any(|slot| {
+                                slot.id == **id
+                                    && slot.kind != "cpu"
+                                    && !self.unusable_slots.contains(&slot.id)
+                            })
+                        })
+                        .cloned()
+                        .collect::<HashSet<_>>(),
+                    // Another task holds the checkout map. Assume a GPU job is in flight
+                    // rather than loading a second copy onto the processor.
+                    Err(_) => self
+                        .plan
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.kind != "cpu" && !self.unusable_slots.contains(&slot.id))
+                        .map(|slot| slot.id.clone())
+                        .collect::<HashSet<_>>(),
+                };
                 let mut workers = self.workers.lock().await;
                 let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+                let gpu_usable = |s: &ComputeSlot| {
+                    s.kind != "cpu"
+                        && !self.unusable_slots.contains(&s.id)
+                        && workers.get(&s.id).is_some_and(|w| w.healthy)
+                };
                 let idle_gpu_can_place = self.plan.slots.iter().any(|s| {
-                    !skip.contains(&s.id)
+                    gpu_usable(s)
+                        && !skip.contains(&s.id)
                         && !occupied.contains(&s.id)
+                        && workers.get(&s.id).is_some_and(|w| !w.busy)
                         && accelerator_live_can_place(s, &live_cuda, model)
                         && crate::models::can_host_model(
                             model,
@@ -793,9 +822,20 @@ impl Supervisor {
                             cpu_ram_headroom_gb,
                         )
                 });
+                // Only our own in-flight GPU job blocks the processor. VRAM held
+                // by other software is not a job we can wait out, and a card the
+                // driver cannot run is not a card that could host this model.
                 let busy_gpu_could_host = self.plan.slots.iter().any(|s| {
-                    s.kind != "cpu"
-                        && occupied.contains(&s.id)
+                    inflight_gpu.contains(&s.id)
+                        && crate::models::can_host_model(
+                            model,
+                            &s.card,
+                            ram_gb,
+                            cpu_ram_headroom_gb,
+                        )
+                }) || self.plan.slots.iter().any(|s| {
+                    gpu_usable(s)
+                        && workers.get(&s.id).is_some_and(|w| w.busy)
                         && crate::models::can_host_model(
                             model,
                             &s.card,
@@ -843,7 +883,7 @@ impl Supervisor {
                         }
                         let need_vision = crate::protocol::messages_have_images(messages);
                         let detail = placement_miss_detail(&self.plan, &idle, model, need_vision);
-                        return Err(anyhow!(detail));
+                        return Err(detail.into());
                     }
                 };
 
@@ -865,7 +905,10 @@ impl Supervisor {
                             }
                         }
                         self.clear_job_cancel(job_id).await;
-                        bail!("agent_busy: slot {sid} not available");
+                        return Err(crate::invoke_code::coded(
+                            crate::invoke_code::InvokeErrorCode::AgentBusy,
+                            format!("slot {sid} not available"),
+                        ));
                     }
                     worker.busy = true;
                 }
@@ -975,7 +1018,7 @@ impl Supervisor {
                 None => {
                     self.clear_job_cancel(job_id).await;
                     let detail = placement_miss_detail(&self.plan, &idle, model, false);
-                    return Err(anyhow!(detail));
+                    return Err(detail.into());
                 }
             };
             for sid in &placement.slot_ids {
@@ -985,7 +1028,10 @@ impl Supervisor {
                 };
                 if worker.busy || !worker.healthy {
                     self.clear_job_cancel(job_id).await;
-                    bail!("agent_busy: slot {sid} not available");
+                    return Err(crate::invoke_code::coded(
+                        crate::invoke_code::InvokeErrorCode::AgentBusy,
+                        format!("slot {sid} not available"),
+                    ));
                 }
                 worker.busy = true;
             }
@@ -1113,9 +1159,12 @@ impl Supervisor {
             if free < need {
                 self.return_worker(slot_id.clone(), worker).await;
                 self.clear_checkout(&slot_id).await;
-                bail!(
-                    "insufficient_vram: not enough free system RAM to hold the context (need {need} GB, {free} GB free)"
-                );
+                return Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                    format!(
+                        "not enough free system RAM to hold the context (need {need} GB, {free} GB free)"
+                    ),
+                ));
             }
         }
         let outcome = worker_rpc_invoke_cancellable(
@@ -1331,6 +1380,7 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
                             // timestamps/targets when the supervisor re-logs.
                             let (_lvl, body) = crate::cloud_log::normalize_tracing_message(t);
                             if !body.is_empty() {
+                                crate::specs::note_worker_stderr_line(&body);
                                 info!(slot = %slot_log_id, "{body}");
                             }
                         }
@@ -1399,7 +1449,10 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
             .context("read worker response")?;
         if n == 0 {
             worker.healthy = false;
-            bail!("worker closed stdout (after {skipped} non-json line(s))");
+            return Err(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::WorkerLost,
+                format!("worker closed stdout (after {skipped} non-json line(s))"),
+            ));
         }
         let Some(resp) = try_parse_worker_response(&buf) else {
             skipped += 1;
@@ -1455,7 +1508,10 @@ async fn worker_rpc_invoke_cancellable(
             let _ = worker.child.kill().await;
             let _ = worker.child.wait().await;
             worker.healthy = false;
-            bail!("invoke_timeout: exceeded wall-clock limit");
+            return Err(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::InvokeTimeout,
+                "exceeded wall-clock limit",
+            ));
         }
         buf.clear();
         let silence_left = silence
@@ -1478,7 +1534,10 @@ async fn worker_rpc_invoke_cancellable(
                 let n = n.context("read worker invoke response")?;
                 if n == 0 {
                     worker.healthy = false;
-                    bail!("worker closed stdout during invoke");
+                    return Err(crate::invoke_code::coded(
+                        crate::invoke_code::InvokeErrorCode::WorkerLost,
+                        "worker closed stdout during invoke",
+                    ));
                 }
                 let Some(resp) = try_parse_worker_response(&buf) else {
                     warn!(
@@ -1532,7 +1591,7 @@ async fn worker_rpc_invoke_cancellable(
                         ));
                     }
                     WorkerResponse::Error { id, error } if id == expect_id => {
-                        bail!("{error}");
+                        return Err(crate::invoke_code::error_from_wire(&error));
                     }
                     other => {
                         warn!(?other, "ignoring unexpected worker message during invoke");
@@ -1552,7 +1611,10 @@ async fn worker_rpc_invoke_cancellable(
                 let _ = worker.child.kill().await;
                 let _ = worker.child.wait().await;
                 worker.healthy = false;
-                bail!("invoke_timeout: worker made no progress");
+                return Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::InvokeTimeout,
+                    "worker made no progress",
+                ));
             }
         }
     }
@@ -1572,13 +1634,24 @@ fn request_id(req: &WorkerRequest) -> String {
 /// Worker process died (CUDA abort / stdout close). Retry on another slot
 /// unless the client already received tokens or the error is a real reject.
 fn worker_crash_retryable(err: &anyhow::Error) -> bool {
-    let d = format!("{err:#}").to_lowercase();
-    if d.contains("request_canceled")
-        || d.contains("prompt too long")
-        || d.contains("invalid_image")
-        || d.contains("agent_busy")
-        || d.contains("insufficient_vram")
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<crate::invoke_code::CodedError>().is_some())
     {
+        return crate::invoke_code::crash_retryable(err);
+    }
+    // A worker that still sends a bare sentence (no code). Our own failures are coded above.
+    let d = format!("{err:#}").to_lowercase();
+    let benign = matches!(
+        crate::invoke_code::code_of(err),
+        crate::invoke_code::InvokeErrorCode::RequestCanceled
+            | crate::invoke_code::InvokeErrorCode::PromptTooLong
+            | crate::invoke_code::InvokeErrorCode::InvalidImage
+            | crate::invoke_code::InvokeErrorCode::AgentBusy
+            | crate::invoke_code::InvokeErrorCode::NoIdleSlot
+            | crate::invoke_code::InvokeErrorCode::InsufficientVram
+    );
+    if benign && !d.contains("null result") && !d.contains("closed stdout") {
         return false;
     }
     d.contains("closed stdout")

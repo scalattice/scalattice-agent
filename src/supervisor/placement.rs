@@ -301,7 +301,7 @@ pub fn placement_miss_detail(
     idle_slot_ids: &[String],
     model: &CatalogModel,
     need_vision: bool,
-) -> String {
+) -> crate::invoke_code::CodedError {
     let model_id = model.model_id.as_str();
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
     let idle_accel: Vec<&ComputeSlot> = plan
@@ -311,7 +311,10 @@ pub fn placement_miss_detail(
         .collect();
 
     if idle_accel.is_empty() && idle_slot_ids.is_empty() {
-        return format!("agent_busy: no idle compute slot for {model_id}");
+        return crate::invoke_code::CodedError::new(
+            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+            format!("no idle compute slot for {model_id}"),
+        );
     }
 
     if model.is_image_job() {
@@ -326,11 +329,15 @@ pub fn placement_miss_detail(
             })
             .collect();
         if image_slots.iter().any(|s| idle.contains(s.id.as_str())) {
-            return format!("agent_busy: no placeable idle slot for {model_id}");
+            return crate::invoke_code::CodedError::new(
+                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                format!("no placeable idle slot for {model_id}"),
+            );
         }
         if !image_slots.is_empty() {
-            return format!(
-                "agent_busy: waiting for a GPU that can host {model_id} (need {min_vram} GB)"
+            return crate::invoke_code::CodedError::new(
+                crate::invoke_code::InvokeErrorCode::AgentBusy,
+                format!("waiting for a GPU that can host {model_id} (need {min_vram} GB)"),
             );
         }
         let max_idle = idle_accel
@@ -338,8 +345,11 @@ pub fn placement_miss_detail(
             .map(|s| s.card.total_vram_gb)
             .max()
             .unwrap_or(0);
-        return format!(
-            "insufficient_vram: need {min_vram} GB GPU for image job {model_id}; largest idle {max_idle} GB"
+        return crate::invoke_code::CodedError::new(
+            crate::invoke_code::InvokeErrorCode::InsufficientVram,
+            format!(
+                "need {min_vram} GB GPU for image job {model_id}; largest idle {max_idle} GB"
+            ),
         );
     }
 
@@ -361,8 +371,9 @@ pub fn placement_miss_detail(
     });
     if has_fitting_gpu {
         let need = gpu_full_host_need_gb_for_job(model, need_vision);
-        return format!(
-            "agent_busy: waiting for a GPU that can fully host {model_id} (need {need:.1} GB)"
+        return crate::invoke_code::CodedError::new(
+            crate::invoke_code::InvokeErrorCode::AgentBusy,
+            format!("waiting for a GPU that can fully host {model_id} (need {need:.1} GB)"),
         );
     }
 
@@ -370,11 +381,15 @@ pub fn placement_miss_detail(
         // Only CPU idle: vision cannot use it; text would have placed CPU.
         if need_vision {
             let need = image_job_min_vram_gb(model);
-            return format!(
-                "insufficient_vram: need {need} GB GPU for vision job {model_id}; no idle accelerator"
+            return crate::invoke_code::CodedError::new(
+                crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                format!("need {need} GB GPU for vision job {model_id}; no idle accelerator"),
             );
         }
-        return format!("agent_busy: no idle compute slot for {model_id}");
+        return crate::invoke_code::CodedError::new(
+            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+            format!("no idle compute slot for {model_id}"),
+        );
     }
 
     if need_vision {
@@ -397,13 +412,19 @@ pub fn placement_miss_detail(
             let pooled: u32 = siblings.iter().map(|s| s.card.total_vram_gb).sum();
             max_pool = max_pool.max(pooled);
         }
-        return format!(
-            "insufficient_vram: need {need} GB GPU for vision job {model_id}; largest idle {max_pool} GB across {} slot(s)",
-            idle_accel.len()
+        return crate::invoke_code::CodedError::new(
+            crate::invoke_code::InvokeErrorCode::InsufficientVram,
+            format!(
+                "need {need} GB GPU for vision job {model_id}; largest idle {max_pool} GB across {} slot(s)",
+                idle_accel.len()
+            ),
         );
     }
 
-    format!("agent_busy: no placeable idle slot for {model_id}")
+    crate::invoke_code::CodedError::new(
+        crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+        format!("no placeable idle slot for {model_id}"),
+    )
 }
 
 #[cfg(test)]
@@ -776,13 +797,11 @@ mod tests {
         let model = image_model(8.0);
         assert!(pick_placement(&plan, &idle, &model, 64, 2, &devices, false).is_none());
         let detail = placement_miss_detail(&plan, &idle, &model, false);
+        assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
         assert!(
-            detail.starts_with("agent_busy:"),
-            "want capacity miss, got {detail}"
-        );
-        assert!(
-            detail.contains("waiting for a GPU"),
-            "want wait-for-fit, got {detail}"
+            detail.detail.contains("waiting for a GPU"),
+            "want wait-for-fit, got {}",
+            detail.detail
         );
     }
 

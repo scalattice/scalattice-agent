@@ -11,6 +11,7 @@ mod compute_pool;
 mod gpu_occupancy;
 mod config;
 mod inference;
+mod invoke_code;
 mod llm;
 mod logging;
 mod image;
