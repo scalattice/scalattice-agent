@@ -3,16 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "macos"))]
 use std::sync::OnceLock;
 
 mod host;
+#[cfg(any(test, not(target_os = "macos")))]
+use host::bytes_to_gb;
 #[allow(unused_imports)]
 pub use host::disk_avail_bytes;
-use host::{bytes_to_gb, disk_usage_gb, host_os_fields};
 pub use host::{
     detect_cpu_model, detect_hostname, detect_install_id, detect_ram_gb, detect_ram_used_gb,
     disk_is_full,
 };
+use host::{disk_usage_gb, host_os_fields};
 
 /// On Windows, console tools (`nvidia-smi`, `powershell`, `where`) briefly flash a
 /// cmd window unless CREATE_NO_WINDOW is set. Specs are refreshed on every
@@ -1360,84 +1363,6 @@ pub(crate) fn apple_usable_gpu_gb(ram_gb: u32) -> u32 {
     ram_gb
         .saturating_sub(system_ram_reserve_gb(ram_gb).round() as u32)
         .max(1)
-}
-
-#[cfg(target_os = "macos")]
-fn sysctl_string(name: &str) -> Option<String> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    let mut size: usize = 0;
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c_name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || size == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; size];
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c_name.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    buf.truncate(size.saturating_sub(1)); // drop trailing NUL
-    let s = String::from_utf8_lossy(&buf).trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-#[cfg(target_os = "macos")]
-fn sysctl_u64(name: &str) -> Option<u64> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    let mut value: u64 = 0;
-    let mut size = std::mem::size_of::<u64>();
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c_name.as_ptr(),
-            &mut value as *mut u64 as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn vm_stat_free_pages() -> Option<u64> {
-    let output = Command::new("vm_stat").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut free = 0u64;
-    for line in stdout.lines() {
-        let lower = line.to_ascii_lowercase();
-        if !(lower.contains("pages free") || lower.contains("pages speculative")) {
-            continue;
-        }
-        if let Some(num) = line.split(':').nth(1) {
-            let digits: String = num.chars().filter(|c| c.is_ascii_digit()).collect();
-            if let Ok(n) = digits.parse::<u64>() {
-                free = free.saturating_add(n);
-            }
-        }
-    }
-    (free > 0).then_some(free)
 }
 
 #[cfg(not(target_os = "macos"))]
