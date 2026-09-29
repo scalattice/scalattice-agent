@@ -874,10 +874,11 @@ async fn run_image_worker(
                         } else {
                             parsed.error
                         };
-                        if parsed.detail.is_empty() {
-                            bail!("{code}");
-                        }
-                        bail!("{code}: {}", parsed.detail);
+                        return Err(crate::invoke_code::error_from_wire(&if parsed.detail.is_empty() {
+                            code
+                        } else {
+                            format!("{code}: {}", parsed.detail)
+                        }));
                     }
                     _ => {}
                 }
@@ -904,13 +905,20 @@ async fn run_image_worker(
     }
     let images = images.ok_or_else(|| {
         if status.success() {
-            anyhow!("inference_failed: image worker returned no images")
+            crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::InferenceFailed,
+                "image worker returned no images",
+            )
         } else if image_worker_oom_killed(&status) {
-            anyhow!(
-                "insufficient_vram: image worker ran out of memory (killed by the OS)"
+            crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                "image worker ran out of memory (killed by the OS)",
             )
         } else {
-            anyhow!("inference_failed: image worker exited {}", status)
+            crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::InferenceFailed,
+                format!("image worker exited {status}"),
+            )
         }
     })?;
     if images.is_empty() {

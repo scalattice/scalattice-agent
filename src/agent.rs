@@ -950,6 +950,7 @@ impl SessionState {
             .supervisor
             .as_ref()
             .is_some_and(|supervisor| supervisor.accelerator_incompatible())
+            || crate::specs::accelerator_runtime_incompatible()
             || crate::specs::nvidia_driver_too_old(specs.cuda_version.as_deref()))
         .then(crate::specs::accelerator_incompatible_message);
         let enabled_count = specs
@@ -1866,11 +1867,7 @@ async fn handle_server_message(
                         if let Err(err) = respond_invoke(&state, &write, invoke).await {
                             warn!("invoke task failed: {err:#}");
                             let code = invoke_error_code(&err);
-                            if code != "agent_busy"
-                                && code != "request_canceled"
-                                && code != "insufficient_vram"
-                                && code != "disk_full"
-                            {
+                            if !crate::invoke_code::code_of(&err).is_benign() {
                                 state::record_inference_failure(code, &format!("{err:#}"));
                             }
                         }
@@ -1912,7 +1909,7 @@ async fn handle_server_message(
                         if let Err(err) = respond_invoke_split(&state, &write, invoke).await {
                             warn!("invoke_split task failed: {err:#}");
                             let code = invoke_error_code(&err);
-                            if code != "agent_busy" {
+                            if !crate::invoke_code::code_of(&err).is_benign() {
                                 state::record_inference_failure(code, &format!("{err:#}"));
                             }
                         }
@@ -2510,10 +2507,8 @@ async fn respond_invoke(
                     if code == "model_not_installed" {
                         withdraw_incomplete_image_snapshot(state, write, &catalog_model).await;
                     }
-                    if code == "agent_busy"
-                        || code == "insufficient_vram"
-                        || code == "model_not_installed"
-                        || code == "disk_full"
+                    if crate::invoke_code::InvokeErrorCode::parse(code)
+                        .is_some_and(|c| c.is_benign())
                     {
                         info!("invoke {} image capacity miss · {code}: {err:#}", invoke_id);
                     } else if code == "request_canceled" {
@@ -2584,7 +2579,9 @@ async fn respond_invoke(
             }
             Err(err) => {
                 let code = invoke_error_code(&err);
-                if code == "agent_busy" || code == "insufficient_vram" || code == "disk_full" {
+                if crate::invoke_code::InvokeErrorCode::parse(code)
+                    .is_some_and(|c| c.is_benign() && c != crate::invoke_code::InvokeErrorCode::RequestCanceled)
+                {
                     // INFO so live/cloud logs show why an invoke vanished after the
                     // start line (placement miss never claims a slot / runs llama).
                     info!("invoke {} capacity miss · {code}: {err:#}", invoke_id);
@@ -2792,7 +2789,9 @@ async fn send_invoke_split_error(
         engine.pool().display_name
     );
     let code = invoke_error_code(&err);
-    if code != "agent_busy" {
+    if !crate::invoke_code::InvokeErrorCode::parse(code)
+        .is_some_and(|c| c.is_benign())
+    {
         state::record_inference_failure(code, &format!("{err:#}"));
     }
     let err = InvokeErrorMessage {
@@ -2810,98 +2809,7 @@ async fn send_invoke_split_error(
 }
 
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
-    let detail = format!("{err:#}").to_lowercase();
-    // Capacity / contention: router must not damage the machine.
-    if detail.contains("request_canceled")
-        || detail.contains("request_cancelled")
-        || detail.contains("invoke_timeout")
-    {
-        "request_canceled"
-    // Weight load failures must win over bare "null result from llama cpp".
-    // Unsupported arch / bad GGUF often surfaces as: load model <path>: null result…
-    // Misclassifying that as agent_busy makes debug UI say "Agent is busy" for a
-    // model that simply cannot load on this agent build.
-    } else if detail.contains("load model")
-        || detail.contains("load_from_file")
-        || detail.contains("weights not found")
-        || detail.contains("model weights not found")
-        || detail.contains("unknown model architecture")
-        || detail.contains("unknown architecture")
-        || (detail.contains("gguf") && detail.contains("not found"))
-    {
-        "model_load_failed"
-    } else if detail.contains("model_not_installed")
-        || detail.contains("snapshot is incomplete")
-        || detail.contains("snapshot is not on disk")
-        || detail.contains("missing a weight shard")
-        || detail.contains("missing a weight file")
-        || (detail.contains("no such file") && detail.contains("safetensors"))
-    {
-        "model_not_installed"
-    } else if detail.contains("insufficient_vram")
-        || detail.contains("no_vision_capacity")
-        || (detail.contains("need") && detail.contains("vision job") && detail.contains("gb"))
-        || detail.contains("create llama context")
-        || detail.contains("mps backend out of memory")
-        || detail.contains("pytorch_mps")
-        || detail.contains("high_watermark")
-        || detail.contains("sigkill")
-        || detail.contains("signal: 9")
-        || (detail.contains("image worker") && detail.contains("ran out of memory"))
-    {
-        // Idle slots exist but none meet the image-job VRAM floor: not "busy".
-        // Context OOM after packing weights (GLM 4.7 Flash on a 48 GB Turing card
-        // with 17 GB free) is the same class: capacity, not contention.
-        "insufficient_vram"
-    } else if detail.contains("agent_busy")
-        || detail.contains("no idle compute slot")
-        || detail.contains("not available")
-        || (detail.contains("sibling slot") && detail.contains("busy"))
-        // Backend memory fights / failed load under fanout (llama null ptr).
-        || detail.contains("erroroutdevicememory")
-        || detail.contains("out of device memory")
-        || detail.contains("null result")
-    {
-        "agent_busy"
-    } else if detail.contains("out of memory")
-        || detail.contains("oom")
-        || detail.contains("cudamalloc")
-        || detail.contains("failed to allocate")
-        || detail.contains("no compute devices")
-        || detail.contains("cuda error")
-        || detail.contains("invalid device")
-        || detail.contains("ggml_backend_cuda")
-    {
-        "model_out_of_memory"
-    } else if detail.contains("context window") || detail.contains("too long") {
-        "prompt_too_long"
-    } else if detail.contains("invalid_image")
-        || detail.contains("decode image for mmproj")
-        || detail.contains("bitmap creation returned null")
-    {
-        "invalid_image"
-    } else if detail.contains("image_accelerator_required")
-        || detail.contains("image_cuda_required")
-    {
-        "image_accelerator_required"
-    } else if detail.contains("image_runtime_missing") {
-        "image_runtime_missing"
-    } else if detail.contains("image_model_chat_unsupported") {
-        "image_model_chat_unsupported"
-    } else if detail.contains("chat_model_image_unsupported") {
-        "chat_model_image_unsupported"
-    } else if detail.contains("image_stream_unsupported") {
-        "image_stream_unsupported"
-    } else if crate::models::is_no_space_error(err) || detail.contains("disk_full") {
-        "disk_full"
-    } else if detail.contains("diffusers load failed")
-        || detail.contains("qwen-image load failed")
-        || detail.contains("model_load_failed")
-    {
-        "model_load_failed"
-    } else {
-        "inference_failed"
-    }
+    crate::invoke_code::wire_code(err)
 }
 
 #[cfg(test)]
@@ -2969,12 +2877,15 @@ mod invoke_error_code_tests {
         let err = anyhow::anyhow!(
             "model_load_failed: Diffusers load failed for Qwen/Qwen-Image-2512: MPS backend out of memory (MPS allocated: 42.38 GiB, other allocations: 384.00 KiB, max allowed: 42.43 GiB)"
         );
-        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+        assert_eq!(invoke_error_code(&err), "model_load_failed");
         let err = anyhow::anyhow!(
             "insufficient_vram: image worker ran out of memory (killed by the OS)"
         );
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
-        let err = anyhow::anyhow!("inference_failed: image worker exited signal: 9 (SIGKILL)");
+        let err = crate::invoke_code::coded(
+            crate::invoke_code::InvokeErrorCode::InsufficientVram,
+            "image worker ran out of memory (killed by the OS)",
+        );
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }
 
