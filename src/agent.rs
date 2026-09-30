@@ -957,7 +957,7 @@ impl SessionState {
             .supervisor
             .as_ref()
             .is_some_and(|supervisor| supervisor.usable_accelerator_slot());
-        // A PTX / init line latches the process flag even when the card keeps
+        // An init failure latches the process flag even when another card keeps
         // finishing jobs. That is a warning. It takes the machine out of ready
         // only when no graphics slot is actually up, or the driver is too old.
         let blocking = driver_too_old || slot_fault || (runtime_fault && !usable);
