@@ -1,9 +1,7 @@
 use crate::config::{read_saved_agent_token, token_snippet, AgentConfig};
 use crate::inference::InferenceEngine;
 use crate::models::{
-    can_host_on_machine, can_host_on_nameplate, can_serve_vision_on_machine,
-    handle_weight_load_failure,
-    preferred_download_card, purge_incomplete_model_weights, should_skip_preload,
+    handle_weight_load_failure, purge_incomplete_model_weights, should_skip_preload,
     spawn_catalog_sync, spawn_delete_staged_dirs, stage_purge_model_weights,
     sweep_staged_purge_dirs,
 };
@@ -316,29 +314,6 @@ impl SessionState {
         if let Some(token) = token.clone() {
             self.hf_token = Some(token);
         }
-        let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
-        let headroom = self.cpu_ram_headroom_gb;
-        let devices = specs.compute_devices.clone();
-        // Download only what placement can start. A tensor-parallel pool must
-        // hold the whole model; offload is judged per card inside can_host_on_machine.
-        let pending: Vec<_> = pending
-            .into_iter()
-            .filter(|model| {
-                model.is_image_job()
-                    || can_host_on_machine(model, &devices, ram_gb, headroom)
-            })
-            .collect();
-        if pending.is_empty() {
-            return;
-        }
-        let card = match preferred_download_card(&devices) {
-            Ok(card) => card,
-            Err(err) => {
-                warn!("model downloads skipped: {err:#}");
-                return;
-            }
-        };
         info!(
             "starting model weight downloads for {} eligible model(s)",
             pending.len()
@@ -348,9 +323,6 @@ impl SessionState {
         self.sync_in_flight.store(true, Ordering::Relaxed);
         spawn_catalog_sync(
             pending,
-            card,
-            ram_gb,
-            self.cpu_ram_headroom_gb,
             agent_token.to_string(),
             token,
             self.download_cancel.clone(),
@@ -359,58 +331,7 @@ impl SessionState {
         );
     }
 
-    fn log_download_blockers(&self) {
-        let enabled: Vec<&CatalogModel> = self
-            .catalog
-            .iter()
-            .filter(|model| self.is_model_enabled(&model.model_id))
-            .filter(|model| model.weights.is_some())
-            .collect();
-        if enabled.is_empty() {
-            return;
-        }
-        let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
-        let max_gpu_gb = specs
-            .compute_devices
-            .iter()
-            .filter(|d| d.enabled)
-            .filter_map(|d| d.vram_gb)
-            .max()
-            .unwrap_or(0);
-        for model in enabled {
-            if self.catalog_ready_on_disk(model) {
-                continue;
-            }
-            if !can_host_on_machine(
-                model,
-                &specs.compute_devices,
-                ram_gb,
-                self.cpu_ram_headroom_gb,
-            ) {
-                let need = model.min_vram_gb.unwrap_or(0.0);
-                if model.is_image_job() && max_gpu_gb as f64 + 0.001 >= need && need > 0.0 {
-                    warn!(
-                        "model {} cannot run on this machine (needs {} GB VRAM on one GPU / {} GB RAM; machine has {} GB max GPU VRAM / {} GB RAM). Picture jobs need a CUDA, Metal, or ROCm GPU slot — CPU and tensor-parallel pools are skipped.",
-                        model.model_id,
-                        need,
-                        model.min_ram_gb.unwrap_or(0.0),
-                        max_gpu_gb,
-                        ram_gb
-                    );
-                } else {
-                    warn!(
-                        "model {} cannot run on this machine (needs {} GB VRAM on one GPU / {} GB RAM; machine has {} GB max GPU VRAM / {} GB RAM)",
-                        model.model_id,
-                        need,
-                        model.min_ram_gb.unwrap_or(0.0),
-                        max_gpu_gb,
-                        ram_gb
-                    );
-                }
-            }
-        }
-    }
+    fn log_download_blockers(&self) {}
 
     fn cancel_active_downloads(&mut self) {
         self.download_cancel.store(true, Ordering::Relaxed);
@@ -717,10 +638,7 @@ impl SessionState {
         crate::image::maybe_teardown_image_runtime(keep);
     }
 
-    /// Policy-enabled catalog SKUs the machine can actually start.
-    /// Cloud fit decides what is enabled. Local `can_host_on_machine` still
-    /// refuses a download or advertisement when the only "fit" is treating a
-    /// tensor-parallel pool as one bigger offload card.
+    /// Models the server enabled for this machine. Fit is the server's decision.
     fn eligible_catalog_models(&self) -> Vec<CatalogModel> {
         self.catalog
             .iter()
@@ -742,22 +660,7 @@ impl SessionState {
         crate::image::image_repo(model).is_some_and(|repo| id.eq_ignore_ascii_case(repo))
     }
 
-    /// GPU-resident weights, not a finished download. Slot status reports the
-    /// in-memory set; a disk list must not keep a model advertised.
-    fn weights_are_resident(&self, model: &CatalogModel) -> bool {
-        let runtime = if model.runtime_model.trim().is_empty() {
-            model.model_id.as_str()
-        } else {
-            model.runtime_model.trim()
-        };
-        self.cached_loaded_models.iter().any(|loaded| {
-            loaded.eq_ignore_ascii_case(&model.model_id) || loaded.eq_ignore_ascii_case(runtime)
-        })
-    }
-
     fn register_model_ids(&self) -> Vec<String> {
-        let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
         let mut out: Vec<String> = Vec::new();
         for model in self.eligible_catalog_models() {
             if !self.catalog_ready_on_disk(&model) {
@@ -766,48 +669,19 @@ impl SessionState {
             if Self::model_download_in_flight(&model) {
                 continue;
             }
-            if model.is_image_job() {
-                out.push(model.model_id.clone());
-                continue;
-            }
-            // A resident model is already using the free memory. Keep offering it.
-            // A cold model has to fit in what is free, not in the sticker size.
-            let hostable = if self.weights_are_resident(&model) {
-                can_host_on_nameplate(
-                    &model,
-                    &specs.compute_devices,
-                    ram_gb,
-                    self.cpu_ram_headroom_gb,
-                )
-            } else {
-                can_host_on_machine(
-                    &model,
-                    &specs.compute_devices,
-                    ram_gb,
-                    self.cpu_ram_headroom_gb,
-                )
-            };
+            out.push(model.model_id.clone());
+            // VL weights also serve the text sibling the server enabled.
             if model.vision_model {
-                // Only advertise the VL id when this machine can actually run image jobs.
-                if hostable && can_serve_vision_on_machine(&model, &specs.compute_devices, ram_gb)
+                if let Some(sib) = model
+                    .text_sibling_model_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                 {
-                    out.push(model.model_id.clone());
-                }
-                // VL weights still serve text via the sibling SKU (bill/route as text).
-                if hostable {
-                    if let Some(sib) = model
-                        .text_sibling_model_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        if !out.iter().any(|id| id == sib) {
-                            out.push(sib.to_string());
-                        }
+                    if !out.iter().any(|id| id == sib) {
+                        out.push(sib.to_string());
                     }
                 }
-            } else if hostable {
-                out.push(model.model_id.clone());
             }
         }
         out.sort();
@@ -915,30 +789,13 @@ impl SessionState {
 
     fn count_blocked_enabled_models(&self) -> usize {
         let specs = self.enabled_devices();
-        let ram_gb = specs.ram_gb.unwrap_or(0);
-        let enabled_models: Vec<&CatalogModel> = self
-            .catalog
+        if specs.compute_devices.iter().any(|device| device.enabled) {
+            return 0;
+        }
+        self.catalog
             .iter()
             .filter(|model| self.is_model_enabled(&model.model_id))
             .filter(|model| model.weights.is_some())
-            .collect();
-        if enabled_models.is_empty() {
-            return 0;
-        }
-        if specs.compute_devices.iter().all(|d| !d.enabled) {
-            return enabled_models.len();
-        }
-
-        enabled_models
-            .into_iter()
-            .filter(|model| {
-                !can_host_on_machine(
-                    model,
-                    &specs.compute_devices,
-                    ram_gb,
-                    self.cpu_ram_headroom_gb,
-                )
-            })
             .count()
     }
 

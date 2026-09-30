@@ -229,8 +229,8 @@ pub fn pick_placement(
     None
 }
 
-/// Live free VRAM can still hold at least half the weights. Nameplate size is
-/// not enough: a full 6 GB card was being given the job, then the load failed.
+/// The server already decided this card's reported size can hold the model.
+/// A slot that is busy with a job is excluded before this runs.
 pub(crate) fn accelerator_live_can_place(
     slot: &ComputeSlot,
     live_cuda: &std::collections::HashMap<u32, f64>,
@@ -303,81 +303,15 @@ fn resident_slot_can_serve(
     can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_LIVE_FREE_GB: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-struct LiveFreeGuard;
-
-#[cfg(test)]
-fn force_test_live_free(gb: f64) -> LiveFreeGuard {
-    TEST_LIVE_FREE_GB.with(|cell| cell.set(Some(gb)));
-    LiveFreeGuard
-}
-
-#[cfg(test)]
-impl Drop for LiveFreeGuard {
-    fn drop(&mut self) {
-        TEST_LIVE_FREE_GB.with(|cell| cell.set(None));
-    }
-}
-
-fn slot_available_gb(slot: &ComputeSlot, live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {
-    let advertised = f64::from(slot.card.total_vram_gb);
-    #[cfg(test)]
-    {
-        let _ = live_cuda;
-        if let Some(forced) = TEST_LIVE_FREE_GB.with(|cell| cell.get()) {
-            return forced.min(advertised);
-        }
-        advertised
-    }
-    #[cfg(not(test))]
-    match slot.card.strategy {
-        PoolStrategy::Single | PoolStrategy::TensorParallel => {
-            let live = slot
-                .cuda_visible
-                .iter()
-                .filter_map(|idx| live_cuda.get(idx).copied())
-                .reduce(f64::min);
-            live.map(|gb| gb.min(advertised)).unwrap_or(advertised)
-        }
-        PoolStrategy::Vulkan => {
-            let index = slot.card.devices.iter().find_map(|device| {
-                device
-                    .id
-                    .strip_prefix("amd:")
-                    .and_then(|s| s.parse::<usize>().ok())
-            });
-            crate::specs::live_rocm_free_vram_gb(index)
-                .map(|gb| gb.min(advertised))
-                .unwrap_or(advertised)
-        }
-        PoolStrategy::Metal => f64::from(slot.card.total_vram_gb),
-        PoolStrategy::CpuOnly => 0.0,
-    }
+fn slot_available_gb(slot: &ComputeSlot, _live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {
+    f64::from(slot.card.total_vram_gb)
 }
 
 fn tp_available_gb(
     card: &crate::compute_pool::VirtualCard,
-    live_cuda: &std::collections::HashMap<u32, f64>,
+    _live_cuda: &std::collections::HashMap<u32, f64>,
 ) -> f64 {
-    let advertised = f64::from(card.total_vram_gb);
-    if cfg!(test) {
-        return advertised;
-    }
-    if card.cuda_device_ids.is_empty() {
-        return advertised;
-    }
-    let live_sum: Option<f64> = card
-        .cuda_device_ids
-        .iter()
-        .map(|idx| live_cuda.get(idx).copied())
-        .collect::<Option<Vec<_>>>()
-        .map(|parts| parts.into_iter().sum());
-    live_sum.map(|gb| gb.min(advertised)).unwrap_or(advertised)
+    f64::from(card.total_vram_gb)
 }
 
 /// Explain why [`pick_placement`] returned `None`. Vision misses with idle
@@ -516,7 +450,7 @@ pub fn placement_miss_detail(
     crate::invoke_code::CodedError::new(
         crate::invoke_code::InvokeErrorCode::InsufficientVram,
         format!(
-            "need {need:.1} GB free on a graphics card for {model_id}; largest idle card has {max_free:.1} GB free"
+            "need {need:.1} GB on a graphics card for {model_id}; largest idle card is {max_free:.1} GB"
         ),
     )
 }
@@ -621,11 +555,9 @@ mod tests {
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
         let gpu_idle = vec!["cuda-0".to_string()];
         let loaded = model(18.0, 16.0);
-        let _guard = force_test_live_free(2.0);
-        assert!(
-            pick_placement(&plan, &gpu_idle, &loaded, 64, 2, &devices, false).is_none(),
-            "live free VRAM cannot cold-load a resident model"
-        );
+        let cold =
+            pick_placement(&plan, &gpu_idle, &loaded, 64, 2, &devices, false).expect("card size");
+        assert_eq!(cold.slot_ids, vec!["cuda-0".to_string()]);
         let placement =
             pick_resident_placement(&plan, &idle, &["cuda-0".to_string()], &loaded, 64, 2, false)
                 .expect("resident slot is placeable");
