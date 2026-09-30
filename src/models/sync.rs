@@ -1,5 +1,3 @@
-use crate::compute_pool::VirtualCard;
-use crate::models::capacity::can_host_model;
 use crate::models::download::{
     download_catalog_model, is_no_space_error, is_retryable_transfer_error,
 };
@@ -10,13 +8,10 @@ use crate::protocol::CatalogModel;
 use crate::state;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub fn spawn_catalog_sync(
     catalog: Vec<CatalogModel>,
-    card: VirtualCard,
-    ram_gb: u32,
-    cpu_ram_headroom_gb: u32,
     agent_token: String,
     hf_token: Option<String>,
     cancel: Arc<AtomicBool>,
@@ -52,20 +47,6 @@ pub fn spawn_catalog_sync(
                 warn!("disk full; pausing remaining model downloads");
                 crate::state::set_disk_full(true);
                 break;
-            }
-            if !model.is_image_job()
-                && !can_host_model(&model, &card, ram_gb, cpu_ram_headroom_gb)
-            {
-                info!(
-                    "skipping {}: needs {} GB VRAM / {} GB RAM (virtual card has {} GB VRAM, {} GB RAM, headroom {} GB)",
-                    model.model_id,
-                    model.min_vram_gb.unwrap_or(0.0),
-                    model.min_ram_gb.unwrap_or(0.0),
-                    card.total_vram_gb,
-                    ram_gb,
-                    cpu_ram_headroom_gb
-                );
-                continue;
             }
             state::set_downloading_model(Some(&model.model_id));
             let result =

@@ -1105,10 +1105,8 @@ impl Supervisor {
                         )
                 });
                 let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
-                let used_ram = crate::specs::detect_ram_used_gb().unwrap_or(0);
-                let cpu_free = ram_gb.saturating_sub(used_ram);
                 let cpu_ram_ok = !has_accel
-                    || crate::models::cpu_fallback_fits(model, cpu_free, cpu_ram_headroom_gb);
+                    || crate::models::cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb);
                 let idle: Vec<String> = self
                     .plan
                     .slots
