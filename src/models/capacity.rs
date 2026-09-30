@@ -130,6 +130,81 @@ pub fn cpu_fallback_fits(model: &CatalogModel, free_gb: u32, cpu_ram_headroom_gb
     free_gb >= weight_plus_kv_ram_need_gb(model, false, cpu_ram_headroom_gb)
 }
 
+/// Whether the CPU slot is strong enough that a RAM-only run is likely to
+/// finish under router timeouts. Weak consumer CPUs may hold weights in RAM
+/// but still crawl into `invoke_timeout`; fat datacenter CPUs may earn.
+///
+/// Budget is continuous: about `CPU_GB_PER_LOGICAL_CORE` GB of Q4 weights per
+/// logical thread (llama.cpp CPU decode scales with threads more than with
+/// advertised GHz, which we do not get reliably on Windows/macOS). Unknown
+/// cores (0) only allow a small model so old agents cannot re-open the
+/// "30B on a laptop CPU" hole.
+pub const CPU_GB_PER_LOGICAL_CORE: f64 = 0.75;
+
+pub fn cpu_slot_capable(model: &CatalogModel, cpu_logical_cores: u32) -> bool {
+    if model.is_image_job() {
+        return false;
+    }
+    let weight = llama_weight_gb(model);
+    if weight <= 0.05 {
+        return false;
+    }
+    let cores = cpu_logical_cores;
+    if cores == 0 {
+        return weight <= 6.0;
+    }
+    let budget = f64::from(cores) * CPU_GB_PER_LOGICAL_CORE;
+    weight <= budget + 0.05
+}
+
+/// CPU slot may serve this model: RAM covers weights+KV and the CPU is capable.
+pub fn cpu_slot_may_serve(
+    model: &CatalogModel,
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+    cpu_logical_cores: u32,
+) -> bool {
+    cpu_slot_capable(model, cpu_logical_cores)
+        && cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb)
+}
+
+/// System RAM this placement will need beyond the GPU/Metal pool — layer spill,
+/// KV left in RAM, or a full CPU-slot load. Used so two concurrent slots do not
+/// both commit the same free RAM.
+pub fn placement_sys_ram_need_gb(
+    model: &CatalogModel,
+    card: &VirtualCard,
+    need_vision: bool,
+    cpu_ram_headroom_gb: u32,
+) -> u32 {
+    if model.is_image_job() {
+        return 0;
+    }
+    match card.strategy {
+        PoolStrategy::CpuOnly => {
+            weight_plus_kv_ram_need_gb(model, need_vision, cpu_ram_headroom_gb)
+        }
+        PoolStrategy::Metal => 0, // unified memory already counted as the card pool
+        _ => {
+            let vram = f64::from(card.total_vram_gb);
+            let weights = gpu_weights_need_gb_for_job(model, need_vision);
+            let spilled = (weights - vram).max(0.0);
+            let kv_ram = if kv_fits_on_gpu(vram, model, need_vision) {
+                0.0
+            } else {
+                job_kv_gb(model, need_vision)
+            };
+            let need = spilled + kv_ram;
+            if need <= 0.05 {
+                return 0;
+            }
+            gb_ceil(Some(need))
+                .saturating_add(cpu_ram_headroom_gb)
+                .max(1)
+        }
+    }
+}
+
 fn unified_pool_gb(card: &VirtualCard, ram_gb: u32) -> f64 {
     f64::from(card.total_vram_gb.max(ram_gb))
 }
@@ -340,10 +415,11 @@ fn layer_offload_fits(
     ram_gb >= ram_need
 }
 
-/// True if any independent slot can host the model, a homogeneous TP group
-/// can hold it entirely, or system RAM can hold it on the CPU slot.
+/// True if any independent accelerator / Metal / Vulkan / TP slot can host,
+/// or the CPU slot may serve under the capability gate.
 /// Layer-offload does not run across the pool: two 2 GB cards are not a 4 GB
-/// offload target. A GPU that cannot host does not block the CPU slot.
+/// offload target. CPU earning stays available on strong CPUs even when a
+/// tiny GPU is also present — assessed per slot, not "GPU poisons CPU".
 ///
 /// This uses the card size and installed RAM the agent reports. Whether a
 /// model is enabled or downloaded is the server's decision.
@@ -352,6 +428,22 @@ pub fn can_host_on_machine(
     devices: &[ComputeDevice],
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
+) -> bool {
+    can_host_on_machine_ex(
+        model,
+        devices,
+        ram_gb,
+        cpu_ram_headroom_gb,
+        crate::specs::cpu_logical_cores(),
+    )
+}
+
+pub fn can_host_on_machine_ex(
+    model: &CatalogModel,
+    devices: &[ComputeDevice],
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+    cpu_logical_cores: u32,
 ) -> bool {
     let Ok(plan) = build_compute_slots(devices) else {
         return build_virtual_card(devices)
@@ -378,14 +470,8 @@ pub fn can_host_on_machine(
             }
         }
     }
-    let has_accel = plan.slots.iter().any(|slot| slot.kind != "cpu");
-    if !has_accel {
-        return plan.slots.iter().any(|slot| {
-            slot.kind == "cpu" && can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
-        });
-    }
     plan.slots.iter().any(|slot| slot.kind == "cpu")
-        && cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb)
+        && cpu_slot_may_serve(model, ram_gb, cpu_ram_headroom_gb, cpu_logical_cores)
 }
 
 /// Best card for weight download sizing: largest single slot, else homogeneous TP pool.
@@ -627,18 +713,25 @@ mod tests {
         assert_eq!(card.total_vram_gb, 4);
         assert!(!can_host_model(&catalog(12.0, 11.7, 16.0), &card, 16, 2));
         // 16 GB meets the catalog RAM floor on the CPU slot. 12 GB does not.
-        assert!(can_host_on_machine(
+        // Pin cores so this does not depend on the builder host's nproc.
+        assert!(can_host_on_machine_ex(
             &catalog(12.0, 11.7, 16.0),
             &devices,
             16,
-            2
+            2,
+            32,
         ));
-        assert!(!can_host_on_machine(
+        assert!(!can_host_on_machine_ex(
             &catalog(12.0, 11.7, 16.0),
             &devices,
             12,
-            2
+            2,
+            32,
         ));
+        assert!(
+            !can_host_on_machine_ex(&catalog(12.0, 11.7, 16.0), &devices, 16, 2, 8),
+            "8 cores cannot earn on ~12 GB weights"
+        );
     }
 
     #[test]
@@ -670,8 +763,8 @@ mod tests {
         // does not offload onto that pool; 16 GB RAM can still hold the model
         // on the CPU slot. 6 GB RAM cannot, so the weights are not installed.
         assert!(can_host_model(&eight_b, &card, 16, 2));
-        assert!(can_host_on_machine(&eight_b, &devices, 16, 2));
-        assert!(!can_host_on_machine(&eight_b, &devices, 6, 2));
+        assert!(can_host_on_machine_ex(&eight_b, &devices, 16, 2, 16));
+        assert!(!can_host_on_machine_ex(&eight_b, &devices, 6, 2, 16));
         let mut cpu_off = devices.to_vec();
         cpu_off.push(ComputeDevice {
             id: "cpu:0".into(),
@@ -683,7 +776,7 @@ mod tests {
             enabled: false,
         });
         assert!(
-            !can_host_on_machine(&eight_b, &cpu_off, 16, 2),
+            !can_host_on_machine_ex(&eight_b, &cpu_off, 16, 2, 16),
             "system RAM switch off must not install a CPU-only model"
         );
     }
@@ -722,9 +815,11 @@ mod tests {
         let card = build_virtual_card(&gpu).unwrap();
         let coder = catalog(22.5, 19.0, 24.0);
         assert!(!can_host_model(&coder, &card, 31, 2));
-        // 31 GB covers weights + KV + headroom on the CPU slot. 20 GB does not.
-        assert!(can_host_on_machine(&coder, &devices, 31, 2));
-        assert!(!can_host_on_machine(&coder, &devices, 20, 2));
+        // Consumer CPU (8 cores): RAM alone is not enough to *earn* on 30B — too slow.
+        assert!(!can_host_on_machine_ex(&coder, &devices, 31, 2, 8));
+        // Fat CPU (32+ cores) + 31 GB RAM may host on the CPU slot.
+        assert!(can_host_on_machine_ex(&coder, &devices, 31, 2, 32));
+        assert!(!can_host_on_machine_ex(&coder, &devices, 20, 2, 32));
     }
 
     #[test]

@@ -222,6 +222,7 @@ fn incoming_vram_need_gb(inner: &CacheInner, model_path: &Path) -> f64 {
     crate::models::full_host_need_gb(weight, shape, 4096)
 }
 
+#[allow(dead_code)]
 fn estimated_gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
     let metal = matches!(pool.strategy, crate::compute_pool::PoolStrategy::Metal);
     let used: f64 = inner
@@ -234,6 +235,7 @@ fn estimated_gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
 
 /// CUDA/Vulkan occupancy is dedicated VRAM. Metal occupancy lives in the same
 /// RAM as the GGUF mmap, so each resident costs occupancy + on-disk weight.
+#[allow(dead_code)]
 fn resident_accounted_gb(key: &str, occupancy_gb: f64, metal: bool) -> f64 {
     let occ = occupancy_gb.max(0.0);
     if !metal {
@@ -263,6 +265,7 @@ fn live_free_vram_gb(pool: &VirtualCard) -> Option<f64> {
     .filter(|n| n.is_finite() && *n >= 0.0)
 }
 
+#[allow(dead_code)]
 fn gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
     // Unified memory: "live free RAM" includes our own Metal buffers, so the
     // nvidia-smi-style probe is wrong. Subtract cache occupancy from advertised.
@@ -324,57 +327,31 @@ fn make_gpu_room(
 
     let metal = matches!(pool.strategy, crate::compute_pool::PoolStrategy::Metal);
 
-    // CPU-pinned residents (0 GPU layers) sit in the GPU map with ~0 occupancy.
-    // VRAM-fit checks skip them, so the next GGUF mmap'd beside them and OOMed
-    // 16 GB boxes (WebSocket reset → five-minute invoke_timeout).
-    let cpu_pinned: Vec<String> = inner
+    // Boot out every other Scalattice resident on this card before a cold load.
+    // Never kill third-party GPU users (games, browser, desktop) — only our cache.
+    // That way live free VRAM matches the nameplate claim we advertised.
+    let others: Vec<String> = inner
         .gpu
-        .iter()
-        .filter(|(k, e)| k.as_str() != keep_key && e.occupancy_gb <= 0.05)
-        .map(|(k, _)| k.clone())
+        .keys()
+        .filter(|k| k.as_str() != keep_key)
+        .cloned()
         .collect();
-    for key in cpu_pinned {
-        info!(
-            evicted = %path_from_gpu_key(&key),
-            "dropping CPU-resident weights before loading a different GGUF"
-        );
-        inner.gpu.remove(&key);
-    }
-
-    let need = incoming_vram_need_gb(inner, model_path);
-    loop {
-        let free = gpu_free_gb(inner, pool);
-        if incoming_model_fits(free, need) {
-            break;
-        }
-        let victim = inner
-            .gpu
-            .iter()
-            .filter(|(k, e)| {
-                k.as_str() != keep_key && resident_accounted_gb(k, e.occupancy_gb, metal) > 0.05
-            })
-            .min_by_key(|(_, e)| e.last_used)
-            .map(|(k, _)| k.clone());
-        let Some(key) = victim else {
-            break;
-        };
+    for key in others {
         crate::llm::report_work_progress("evict", 0.0);
         if let Some(entry) = inner.gpu.remove(&key) {
             info!(
                 evicted = %path_from_gpu_key(&key),
                 occupancy_gb = format!("{:.2}", entry.occupancy_gb),
-                free_gb = format!("{:.2}", free),
-                need_gb = format!("{:.2}", need),
-                "evicting GPU resident: incoming model does not fit beside it"
+                "evicting our resident model to free the card for the claimed job"
             );
-            // Discrete VRAM: RAM-shelve when live RAM can hold the mmap.
-            // Unified memory: shelving re-mmaps the same pages Metal just freed.
             if !metal {
                 try_shelve_cpu(inner, backend, Path::new(path_from_gpu_key(&key)));
             }
         }
         crate::llm::report_work_progress("evict", 1.0);
     }
+
+    let need = incoming_vram_need_gb(inner, model_path);
 
     // CUDA frees asynchronously. nvidia-smi still showed 17.5 GB free after
     // dropping a resident, so GLM 4.7 Flash skipped gpu-full on a 48 GB RTX 8000.
@@ -396,7 +373,9 @@ fn wait_cuda_reclaim(pool: &VirtualCard, need_gb: f64) {
     }
     // cudaFree is asynchronous; wait in proportion to the GiB still outstanding.
     let gap = (need_gb - free).max(0.0);
-    let budget = Duration::from_millis((80.0 + 50.0 * gap).clamp(80.0, 2_000.0) as u64);
+    // After we unload our own residents, wait a bit longer for cudaFree to settle
+    // so the next load can take the gpu-full path we claimed on nameplate.
+    let budget = Duration::from_millis((120.0 + 80.0 * gap).clamp(120.0, 4_000.0) as u64);
     let start = Instant::now();
     while start.elapsed() < budget {
         std::thread::sleep(Duration::from_millis(40));

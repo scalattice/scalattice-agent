@@ -15,6 +15,13 @@ pub use host::{
     detect_cpu_model, detect_hostname, detect_install_id, detect_ram_gb, detect_ram_used_gb,
     disk_is_full,
 };
+
+/// Logical CPU thread count for CPU-slot capability gating.
+pub fn cpu_logical_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(0)
+}
 use host::{disk_usage_gb, host_os_fields};
 
 /// On Windows, console tools (`nvidia-smi`, `powershell`, `where`) briefly flash a
@@ -85,6 +92,10 @@ pub struct MachineSpecs {
     pub install_id: Option<String>,
     #[serde(rename = "cpuModel", skip_serializing_if = "Option::is_none")]
     pub cpu_model: Option<String>,
+    /// Logical CPU threads (std::thread::available_parallelism). Used to gate
+    /// CPU-only model enable/download so weak boxes do not crawl huge GGUFs.
+    #[serde(rename = "cpuLogicalCores", skip_serializing_if = "Option::is_none")]
+    pub cpu_logical_cores: Option<u32>,
     #[serde(rename = "ramGb", skip_serializing_if = "Option::is_none")]
     pub ram_gb: Option<u32>,
     #[serde(rename = "ramUsedGb", skip_serializing_if = "Option::is_none")]
@@ -218,6 +229,7 @@ pub fn detect_machine_specs() -> MachineSpecs {
             agent_version: Some(agent_version_string()),
             hostname,
             cpu_model,
+            cpu_logical_cores: Some(cpu_logical_cores()).filter(|&n| n > 0),
             ram_gb,
             ram_used_gb: detect_ram_used_gb(),
             disk_total_gb: disk.0,
@@ -291,6 +303,7 @@ pub fn build_specs_from_devices(
         cuda_version,
         hostname,
         cpu_model,
+        cpu_logical_cores: Some(cpu_logical_cores()).filter(|&n| n > 0),
         ram_gb,
         ram_used_gb: detect_ram_used_gb(),
         disk_total_gb: disk.0,
@@ -1661,8 +1674,13 @@ pub fn note_accelerator_log_line(msg: &str) {
     if lower.contains("ptx jit compiler library not found") {
         return;
     }
+    // Vulkan (and CPU) workers hide CUDA, so llama.cpp logs
+    // "failed to initialize CUDA: no CUDA-capable device is detected".
+    // That is expected and must not mark the Radeon/Intel Vulkan slot down.
+    // Real NVIDIA driver faults say the driver version is insufficient.
+    let no_cuda_device = lower.contains("no cuda-capable device is detected");
     let incompatible = lower.contains("driver version is insufficient")
-        || lower.contains("failed to initialize cuda");
+        || (lower.contains("failed to initialize cuda") && !no_cuda_device);
     if incompatible {
         mark_accelerator_incompatible();
     }
@@ -1737,6 +1755,17 @@ mod tests {
         reset_accelerator_compat_for_test();
         arm_accelerator_compat_watch();
         note_accelerator_log_line("ggml_vulkan: failed to initialize vulkan");
+        assert!(!accelerator_runtime_incompatible());
+        reset_accelerator_compat_for_test();
+    }
+
+    #[test]
+    fn cuda_probe_miss_on_vulkan_worker_is_not_incompatible() {
+        reset_accelerator_compat_for_test();
+        arm_accelerator_compat_watch();
+        note_accelerator_log_line(
+            "llama-cpp-2: failed to initialize CUDA: no CUDA-capable device is detected",
+        );
         assert!(!accelerator_runtime_incompatible());
         reset_accelerator_compat_for_test();
     }

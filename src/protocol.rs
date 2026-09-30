@@ -332,6 +332,9 @@ pub struct InvokeMessage {
     pub seed: Option<i64>,
     #[serde(default, rename = "inputImages", deserialize_with = "null_as_empty_vec")]
     pub input_images: Vec<ChatImage>,
+    /// Admin/debug may pin a compute slot. Empty = agent picks.
+    #[serde(default, rename = "preferredSlotId")]
+    pub preferred_slot_id: String,
 }
 
 #[derive(Debug, Deserialize)]

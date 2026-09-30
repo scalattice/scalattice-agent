@@ -388,9 +388,10 @@ jobs:
         env:
           SCALATTICE_VERSION: ${{ needs.prepare.outputs.tag }}
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-cargo-version.ps1
+      # Stable across releases. Putting the tag here made every release a cold llama.cpp compile.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-self-hosted-v5-${{ needs.prepare.outputs.tag }}
+          shared-key: release-windows-self-hosted-v5
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -459,9 +460,10 @@ jobs:
           cache: true
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
+      # Stable across releases. Putting the tag here made every release a cold llama.cpp compile.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-gpu-v5-${{ needs.prepare.outputs.tag }}
+          shared-key: release-windows-gpu-v5
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
