@@ -145,7 +145,7 @@ pub fn prefill_vision(
     }
     // Use llama-cpp-2's helper (correct llama_context pointer). A homemade
     // first-field transmute aborted the worker on Metal: "closed stdout".
-    let n_batch = ctx.n_ubatch().max(64) as i32;
+    let n_batch = ctx.n_batch().max(1) as i32;
     super::progress::report("prefill", 0.15);
     info!(
         n_chunks = chunks.len(),

@@ -946,13 +946,25 @@ impl SessionState {
                 }
             }
         }
-        let driver_fault = (self
+        let slot_fault = self
             .supervisor
             .as_ref()
-            .is_some_and(|supervisor| supervisor.accelerator_incompatible())
-            || crate::specs::accelerator_runtime_incompatible()
-            || crate::specs::nvidia_driver_too_old(specs.cuda_version.as_deref()))
-        .then(crate::specs::accelerator_incompatible_message);
+            .is_some_and(|supervisor| supervisor.accelerator_incompatible());
+        let runtime_fault = crate::specs::accelerator_runtime_incompatible();
+        let driver_too_old =
+            crate::specs::nvidia_driver_too_old(specs.cuda_version.as_deref());
+        let usable = self
+            .supervisor
+            .as_ref()
+            .is_some_and(|supervisor| supervisor.usable_accelerator_slot());
+        // A PTX / init line latches the process flag even when the card keeps
+        // finishing jobs. That is a warning. It takes the machine out of ready
+        // only when no graphics slot is actually up, or the driver is too old.
+        let blocking = driver_too_old || slot_fault || (runtime_fault && !usable);
+        let warning = runtime_fault && usable && !blocking;
+        let message = crate::specs::accelerator_incompatible_message();
+        let driver_fault = blocking.then_some(message);
+        let reported_fault = (blocking || warning).then_some(message);
         let enabled_count = specs
             .compute_devices
             .iter()
@@ -985,7 +997,7 @@ impl SessionState {
             self.cached_max_jobs.max(1),
             self.cached_idle_slots,
             self.cached_gpu_occupied,
-            driver_fault,
+            reported_fault,
         )
     }
 
@@ -1855,6 +1867,8 @@ async fn handle_server_message(
                                     id,
                                     error: "invalid_invoke".into(),
                                     detail: Some(err.to_string()),
+                                
+                                    slot_id: None,
                                 };
                                 let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
                             }
@@ -1897,6 +1911,8 @@ async fn handle_server_message(
                                     id,
                                     error: "invalid_invoke".into(),
                                     detail: Some(err.to_string()),
+                                
+                                    slot_id: None,
                                 };
                                 let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
                             }
@@ -1916,7 +1932,17 @@ async fn handle_server_message(
                     });
                 }
                 "pong" | "policy" => {
-                    if let Ok(pong) = parse_pong(data) {
+                        if let Ok(pong) = parse_pong(data) {
+                        if let Some(groups) = pong.blocked_slots.as_ref() {
+                            let supervisor = state.lock().await.supervisor.clone();
+                            if let Some(supervisor) = supervisor {
+                                let pairs = groups
+                                    .iter()
+                                    .map(|group| (group.model_id.clone(), group.slot_ids.clone()))
+                                    .collect();
+                                supervisor.apply_server_blocks(Some(pairs)).await;
+                            }
+                        }
                         let purge_requested = !pong.purge_models.is_empty();
                         let catalog_updated = pong.catalog.is_some();
                         let hf_token = pong.hugging_face_token.clone();
@@ -2272,6 +2298,8 @@ async fn respond_invoke(
                 id: invoke.id.clone(),
                 error: "agent_busy".to_string(),
                 detail: Some("agent_busy: max concurrent jobs reached".to_string()),
+            
+                slot_id: None,
             };
             let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
             return Ok(());
@@ -2369,6 +2397,8 @@ async fn respond_invoke(
                 id: invoke_id.clone(),
                 error: code.to_string(),
                 detail: Some(detail.to_string()),
+            
+                slot_id: None,
             };
             drop(delta_tx);
             let _ = delta_writer.await;
@@ -2383,6 +2413,8 @@ async fn respond_invoke(
                     id: invoke_id.clone(),
                     error: "image_stream_unsupported".to_string(),
                     detail: Some("Image generation does not stream.".to_string()),
+                
+                    slot_id: None,
                 };
                 drop(delta_tx);
                 let _ = delta_writer.await;
@@ -2414,6 +2446,8 @@ async fn respond_invoke(
                     detail: Some(
                         "Catalog image models need a Hugging Face Diffusers repo.".to_string(),
                     ),
+                
+                    slot_id: None,
                 };
                 drop(delta_tx);
                 let _ = delta_writer.await;
@@ -2429,6 +2463,8 @@ async fn respond_invoke(
                     detail: Some(format!(
                         "Diffusers snapshot is incomplete for {repo}. This machine will fill missing files."
                     )),
+                
+                    slot_id: None,
                 };
                 drop(delta_tx);
                 let _ = delta_writer.await;
@@ -2522,6 +2558,8 @@ async fn respond_invoke(
                         id: invoke_id.clone(),
                         error: code.to_string(),
                         detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+                    
+                        slot_id: None,
                     };
                     let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
                     return Ok(());
@@ -2538,6 +2576,8 @@ async fn respond_invoke(
                     "Chat and vision models do not accept image-generation reference pictures."
                         .to_string(),
                 ),
+            
+                slot_id: None,
             };
             drop(delta_tx);
             let _ = delta_writer.await;
@@ -2599,6 +2639,7 @@ async fn respond_invoke(
                     id: invoke_id.clone(),
                     error: code.to_string(),
                     detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+                    slot_id: slot_id_from_error(&err),
                 };
                 // Capacity rejects must not tear down the session if the socket is racing.
                 let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
@@ -2647,6 +2688,8 @@ async fn respond_invoke_split(
                 id: invoke.id.clone(),
                 error: "image_model_chat_unsupported".to_string(),
                 detail: Some("Image models do not support split inference.".to_string()),
+            
+                slot_id: None,
             };
             ws_send_text(write, &serde_json::to_string(&err)?).await?;
             return Ok(());
@@ -2753,6 +2796,8 @@ async fn respond_invoke_split(
                     id: invoke.id,
                     error: "inference_failed".to_string(),
                     detail: Some(format!("unknown split segment: {other}")),
+                
+                    slot_id: None,
                 };
                 write
                     .lock()
@@ -2799,6 +2844,7 @@ async fn send_invoke_split_error(
         id: id.to_string(),
         error: code.to_string(),
         detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+        slot_id: slot_id_from_error(&err),
     };
     write
         .lock()
@@ -2810,6 +2856,19 @@ async fn send_invoke_split_error(
 
 fn invoke_error_code(err: &anyhow::Error) -> &'static str {
     crate::invoke_code::wire_code(err)
+}
+
+fn slot_id_from_error(err: &anyhow::Error) -> Option<String> {
+    for cause in err.chain() {
+        let text = cause.to_string();
+        if let Some(rest) = text.strip_prefix("slot_id=") {
+            let id = rest.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

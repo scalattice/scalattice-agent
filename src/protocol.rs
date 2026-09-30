@@ -238,6 +238,17 @@ pub struct PongMessage {
     pub warm_runtime_model: Option<String>,
     #[serde(default)]
     pub schedule: AgentSchedule,
+    /// Omitted on older servers. Present (even empty) replaces server slot blocks.
+    #[serde(rename = "blockedSlots", default)]
+    pub blocked_slots: Option<Vec<BlockedSlotGroup>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlockedSlotGroup {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "slotIds", default)]
+    pub slot_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -518,6 +529,9 @@ pub struct InvokeErrorMessage {
     /// Truncated human detail for Scalattice admin / ops (not shown to API customers).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Slot that failed (`cuda-0`, `cpu-0`, …).
+    #[serde(rename = "slotId", skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

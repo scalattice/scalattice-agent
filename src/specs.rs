@@ -1269,8 +1269,32 @@ fn detect_integrated_windows_devices(existing: &[ComputeDevice]) -> Vec<ComputeD
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
-fn is_integrated_pci_name(raw: &str) -> bool {
+fn gpu_name_key(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
     let lower = raw.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while !rest.is_empty() {
+        if let Some(stripped) = rest
+            .strip_prefix("(tm)")
+            .or_else(|| rest.strip_prefix("(r)"))
+        {
+            rest = stripped;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if ch != '™' && ch != '®' {
+            out.push(ch);
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn is_integrated_pci_name(raw: &str) -> bool {
+    let lower = gpu_name_key(raw);
     if lower.contains("nvidia")
         || lower.contains("geforce")
         || lower.contains("quadro")
@@ -1655,9 +1679,7 @@ pub fn note_accelerator_log_line(msg: &str) {
         return;
     }
     let incompatible = lower.contains("driver version is insufficient")
-        || lower.contains("failed to initialize cuda")
-        || lower.contains("failed to initialize vulkan")
-        || lower.contains("failed to initialize metal");
+        || lower.contains("failed to initialize cuda");
     if incompatible {
         mark_accelerator_incompatible();
     }
@@ -1725,6 +1747,15 @@ mod tests {
         note_accelerator_log_line("CUDA error: PTX JIT compiler library not found");
         assert!(accelerator_runtime_incompatible());
         assert!(accelerator_incompatible_message().contains("PTX compiler library"));
+        reset_accelerator_compat_for_test();
+    }
+
+    #[test]
+    fn vulkan_init_failure_is_not_a_machine_driver_fault() {
+        reset_accelerator_compat_for_test();
+        arm_accelerator_compat_watch();
+        note_accelerator_log_line("ggml_vulkan: failed to initialize vulkan");
+        assert!(!accelerator_runtime_incompatible());
         reset_accelerator_compat_for_test();
     }
 
@@ -1906,6 +1937,7 @@ GPU[1]		: VRAM Total Memory (B): 2147483648
     #[test]
     fn amd_igpu_names_are_integrated() {
         assert!(is_integrated_pci_name("AMD Radeon Graphics"));
+        assert!(is_integrated_pci_name("AMD Radeon(TM) Graphics"));
         assert!(is_integrated_pci_name(
             "AMD Ryzen AI 9 HX PRO 370 w/ Radeon 890M"
         ));

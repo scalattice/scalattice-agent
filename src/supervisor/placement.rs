@@ -243,11 +243,98 @@ pub(crate) fn accelerator_live_can_place(
     available + 0.005 >= occupancy_min_vram_gb(model)
 }
 
+/// Idle slot that already holds this model. A cold load checks live free VRAM;
+/// reusing the resident copy does not.
+pub fn pick_resident_placement(
+    plan: &ComputePlan,
+    idle_slot_ids: &[String],
+    resident_slot_ids: &[String],
+    model: &CatalogModel,
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+    need_vision: bool,
+) -> Option<Placement> {
+    if resident_slot_ids.is_empty() || idle_slot_ids.is_empty() {
+        return None;
+    }
+    let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
+    let mut hits: Vec<&ComputeSlot> = plan
+        .slots
+        .iter()
+        .filter(|slot| {
+            resident_slot_ids.iter().any(|id| id == &slot.id) && idle.contains(slot.id.as_str())
+        })
+        .filter(|slot| {
+            resident_slot_can_serve(slot, model, ram_gb, cpu_ram_headroom_gb, need_vision)
+        })
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by(|a, b| {
+        let ak = u8::from(a.kind == "cpu");
+        let bk = u8::from(b.kind == "cpu");
+        ak.cmp(&bk)
+            .then(a.priority.cmp(&b.priority))
+            .then(a.id.cmp(&b.id))
+    });
+    let slot = hits[0];
+    Some(Placement {
+        slot_ids: vec![slot.id.clone()],
+        card: slot.card.clone(),
+        cuda_visible: slot.cuda_visible.clone(),
+        use_tp_worker: matches!(slot.card.strategy, PoolStrategy::TensorParallel),
+    })
+}
+
+fn resident_slot_can_serve(
+    slot: &ComputeSlot,
+    model: &CatalogModel,
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+    need_vision: bool,
+) -> bool {
+    if slot.kind == "cpu" {
+        return cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb);
+    }
+    if need_vision && !can_serve_vision_on_card(model, &slot.card) {
+        return false;
+    }
+    can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LIVE_FREE_GB: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct LiveFreeGuard;
+
+#[cfg(test)]
+fn force_test_live_free(gb: f64) -> LiveFreeGuard {
+    TEST_LIVE_FREE_GB.with(|cell| cell.set(Some(gb)));
+    LiveFreeGuard
+}
+
+#[cfg(test)]
+impl Drop for LiveFreeGuard {
+    fn drop(&mut self) {
+        TEST_LIVE_FREE_GB.with(|cell| cell.set(None));
+    }
+}
+
 fn slot_available_gb(slot: &ComputeSlot, live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {
     let advertised = f64::from(slot.card.total_vram_gb);
-    if cfg!(test) {
-        return advertised;
+    #[cfg(test)]
+    {
+        let _ = live_cuda;
+        if let Some(forced) = TEST_LIVE_FREE_GB.with(|cell| cell.get()) {
+            return forced.min(advertised);
+        }
+        advertised
     }
+    #[cfg(not(test))]
     match slot.card.strategy {
         PoolStrategy::Single | PoolStrategy::TensorParallel => {
             let live = slot
@@ -499,6 +586,53 @@ mod tests {
             pick_placement(&plan, &idle, &model(8.0, 5.0), 64, 2, &devices, false).unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
         assert!(!placement.use_tp_worker);
+    }
+
+    #[test]
+    fn resident_slot_places_when_live_free_vram_cannot_cold_load() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "RTX 3090".into(),
+                vram_gb: Some(24),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let gpu_idle = vec!["cuda-0".to_string()];
+        let loaded = model(18.0, 16.0);
+        let _guard = force_test_live_free(2.0);
+        assert!(
+            pick_placement(&plan, &gpu_idle, &loaded, 64, 2, &devices, false).is_none(),
+            "live free VRAM cannot cold-load a resident model"
+        );
+        let placement =
+            pick_resident_placement(&plan, &idle, &["cuda-0".to_string()], &loaded, 64, 2, false)
+                .expect("resident slot is placeable");
+        assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+        assert!(pick_resident_placement(
+            &plan,
+            &["cpu-0".to_string()],
+            &["cuda-0".to_string()],
+            &loaded,
+            64,
+            2,
+            false,
+        )
+        .is_none());
     }
 
     #[test]
