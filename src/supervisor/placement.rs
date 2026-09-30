@@ -508,9 +508,16 @@ pub fn placement_miss_detail(
         );
     }
 
+    let max_free = idle_accel
+        .iter()
+        .map(|slot| slot_available_gb(slot, &live_cuda))
+        .fold(0.0_f64, f64::max);
+    let need = occupancy_min_vram_gb(model);
     crate::invoke_code::CodedError::new(
-        crate::invoke_code::InvokeErrorCode::NoIdleSlot,
-        format!("no placeable idle slot for {model_id}"),
+        crate::invoke_code::InvokeErrorCode::InsufficientVram,
+        format!(
+            "need {need:.1} GB free on a graphics card for {model_id}; largest idle card has {max_free:.1} GB free"
+        ),
     )
 }
 

@@ -1,7 +1,8 @@
 use crate::config::{read_saved_agent_token, token_snippet, AgentConfig};
 use crate::inference::InferenceEngine;
 use crate::models::{
-    can_host_on_machine, can_serve_vision_on_machine, handle_weight_load_failure,
+    can_host_on_machine, can_host_on_nameplate, can_serve_vision_on_machine,
+    handle_weight_load_failure,
     preferred_download_card, purge_incomplete_model_weights, should_skip_preload,
     spawn_catalog_sync, spawn_delete_staged_dirs, stage_purge_model_weights,
     sweep_staged_purge_dirs,
@@ -741,6 +742,19 @@ impl SessionState {
         crate::image::image_repo(model).is_some_and(|repo| id.eq_ignore_ascii_case(repo))
     }
 
+    /// GPU-resident weights, not a finished download. Slot status reports the
+    /// in-memory set; a disk list must not keep a model advertised.
+    fn weights_are_resident(&self, model: &CatalogModel) -> bool {
+        let runtime = if model.runtime_model.trim().is_empty() {
+            model.model_id.as_str()
+        } else {
+            model.runtime_model.trim()
+        };
+        self.cached_loaded_models.iter().any(|loaded| {
+            loaded.eq_ignore_ascii_case(&model.model_id) || loaded.eq_ignore_ascii_case(runtime)
+        })
+    }
+
     fn register_model_ids(&self) -> Vec<String> {
         let specs = self.enabled_devices();
         let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
@@ -756,12 +770,23 @@ impl SessionState {
                 out.push(model.model_id.clone());
                 continue;
             }
-            let hostable = can_host_on_machine(
-                &model,
-                &specs.compute_devices,
-                ram_gb,
-                self.cpu_ram_headroom_gb,
-            );
+            // A resident model is already using the free memory. Keep offering it.
+            // A cold model has to fit in what is free, not in the sticker size.
+            let hostable = if self.weights_are_resident(&model) {
+                can_host_on_nameplate(
+                    &model,
+                    &specs.compute_devices,
+                    ram_gb,
+                    self.cpu_ram_headroom_gb,
+                )
+            } else {
+                can_host_on_machine(
+                    &model,
+                    &specs.compute_devices,
+                    ram_gb,
+                    self.cpu_ram_headroom_gb,
+                )
+            };
             if model.vision_model {
                 // Only advertise the VL id when this machine can actually run image jobs.
                 if hostable && can_serve_vision_on_machine(&model, &specs.compute_devices, ram_gb)
