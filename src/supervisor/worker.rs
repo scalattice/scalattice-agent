@@ -1,7 +1,10 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use crate::compute_pool::{apply_slot_backend_visibility, PoolStrategy};
-use crate::llm::{evict_all, generate_with_callback, init_backend, preload_model, GenerateConfig};
-use crate::models::{list_cached_runtime_models, resolve_model_gguf};
+use crate::llm::{
+    evict_all, generate_with_callback, init_backend, list_gpu_resident_runtime_models, preload_model,
+    GenerateConfig,
+};
+use crate::models::resolve_model_gguf;
 use crate::protocol::InvokeTimings;
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
@@ -128,7 +131,7 @@ fn handle_request(
             &WorkerResponse::Health {
                 id,
                 ready: !crate::specs::accelerator_runtime_incompatible(),
-                loaded_models: list_cached_runtime_models(),
+                loaded_models: list_gpu_resident_runtime_models(),
                 busy: busy.load(Ordering::Relaxed),
             },
         ),
@@ -286,7 +289,7 @@ fn run_invoke(
                     decode_ms: Some(out.timings.decode_ms),
                     total_ms: Some(out.timings.total_ms),
                 },
-                loaded_models: list_cached_runtime_models(),
+                loaded_models: list_gpu_resident_runtime_models(),
             },
         ),
         Err(err) => write_response(
