@@ -645,6 +645,37 @@ fn ensure_mtmd(
     Ok(())
 }
 
+/// Runtime ids whose weights are actually resident in this process, not every
+/// finished download on disk.
+pub fn list_gpu_resident_runtime_models() -> Vec<String> {
+    let Ok(guard) = cache().lock() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in guard.gpu.keys() {
+        let Some(id) = runtime_model_from_gguf_path(path_from_gpu_key(key)) else {
+            continue;
+        };
+        if out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(&id)) {
+            continue;
+        }
+        out.push(id);
+    }
+    out
+}
+
+fn runtime_model_from_gguf_path(path: &str) -> Option<String> {
+    let dir = std::path::Path::new(path).parent()?.file_name()?.to_str()?;
+    if dir == "hub" || dir.starts_with('.') || !dir.contains("__") {
+        return None;
+    }
+    let id = dir.replace("__", "/");
+    if id.is_empty() {
+        return None;
+    }
+    Some(id)
+}
+
 pub fn evict_all() {
     if let Ok(mut guard) = cache().lock() {
         guard.gpu.clear();

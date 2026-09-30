@@ -340,23 +340,126 @@ fn layer_offload_fits(
     ram_gb >= ram_need
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LIVE_CARD_FREE_GB: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct LiveCardFreeGuard;
+
+#[cfg(test)]
+fn force_live_card_free(gb: f64) -> LiveCardFreeGuard {
+    TEST_LIVE_CARD_FREE_GB.with(|cell| cell.set(Some(gb)));
+    LiveCardFreeGuard
+}
+
+#[cfg(test)]
+impl Drop for LiveCardFreeGuard {
+    fn drop(&mut self) {
+        TEST_LIVE_CARD_FREE_GB.with(|cell| cell.set(None));
+    }
+}
+
+/// Free VRAM the driver will give this card right now.
+/// `None` when the probe missed: callers keep the nameplate size.
+fn live_card_free_vram_gb(card: &VirtualCard) -> Option<f64> {
+    #[cfg(test)]
+    {
+        return TEST_LIVE_CARD_FREE_GB.with(|cell| cell.get()).map(|gb| gb.min(f64::from(card.total_vram_gb)));
+    }
+    #[cfg(not(test))]
+    {
+        let advertised = f64::from(card.total_vram_gb);
+        match card.strategy {
+            PoolStrategy::CpuOnly | PoolStrategy::Metal => None,
+            PoolStrategy::Single | PoolStrategy::TensorParallel => {
+                if card.cuda_device_ids.is_empty() {
+                    return None;
+                }
+                let live = crate::specs::live_cuda_free_vram_by_index();
+                if card.strategy == PoolStrategy::TensorParallel {
+                    let parts: Option<Vec<f64>> = card
+                        .cuda_device_ids
+                        .iter()
+                        .map(|idx| live.get(idx).copied())
+                        .collect();
+                    parts.map(|values| values.into_iter().sum::<f64>().min(advertised))
+                } else {
+                    card.cuda_device_ids
+                        .iter()
+                        .filter_map(|idx| live.get(idx).copied())
+                        .reduce(f64::min)
+                        .map(|gb| gb.min(advertised))
+                }
+            }
+            PoolStrategy::Vulkan => {
+                let index = card.devices.iter().find_map(|device| {
+                    device
+                        .id
+                        .strip_prefix("amd:")
+                        .or_else(|| device.id.strip_prefix("intel:"))
+                        .and_then(|s| s.parse::<usize>().ok())
+                });
+                crate::specs::live_rocm_free_vram_gb(index).map(|gb| gb.min(advertised))
+            }
+        }
+    }
+}
+
+/// A cold start needs the offload floor in memory that is actually free.
+/// A missing probe does not refuse the card.
+fn live_card_can_start(card: &VirtualCard, model: &CatalogModel) -> bool {
+    match live_card_free_vram_gb(card) {
+        Some(free) => free + 0.005 >= occupancy_min_vram_gb(model),
+        None => true,
+    }
+}
+
+/// Installed RAM for a CPU-only machine. Free RAM when a graphics card is
+/// also on, matching placement: the desktop's RAM is not available to the model.
+fn cpu_place_ram_gb(ram_gb: u32, has_accel: bool) -> u32 {
+    if !has_accel {
+        return ram_gb;
+    }
+    #[cfg(test)]
+    {
+        return ram_gb;
+    }
+    #[cfg(not(test))]
+    {
+        let used = crate::specs::detect_ram_used_gb().unwrap_or(0);
+        ram_gb.saturating_sub(used)
+    }
+}
+
 /// True if any independent slot can host the model, a homogeneous TP group
 /// can hold it entirely, or system RAM can hold it on the CPU slot.
 /// Layer-offload does not run across the pool: two 2 GB cards are not a 4 GB
 /// offload target. A GPU that cannot host does not block the CPU slot.
-pub fn can_host_on_machine(
+///
+/// `honor_live` applies the same free-VRAM floor placement uses. Nameplate
+/// size alone was installing 5 GB models on a 4 GB card that idles with
+/// about 2 GB free, then every invoke died as "no idle slot".
+fn host_on_machine(
     model: &CatalogModel,
     devices: &[ComputeDevice],
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
+    honor_live: bool,
 ) -> bool {
+    let live_ok = |card: &VirtualCard| !honor_live || live_card_can_start(card, model);
     let Ok(plan) = build_compute_slots(devices) else {
         return build_virtual_card(devices)
-            .map(|card| can_host_model(model, &card, ram_gb, cpu_ram_headroom_gb))
+            .map(|card| {
+                can_host_model(model, &card, ram_gb, cpu_ram_headroom_gb) && live_ok(&card)
+            })
             .unwrap_or(false);
     };
     if plan.slots.iter().any(|slot| {
-        slot.kind != "cpu" && can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+        slot.kind != "cpu"
+            && can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+            && live_ok(&slot.card)
     }) {
         return true;
     }
@@ -367,22 +470,53 @@ pub fn can_host_on_machine(
     for phys in plan.tp_groups.values() {
         if let Ok(tp) = build_tp_card_for_group(devices, phys) {
             let min_vram = hosting_min_vram_gb(model);
-            if !vram_can_gpu_full(f64::from(tp.total_vram_gb), model, min_vram, false) {
+            let tp_gb = if honor_live {
+                live_card_free_vram_gb(&tp).unwrap_or(f64::from(tp.total_vram_gb))
+            } else {
+                f64::from(tp.total_vram_gb)
+            };
+            if !vram_can_gpu_full(tp_gb, model, min_vram, false) {
                 continue;
             }
-            if can_host_model(model, &tp, ram_gb, cpu_ram_headroom_gb) {
+            if can_host_model(model, &tp, ram_gb, cpu_ram_headroom_gb) && live_ok(&tp) {
                 return true;
             }
         }
     }
     let has_accel = plan.slots.iter().any(|slot| slot.kind != "cpu");
+    let cpu_ram = if honor_live {
+        cpu_place_ram_gb(ram_gb, has_accel)
+    } else {
+        ram_gb
+    };
     if !has_accel {
         return plan.slots.iter().any(|slot| {
-            slot.kind == "cpu" && can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+            slot.kind == "cpu" && can_host_model(model, &slot.card, cpu_ram, cpu_ram_headroom_gb)
         });
     }
     plan.slots.iter().any(|slot| slot.kind == "cpu")
-        && cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb)
+        && cpu_fallback_fits(model, cpu_ram, cpu_ram_headroom_gb)
+}
+
+/// Download and advertise path. Uses free graphics memory, not the sticker size.
+pub fn can_host_on_machine(
+    model: &CatalogModel,
+    devices: &[ComputeDevice],
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+) -> bool {
+    host_on_machine(model, devices, ram_gb, cpu_ram_headroom_gb, true)
+}
+
+/// Nameplate fit for a model already resident on the card. Live free VRAM is
+/// low because those weights are the thing using it.
+pub fn can_host_on_nameplate(
+    model: &CatalogModel,
+    devices: &[ComputeDevice],
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+) -> bool {
+    host_on_machine(model, devices, ram_gb, cpu_ram_headroom_gb, false)
 }
 
 /// Best card for weight download sizing: largest single slot, else homogeneous TP pool.
@@ -757,6 +891,37 @@ mod tests {
         .unwrap();
         assert!(can_host_model(&catalog(13.2, 9.0, 12.0), &card, 31, 2));
         assert!(!can_host_model(&catalog(22.5, 19.0, 24.0), &card, 31, 2));
+    }
+
+    #[test]
+    fn four_gb_card_does_not_host_eight_b_when_desktop_holds_the_free_memory() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "GTX 1650 SUPER".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: false,
+            },
+        ];
+        let model = catalog(4.0, 5.0, 10.0);
+        assert!(can_host_on_machine(&model, &devices, 16, 2));
+        let _low = force_live_card_free(2.0);
+        assert!(!can_host_on_machine(&model, &devices, 16, 2));
+        drop(_low);
+        let _ok = force_live_card_free(3.0);
+        assert!(can_host_on_machine(&model, &devices, 16, 2));
     }
 
     #[test]
