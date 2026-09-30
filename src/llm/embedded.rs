@@ -308,13 +308,15 @@ pub fn generate_with_callback(
                 let prompt_token_count = prompt_tokens.len() as u32;
                 let tokens = prompt_tokens;
                 let n = tokens.len();
-                const PREFILL_CHUNK: usize = 64;
-                let mut batch = LlamaBatch::new(PREFILL_CHUNK.max(1), 1);
+                // Context n_batch is already 2048 (clamped to n_ctx). Scratch is
+                // reserved for that. A 64-token chunk only adds kernel launches.
+                let prefill_chunk = ctx.n_batch().max(1) as usize;
+                let mut batch = LlamaBatch::new(prefill_chunk, 1);
                 let mut i = 0usize;
                 super::progress::report("prefill", 0.0);
                 while i < n {
                     batch.clear();
-                    let end = (i + PREFILL_CHUNK).min(n);
+                    let end = (i + prefill_chunk).min(n);
                     super::progress::report("prefill", i as f32 / n.max(1) as f32);
                     for pos in i..end {
                         let want_logits = pos + 1 == n;

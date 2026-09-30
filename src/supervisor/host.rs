@@ -1,8 +1,9 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use super::placement::{
-    accelerator_live_can_place, pick_placement, placement_miss_detail, Placement,
+    accelerator_live_can_place, pick_placement, pick_resident_placement, placement_miss_detail,
+    Placement,
 };
-use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot};
+use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot, PoolStrategy};
 use crate::gpu_occupancy::{
     smallest_advertised_need_gb, slot_live_free_gb, OccupancyWatch, SlotOccupancyView,
 };
@@ -107,6 +108,10 @@ pub struct Supervisor {
     occupancy: Mutex<OccupancyWatch>,
     /// NVIDIA slots we refused to start because the driver cannot run this CUDA.
     unusable_slots: HashSet<String>,
+    /// Slot ids the server says must not run a model. Replaced on each pong.
+    server_blocks: Mutex<HashMap<String, HashSet<String>>>,
+    /// Slot ids this process has already seen fail. Kept across pongs.
+    local_blocks: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 /// Give up only when the worker stops sending progress/token lines.
@@ -133,8 +138,165 @@ fn worker_silence_for_phase(phase: &str) -> Duration {
     }
 }
 
+fn fault_text(code: &str, detail: &str) -> String {
+    format!("{code} {detail}").to_ascii_lowercase()
+}
+
+fn slot_resource_failure(text: &str) -> bool {
+    text.contains("invoke_timeout")
+        || text.contains("operator_timeout")
+        || text.contains("insufficient_vram")
+        || text.contains("no_vision_capacity")
+        || text.contains("out of memory")
+        || text.contains("out_of_memory")
+        || text.contains("model_out_of_memory")
+        || text.contains("operator_out_of_memory")
+        || text.contains("cudamalloc")
+        || text.contains("cuda malloc")
+        || text.contains("failed to allocate")
+        || text.contains("out of device memory")
+        || text.contains("mps backend out of memory")
+        || text.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "oom")
+}
+
+fn shared_weight_failure(text: &str) -> bool {
+    if text.contains("disk_full")
+        || text.contains("disk full")
+        || text.contains("no space left")
+        || text.contains("model_not_installed")
+        || text.contains("model not installed")
+        || text.contains("weights not found")
+        || text.contains("unknown architecture")
+        || text.contains("unknown model architecture")
+    {
+        return true;
+    }
+    let missing = text.contains("no such file") || text.contains("failed to open");
+    let weight = text.contains("gguf") || text.contains("safetensors") || text.contains("weight");
+    missing && weight
+}
+
+fn load_failure(text: &str) -> bool {
+    text.contains("model_load_failed")
+        || text.contains("diffusers load failed")
+        || text.contains("diffusers snapshot missing")
+}
+
+fn family_from_text(text: &str) -> Option<&'static str> {
+    if text.contains("ptx")
+        || text.contains("failed to initialize cuda")
+        || text.contains("cuda driver")
+        || text.contains("libcuda")
+        || text.contains("libnvidia")
+        || text.contains("cublas")
+        || text.contains("nvidia driver")
+        || text.contains("isn't compatible with the graphics")
+    {
+        return Some("nvidia");
+    }
+    if text.contains("rocm")
+        || text.contains("amdgpu")
+        || text.contains("hsa_")
+        || text.contains("hip error")
+        || text.contains("amd driver")
+    {
+        return Some("amd");
+    }
+    if text.contains("level-zero")
+        || text.contains("level zero")
+        || text.contains("ze_result")
+        || text.contains("oneapi")
+        || text.contains("intel arc")
+        || text.contains("intel gpu")
+    {
+        return Some("intel");
+    }
+    if text.contains("failed to initialize metal")
+        || text.contains("metal shader")
+        || text.contains("metal library")
+        || text.contains("apple gpu")
+    {
+        return Some("apple");
+    }
+    None
+}
+
+fn generic_driver_failure(text: &str) -> bool {
+    text.contains("graphics driver") || text.contains("driver is too old")
+}
+
+/// `slot`, `machine`, `nvidia`, `amd`, `intel`, `apple`, or `origin` (same vendor as the card that failed).
+fn fault_scope(code: &str, detail: &str) -> &'static str {
+    let text = fault_text(code, detail);
+    if slot_resource_failure(&text) {
+        return "slot";
+    }
+    if shared_weight_failure(&text) {
+        return "machine";
+    }
+    if let Some(family) = family_from_text(&text) {
+        return family;
+    }
+    if load_failure(&text) {
+        return "machine";
+    }
+    if generic_driver_failure(&text) {
+        return "origin";
+    }
+    "slot"
+}
+
+fn slot_family(slot: &ComputeSlot) -> Option<&'static str> {
+    if slot.kind == "cpu" || matches!(slot.card.strategy, PoolStrategy::CpuOnly) {
+        return None;
+    }
+    if slot.kind == "metal" || matches!(slot.card.strategy, PoolStrategy::Metal) {
+        return Some("apple");
+    }
+    let mut intel = false;
+    let mut amd = false;
+    let mut nvidia = false;
+    for device in &slot.card.devices {
+        let id = device.id.to_ascii_lowercase();
+        if id.contains("intel") {
+            intel = true;
+        } else if id.contains("amd:") || id.contains("pci-amd") || id.contains("amdgpu") {
+            amd = true;
+        } else if id.contains("nvidia:") {
+            nvidia = true;
+        }
+    }
+    if intel {
+        return Some("intel");
+    }
+    if amd {
+        return Some("amd");
+    }
+    if nvidia || slot_requires_nvidia_cuda(slot) {
+        return Some("nvidia");
+    }
+    None
+}
+
+fn slots_in_family<'a>(slots: &'a [ComputeSlot], family: &str) -> Vec<String> {
+    slots
+        .iter()
+        .filter(|slot| slot_family(slot) == Some(family))
+        .map(|slot| slot.id.clone())
+        .collect()
+}
+
 fn slot_requires_nvidia_cuda(slot: &ComputeSlot) -> bool {
-    matches!(slot.card.strategy.as_str(), "single" | "tensor_parallel")
+    matches!(
+        slot.card.strategy,
+        PoolStrategy::Single | PoolStrategy::TensorParallel
+    )
+}
+
+fn nvidia_slots_unusable(slots: &[ComputeSlot], unusable: &HashSet<String>) -> bool {
+    slots
+        .iter()
+        .any(|slot| unusable.contains(&slot.id) && slot_requires_nvidia_cuda(slot))
 }
 
 fn worker_wall_for_phase(phase: &str) -> Duration {
@@ -178,11 +340,15 @@ impl Supervisor {
                     if w.healthy {
                         info!(slot = %slot.id, kind = %slot.kind, "slot worker ready");
                     } else {
-                        warn!(
-                            slot = %slot.id,
-                            "{}",
-                            crate::specs::accelerator_incompatible_message()
-                        );
+                        if slot_requires_nvidia_cuda(slot) {
+                            warn!(
+                                slot = %slot.id,
+                                "{}",
+                                crate::specs::accelerator_incompatible_message()
+                            );
+                        } else {
+                            warn!(slot = %slot.id, "graphics slot not started");
+                        }
                         unusable_slots.insert(slot.id.clone());
                     }
                     workers.insert(slot.id.clone(), w);
@@ -207,11 +373,93 @@ impl Supervisor {
             mmap_gate: Mutex::new(()),
             occupancy: Mutex::new(OccupancyWatch::new()),
             unusable_slots,
+            server_blocks: Mutex::new(HashMap::new()),
+            local_blocks: Mutex::new(HashMap::new()),
         }))
     }
 
     pub fn plan(&self) -> &ComputePlan {
         &self.plan
+    }
+
+    /// `None` is an old server and must not wipe blocks learned earlier.
+    pub async fn apply_server_blocks(&self, blocks: Option<Vec<(String, Vec<String>)>>) {
+        let Some(blocks) = blocks else {
+            return;
+        };
+        let mut map = HashMap::new();
+        for (model, slots) in blocks {
+            let key = model.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            let set = map.entry(key).or_insert_with(HashSet::new);
+            for slot in slots {
+                let id = slot.trim();
+                if !id.is_empty() {
+                    set.insert(id.to_string());
+                }
+            }
+        }
+        *self.server_blocks.lock().await = map.clone();
+        // The server list is the durable set. Drop a local block it has cleared.
+        *self.local_blocks.lock().await = map;
+    }
+
+    async fn blocked_slot_ids(&self, model_id: &str) -> HashSet<String> {
+        let key = model_id.trim().to_ascii_lowercase();
+        let mut out = HashSet::new();
+        if let Some(ids) = self.server_blocks.lock().await.get(&key) {
+            out.extend(ids.iter().cloned());
+        }
+        if let Some(ids) = self.local_blocks.lock().await.get(&key) {
+            out.extend(ids.iter().cloned());
+        }
+        out
+    }
+
+    async fn note_slot_failure(&self, model_id: &str, slot_id: &str, code: &str, detail: &str) {
+        let scope = fault_scope(code, detail);
+        let mut ids = Vec::new();
+        match scope {
+            "machine" => ids.extend(self.plan.slots.iter().map(|slot| slot.id.clone())),
+            "nvidia" | "amd" | "intel" | "apple" => {
+                ids.extend(slots_in_family(&self.plan.slots, scope));
+                if ids.is_empty() && !slot_id.is_empty() {
+                    ids.push(slot_id.to_string());
+                }
+            }
+            "origin" => {
+                let family = self
+                    .plan
+                    .slots
+                    .iter()
+                    .find(|slot| slot.id == slot_id)
+                    .and_then(slot_family);
+                if let Some(family) = family {
+                    ids.extend(slots_in_family(&self.plan.slots, family));
+                }
+            }
+            _ => {}
+        }
+        if ids.is_empty() && !slot_id.is_empty() && scope != "machine" {
+            let text = fault_text(code, detail);
+            if slot_resource_failure(&text) {
+                ids.push(slot_id.to_string());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let key = model_id.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        let mut local = self.local_blocks.lock().await;
+        let set = local.entry(key).or_insert_with(HashSet::new);
+        for id in ids {
+            set.insert(id);
+        }
     }
 
     async fn register_job_cancel(&self, job_id: &str) -> Arc<Notify> {
@@ -504,8 +752,18 @@ impl Supervisor {
         self.occupancy.lock().await.latched_ids()
     }
 
+    /// Machine-wide driver fault. A failed Vulkan or Metal slot stays unusable
+    /// on its own; it does not mean the NVIDIA driver cannot run jobs.
     pub fn accelerator_incompatible(&self) -> bool {
-        !self.unusable_slots.is_empty()
+        nvidia_slots_unusable(&self.plan.slots, &self.unusable_slots)
+    }
+
+    /// A graphics slot that started. One stderr warning does not make this false
+    /// while that slot is still taking jobs.
+    pub fn usable_accelerator_slot(&self) -> bool {
+        self.plan.slots.iter().any(|slot| {
+            slot.kind != "cpu" && !self.unusable_slots.contains(&slot.id)
+        })
     }
 
     /// Idle slots the router may fill. CPU is hidden while a healthy graphics
@@ -778,6 +1036,7 @@ impl Supervisor {
             .min(4);
 
         for attempt in 0..accel_slots {
+            let blocked = self.blocked_slot_ids(model_id).await;
             let placement = {
                 let occupied = self.occupied_slot_ids().await;
                 let inflight_gpu = match self.checkouts.try_lock() {
@@ -853,6 +1112,7 @@ impl Supervisor {
                     .slots
                     .iter()
                     .filter(|s| !skip.contains(&s.id))
+                    .filter(|s| !blocked.contains(&s.id))
                     .filter(|s| !occupied.contains(&s.id))
                     .filter(|s| {
                         s.kind != "cpu"
@@ -866,22 +1126,45 @@ impl Supervisor {
                     })
                     .map(|s| s.id.clone())
                     .collect();
-                let placement = match pick_placement(
+                let need_vision = crate::protocol::messages_have_images(messages);
+                let resident: Vec<String> = idle
+                    .iter()
+                    .filter(|id| {
+                        workers.get(*id).is_some_and(|worker| {
+                            worker.loaded_models.iter().any(|loaded| {
+                                loaded.eq_ignore_ascii_case(runtime_model)
+                                    || loaded.eq_ignore_ascii_case(model_id)
+                            })
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                let placement = match pick_resident_placement(
                     &self.plan,
                     &idle,
+                    &resident,
                     model,
                     ram_gb,
                     cpu_ram_headroom_gb,
-                    &self.devices,
-                    crate::protocol::messages_have_images(messages),
-                ) {
+                    need_vision,
+                )
+                .or_else(|| {
+                    pick_placement(
+                        &self.plan,
+                        &idle,
+                        model,
+                        ram_gb,
+                        cpu_ram_headroom_gb,
+                        &self.devices,
+                        need_vision,
+                    )
+                }) {
                     Some(p) => p,
                     None => {
                         self.clear_job_cancel(job_id).await;
                         if let Some(err) = last_crash {
                             return Err(err);
                         }
-                        let need_vision = crate::protocol::messages_have_images(messages);
                         let detail = placement_miss_detail(&self.plan, &idle, model, need_vision);
                         return Err(detail.into());
                     }
@@ -967,6 +1250,17 @@ impl Supervisor {
                 }
                 Err(err) => {
                     self.clear_job_cancel(job_id).await;
+                    let slot = placement
+                        .slot_ids
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
+                    if !slot.is_empty() {
+                        let code = crate::invoke_code::wire_code(&err);
+                        self.note_slot_failure(model_id, &slot, code, &format!("{err:#}"))
+                            .await;
+                        return Err(err.context(format!("slot_id={slot}")));
+                    }
                     return Err(err);
                 }
             }
@@ -989,6 +1283,7 @@ impl Supervisor {
         crate::image::refuse_if_disk_full()?;
         let cancel = self.register_job_cancel(job_id).await;
         let started = Instant::now();
+        let blocked = self.blocked_slot_ids(&model.model_id).await;
         let placement = {
             let occupied = self.occupied_slot_ids().await;
             let mut workers = self.workers.lock().await;
@@ -996,6 +1291,7 @@ impl Supervisor {
                 .plan
                 .slots
                 .iter()
+                .filter(|s| !blocked.contains(&s.id))
                 .filter(|s| !occupied.contains(&s.id))
                 .filter(|s| {
                     workers
@@ -1098,7 +1394,15 @@ impl Supervisor {
         self.return_worker(slot_id.clone(), worker).await;
         self.clear_job_cancel(job_id).await;
 
-        let images = outcome?;
+        let images = match outcome {
+            Ok(images) => images,
+            Err(err) => {
+                let code = crate::invoke_code::wire_code(&err);
+                self.note_slot_failure(&model.model_id, &slot_id, code, &format!("{err:#}"))
+                    .await;
+                return Err(err.context(format!("slot_id={slot_id}")));
+            }
+        };
         let timings = InvokeTimings {
             model_load_ms: None,
             prefill_ms: None,
@@ -1665,10 +1969,43 @@ fn worker_crash_retryable(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        worker_crash_retryable, worker_silence_for_phase, worker_wall_for_phase,
-        STUCK_CHECKOUT, WORKER_DECODE_SILENCE, WORKER_DECODE_WALL, WORKER_PREFILL_SILENCE,
-        WORKER_PREFILL_WALL,
+        nvidia_slots_unusable, worker_crash_retryable, worker_silence_for_phase,
+        worker_wall_for_phase, STUCK_CHECKOUT, WORKER_DECODE_SILENCE, WORKER_DECODE_WALL,
+        WORKER_PREFILL_SILENCE, WORKER_PREFILL_WALL,
     };
+    use crate::compute_pool::build_compute_slots;
+    use crate::specs::ComputeDevice;
+    use std::collections::HashSet;
+
+    #[test]
+    fn amd_slot_failure_is_not_a_nvidia_driver_fault() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "RTX 3050 Ti".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let mut unusable = HashSet::new();
+        unusable.insert("cpu-0".to_string());
+        assert!(!nvidia_slots_unusable(&plan.slots, &unusable));
+        unusable.insert("cuda-0".to_string());
+        assert!(nvidia_slots_unusable(&plan.slots, &unusable));
+    }
 
     #[test]
     fn stdout_close_retries_on_another_slot() {
