@@ -1625,12 +1625,8 @@ pub const BUNDLED_CUDA_MINOR: u32 = 6;
 
 static ACCEL_COMPAT_WATCH: AtomicBool = AtomicBool::new(false);
 static ACCEL_INCOMPATIBLE: AtomicBool = AtomicBool::new(false);
-static ACCEL_PTX_JIT_MISSING: AtomicBool = AtomicBool::new(false);
 
 pub fn accelerator_incompatible_message() -> &'static str {
-    if ACCEL_PTX_JIT_MISSING.load(Ordering::Relaxed) {
-        return "This graphics card cannot run jobs: NVIDIA's PTX compiler library is missing. Install the driver package that includes it. GPU containers need that library mounted in.";
-    }
     "This agent isn't compatible with the graphics driver. Update the driver so the graphics cards can run jobs."
 }
 
@@ -1652,30 +1648,17 @@ pub fn accelerator_runtime_incompatible() -> bool {
 pub fn reset_accelerator_compat_for_test() {
     ACCEL_COMPAT_WATCH.store(false, Ordering::Relaxed);
     ACCEL_INCOMPATIBLE.store(false, Ordering::Relaxed);
-    ACCEL_PTX_JIT_MISSING.store(false, Ordering::Relaxed);
-}
-
-/// Parent-side: a worker stderr line, including after the worker has already aborted.
-/// Does not use the GPU-worker watch, so a CPU slot probing CUDA cannot flag the machine.
-pub fn note_worker_stderr_line(msg: &str) {
-    if msg
-        .to_ascii_lowercase()
-        .contains("ptx jit compiler library not found")
-    {
-        ACCEL_PTX_JIT_MISSING.store(true, Ordering::Relaxed);
-        mark_accelerator_incompatible();
-    }
 }
 
 /// True when a graphics worker's own log says its backend cannot run.
+/// A missing PTX JIT library is not that: CUDA still runs the kernels that
+/// were already compiled for the card.
 pub fn note_accelerator_log_line(msg: &str) {
     if !ACCEL_COMPAT_WATCH.load(Ordering::Relaxed) {
         return;
     }
     let lower = msg.to_ascii_lowercase();
     if lower.contains("ptx jit compiler library not found") {
-        ACCEL_PTX_JIT_MISSING.store(true, Ordering::Relaxed);
-        mark_accelerator_incompatible();
         return;
     }
     let incompatible = lower.contains("driver version is insufficient")
@@ -1741,12 +1724,11 @@ mod tests {
     }
 
     #[test]
-    fn ptx_jit_missing_is_a_distinct_driver_fault() {
+    fn ptx_jit_missing_does_not_mark_the_driver_incompatible() {
         reset_accelerator_compat_for_test();
         arm_accelerator_compat_watch();
         note_accelerator_log_line("CUDA error: PTX JIT compiler library not found");
-        assert!(accelerator_runtime_incompatible());
-        assert!(accelerator_incompatible_message().contains("PTX compiler library"));
+        assert!(!accelerator_runtime_incompatible());
         reset_accelerator_compat_for_test();
     }
 

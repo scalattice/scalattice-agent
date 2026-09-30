@@ -67,10 +67,10 @@ impl InvokeErrorCode {
             "no_idle_slot" => Some(Self::NoIdleSlot),
             "insufficient_vram" | "no_vision_capacity" => Some(Self::InsufficientVram),
             "request_canceled" | "request_cancelled" => Some(Self::RequestCanceled),
-            "invoke_timeout" | "operator_timeout" => Some(Self::InvokeTimeout),
+            "invoke_timeout" | "provider_timeout" | "operator_timeout" => Some(Self::InvokeTimeout),
             "model_load_failed" => Some(Self::ModelLoadFailed),
             "model_not_installed" => Some(Self::ModelNotInstalled),
-            "model_out_of_memory" | "out_of_memory" | "operator_out_of_memory" => {
+            "model_out_of_memory" | "out_of_memory" | "provider_out_of_memory" | "operator_out_of_memory" => {
                 Some(Self::ModelOutOfMemory)
             }
             "prompt_too_long" => Some(Self::PromptTooLong),

@@ -144,12 +144,14 @@ fn fault_text(code: &str, detail: &str) -> String {
 
 fn slot_resource_failure(text: &str) -> bool {
     text.contains("invoke_timeout")
+        || text.contains("provider_timeout")
         || text.contains("operator_timeout")
         || text.contains("insufficient_vram")
         || text.contains("no_vision_capacity")
         || text.contains("out of memory")
         || text.contains("out_of_memory")
         || text.contains("model_out_of_memory")
+        || text.contains("provider_out_of_memory")
         || text.contains("operator_out_of_memory")
         || text.contains("cudamalloc")
         || text.contains("cuda malloc")
@@ -1684,7 +1686,6 @@ async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
                             // timestamps/targets when the supervisor re-logs.
                             let (_lvl, body) = crate::cloud_log::normalize_tracing_message(t);
                             if !body.is_empty() {
-                                crate::specs::note_worker_stderr_line(&body);
                                 info!(slot = %slot_log_id, "{body}");
                             }
                         }
