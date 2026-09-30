@@ -2478,6 +2478,14 @@ async fn respond_invoke(
                 ram_gb,
                 headroom,
                 on_delta,
+                {
+                    let pin = invoke.preferred_slot_id.trim();
+                    if pin.is_empty() {
+                        None
+                    } else {
+                        Some(pin)
+                    }
+                },
             )
             .await;
         drop(delta_tx);

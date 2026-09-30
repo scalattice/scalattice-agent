@@ -1,7 +1,8 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
 use crate::models::{
-    can_host_model, can_serve_vision_on_card, cpu_fallback_fits, gpu_full_host_need_gb_for_job,
-    hosting_min_vram_gb, image_job_min_vram_gb, occupancy_min_vram_gb, vram_can_gpu_full,
+    can_host_model, can_serve_vision_on_card, cpu_slot_may_serve, gpu_full_host_need_gb_for_job,
+    hosting_min_vram_gb, image_job_min_vram_gb, occupancy_min_vram_gb, placement_sys_ram_need_gb,
+    vram_can_gpu_full,
 };
 use crate::protocol::CatalogModel;
 use tracing::debug;
@@ -84,6 +85,30 @@ pub fn pick_placement(
     cpu_ram_headroom_gb: u32,
     devices: &[crate::specs::ComputeDevice],
     need_vision: bool,
+) -> Option<Placement> {
+    pick_placement_with_cpu(
+        plan,
+        idle_slot_ids,
+        model,
+        ram_gb,
+        cpu_ram_headroom_gb,
+        devices,
+        need_vision,
+        crate::specs::cpu_logical_cores(),
+        ram_gb.saturating_sub(crate::specs::detect_ram_used_gb().unwrap_or(0)),
+    )
+}
+
+pub fn pick_placement_with_cpu(
+    plan: &ComputePlan,
+    idle_slot_ids: &[String],
+    model: &CatalogModel,
+    ram_gb: u32,
+    cpu_ram_headroom_gb: u32,
+    devices: &[crate::specs::ComputeDevice],
+    need_vision: bool,
+    cpu_logical_cores: u32,
+    sys_ram_available_gb: u32,
 ) -> Option<Placement> {
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
@@ -178,6 +203,10 @@ pub fn pick_placement(
             .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
             .filter(|s| accelerator_live_can_place(s, &live_cuda, model))
             .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
+            .filter(|s| {
+                placement_sys_ram_need_gb(model, &s.card, need_vision, cpu_ram_headroom_gb)
+                    <= sys_ram_available_gb
+            })
             .collect();
         offload.sort_by(|a, b| {
             b.card
@@ -201,19 +230,42 @@ pub fn pick_placement(
             .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
             .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
         {
-            // A busy card that could host keeps the job off the CPU. An idle card
-            // with no free VRAM does not: the processor slot can run it.
+            // Idle accelerator that nameplate-hosts this model but lacks live free
+            // VRAM → bounce for failover. Do not silently rewrite onto CPU.
+            let idle_accel_nameplate_hosts = plan.slots.iter().any(|s| {
+                s.kind != "cpu"
+                    && idle.contains(s.id.as_str())
+                    && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+            });
+            // A busy card that could host keeps the job off the CPU.
             let busy_accel_could_host = plan.slots.iter().any(|s| {
                 s.kind != "cpu"
                     && !idle.contains(s.id.as_str())
                     && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
             });
-            if busy_accel_could_host {
+            let cpu_ram_need =
+                placement_sys_ram_need_gb(model, &slot.card, need_vision, cpu_ram_headroom_gb);
+            if idle_accel_nameplate_hosts {
+                debug!(
+                    slot = %slot.id,
+                    "placement: skip cpu; idle accelerator nameplate-hosts but live free is too small"
+                );
+            } else if busy_accel_could_host {
                 debug!(slot = %slot.id, "placement: skip cpu; an accelerator can host this model");
-            } else if plan.slots.iter().any(|s| s.kind != "cpu")
-                && !cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb)
+            } else if !cpu_slot_may_serve(model, ram_gb, cpu_ram_headroom_gb, cpu_logical_cores)
             {
-                debug!(slot = %slot.id, "placement: skip cpu; RAM does not cover weights and KV");
+                debug!(
+                    slot = %slot.id,
+                    cores = cpu_logical_cores,
+                    "placement: skip cpu; RAM or CPU capability gate"
+                );
+            } else if cpu_ram_need > sys_ram_available_gb {
+                debug!(
+                    slot = %slot.id,
+                    need = cpu_ram_need,
+                    available = sys_ram_available_gb,
+                    "placement: skip cpu; system RAM already reserved by sibling slots"
+                );
             } else {
                 debug!(slot = %slot.id, "placement: cpu slot");
                 return Some(Placement {
@@ -295,7 +347,12 @@ fn resident_slot_can_serve(
     need_vision: bool,
 ) -> bool {
     if slot.kind == "cpu" {
-        return cpu_fallback_fits(model, ram_gb, cpu_ram_headroom_gb);
+        return cpu_slot_may_serve(
+            model,
+            ram_gb,
+            cpu_ram_headroom_gb,
+            crate::specs::cpu_logical_cores(),
+        );
     }
     if need_vision && !can_serve_vision_on_card(model, &slot.card) {
         return false;
@@ -679,11 +736,22 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let placement =
-            pick_placement(&plan, &idle, &model(12.1, 5.0), 16, 2, &devices, false).unwrap();
+        let placement = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(12.1, 5.0),
+            16,
+            2,
+            &devices,
+            false,
+            16,
+            16,
+        )
+        .unwrap();
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
         assert!(
-            pick_placement(&plan, &idle, &model(12.1, 5.0), 6, 2, &devices, false).is_none(),
+            pick_placement_with_cpu(&plan, &idle, &model(12.1, 5.0), 6, 2, &devices, false, 16, 6)
+                .is_none(),
             "6 GB RAM must not start an 8B beside a 2 GB card"
         );
     }
@@ -701,8 +769,18 @@ mod tests {
         }];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let placement =
-            pick_placement(&plan, &idle, &model(4.0, 4.68), 32, 2, &devices, false).unwrap();
+        let placement = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(4.0, 4.68),
+            32,
+            2,
+            &devices,
+            false,
+            16,
+            32,
+        )
+        .unwrap();
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
     }
 
@@ -736,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn eight_gb_does_not_place_coder_30b() {
+    fn eight_gb_cpu_slot_only_with_capable_cpu_for_coder_30b() {
         let devices = [
             ComputeDevice {
                 id: "nvidia:0".into(),
@@ -759,11 +837,27 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let on_cpu =
-            pick_placement(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false).unwrap();
+        // Consumer cores: do not crawl 30B on CPU just because RAM fits.
+        assert!(
+            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false, 8, 31)
+                .is_none()
+        );
+        let on_cpu = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(22.5, 19.0),
+            31,
+            2,
+            &devices,
+            false,
+            32,
+            31,
+        )
+        .unwrap();
         assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
         assert!(
-            pick_placement(&plan, &idle, &model(22.5, 19.0), 20, 2, &devices, false).is_none(),
+            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 20, 2, &devices, false, 32, 20)
+                .is_none(),
             "20 GB RAM must not start a 19 GB coder"
         );
     }
@@ -792,19 +886,45 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let placement =
-            pick_placement(&plan, &idle, &model(10.7, 5.0), 16, 2, &devices, false).unwrap();
+        let placement = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(10.7, 5.0),
+            16,
+            2,
+            &devices,
+            false,
+            16,
+            16,
+        )
+        .unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
-        let fourteen =
-            pick_placement(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false).unwrap();
+        let fourteen = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(13.2, 9.0),
+            16,
+            2,
+            &devices,
+            false,
+            16,
+            16,
+        )
+        .unwrap();
         assert_eq!(
             fourteen.slot_ids,
             vec!["cpu-0".to_string()],
-            "4 GB card must not layer-offload a 14B; RAM can still run it"
+            "4 GB card must not layer-offload a 14B; capable CPU+RAM can still run it"
         );
         assert!(
-            pick_placement(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false).is_none(),
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8)
+                .is_none(),
             "8 GB RAM must not start a 14B"
+        );
+        assert!(
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16)
+                .is_none(),
+            "weak CPU must not claim a 14B even with RAM"
         );
     }
 
