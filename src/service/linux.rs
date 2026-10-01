@@ -146,10 +146,49 @@ pub fn in_tray_process() -> bool {
 
 pub fn stop_background_for_update() -> Result<()> {
     if !background_service_available() || !service_active() {
+        kill_non_tray_agent_processes();
         return Ok(());
     }
     run_systemctl(&["--user", "stop", UNIT_NAME])?;
+    // systemd stop does not reap orphaned `worker` children left by process::exit.
+    kill_non_tray_agent_processes();
     Ok(())
+}
+
+/// Slot workers share this binary name. `process::exit` skips kill_on_drop, so
+/// kill leftover `worker` processes before a service restart.
+pub fn kill_non_tray_agent_processes() {
+    let me = std::process::id();
+    let _ = Command::new("pkill")
+        .args(["-f", "scalattice-agent worker"])
+        .status();
+    // Also reap any direct children still listed under /proc (best-effort).
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            // Field 4 is PPID in /proc/pid/stat.
+            let ppid = stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u32>().ok());
+            if ppid != Some(me) {
+                continue;
+            }
+            let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmdline.contains("scalattice-agent") {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+    }
 }
 
 pub fn restart_background_after_update() -> Result<()> {

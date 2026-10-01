@@ -1,7 +1,22 @@
+fn resolve_package_version() -> String {
+    if let Ok(raw) = std::env::var("SCALATTICE_VERSION") {
+        let trimmed = raw.trim().trim_start_matches('v').trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into())
+}
+
 fn main() {
+    println!("cargo:rerun-if-env-changed=SCALATTICE_VERSION");
+    let version = resolve_package_version();
+    // Prefer the release-channel version over a stale Cargo.toml on the branch.
+    // CI sets SCALATTICE_VERSION from the Git tag before building.
+    println!("cargo:rustc-env=SCALATTICE_AGENT_VERSION={version}");
+
     #[cfg(windows)]
     {
-        let version = env!("CARGO_PKG_VERSION");
         let mut res = winres::WindowsResource::new();
         res.set_icon("installer/windows/scalattice.ico");
         res.set("ProductName", "Scalattice Agent");
@@ -9,7 +24,7 @@ fn main() {
         res.set("CompanyName", "Robottik Ltd");
         res.set("LegalCopyright", "Copyright (C) Robottik Ltd");
         // Keep string + numeric versions aligned so Explorer/ARP update after upgrades.
-        res.set("ProductVersion", version);
+        res.set("ProductVersion", &version);
         res.set("FileVersion", &format!("{version}.0"));
         let parts: Vec<u64> = version.split('.').filter_map(|p| p.parse().ok()).collect();
         let major = *parts.first().unwrap_or(&0);
@@ -43,7 +58,6 @@ fn main() {
         let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let src = manifest.join("installer/macos/Info.plist");
         println!("cargo:rerun-if-changed={}", src.display());
-        let version = std::env::var("CARGO_PKG_VERSION").unwrap();
         let raw = std::fs::read_to_string(&src).expect("read installer/macos/Info.plist");
         let patched = patch_plist_version(&raw, &version);
         let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("Info.plist");
@@ -55,7 +69,7 @@ fn main() {
     }
 }
 
-/// Keep the Mach-O `__TEXT,__info_plist` version in lockstep with `CARGO_PKG_VERSION`.
+/// Keep the Mach-O `__TEXT,__info_plist` version in lockstep with the release tag.
 /// The bundle `Info.plist` is rewritten at package time; a stale embedded plist
 /// makes `codesign --verify --strict` report `invalid Info.plist`.
 #[cfg(target_os = "macos")]

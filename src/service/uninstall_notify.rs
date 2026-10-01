@@ -28,7 +28,7 @@ pub fn notify_server_uninstall(reason: &str) {
             let client = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
                 .connect_timeout(Duration::from_secs(4))
-                .user_agent(format!("scalattice-agent/{}", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!("scalattice-agent/{}", crate::update::current_version()))
                 .build()
             {
                 Ok(c) => c,
@@ -37,7 +37,7 @@ pub fn notify_server_uninstall(reason: &str) {
             let url = format!("{SCALATTICE_API_BASE}/uninstall");
             let body = serde_json::json!({
                 "reason": reason,
-                "agentVersion": env!("CARGO_PKG_VERSION"),
+                "agentVersion": crate::update::current_version(),
                 "platform": std::env::consts::OS,
             });
             let _ = client.post(url).bearer_auth(token).json(&body).send().await;

@@ -547,7 +547,7 @@ impl TrayApp {
                             // notification helper cannot block auto-install.
                             self.start_update_install();
                             self.notify_desktop(
-                                "Installing update",
+                                "Installing channel version",
                                 &format!("Scalattice Agent v{latest} is downloading."),
                             );
                         } else {
@@ -1193,7 +1193,7 @@ impl eframe::App for TrayApp {
 }
 
 fn gather_status_lines() -> Vec<String> {
-    let mut lines = vec![format!("Version {}", env!("CARGO_PKG_VERSION"))];
+    let mut lines = vec![format!("Version {}", crate::update::current_version())];
     lines.push(state::cloud_connection_line());
 
     if crate::config::read_saved_agent_token().is_some() {

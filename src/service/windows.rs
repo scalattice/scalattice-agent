@@ -556,35 +556,41 @@ fn stop_background_agent_only() {
         stop_smoke_background_only();
         return;
     }
-    let mut killed = false;
     if let Some(path) = background_pid_path() {
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(pid) = raw.trim().parse::<u32>() {
-                killed = taskkill_pid(pid);
+                let _ = taskkill_pid(pid);
             }
         }
         let _ = fs::remove_file(&path);
     }
-    // Never taskkill /IM: that would also kill the tray. Prefer the pid file;
-    // if it's missing, skip anything that looks like the tray instance.
-    if !killed && background_mutex_held() {
-        let tray_pid = install_dir()
-            .ok()
-            .and_then(|d| fs::read_to_string(d.join("tray.pid")).ok())
-            .and_then(|raw| raw.trim().parse::<u32>().ok());
-        let self_pid = std::process::id();
-        for pid in agent_exe_pids() {
-            if pid == self_pid || Some(pid) == tray_pid {
-                continue;
-            }
-            let _ = taskkill_pid(pid);
+    // Always sweep leftover supervisor + slot workers. `process::exit` (wedge /
+    // update) skips Drop, so kill_on_drop never runs and orphans keep looking
+    // like a live agent to background_agent_process_listed — tray then refuses
+    // to start a fresh background process. Never taskkill /IM (that kills tray).
+    kill_non_tray_agent_processes();
+}
+
+/// Kill every scalattice-agent.exe except this process and the tray.
+/// Used on wedge exit and stop so orphaned slot workers cannot block restart.
+pub fn kill_non_tray_agent_processes() {
+    if crate::config::update_smoke_test() {
+        return;
+    }
+    let tray_pid = tray_pid_from_file();
+    let self_pid = std::process::id();
+    for pid in agent_exe_pids() {
+        if pid == self_pid || Some(pid) == tray_pid {
+            continue;
         }
+        let _ = taskkill_pid(pid);
     }
 }
 
 fn taskkill_pid(pid: u32) -> bool {
+    // /T: also kill slot-worker children when the supervisor PID is targeted.
     Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map(|o| o.status.success())

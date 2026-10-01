@@ -418,7 +418,7 @@ fn maybe_start_background_from_saved_token() -> Result<()> {
 }
 
 fn print_status() -> Result<()> {
-    println!("scalattice-agent {}", env!("CARGO_PKG_VERSION"));
+    println!("scalattice-agent {}", update::current_version());
     println!();
 
     let cloud_line = state::cloud_connection_line();

@@ -86,10 +86,16 @@ pub fn maybe_sync_auto_update_timer() -> anyhow::Result<()> {
 pub fn format_update_status(outcome: &UpdateCheckOutcome) -> String {
     let info = outcome.info();
     if info.update_available {
-        format!(
-            "Update available: v{} (you have v{})",
-            info.latest_version, info.current_version
-        )
+        match compare_versions(&info.latest_version, &info.current_version) {
+            std::cmp::Ordering::Less => format!(
+                "Rollback available: v{} (you have v{})",
+                info.latest_version, info.current_version
+            ),
+            _ => format!(
+                "Update available: v{} (you have v{})",
+                info.latest_version, info.current_version
+            ),
+        }
     } else {
         format!("Up to date (v{})", info.current_version)
     }

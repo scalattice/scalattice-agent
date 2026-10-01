@@ -1964,49 +1964,71 @@ fn try_parse_worker_response(line: &str) -> Option<WorkerResponse> {
 
 async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<WorkerResponse> {
     let expect_id = request_id(&req);
+    let rpc_timeout = match &req {
+        WorkerRequest::Warm { .. } => Duration::from_secs(10 * 60),
+        WorkerRequest::Evict { .. } => Duration::from_secs(120),
+        _ => Duration::from_secs(60),
+    };
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');
     worker.stdin.write_all(line.as_bytes()).await?;
     worker.stdin.flush().await?;
 
-    let mut buf = String::new();
-    let mut skipped = 0u32;
-    loop {
-        buf.clear();
-        let n = worker
-            .reader
-            .read_line(&mut buf)
-            .await
-            .context("read worker response")?;
-        if n == 0 {
-            worker.healthy = false;
-            return Err(crate::invoke_code::coded(
-                crate::invoke_code::InvokeErrorCode::WorkerLost,
-                format!("worker closed stdout (after {skipped} non-json line(s))"),
-            ));
-        }
-        let Some(resp) = try_parse_worker_response(&buf) else {
-            skipped += 1;
-            if skipped <= 8 {
-                warn!(
-                    slot = %worker.spec.id,
-                    line = %buf.trim(),
-                    "ignoring non-json worker stdout"
-                );
+    let read = async {
+        let mut buf = String::new();
+        let mut skipped = 0u32;
+        loop {
+            buf.clear();
+            let n = worker
+                .reader
+                .read_line(&mut buf)
+                .await
+                .context("read worker response")?;
+            if n == 0 {
+                worker.healthy = false;
+                return Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::WorkerLost,
+                    format!("worker closed stdout (after {skipped} non-json line(s))"),
+                ));
             }
-            continue;
-        };
-        match &resp {
-            WorkerResponse::Delta { .. } | WorkerResponse::Progress { .. } => continue,
-            WorkerResponse::Pong { id, .. }
-            | WorkerResponse::Ok { id }
-            | WorkerResponse::Result { id, .. }
-            | WorkerResponse::Health { id, .. }
-            | WorkerResponse::Error { id, .. } => {
-                if id == &expect_id || expect_id == "unknown" {
-                    return Ok(resp);
+            let Some(resp) = try_parse_worker_response(&buf) else {
+                skipped += 1;
+                if skipped <= 8 {
+                    warn!(
+                        slot = %worker.spec.id,
+                        line = %buf.trim(),
+                        "ignoring non-json worker stdout"
+                    );
+                }
+                continue;
+            };
+            match &resp {
+                WorkerResponse::Delta { .. } | WorkerResponse::Progress { .. } => continue,
+                WorkerResponse::Pong { id, .. }
+                | WorkerResponse::Ok { id }
+                | WorkerResponse::Result { id, .. }
+                | WorkerResponse::Health { id, .. }
+                | WorkerResponse::Error { id, .. } => {
+                    if id == &expect_id || expect_id == "unknown" {
+                        return Ok(resp);
+                    }
                 }
             }
+        }
+    };
+
+    match tokio::time::timeout(rpc_timeout, read).await {
+        Ok(result) => result,
+        Err(_) => {
+            worker.healthy = false;
+            let _ = worker.child.kill().await;
+            Err(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::WorkerLost,
+                format!(
+                    "worker rpc timed out after {}s (id={expect_id})",
+                    rpc_timeout.as_secs()
+                ),
+            ))
         }
     }
 }
