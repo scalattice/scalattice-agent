@@ -405,6 +405,11 @@ function Prioritize-SystemRustOnPath {
 function Ensure-RustTarget {
     param([string]$Target)
 
+    # GitHub-hosted runners have rustup under the user profile, not C:\Rust.
+    # Bootstrap C:\ar\rust when the system install is missing (same path the
+    # old sync-cargo-version.ps1 side effect used to cover).
+    Ensure-RunnerRustToolchain | Out-Null
+
     if (-not (Prioritize-SystemRustOnPath)) {
         Write-Error "Rust toolchain not found at C:\Rust - run scripts\setup-windows-build.cmd"
     }
