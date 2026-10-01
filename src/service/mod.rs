@@ -51,6 +51,16 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::restart_background_from_config(config)
 }
 
+/// Best-effort cleanup before `process::exit` on a wedged event loop.
+/// `exit` skips Drop, so slot workers with `kill_on_drop` would otherwise orphan
+/// and (on Windows) look like a still-running background agent.
+pub fn prepare_wedge_restart(hung_secs: u64) {
+    crate::state::mark_disconnected(Some(format!(
+        "event loop wedged for {hung_secs}s; restarting"
+    )));
+    platform::kill_non_tray_agent_processes();
+}
+
 /// OS scheduler tick: start a dead agent, or kill one that has frozen mid-session.
 /// Independent of the Windows/macOS tray: that UI used to be the only restarter,
 /// so quitting the tray (or App Nap) left machines offline until someone opened it.

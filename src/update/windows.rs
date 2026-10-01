@@ -15,7 +15,9 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 pub async fn check_for_update() -> Result<UpdateCheckOutcome> {
     let latest = fetch_latest_release().await?;
     let current = current_version().to_string();
-    let update_available = compare_versions(&latest.version, &current) == Ordering::Greater;
+    // Cloud `/latest` is the served channel tip (safeAgentVersion pin or GitHub
+    // tip). Install when we are not on that tip — including rollbacks.
+    let update_available = compare_versions(&latest.version, &current) != Ordering::Equal;
     let info = UpdateInfo {
         current_version: current,
         latest_version: latest.version,
@@ -33,7 +35,7 @@ pub async fn install_latest_update() -> Result<()> {
     let outcome = check_for_update().await?;
     let info = outcome.info();
     if !info.update_available {
-        println!("Already up to date (v{}).", info.current_version);
+        println!("Already on channel tip (v{}).", info.current_version);
         return Ok(());
     }
 

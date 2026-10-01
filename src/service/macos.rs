@@ -141,12 +141,36 @@ pub fn stop_background_for_update() -> Result<()> {
         return Ok(());
     }
     if !service_active() {
+        kill_non_tray_agent_processes();
         return Ok(());
     }
     let uid = user_id();
     let domain = format!("gui/{uid}/{LABEL}");
     let _ = run_launchctl(&["bootout", &domain]);
+    kill_non_tray_agent_processes();
     Ok(())
+}
+
+/// Slot workers share this binary. `process::exit` skips kill_on_drop, so kill
+/// leftover workers before KeepAlive / tray brings the supervisor back.
+pub fn kill_non_tray_agent_processes() {
+    let me = std::process::id();
+    let _ = Command::new("pkill")
+        .args(["-f", "scalattice-agent worker"])
+        .status();
+    // Best-effort: kill direct children that are still our binary.
+    let output = Command::new("pgrep")
+        .args(["-P", &me.to_string()])
+        .output();
+    if let Ok(output) = output {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
 }
 
 pub fn restart_background_after_update() -> Result<()> {

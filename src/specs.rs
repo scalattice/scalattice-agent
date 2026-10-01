@@ -117,7 +117,7 @@ pub struct MachineSpecs {
 }
 
 fn agent_version_string() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    crate::update::current_version().to_string()
 }
 
 pub fn detect_all_compute_devices() -> Vec<ComputeDevice> {

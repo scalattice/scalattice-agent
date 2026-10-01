@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 
+/// Runtime agent version. Prefer `SCALATTICE_VERSION` from the release tag
+/// (injected by `build.rs`); fall back to `Cargo.toml` for plain local builds.
 pub fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    option_env!("SCALATTICE_AGENT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 pub fn normalize_version(raw: &str) -> String {
@@ -36,5 +38,11 @@ mod tests {
     #[test]
     fn same_with_v_prefix() {
         assert_eq!(compare_versions("v1.0.32", "1.0.32"), Ordering::Equal);
+    }
+
+    #[test]
+    fn older_channel_tip_is_less() {
+        assert_eq!(compare_versions("1.1.90", "1.1.93"), Ordering::Less);
+        assert_ne!(compare_versions("1.1.90", "1.1.93"), Ordering::Equal);
     }
 }

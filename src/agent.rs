@@ -723,12 +723,22 @@ impl SessionState {
             );
         }
         self.compute_policy = next;
-        self.invalidate_specs_cache();
+        self.mark_specs_cache_stale();
         self.pending_supervisor_restart = true;
     }
 
-    fn invalidate_specs_cache(&self) {
-        *self.specs_cache.borrow_mut() = None;
+    /// Mark the probe TTL expired so `refresh_specs_cache` re-runs off-thread.
+    /// Do **not** clear the snapshot: clearing forced `enabled_devices()` to run
+    /// nvidia-smi/powershell on the WS select task, which wedged the fleet for
+    /// ~180s after every compute-policy change (ready/pong).
+    fn mark_specs_cache_stale(&self) {
+        if let Some((at, _)) = self.specs_cache.borrow_mut().as_mut() {
+            // Force specs_cache_fresh() false without dropping the snapshot.
+            if let Some(stale) = Instant::now().checked_sub(SPECS_CACHE_TTL + Duration::from_secs(1))
+            {
+                *at = stale;
+            }
+        }
     }
 
     fn store_specs_cache(&self, specs: MachineSpecs) {
@@ -762,15 +772,41 @@ impl SessionState {
         )
     }
 
+    /// Specs for heartbeats / register / tray. Never probes GPUs here.
     fn enabled_devices(&self) -> MachineSpecs {
-        // Prefer any cached snapshot (even slightly stale) over blocking the WS loop
-        // with PowerShell/nvidia-smi. Heartbeat refreshes the cache off-thread.
         if let Some(specs) = self.cached_specs() {
             return specs;
         }
-        let specs = Self::detect_enabled_devices(&self.compute_policy);
-        self.store_specs_cache(specs.clone());
-        specs
+        // Cold cache (first seconds after process start): stub from policy only.
+        // Background `refresh_specs_cache` fills the real snapshot.
+        Self::policy_stub_specs(&self.compute_policy)
+    }
+
+    fn policy_stub_specs(policy: &[(String, bool)]) -> MachineSpecs {
+        let devices: Vec<crate::specs::ComputeDevice> = policy
+            .iter()
+            .map(|(id, enabled)| crate::specs::ComputeDevice {
+                id: id.clone(),
+                kind: if id.starts_with("cpu") {
+                    "cpu".into()
+                } else {
+                    "discrete".into()
+                },
+                name: id.clone(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: *enabled,
+            })
+            .collect();
+        build_specs_from_devices(
+            &devices,
+            detect_hostname(),
+            detect_cpu_model(),
+            detect_ram_gb(),
+            None,
+            None,
+        )
     }
 
     fn live_specs(&self) -> MachineSpecs {
@@ -929,6 +965,10 @@ const ALREADY_CONNECTED_DELAY: Duration = Duration::from_secs(8);
 const EVENT_LOOP_WEDGE_AFTER: Duration = Duration::from_secs(180);
 const CATALOG_SYNC_CANCEL_WAIT: Duration = Duration::from_secs(90);
 
+/// Shared with `EventLoopLiveness` so long awaits inside the WS select branch
+/// (catalog cancel wait, etc.) can still refresh the wedge watchdog.
+static EVENT_LOOP_LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+
 async fn wait_for_catalog_sync_idle(flag: &AtomicBool) {
     let deadline = Instant::now() + CATALOG_SYNC_CANCEL_WAIT;
     while flag.load(Ordering::Relaxed) {
@@ -936,6 +976,9 @@ async fn wait_for_catalog_sync_idle(flag: &AtomicBool) {
             warn!("timed out waiting for catalog install to stop after cancel");
             break;
         }
+        // Keep the wedge watchdog fed: this await runs inside the WS select
+        // branch, so heartbeat ticks cannot run until we return.
+        EVENT_LOOP_LAST_TICK_MS.store(liveness_now_ms(), Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -1041,38 +1084,38 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
     }
 }
 
-struct EventLoopLiveness {
-    last_tick_ms: Arc<AtomicU64>,
-}
+struct EventLoopLiveness;
 
 impl EventLoopLiveness {
     fn spawn() -> Self {
-        let last_tick_ms = Arc::new(AtomicU64::new(liveness_now_ms()));
-        let watch = last_tick_ms.clone();
+        let now = liveness_now_ms();
+        EVENT_LOOP_LAST_TICK_MS.store(now, Ordering::Relaxed);
         let _ = std::thread::Builder::new()
             .name("scalattice-liveness".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(15));
-                let last = watch.load(Ordering::Relaxed);
+                let last = EVENT_LOOP_LAST_TICK_MS.load(Ordering::Relaxed);
                 let hung_for = liveness_now_ms().saturating_sub(last);
                 if hung_for >= EVENT_LOOP_WEDGE_AFTER.as_millis() as u64 {
+                    let hung_secs = hung_for / 1000;
                     warn!(
-                        hung_secs = hung_for / 1000,
+                        hung_secs,
                         "event loop wedged; exiting so the service manager restarts the agent"
                     );
                     eprintln!(
-                        "scalattice-agent: event loop wedged for {}s; exiting for service restart",
-                        hung_for / 1000
+                        "scalattice-agent: event loop wedged for {hung_secs}s; exiting for service restart"
                     );
+                    // process::exit skips Drop: kill slot workers first or Windows
+                    // treats orphans as a live agent and the tray never relaunches.
+                    crate::service::prepare_wedge_restart(hung_secs);
                     std::process::exit(75);
                 }
             });
-        Self { last_tick_ms }
+        Self
     }
 
     fn tick(&self) {
-        self.last_tick_ms
-            .store(liveness_now_ms(), Ordering::Relaxed);
+        EVENT_LOOP_LAST_TICK_MS.store(liveness_now_ms(), Ordering::Relaxed);
     }
 }
 
@@ -1308,6 +1351,7 @@ async fn run_agent_session(
                 }
             }
             _ = logs_flush.tick() => {
+                liveness.tick();
                 if crate::cloud_log::is_streaming() {
                     let _ = flush_live_logs(&write).await;
                 }
@@ -1391,10 +1435,19 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
         }
     };
     if let Some(policy) = policy {
-        let specs =
-            tokio::task::spawn_blocking(move || SessionState::detect_enabled_devices(&policy))
-                .await;
-        if let Ok(specs) = specs {
+        let specs = match timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || SessionState::detect_enabled_devices(&policy)),
+        )
+        .await
+        {
+            Ok(Ok(specs)) => Some(specs),
+            Ok(Err(_)) | Err(_) => {
+                state.lock().await.pending_supervisor_restart = true;
+                None
+            }
+        };
+        if let Some(specs) = specs {
             match Supervisor::start(&specs.compute_devices).await {
                 Ok(supervisor) => {
                     let mut guard = state.lock().await;
@@ -1407,8 +1460,6 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
                     state.lock().await.pending_supervisor_restart = true;
                 }
             }
-        } else {
-            state.lock().await.pending_supervisor_restart = true;
         }
     }
 
@@ -1439,9 +1490,15 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
             guard.cpu_ram_headroom_gb,
         )
     };
-    let live_cuda = tokio::task::spawn_blocking(crate::specs::live_cuda_free_vram_by_index)
-        .await
-        .unwrap_or_default();
+    let live_cuda = match timeout(
+        Duration::from_secs(15),
+        tokio::task::spawn_blocking(crate::specs::live_cuda_free_vram_by_index),
+    )
+    .await
+    {
+        Ok(Ok(map)) => map,
+        Ok(Err(_)) | Err(_) => Default::default(),
+    };
     supervisor
         .refresh_gpu_occupancy(&catalog, &advertised, ram_gb, headroom, live_cuda)
         .await;
@@ -1480,16 +1537,22 @@ async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
     if !need_refresh {
         return;
     }
-    let specs =
-        match tokio::task::spawn_blocking(move || SessionState::detect_enabled_devices(&policy))
-            .await
-        {
-            Ok(specs) => specs,
-            Err(err) => {
-                warn!("specs refresh task failed: {err:#}");
-                return;
-            }
-        };
+    let specs = match timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || SessionState::detect_enabled_devices(&policy)),
+    )
+    .await
+    {
+        Ok(Ok(specs)) => specs,
+        Ok(Err(err)) => {
+            warn!("specs refresh task failed: {err:#}");
+            return;
+        }
+        Err(_) => {
+            warn!("specs refresh timed out after 30s (nvidia-smi/powershell hung?)");
+            return;
+        }
+    };
     state.lock().await.store_specs_cache(specs);
 }
 
@@ -1623,14 +1686,17 @@ async fn refresh_disk_inventory(state: &Arc<Mutex<SessionState>>) {
 /// Best-effort WS write. Returns Ok even if the peer already reset: invoke tasks
 /// must not treat a dying socket as a logic failure that races the reconnect loop.
 async fn ws_send_text(write: &SharedWsWrite, text: &str) -> Result<()> {
-    match write
-        .lock()
-        .await
-        .send(Message::Text(text.to_string()))
-        .await
+    match timeout(WS_WRITE_TIMEOUT, async {
+        write
+            .lock()
+            .await
+            .send(Message::Text(text.to_string()))
+            .await
+    })
+    .await
     {
-        Ok(()) => Ok(()),
-        Err(err) => {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
             let msg = err.to_string().to_lowercase();
             if msg.contains("closed")
                 || msg.contains("reset")
@@ -1642,6 +1708,10 @@ async fn ws_send_text(write: &SharedWsWrite, text: &str) -> Result<()> {
             } else {
                 Err(err.into())
             }
+        }
+        Err(_) => {
+            debug!("websocket write timed out (network likely dropped)");
+            Ok(())
         }
     }
 }
@@ -1893,7 +1963,11 @@ async fn handle_server_message(
                         };
                         spawn_delete_staged_dirs(trash);
                         // Apply server warm plan on each pong (slot targets arrive after register).
-                        apply_warm_plan(state.clone()).await;
+                        // Never await warm on the WS select task — preload can take minutes.
+                        let state_warm = state.clone();
+                        tokio::spawn(async move {
+                            apply_warm_plan(state_warm).await;
+                        });
                         if state.lock().await.needs_reregister() {
                             send_register_message(state, write).await?;
                         } else if purge_requested || catalog_updated {
