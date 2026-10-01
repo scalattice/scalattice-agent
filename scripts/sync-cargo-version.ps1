@@ -27,52 +27,26 @@ if ($updated -eq $text) {
     Write-Host "==> Cargo.toml set to v$Version"
 }
 
-function Resolve-CargoExe {
-    $common = Join-Path $PSScriptRoot "windows-build-common.ps1"
-    if (Test-Path -LiteralPath $common) {
-        . $common
-        $paths = Get-WindowsBuildPathEntries
-        if ($paths.Count -gt 0) {
-            $env:PATH = (($paths -join ';') + ';' + $env:PATH)
-        }
-        Ensure-RunnerRustToolchain | Out-Null
-        if (Prioritize-SystemRustOnPath) {
-            try {
-                return (Get-SystemRustTool cargo)
-            } catch {
-                Write-Host "==> System Rust bootstrap incomplete: $_"
-            }
-        }
+# Patch only the workspace package version in Cargo.lock. Never run
+# `cargo generate-lockfile` here — that re-resolves to latest compatible
+# crates (e.g. llama-cpp-2 0.1.154 → 0.1.158) and breaks the Windows build.
+$lock = Join-Path $Root "Cargo.lock"
+if (Test-Path -LiteralPath $lock) {
+    $lockText = Get-Content -LiteralPath $lock -Raw
+    $updatedLock = [regex]::Replace(
+        $lockText,
+        '(?ms)(name = "scalattice-agent"\r?\n)version = "[^"]+"',
+        "`${1}version = `"$Version`"",
+        1
+    )
+    if ($updatedLock -eq $lockText) {
+        Write-Host "==> Cargo.lock already at v$Version (or package entry not found)"
+    } else {
+        Set-Content -LiteralPath $lock -Value $updatedLock -NoNewline
+        Write-Host "==> Cargo.lock package version set to v$Version"
     }
-
-    if ($env:CARGO -and (Test-Path -LiteralPath $env:CARGO)) {
-        return $env:CARGO
-    }
-
-    $cmd = Get-Command cargo -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) {
-        return $cmd.Source
-    }
-
-    return $null
-}
-
-# Keep Cargo.lock in sync when a working cargo is available.
-$cargoExe = Resolve-CargoExe
-if (-not $cargoExe) {
-    Write-Host "==> Skipping Cargo.lock sync (cargo not on PATH yet)"
 } else {
-    try {
-        & $cargoExe --version | Out-Host
-        & $cargoExe generate-lockfile | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "cargo generate-lockfile exited $LASTEXITCODE (continuing)"
-        } else {
-            Write-Host "==> Cargo.lock refreshed"
-        }
-    } catch {
-        Write-Warning "cargo generate-lockfile failed: $_ (continuing)"
-    }
+    Write-Host "==> No Cargo.lock to patch"
 }
 
 Write-Host "==> Verified: $(Select-String -Path $cargo -Pattern '^version = ' | Select-Object -First 1 -ExpandProperty Line)"

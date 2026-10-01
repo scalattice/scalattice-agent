@@ -239,7 +239,7 @@ jobs:
           set -euo pipefail
           export PATH="${CUDA_PATH}/bin:$PATH"
           nvcc --version
-          cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --features arm-gpu
+          cargo build --locked --release --target aarch64-unknown-linux-gnu --no-default-features --features arm-gpu
           mkdir -p dist
           cp target/aarch64-unknown-linux-gnu/release/scalattice-agent dist/
           chmod +x scripts/bundle-release-libs.sh
@@ -288,7 +288,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup target add aarch64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin --no-default-features --features metal
+          cargo build --locked --release --target aarch64-apple-darwin --no-default-features --features metal
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/scalattice-agent dist/scalattice-agent
           file dist/scalattice-agent

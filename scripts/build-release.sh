@@ -42,7 +42,7 @@ fi
 
 rustup target add "$TARGET" >/dev/null 2>&1 || true
 
-args=(build --release --target "$TARGET")
+args=(build --locked --release --target "$TARGET")
 if [[ "$NO_DEFAULT" == "true" ]]; then
   args+=(--no-default-features)
 fi
