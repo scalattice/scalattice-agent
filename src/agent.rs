@@ -126,6 +126,9 @@ struct SessionState {
     last_server_activity_ms: u64,
     /// Runtime the Go hypervisor told us to preload. Empty = do not guess.
     warm_runtime_model: Option<String>,
+    /// Slot ids the hypervisor authorized for that runtime. `None` = not set yet
+    /// (older router). Empty vec = stay cold / clear unauthorized residents.
+    warm_slot_ids: Option<Vec<String>>,
 }
 
 impl SessionState {
@@ -163,6 +166,7 @@ impl SessionState {
             cached_model_disk: Vec::new(),
             last_server_activity_ms: wall_now_ms(),
             warm_runtime_model: None,
+            warm_slot_ids: None,
         }
     }
 
@@ -257,7 +261,7 @@ impl SessionState {
         }
     }
 
-    fn instructed_warm_runtime(&self) -> Option<String> {
+    fn instructed_warm_plan(&self) -> Option<(String, Vec<String>)> {
         let runtime = self.warm_runtime_model.as_ref()?.trim();
         if runtime.is_empty() {
             return None;
@@ -274,7 +278,9 @@ impl SessionState {
         if self.disk_inventory_primed && !self.disk_has_runtime(runtime) {
             return None;
         }
-        Some(runtime.to_string())
+        // Wait for slot targets from the router. Empty list is intentional (no fit).
+        let slots = self.warm_slot_ids.clone()?;
+        Some((runtime.to_string(), slots))
     }
 
     fn effective_hf_token(&self, server_token: Option<String>) -> Option<String> {
@@ -1345,7 +1351,7 @@ async fn run_agent_session(
                             refresh_specs_cache(&state_bg).await;
                             refresh_slot_cache(&state_bg).await;
                             refresh_disk_inventory(&state_bg).await;
-                            maybe_warm_models(state_bg.clone()).await;
+                            apply_warm_plan(state_bg.clone()).await;
                             let reregister = state_bg.lock().await.needs_reregister();
                             if reregister {
                                 if let Err(err) = send_register_message(&state_bg, &write_bg).await {
@@ -1487,8 +1493,8 @@ async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
     state.lock().await.store_specs_cache(specs);
 }
 
-async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
-    let (runtime, supervisor) = {
+async fn apply_warm_plan(state: Arc<Mutex<SessionState>>) {
+    let (runtime, slot_ids, supervisor) = {
         let guard = state.lock().await;
         if guard.active_job_count > 0 {
             return;
@@ -1497,13 +1503,13 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
         if !guard.vram_lifecycle.should_preload(&config) {
             return;
         }
-        let Some(runtime) = guard.instructed_warm_runtime() else {
+        let Some((runtime, slot_ids)) = guard.instructed_warm_plan() else {
             return;
         };
         let Some(supervisor) = guard.supervisor.clone() else {
             return;
         };
-        (runtime, supervisor)
+        (runtime, slot_ids, supervisor)
     };
     if supervisor.has_in_flight_work().await {
         return;
@@ -1516,7 +1522,12 @@ async fn maybe_warm_models(state: Arc<Mutex<SessionState>>) {
         if supervisor.has_in_flight_work().await {
             return;
         }
-        if supervisor.warm_models(&[runtime]).await.ok() == Some(true) {
+        if supervisor
+            .preload_slots(&runtime, &slot_ids)
+            .await
+            .ok()
+            == Some(true)
+        {
             let mut guard = state_for_task.lock().await;
             guard.vram_lifecycle.on_vram_loaded();
         }
@@ -1682,6 +1693,12 @@ async fn handle_server_message(
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
+                        guard.warm_slot_ids = ready.warm_slot_ids.clone().map(|ids| {
+                            ids.into_iter()
+                                .map(|id| id.trim().to_string())
+                                .filter(|id| !id.is_empty())
+                                .collect()
+                        });
                         guard.last_sync_token = None;
                         guard.apply_schedule(ready.schedule.clone());
                         let wait_flag = if cancelled {
@@ -1711,7 +1728,7 @@ async fn handle_server_message(
                         // A reconnect that killed a live job must not immediately mmap
                         // another GGUF beside the dying worker (16 GB WS reset).
                         if canceled == 0 {
-                            maybe_warm_models(state_bg.clone()).await;
+                            apply_warm_plan(state_bg.clone()).await;
                         }
                         if state_bg.lock().await.needs_reregister() {
                             if let Err(err) = send_register_message(&state_bg, &write_bg).await {
@@ -1828,7 +1845,7 @@ async fn handle_server_message(
                         let purge_requested = !pong.purge_models.is_empty();
                         let catalog_updated = pong.catalog.is_some();
                         let hf_token = pong.hugging_face_token.clone();
-                        let (transition, wait_sync) = {
+                        let (_transition, wait_sync) = {
                             let mut guard = state.lock().await;
                             guard.apply_compute_devices(&pong.compute_devices);
                             if let Some(catalog) = pong.catalog.clone() {
@@ -1845,6 +1862,14 @@ async fn handle_server_message(
                                 } else {
                                     Some(trimmed.to_string())
                                 };
+                            }
+                            if let Some(ids) = pong.warm_slot_ids.clone() {
+                                guard.warm_slot_ids = Some(
+                                    ids.into_iter()
+                                        .map(|id| id.trim().to_string())
+                                        .filter(|id| !id.is_empty())
+                                        .collect(),
+                                );
                             }
                             let transition = guard.apply_schedule(pong.schedule.clone());
                             let wait_sync = if cancelled_policy || cancelled_purge {
@@ -1867,9 +1892,8 @@ async fn handle_server_message(
                             trash
                         };
                         spawn_delete_staged_dirs(trash);
-                        if transition.entered_earning {
-                            maybe_warm_models(state.clone()).await;
-                        }
+                        // Apply server warm plan on each pong (slot targets arrive after register).
+                        apply_warm_plan(state.clone()).await;
                         if state.lock().await.needs_reregister() {
                             send_register_message(state, write).await?;
                         } else if purge_requested || catalog_updated {
