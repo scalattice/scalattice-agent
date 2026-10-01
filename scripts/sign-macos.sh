@@ -105,37 +105,6 @@ if [[ -z "$KEY_FILE" ]]; then
   trap cleanup_signing_temps EXIT
 fi
 
-# Codesign already succeeded. Notarization is best-effort when Apple's
-# developer legal agreement is missing/expired (HTTP 403) so a Mac-only
-# Apple account glitch cannot block the multi-platform fleet release.
-notary_submit() {
-  local submit="$1"
-  local label="$2"
-  local log rc
-  log="$(mktemp /tmp/scalattice-notary.XXXXXX)"
-  set +e
-  xcrun notarytool submit "$submit" \
-    --key "$KEY_FILE" \
-    --key-id "$APPLE_API_KEY_ID" \
-    --issuer "$APPLE_API_ISSUER_ID" \
-    --wait >"$log" 2>&1
-  rc=$?
-  set -e
-  cat "$log"
-  if [[ $rc -eq 0 ]]; then
-    rm -f "$log"
-    return 0
-  fi
-  if grep -qiE 'required agreement is missing or has expired|agreement that has not been signed' "$log"; then
-    echo "==> WARNING: notarization skipped for ${label}: Apple Developer agreement missing/expired." >&2
-    echo "==> Signed ${label} will still upload. Accept the agreement at https://developer.apple.com/account then re-release to notarize." >&2
-    rm -f "$log"
-    return 0
-  fi
-  rm -f "$log"
-  return "$rc"
-}
-
 SUBMIT="$DMG"
 if [[ -z "$SUBMIT" && -f "$TARGET" ]]; then
   # Bare Mach-O cannot be stapled, but Gatekeeper looks up the notarization
@@ -150,8 +119,12 @@ if [[ -z "$SUBMIT" && -f "$TARGET" ]]; then
     ditto -c -k --keepParent "$(basename "$TARGET")" "$SUBMIT"
   )
   echo "==> notarytool submit $(basename "$SUBMIT") (standalone CLI)"
-  notary_submit "$SUBMIT" "standalone CLI"
-  echo "==> Done with standalone CLI signing (notarize when Apple agreement allows)"
+  xcrun notarytool submit "$SUBMIT" \
+    --key "$KEY_FILE" \
+    --key-id "$APPLE_API_KEY_ID" \
+    --issuer "$APPLE_API_ISSUER_ID" \
+    --wait
+  echo "==> Notarized standalone CLI (ticket only; cannot staple a Mach-O)"
   exit 0
 fi
 if [[ -z "$SUBMIT" ]]; then
@@ -164,12 +137,12 @@ if [[ ! -f "$SUBMIT" ]]; then
 fi
 
 echo "==> notarytool submit $(basename "$SUBMIT")"
-notary_submit "$SUBMIT" "$(basename "$SUBMIT")"
+xcrun notarytool submit "$SUBMIT" \
+  --key "$KEY_FILE" \
+  --key-id "$APPLE_API_KEY_ID" \
+  --issuer "$APPLE_API_ISSUER_ID" \
+  --wait
 
-if xcrun stapler validate "$SUBMIT" >/dev/null 2>&1; then
-  echo "==> stapler staple"
-  xcrun stapler staple "$SUBMIT"
-  echo "==> Notarized and stapled $(basename "$SUBMIT")"
-else
-  echo "==> Skipping stapler (no notarization ticket for $(basename "$SUBMIT"))"
-fi
+echo "==> stapler staple"
+xcrun stapler staple "$SUBMIT"
+echo "==> Notarized and stapled $(basename "$SUBMIT")"
