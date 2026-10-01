@@ -96,6 +96,9 @@ struct SlotCheckout {
     /// Cleared after ~15s once RSS usually reflects the load, so we do not
     /// double-count against `detect_ram_used_gb`.
     reserved_sys_ram_gb: u32,
+    /// Residents at checkout time — status still reports these while the worker
+    /// is out of the map for an in-flight invoke.
+    loaded_models: Vec<String>,
 }
 
 pub struct Supervisor {
@@ -551,8 +554,9 @@ impl Supervisor {
         !self.checkouts.lock().await.is_empty() || !self.job_cancels.lock().await.is_empty()
     }
 
-    async fn mark_checkout(&self, slot_id: &str, job_id: &str, pid: Option<u32>) {
-        self.mark_checkout_reserved(slot_id, job_id, pid, 0).await;
+    async fn mark_checkout(&self, slot_id: &str, job_id: &str, pid: Option<u32>, loaded_models: Vec<String>) {
+        self.mark_checkout_reserved(slot_id, job_id, pid, 0, loaded_models)
+            .await;
     }
 
     async fn mark_checkout_reserved(
@@ -561,6 +565,7 @@ impl Supervisor {
         job_id: &str,
         pid: Option<u32>,
         reserved_sys_ram_gb: u32,
+        loaded_models: Vec<String>,
     ) {
         self.checkouts.lock().await.insert(
             slot_id.to_string(),
@@ -569,6 +574,7 @@ impl Supervisor {
                 since: Instant::now(),
                 pid,
                 reserved_sys_ram_gb,
+                loaded_models,
             },
         );
     }
@@ -648,6 +654,7 @@ impl Supervisor {
                             since: c.since,
                             pid: c.pid,
                             reserved_sys_ram_gb: c.reserved_sys_ram_gb,
+                            loaded_models: c.loaded_models.clone(),
                         },
                     )
                 })
@@ -726,6 +733,7 @@ impl Supervisor {
     pub async fn slot_statuses(&self) -> Vec<SlotStatus> {
         let occupied = self.occupancy.lock().await.latched_ids();
         let workers = self.workers.lock().await;
+        let checkouts = self.checkouts.lock().await;
         self.plan
             .slots
             .iter()
@@ -733,11 +741,12 @@ impl Supervisor {
                 // Missing from the map = temporarily checked out for an in-flight invoke.
                 let (busy, healthy, loaded) = if self.unusable_slots.contains(&spec.id) {
                     (false, false, Vec::new())
+                } else if let Some(w) = workers.get(&spec.id) {
+                    (w.busy, w.healthy, w.loaded_models.clone())
+                } else if let Some(c) = checkouts.get(&spec.id) {
+                    (true, true, c.loaded_models.clone())
                 } else {
-                    workers
-                        .get(&spec.id)
-                        .map(|w| (w.busy, w.healthy, w.loaded_models.clone()))
-                        .unwrap_or((true, true, Vec::new()))
+                    (true, true, Vec::new())
                 };
                 SlotStatus {
                     id: spec.id.clone(),
@@ -931,25 +940,85 @@ impl Supervisor {
         self.note_our_vram_activity().await;
     }
 
-    /// Preload only the runtime the Go hypervisor named. Empty = stay empty.
-    pub async fn warm_models(&self, runtime_models: &[String]) -> Result<bool> {
-        if runtime_models.is_empty() {
+    /// Execute a server warm plan: preload `runtime_model` only on `slot_ids`.
+    /// Evicts residents on every other idle slot. Empty `slot_ids` means stay cold.
+    pub async fn preload_slots(&self, runtime_model: &str, slot_ids: &[String]) -> Result<bool> {
+        let runtime = runtime_model.trim();
+        if runtime.is_empty() {
             return Ok(false);
         }
-        let idle = self.idle_slot_ids().await;
+        let runtime = runtime.to_string();
+        let wanted: HashSet<String> = slot_ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
         let occupied = self.occupied_slot_ids().await;
-        let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
-        // Never fall back to warming cpu-0 while GPUs exist but are busy.
+
+        // Clear residents the server did not authorize for this plan.
+        let evict_ids: Vec<String> = {
+            let workers = self.workers.lock().await;
+            self.plan
+                .slots
+                .iter()
+                .filter(|s| !wanted.contains(&s.id))
+                .filter(|s| !occupied.contains(&s.id))
+                .filter(|s| {
+                    workers
+                        .get(&s.id)
+                        .map(|w| !w.busy && w.healthy && !w.loaded_models.is_empty())
+                        .unwrap_or(false)
+                })
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        for slot_id in evict_ids {
+            let mut worker = {
+                let mut workers = self.workers.lock().await;
+                match workers.remove(&slot_id) {
+                    Some(w) if !w.busy && w.healthy && !w.loaded_models.is_empty() => w,
+                    Some(w) => {
+                        workers.insert(slot_id, w);
+                        continue;
+                    }
+                    None => continue,
+                }
+            };
+            let pid = worker.child.id();
+            self.mark_checkout(
+                &slot_id,
+                &format!("warm-evict:{slot_id}"),
+                pid,
+                worker.loaded_models.clone(),
+            )
+            .await;
+            let req_id = next_req_id();
+            match worker_rpc(&mut worker, WorkerRequest::Evict { id: req_id }).await {
+                Ok(WorkerResponse::Ok { .. }) => {
+                    worker.loaded_models.clear();
+                    info!(
+                        slot = %slot_id,
+                        model = %runtime,
+                        "evicted resident outside server warm plan"
+                    );
+                }
+                Ok(WorkerResponse::Error { error, .. }) => {
+                    warn!(slot = %slot_id, error = %error, "evict outside warm plan failed");
+                }
+                Ok(_) => {}
+                Err(err) => warn!(slot = %slot_id, error = %err, "evict outside warm plan rpc failed"),
+            }
+            self.return_worker(slot_id, worker).await;
+        }
+
+        if wanted.is_empty() {
+            return Ok(false);
+        }
+
+        let idle = self.idle_slot_ids().await;
         let targets: Vec<String> = idle
             .into_iter()
-            .filter(|id| !occupied.contains(id))
-            .filter(|id| {
-                if id.starts_with("cpu-") {
-                    !has_accel
-                } else {
-                    true
-                }
-            })
+            .filter(|id| wanted.contains(id) && !occupied.contains(id))
             .collect();
         if targets.is_empty() {
             return Ok(false);
@@ -957,11 +1026,7 @@ impl Supervisor {
 
         let mut warmed_any = false;
         for slot_id in targets {
-            let Some(model) = runtime_models.first().cloned() else {
-                continue;
-            };
-
-            let incoming_gb = warm_model_weight_mb(&model) as f64 / 1024.0;
+            let incoming_gb = warm_model_weight_mb(&runtime) as f64 / 1024.0;
             let _mmap = self.lock_mmap_if_needed(incoming_gb).await;
 
             let mut workers = self.workers.lock().await;
@@ -971,8 +1036,7 @@ impl Supervisor {
             if worker.busy || !worker.healthy {
                 continue;
             }
-            // Already resident: keep it. Advisory warm must not evict/offload a
-            // warm model just to chase a different catalog preference.
+            // Already resident: keep it. Do not chase a different preference.
             if !worker.loaded_models.is_empty() {
                 warmed_any = true;
                 continue;
@@ -980,8 +1044,6 @@ impl Supervisor {
             worker.busy = true;
             drop(workers);
 
-            // Take the worker out so invoke can claim other slots while this
-            // load runs (holding the map lock during Warm blocked debug for minutes).
             let mut worker = {
                 let mut workers = self.workers.lock().await;
                 match workers.remove(&slot_id) {
@@ -990,30 +1052,35 @@ impl Supervisor {
                 }
             };
             let pid = worker.child.id();
-            self.mark_checkout(&slot_id, &format!("warm:{slot_id}"), pid)
-                .await;
+            self.mark_checkout(
+                &slot_id,
+                &format!("warm:{slot_id}"),
+                pid,
+                worker.loaded_models.clone(),
+            )
+            .await;
             let req_id = next_req_id();
             let outcome = worker_rpc(
                 &mut worker,
                 WorkerRequest::Warm {
                     id: req_id,
-                    runtime_model: model.clone(),
+                    runtime_model: runtime.clone(),
                 },
             )
             .await;
             match &outcome {
                 Ok(WorkerResponse::Ok { .. }) => {
-                    if !worker.loaded_models.iter().any(|m| m == &model) {
-                        worker.loaded_models.push(model.clone());
+                    if !worker.loaded_models.iter().any(|m| m == &runtime) {
+                        worker.loaded_models.push(runtime.clone());
                     }
                     warmed_any = true;
-                    info!(slot = %slot_id, model = %model, "warmed model on slot");
+                    info!(slot = %slot_id, model = %runtime, "preloaded model on slot");
                 }
                 Ok(WorkerResponse::Error { error, .. }) => {
-                    warn!(slot = %slot_id, model = %model, error = %error, "warm failed");
+                    warn!(slot = %slot_id, model = %runtime, error = %error, "preload failed");
                 }
                 Ok(_) => {}
-                Err(err) => warn!(slot = %slot_id, error = %err, "warm rpc failed"),
+                Err(err) => warn!(slot = %slot_id, error = %err, "preload rpc failed"),
             }
             self.return_worker(slot_id, worker).await;
         }
@@ -1444,7 +1511,18 @@ impl Supervisor {
                 .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?
         };
         let pid = worker.child.id();
-        self.mark_checkout(&slot_id, job_id, pid).await;
+        let runtime = model.runtime_model.trim();
+        // Show the in-flight runtime under Loaded while the worker is checked out.
+        if !runtime.is_empty()
+            && !worker
+                .loaded_models
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(runtime))
+        {
+            worker.loaded_models.push(runtime.to_string());
+        }
+        self.mark_checkout(&slot_id, job_id, pid, worker.loaded_models.clone())
+            .await;
 
         // Evict llama.cpp so PyTorch can take the same GPU.
         let _ = worker.child.kill().await;
@@ -1557,8 +1635,23 @@ impl Supervisor {
                 ),
             ));
         }
-        self.mark_checkout_reserved(&slot_id, job_id, pid, ram_need)
-            .await;
+        // Show the in-flight runtime under Loaded while the worker is checked out.
+        if !runtime_model.trim().is_empty()
+            && !worker
+                .loaded_models
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(runtime_model))
+        {
+            worker.loaded_models.push(runtime_model.to_string());
+        }
+        self.mark_checkout_reserved(
+            &slot_id,
+            job_id,
+            pid,
+            ram_need,
+            worker.loaded_models.clone(),
+        )
+        .await;
 
         let req_id = next_req_id();
         let stream = on_delta.is_some();
@@ -1663,8 +1756,18 @@ impl Supervisor {
             } else {
                 0
             };
-            self.mark_checkout_reserved(sid, job_id, *pid, ram_need)
-                .await;
+            self.mark_checkout_reserved(
+                sid,
+                job_id,
+                *pid,
+                ram_need,
+                if runtime_model.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![runtime_model.to_string()]
+                },
+            )
+            .await;
         }
 
         let tp_key = placement.slot_ids.join("+");

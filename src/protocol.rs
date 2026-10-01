@@ -208,6 +208,9 @@ pub struct ReadyMessage {
     /// Runtime the Go hypervisor wants preloaded. Empty / omitted = stay empty.
     #[serde(rename = "warmRuntimeModel", default)]
     pub warm_runtime_model: Option<String>,
+    /// Slot ids authorized for that runtime. Present (even empty) replaces prior plan.
+    #[serde(rename = "warmSlotIds", default)]
+    pub warm_slot_ids: Option<Vec<String>>,
     #[serde(default)]
     pub schedule: AgentSchedule,
 }
@@ -236,6 +239,9 @@ pub struct PongMessage {
     /// Runtime the Go hypervisor wants preloaded. Omitted on older routers.
     #[serde(rename = "warmRuntimeModel", default)]
     pub warm_runtime_model: Option<String>,
+    /// Slot ids authorized for that runtime. Omitted on older routers.
+    #[serde(rename = "warmSlotIds", default)]
+    pub warm_slot_ids: Option<Vec<String>>,
     #[serde(default)]
     pub schedule: AgentSchedule,
     /// Omitted on older servers. Present (even empty) replaces server slot blocks.
