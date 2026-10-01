@@ -85,9 +85,9 @@ if ($rustflags -notmatch 'delayimp') {
     $rustflags = ("{0} -C link-arg=delayimp.lib" -f $rustflags.Trim()).Trim()
 }
 $env:RUSTFLAGS = $rustflags
-Write-Host "==> cargo build --release --target $Target --no-default-features --features $Features"
+Write-Host "==> cargo build --locked --release --target $Target --no-default-features --features $Features"
 Write-Host "    RUSTFLAGS=$($env:RUSTFLAGS)"
-cargo build --release --target $Target --no-default-features --features $Features
+cargo build --locked --release --target $Target --no-default-features --features $Features
 if ($LASTEXITCODE -ne 0) {
     Write-Error "cargo build failed with exit code $LASTEXITCODE"
 }
