@@ -244,10 +244,10 @@ fn status_label(
     if gpu_occupied {
         return "GPUs in use".to_string();
     }
-    if idle_slots > 0 && idle_slots < total_slots && total_slots > 1 {
-        let model = active_model_id.unwrap_or("inference");
-        return format!("Running {model} · {idle_slots}/{total_slots} slots free");
-    }
+    // Do not infer "Running" from idle_slots < total_slots while Idle.
+    // routing_idle_slot_count hides CPU when a GPU is healthy, but total_slots
+    // still counts cpu-0 — so a fully idle laptop (2 GPU slots free + CPU)
+    // used to show "Running inference · 2/3 slots free".
     if let Some(model) = downloading_model {
         return format!("Downloading {model}");
     }
@@ -333,6 +333,28 @@ mod tests {
         );
     }
 
+    fn dummy_slots(n: usize) -> Vec<SlotStatus> {
+        (0..n)
+            .map(|i| SlotStatus {
+                id: format!("slot-{i}"),
+                kind: if i == n - 1 {
+                    "cpu".into()
+                } else {
+                    "discrete_cuda".into()
+                },
+                strategy: "single".into(),
+                display_name: format!("Slot {i}"),
+                vram_gb: 4,
+                busy: false,
+                healthy: true,
+                loaded_models: Vec::new(),
+                device_ids: vec![format!("dev:{i}")],
+                tp_group: None,
+                occupied_external: false,
+            })
+            .collect()
+    }
+
     #[test]
     fn occupancy_reports_idle_gpus_in_use() {
         let runtime = build_runtime(
@@ -355,5 +377,55 @@ mod tests {
         assert_eq!(runtime.status_label, "GPUs in use");
         assert!(runtime.gpu_occupied);
         assert_eq!(runtime.idle_slots, Some(0));
+    }
+
+    #[test]
+    fn idle_laptop_with_cpu_hidden_from_routing_does_not_say_running() {
+        // routing_idle_slot_count excludes cpu-0 while healthy GPUs exist, so
+        // idle_slots=2 with total_slots=3 is the normal idle laptop shape.
+        let runtime = build_runtime(
+            JobState::Idle,
+            None,
+            None,
+            &["ornith-ai/Ornith-1.5-9B".into()],
+            3,
+            None,
+            0,
+            16,
+            HashMap::new(),
+            dummy_slots(3),
+            3,
+            2,
+            false,
+            None,
+        );
+        assert_eq!(runtime.job_state, "idle");
+        assert_eq!(runtime.status_label, "Ready · 3 compute slots");
+        assert!(!runtime.status_label.starts_with("Running"));
+    }
+
+    #[test]
+    fn busy_partial_slots_still_says_running() {
+        let runtime = build_runtime(
+            JobState::Busy,
+            Some("job-1".into()),
+            Some("ornith-1.5-9b".into()),
+            &["ornith-ai/Ornith-1.5-9B".into()],
+            3,
+            None,
+            0,
+            16,
+            HashMap::new(),
+            dummy_slots(3),
+            3,
+            2,
+            false,
+            None,
+        );
+        assert_eq!(runtime.job_state, "busy");
+        assert_eq!(
+            runtime.status_label,
+            "Running ornith-1.5-9b · 2/3 slots free"
+        );
     }
 }

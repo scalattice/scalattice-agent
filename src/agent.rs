@@ -71,6 +71,7 @@ impl Drop for ActiveJobLease {
                 return;
             }
             guard.active_job_count = guard.active_job_count.saturating_sub(1);
+            crate::state::set_reported_active_jobs(guard.active_job_count);
             if guard.active_job_count == 0 {
                 guard.job_state = JobState::Idle;
                 guard.active_job_id = None;
@@ -896,6 +897,7 @@ impl SessionState {
             .filter(|device| driver_fault.is_none() || device.kind != "discrete")
             .count();
         let downloading = crate::state::downloading_model();
+        let draining = crate::state::update_draining();
         let blocked_models = if downloading.is_some() || !loaded_models.is_empty() {
             0
         } else if self.pending_weight_downloads().is_empty() {
@@ -904,7 +906,11 @@ impl SessionState {
             0
         };
 
-        build_runtime(
+        // While draining for an update, advertise no free slots so the router
+        // stops claiming work that would be abandoned on restart.
+        let idle_slots = if draining { 0 } else { self.cached_idle_slots };
+
+        let mut runtime = build_runtime(
             self.job_state,
             self.active_job_id.clone(),
             self.active_model_id.clone(),
@@ -919,10 +925,22 @@ impl SessionState {
             ),
             self.cached_slots.clone(),
             self.cached_max_jobs.max(1),
-            self.cached_idle_slots,
+            idle_slots,
             self.cached_gpu_occupied,
             reported_fault,
-        )
+        );
+        if draining {
+            runtime.status_label = if self.active_job_count > 0 {
+                format!(
+                    "Updating · finishing {} job(s)…",
+                    self.active_job_count
+                )
+            } else {
+                "Updating · applying…".to_string()
+            };
+            runtime.idle_slots = Some(0);
+        }
+        runtime
     }
 
     fn persist_local_state(&self) {
@@ -1358,6 +1376,15 @@ async fn run_agent_session(
             }
             _ = heartbeat.tick() => {
                 liveness.tick();
+                crate::state::adopt_update_drain_request();
+                {
+                    let mut guard = state.lock().await;
+                    crate::state::set_reported_active_jobs(guard.active_job_count);
+                    if crate::state::update_draining() {
+                        // Keep heartbeats advertising idleSlots=0 while an updater waits.
+                        guard.cached_idle_slots = 0;
+                    }
+                }
                 let registered = {
                     let mut guard = state.lock().await;
                     guard.tick_vram_lifecycle();
@@ -1522,6 +1549,7 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
             idle, "clearing stale active_job_count; supervisor has no in-flight work"
         );
         guard.active_job_count = 0;
+        crate::state::set_reported_active_jobs(0);
         guard.job_state = JobState::Idle;
         guard.active_job_id = None;
         guard.active_model_id = None;
@@ -2101,6 +2129,7 @@ async fn handle_remote_control(
             if clear_counter {
                 let mut guard = state.lock().await;
                 guard.active_job_count = 0;
+                crate::state::set_reported_active_jobs(0);
                 guard.job_state = JobState::Idle;
                 guard.active_job_id = None;
                 guard.active_model_id = None;
@@ -2228,6 +2257,7 @@ async fn handle_remote_control(
                         crate::state::end_lifecycle_control();
                     }
                     Err(err) => {
+                        crate::state::end_update_drain();
                         crate::state::end_lifecycle_control();
                         warn!("remote update failed: {err:#}");
                         let ack = ControlAckMessage {
@@ -2270,6 +2300,18 @@ async fn respond_invoke(
 
     let (supervisor, catalog_model, runtime_model, ram_gb, headroom, max_tokens, hf_token, mut job_lease) = {
         let mut guard = state.lock().await;
+        crate::state::adopt_update_drain_request();
+        if crate::state::update_draining() {
+            let msg = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke.id.clone(),
+                error: "agent_busy".to_string(),
+                detail: Some("agent_busy: agent is draining for an update".to_string()),
+                slot_id: None,
+            };
+            let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+            return Ok(());
+        }
         let max_jobs = guard.cached_max_jobs.max(1);
         if guard.active_job_count >= max_jobs {
             // Defense in depth: router claim can free while we still run stragglers.
@@ -2278,13 +2320,13 @@ async fn respond_invoke(
                 id: invoke.id.clone(),
                 error: "agent_busy".to_string(),
                 detail: Some("agent_busy: max concurrent jobs reached".to_string()),
-            
                 slot_id: None,
             };
             let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
             return Ok(());
         }
         guard.active_job_count = guard.active_job_count.saturating_add(1);
+        crate::state::set_reported_active_jobs(guard.active_job_count);
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
@@ -2640,6 +2682,7 @@ async fn respond_invoke(
     {
         let mut guard = state.lock().await;
         guard.active_job_count = guard.active_job_count.saturating_sub(1);
+        crate::state::set_reported_active_jobs(guard.active_job_count);
         if guard.active_job_count == 0 {
             guard.job_state = JobState::Idle;
             guard.active_job_id = None;
@@ -2663,30 +2706,71 @@ async fn respond_invoke_split(
         invoke.id, invoke.segment, invoke.model_id
     );
 
-    {
-        let catalog_model = {
-            let guard = state.lock().await;
-            guard
-                .resolve_invoke_catalog(&invoke.model_id, &invoke.runtime_model)
-                .0
+    let (supervisor, catalog_model, runtime_model, ram_gb, headroom) = {
+        let guard = state.lock().await;
+        let (catalog_model, runtime_model) =
+            guard.resolve_invoke_catalog(&invoke.model_id, &invoke.runtime_model);
+        let specs = guard.enabled_devices();
+        let ram_gb = specs.ram_gb.or(detect_ram_gb()).unwrap_or(0);
+        (
+            guard.supervisor.clone(),
+            catalog_model,
+            runtime_model,
+            ram_gb,
+            guard.cpu_ram_headroom_gb,
+        )
+    };
+
+    if catalog_model.is_image_job() {
+        let err = InvokeErrorMessage {
+            kind: "invoke_error",
+            id: invoke.id.clone(),
+            error: "image_model_chat_unsupported".to_string(),
+            detail: Some("Image models do not support split inference.".to_string()),
+            slot_id: None,
         };
-        if catalog_model.is_image_job() {
-            let err = InvokeErrorMessage {
+        ws_send_text(write, &serde_json::to_string(&err)?).await?;
+        return Ok(());
+    }
+
+    if let Some(ref supervisor) = supervisor {
+        if let Err(err) = supervisor
+            .preflight_split_model(&catalog_model, ram_gb, headroom)
+            .await
+        {
+            let code = invoke_error_code(&err);
+            info!(
+                "invoke_split {} capacity miss · {code}: {err:#}",
+                invoke.id
+            );
+            let msg = InvokeErrorMessage {
                 kind: "invoke_error",
                 id: invoke.id.clone(),
-                error: "image_model_chat_unsupported".to_string(),
-                detail: Some("Image models do not support split inference.".to_string()),
-            
-                slot_id: None,
+                error: code.to_string(),
+                detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+                slot_id: slot_id_from_error(&err),
             };
-            ws_send_text(write, &serde_json::to_string(&err)?).await?;
+            ws_send_text(write, &serde_json::to_string(&msg)?).await?;
             return Ok(());
         }
     }
 
     {
         let mut guard = state.lock().await;
+        crate::state::adopt_update_drain_request();
+        if crate::state::update_draining() {
+            let err = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke.id.clone(),
+                error: "agent_busy".to_string(),
+                detail: Some("agent_busy: agent is draining for an update".to_string()),
+                slot_id: None,
+            };
+            ws_send_text(write, &serde_json::to_string(&err)?).await?;
+            return Ok(());
+        }
         guard.active_job_count = guard.active_job_count.saturating_add(1);
+        crate::state::set_reported_active_jobs(guard.active_job_count);
         guard.job_state = JobState::Busy;
         guard.active_job_id = Some(invoke.id.clone());
         guard.active_model_id = Some(invoke.model_id.clone());
@@ -2697,12 +2781,6 @@ async fn respond_invoke_split(
     }
 
     let specs = state.lock().await.enabled_devices();
-    let runtime_model = {
-        let guard = state.lock().await;
-        guard
-            .resolve_invoke_catalog(&invoke.model_id, &invoke.runtime_model)
-            .1
-    };
     let engine = InferenceEngine::new(&specs.compute_devices)
         .context("no enabled compute devices for split inference")?;
 
@@ -2784,7 +2862,6 @@ async fn respond_invoke_split(
                     id: invoke.id,
                     error: "inference_failed".to_string(),
                     detail: Some(format!("unknown split segment: {other}")),
-                
                     slot_id: None,
                 };
                 write
@@ -2801,6 +2878,7 @@ async fn respond_invoke_split(
     {
         let mut guard = state.lock().await;
         guard.active_job_count = guard.active_job_count.saturating_sub(1);
+        crate::state::set_reported_active_jobs(guard.active_job_count);
         if guard.active_job_count == 0 {
             guard.job_state = JobState::Idle;
             guard.active_job_id = None;
@@ -2864,17 +2942,33 @@ mod invoke_error_code_tests {
     use super::invoke_error_code;
 
     #[test]
-    fn load_model_null_result_is_model_load_failed_not_busy() {
+    fn load_model_null_result_is_insufficient_vram_not_corrupt() {
         let err = anyhow::anyhow!(
             "load model C:\\Users\\x\\.cache\\scalattice\\models\\Qwen__Qwen3.5-9B\\Qwen_Qwen3.5-9B-Q4_K_M.gguf: null result from llama cpp"
         );
-        assert_eq!(invoke_error_code(&err), "model_load_failed");
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }
 
     #[test]
-    fn bare_null_result_still_agent_busy() {
+    fn load_model_insufficient_vram_stays_capacity() {
+        let err = anyhow::anyhow!(
+            "load model /home/x/.cache/scalattice/models/Qwen__Qwen3-8B/Qwen_Qwen3-8B-Q4_K_M.gguf: insufficient_vram: GPU slot has no placeable offload (live free VRAM too small)"
+        );
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+    }
+
+    #[test]
+    fn bare_null_result_is_insufficient_vram() {
         let err = anyhow::anyhow!("null result from llama cpp");
-        assert_eq!(invoke_error_code(&err), "agent_busy");
+        assert_eq!(invoke_error_code(&err), "insufficient_vram");
+    }
+
+    #[test]
+    fn corrupt_gguf_null_result_stays_model_load_failed() {
+        let err = anyhow::anyhow!(
+            "load model /tmp/model.gguf: null result from llama cpp: corrupted or incomplete GGUF (tensor payloads exceed file size)"
+        );
+        assert_eq!(invoke_error_code(&err), "model_load_failed");
     }
 
     #[test]

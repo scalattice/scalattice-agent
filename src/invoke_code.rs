@@ -212,24 +212,8 @@ fn classify_foreign(err: &anyhow::Error) -> &'static str {
         || detail.contains("invoke_timeout")
     {
         "request_canceled"
-    } else if detail.contains("load model")
-        || detail.contains("load_from_file")
-        || detail.contains("weights not found")
-        || detail.contains("model weights not found")
-        || detail.contains("unknown model architecture")
-        || detail.contains("unknown architecture")
-        || (detail.contains("gguf") && detail.contains("not found"))
-    {
-        "model_load_failed"
-    } else if detail.contains("model_not_installed")
-        || detail.contains("snapshot is incomplete")
-        || detail.contains("snapshot is not on disk")
-        || detail.contains("missing a weight shard")
-        || detail.contains("missing a weight file")
-        || (detail.contains("no such file") && detail.contains("safetensors"))
-    {
-        "model_not_installed"
     } else if detail.contains("insufficient_vram")
+        || detail.contains("no placeable offload")
         || detail.contains("no_vision_capacity")
         || (detail.contains("need") && detail.contains("vision job") && detail.contains("gb"))
         || detail.contains("create llama context")
@@ -239,15 +223,37 @@ fn classify_foreign(err: &anyhow::Error) -> &'static str {
         || detail.contains("sigkill")
         || detail.contains("signal: 9")
         || (detail.contains("image worker") && detail.contains("ran out of memory"))
+        // Opaque llama-cpp-2 null after a GPU cascade is almost always alloc/OOM,
+        // not a corrupt GGUF. Real corrupt loads attach "corrupted or incomplete".
+        || (detail.contains("null result")
+            && !detail.contains("corrupted")
+            && !detail.contains("incomplete gguf")
+            && !detail.contains("unknown architecture"))
     {
         "insufficient_vram"
+    } else if detail.contains("model_not_installed")
+        || detail.contains("snapshot is incomplete")
+        || detail.contains("snapshot is not on disk")
+        || detail.contains("missing a weight shard")
+        || detail.contains("missing a weight file")
+        || (detail.contains("no such file") && detail.contains("safetensors"))
+    {
+        "model_not_installed"
+    } else if detail.contains("load model")
+        || detail.contains("load_from_file")
+        || detail.contains("weights not found")
+        || detail.contains("model weights not found")
+        || detail.contains("unknown model architecture")
+        || detail.contains("unknown architecture")
+        || (detail.contains("gguf") && detail.contains("not found"))
+    {
+        "model_load_failed"
     } else if detail.contains("agent_busy")
         || detail.contains("no idle compute slot")
         || detail.contains("not available")
         || (detail.contains("sibling slot") && detail.contains("busy"))
         || detail.contains("erroroutdevicememory")
         || detail.contains("out of device memory")
-        || detail.contains("null result")
     {
         "agent_busy"
     } else if detail.contains("out of memory")

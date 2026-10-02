@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::specs::ComputeDevice;
 
 static DISK_FULL: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static UPDATE_DRAINING: AtomicBool = AtomicBool::new(false);
+static REPORTED_ACTIVE_JOBS: AtomicU32 = AtomicU32::new(0);
 
 pub fn set_disk_full(full: bool) {
     DISK_FULL.store(full, Ordering::Relaxed);
@@ -26,6 +28,55 @@ pub fn begin_lifecycle_control() -> bool {
 
 pub fn end_lifecycle_control() {
     LIFECYCLE_IN_FLIGHT.store(false, Ordering::SeqCst);
+}
+
+pub fn set_reported_active_jobs(count: u32) {
+    REPORTED_ACTIVE_JOBS.store(count, Ordering::Relaxed);
+}
+
+pub fn reported_active_jobs() -> u32 {
+    REPORTED_ACTIVE_JOBS.load(Ordering::Relaxed)
+}
+
+/// Ask the live agent to refuse new jobs and finish current ones before apply.
+pub fn begin_update_drain() {
+    UPDATE_DRAINING.store(true, Ordering::SeqCst);
+    if let Ok(path) = crate::paths::update_drain_request_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&path, b"1");
+    }
+}
+
+pub fn end_update_drain() {
+    UPDATE_DRAINING.store(false, Ordering::SeqCst);
+    if let Ok(path) = crate::paths::update_drain_request_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// True when this process is draining, or another updater left a drain request.
+pub fn update_draining() -> bool {
+    if UPDATE_DRAINING.load(Ordering::SeqCst) {
+        return true;
+    }
+    crate::paths::update_drain_request_path()
+        .ok()
+        .is_some_and(|p| p.is_file())
+}
+
+/// Absorb an external drain request into this process (heartbeat path).
+pub fn adopt_update_drain_request() {
+    if UPDATE_DRAINING.load(Ordering::SeqCst) {
+        return;
+    }
+    if crate::paths::update_drain_request_path()
+        .ok()
+        .is_some_and(|p| p.is_file())
+    {
+        UPDATE_DRAINING.store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +102,30 @@ pub struct AgentLocalState {
     pub last_inference_error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_inference_error_at_ms: Option<u64>,
+    /// In-flight invoke count for CLI/tray updaters waiting to apply safely.
+    #[serde(default)]
+    pub active_job_count: u32,
+    #[serde(default)]
+    pub update_draining: bool,
     pub updated_at_ms: u64,
+}
+
+fn empty_local_state() -> AgentLocalState {
+    AgentLocalState {
+        status_label: None,
+        downloading_model: None,
+        node_id: None,
+        server_connected: false,
+        server_registered: false,
+        compute_devices: Vec::new(),
+        last_error: None,
+        last_inference_error: None,
+        last_inference_error_code: None,
+        last_inference_error_at_ms: None,
+        active_job_count: 0,
+        update_draining: false,
+        updated_at_ms: 0,
+    }
 }
 
 pub fn state_file_path() -> Option<PathBuf> {
@@ -75,19 +149,7 @@ pub fn update_connection_state(
     };
     let _ = fs::create_dir_all(parent);
 
-    let mut state = read_state().unwrap_or(AgentLocalState {
-        status_label: None,
-        downloading_model: None,
-        node_id: None,
-        server_connected: false,
-        server_registered: false,
-        compute_devices: Vec::new(),
-        last_error: None,
-        last_inference_error: None,
-        last_inference_error_code: None,
-        last_inference_error_at_ms: None,
-        updated_at_ms: 0,
-    });
+    let mut state = read_state().unwrap_or_else(empty_local_state);
     if let Some(label) = status_label {
         state.status_label = Some(label);
     }
@@ -105,6 +167,8 @@ pub fn update_connection_state(
     } else if server_registered {
         state.last_error = None;
     }
+    state.active_job_count = reported_active_jobs();
+    state.update_draining = update_draining();
     state.updated_at_ms = now_ms();
 
     write_state(&state);
@@ -114,23 +178,13 @@ pub fn mark_disconnected(error: Option<String>) {
     if state_file_path().is_none() {
         return;
     }
-    let mut state = read_state().unwrap_or(AgentLocalState {
-        status_label: None,
-        downloading_model: None,
-        node_id: None,
-        server_connected: false,
-        server_registered: false,
-        compute_devices: Vec::new(),
-        last_error: None,
-        last_inference_error: None,
-        last_inference_error_code: None,
-        last_inference_error_at_ms: None,
-        updated_at_ms: 0,
-    });
+    let mut state = read_state().unwrap_or_else(empty_local_state);
     state.server_connected = false;
     state.server_registered = false;
     state.status_label = None;
     state.downloading_model = None;
+    state.active_job_count = 0;
+    state.update_draining = false;
     if let Some(err) = error {
         state.last_error = Some(err);
     }
@@ -147,19 +201,7 @@ pub fn set_downloading_model(model_id: Option<&str>) {
     };
     let _ = fs::create_dir_all(parent);
 
-    let mut state = read_state().unwrap_or(AgentLocalState {
-        status_label: None,
-        downloading_model: None,
-        node_id: None,
-        server_connected: false,
-        server_registered: false,
-        compute_devices: Vec::new(),
-        last_error: None,
-        last_inference_error: None,
-        last_inference_error_code: None,
-        last_inference_error_at_ms: None,
-        updated_at_ms: 0,
-    });
+    let mut state = read_state().unwrap_or_else(empty_local_state);
 
     state.downloading_model = model_id.map(str::to_string);
     if let Some(id) = model_id {
@@ -177,19 +219,7 @@ pub fn record_inference_failure(code: &str, detail: &str) {
     if state_file_path().is_none() {
         return;
     }
-    let mut state = read_state().unwrap_or(AgentLocalState {
-        status_label: None,
-        downloading_model: None,
-        node_id: None,
-        server_connected: false,
-        server_registered: false,
-        compute_devices: Vec::new(),
-        last_error: None,
-        last_inference_error: None,
-        last_inference_error_code: None,
-        last_inference_error_at_ms: None,
-        updated_at_ms: 0,
-    });
+    let mut state = read_state().unwrap_or_else(empty_local_state);
     let summary = detail.lines().next().unwrap_or(detail).trim();
     let summary = if summary.len() > 180 {
         format!("{}…", &summary[..177])
@@ -427,6 +457,8 @@ mod wedge_tests {
             last_inference_error: None,
             last_inference_error_code: None,
             last_inference_error_at_ms: None,
+            active_job_count: 0,
+            update_draining: false,
             updated_at_ms,
         }
     }
