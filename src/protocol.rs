@@ -127,21 +127,6 @@ impl CatalogModel {
         self.kv_cache_gb.filter(|v| *v > 0.0)
     }
 
-    /// Catalog `chatTemplate=chatml`: skip GGUF jinja and render ChatML.
-    pub fn uses_chatml(&self) -> bool {
-        self.chat_template.trim().eq_ignore_ascii_case("chatml")
-    }
-
-    /// Catalog `thinking=none`: instruct-only, never CoT.
-    pub fn thinking_none(&self) -> bool {
-        self.thinking.trim().eq_ignore_ascii_case("none")
-    }
-
-    /// Catalog `thinking=always`: cannot disable CoT (R1 / Ornith).
-    pub fn thinking_always(&self) -> bool {
-        self.thinking.trim().eq_ignore_ascii_case("always")
-    }
-
     pub fn catalog_gpu_full_vram_gb(&self) -> Option<f64> {
         self.gpu_full_vram_gb.filter(|v| *v > 0.0)
     }
@@ -732,22 +717,22 @@ mod tests {
             model_id: "anything".into(),
             ..CatalogModel::default()
         };
-        assert!(!m.uses_chatml());
-        assert!(!m.thinking_none());
+        assert!(!m.chat_template.eq_ignore_ascii_case("chatml"));
+        assert!(!m.thinking.eq_ignore_ascii_case("none"));
         m.chat_template = "chatml".into();
         m.thinking = "none".into();
-        assert!(m.uses_chatml());
-        assert!(m.thinking_none());
-        assert!(!m.thinking_always());
+        assert!(m.chat_template.eq_ignore_ascii_case("chatml"));
+        assert!(m.thinking.eq_ignore_ascii_case("none"));
+        assert!(!m.thinking.eq_ignore_ascii_case("always"));
         m.thinking = "always".into();
-        assert!(m.thinking_always());
-        assert!(!m.thinking_none());
+        assert!(m.thinking.eq_ignore_ascii_case("always"));
+        assert!(!m.thinking.eq_ignore_ascii_case("none"));
         let wired: CatalogModel = serde_json::from_str(
             r#"{"modelId":"x","chatTemplate":"chatml","thinking":"none"}"#,
         )
         .unwrap();
-        assert!(wired.uses_chatml());
-        assert!(wired.thinking_none());
+        assert!(wired.chat_template.eq_ignore_ascii_case("chatml"));
+        assert!(wired.thinking.eq_ignore_ascii_case("none"));
     }
 
     #[test]

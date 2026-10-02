@@ -130,12 +130,19 @@ const WORKER_LOAD_SILENCE: Duration = Duration::from_secs(30);
 /// Cold open of a large GGUF, and CPU-heavy prefill, can sit quiet for more
 /// than 30s before the next progress line. 30s killed a 27B load and Coder on 8 GB.
 const WORKER_PREFILL_SILENCE: Duration = Duration::from_secs(180);
+/// While waiting on load/prefill, still ping the cloud ≤ every 15s so the router
+/// 30s stall timer cannot cancel a healthy cold mmap (fleet: poorweave).
+const WORKER_CLOUD_KEEPALIVE: Duration = Duration::from_secs(15);
+/// Absolute wall from invoke start. Phase walls alone still let jobs run 45+ min
+/// and outlive clients (fleet: onsite / shunno / SJVL).
+const WORKER_INVOKE_DEADLINE: Duration = Duration::from_secs(12 * 60);
 /// Decode ceiling, measured from the first token. Slow cards with the cache in
 /// system RAM were still generating when 12 minutes cut them off.
-const WORKER_DECODE_WALL: Duration = Duration::from_secs(20 * 60);
-const WORKER_PREFILL_WALL: Duration = Duration::from_secs(45 * 60);
-/// Must exceed prefill wall + decode wall or Full Debug reclaim kills mid-decode.
-const STUCK_CHECKOUT: Duration = Duration::from_secs(70 * 60);
+const WORKER_DECODE_WALL: Duration = Duration::from_secs(10 * 60);
+/// Prefill/load wall — capped under the absolute invoke deadline.
+const WORKER_PREFILL_WALL: Duration = Duration::from_secs(12 * 60);
+/// Must exceed invoke deadline or Full Debug reclaim kills mid-decode.
+const STUCK_CHECKOUT: Duration = Duration::from_secs(20 * 60);
 
 fn worker_silence_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
@@ -780,11 +787,6 @@ impl Supervisor {
             .collect()
     }
 
-    #[allow(dead_code)]
-    pub async fn idle_slot_count(&self) -> u32 {
-        self.idle_slot_ids().await.len() as u32
-    }
-
     fn slot_is_cpu(&self, id: &str) -> bool {
         self.plan
             .slots
@@ -1074,13 +1076,23 @@ impl Supervisor {
                         worker.loaded_models.push(runtime.clone());
                     }
                     warmed_any = true;
+                    crate::models::clear_preload_backoff(&runtime);
                     info!(slot = %slot_id, model = %runtime, "preloaded model on slot");
                 }
                 Ok(WorkerResponse::Error { error, .. }) => {
                     warn!(slot = %slot_id, model = %runtime, error = %error, "preload failed");
+                    // Fail-fast backoff so 12s warm heartbeats cannot loop forever on
+                    // insufficient_vram (fleet: DESKTOP-SJVL4OL).
+                    let _ = crate::models::handle_weight_load_failure(
+                        &runtime,
+                        &anyhow::anyhow!("{error}"),
+                    );
                 }
                 Ok(_) => {}
-                Err(err) => warn!(slot = %slot_id, error = %err, "preload rpc failed"),
+                Err(err) => {
+                    warn!(slot = %slot_id, error = %err, "preload rpc failed");
+                    let _ = crate::models::handle_weight_load_failure(&runtime, err);
+                }
             }
             self.return_worker(slot_id, worker).await;
         }
@@ -2050,7 +2062,27 @@ async fn worker_rpc_invoke_cancellable(
     let mut silence = worker_silence_for_phase(&last_phase);
     let mut phase_started = Instant::now();
     let mut last_progress = Instant::now();
+    let mut last_cloud_keepalive = Instant::now();
+    let invoke_started = Instant::now();
     loop {
+        if invoke_started.elapsed() >= WORKER_INVOKE_DEADLINE {
+            warn!(
+                slot = %worker.spec.id,
+                phase = %last_phase,
+                wall_s = invoke_started.elapsed().as_secs(),
+                "killing worker; invoke exceeded absolute deadline"
+            );
+            let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            worker.healthy = false;
+            return Err(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::InvokeTimeout,
+                format!(
+                    "exceeded absolute invoke deadline ({}s)",
+                    WORKER_INVOKE_DEADLINE.as_secs()
+                ),
+            ));
+        }
         if phase_started.elapsed() >= worker_wall_for_phase(&last_phase) {
             warn!(
                 slot = %worker.spec.id,
@@ -2073,7 +2105,17 @@ async fn worker_rpc_invoke_cancellable(
         let wall_left = worker_wall_for_phase(&last_phase)
             .checked_sub(phase_started.elapsed())
             .unwrap_or(Duration::from_millis(1));
-        let wait = silence_left.min(wall_left).max(Duration::from_millis(50));
+        let deadline_left = WORKER_INVOKE_DEADLINE
+            .checked_sub(invoke_started.elapsed())
+            .unwrap_or(Duration::from_millis(1));
+        let keepalive_left = WORKER_CLOUD_KEEPALIVE
+            .checked_sub(last_cloud_keepalive.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let wait = silence_left
+            .min(wall_left)
+            .min(deadline_left)
+            .min(keepalive_left.max(Duration::from_millis(50)))
+            .max(Duration::from_millis(50));
         tokio::select! {
             biased;
             _ = cancel.notified() => {
@@ -2108,6 +2150,7 @@ async fn worker_rpc_invoke_cancellable(
                         }
                         silence = worker_silence_for_phase(&phase);
                         last_progress = Instant::now();
+                        last_cloud_keepalive = Instant::now();
                         if let Some(cb) = on_delta.as_mut() {
                             cb(format!(
                                 "\u{1e}{}\u{1e}{}",
@@ -2123,6 +2166,7 @@ async fn worker_rpc_invoke_cancellable(
                         }
                         silence = WORKER_DECODE_SILENCE;
                         last_progress = Instant::now();
+                        last_cloud_keepalive = Instant::now();
                         if let Some(cb) = on_delta.as_mut() {
                             cb(text);
                         }
@@ -2152,6 +2196,21 @@ async fn worker_rpc_invoke_cancellable(
                 }
             }
             _ = tokio::time::sleep(wait) => {
+                // Keep the router stall timer alive during long mmap/load without
+                // resetting the worker silence clock (still kill at 180s of no real progress).
+                let loadish = matches!(
+                    last_phase.to_ascii_lowercase().as_str(),
+                    "start" | "load" | "prefill" | "context"
+                );
+                if loadish
+                    && last_cloud_keepalive.elapsed() >= WORKER_CLOUD_KEEPALIVE
+                    && last_progress.elapsed() < silence
+                {
+                    last_cloud_keepalive = Instant::now();
+                    if let Some(cb) = on_delta.as_mut() {
+                        cb(format!("\u{1e}{}\u{1e}-1", last_phase));
+                    }
+                }
                 if last_progress.elapsed() < silence {
                     continue;
                 }

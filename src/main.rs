@@ -35,7 +35,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "scalattice-agent", about = "Scalattice GPU agent", version)]
+#[command(
+    name = "scalattice-agent",
+    about = "Scalattice GPU agent",
+    version = update::current_version()
+)]
 struct Cli {
     /// Emit full llama.cpp / GGML detail (default is provider-friendly Simplified logs)
     #[arg(long, global = true)]

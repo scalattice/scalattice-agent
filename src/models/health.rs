@@ -16,7 +16,9 @@ use tracing::{info, warn};
 
 const HEALTH_FILE: &str = "health.json";
 const PURGING_MARKER: &str = ".__purging__";
-const PRELOAD_BACKOFF: Duration = Duration::from_secs(5 * 60);
+/// After live-VRAM / OOM preload failures, stay cold long enough that a 12s
+/// warm heartbeat cannot hammer the same card forever (fleet: DESKTOP-SJVL4OL).
+const PRELOAD_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightLoadKind {
@@ -71,6 +73,16 @@ pub fn classify_weight_load_error(err: &anyhow::Error) -> WeightLoadKind {
     if detail.contains("too many open files")
         || detail.contains("emfile")
         || detail.contains("error=24")
+    {
+        return WeightLoadKind::ResourceLimit;
+    }
+    // Live free VRAM / placeable-offload misses: back off preloads (ResourceLimit)
+    // without quarantining healthy weights.
+    if detail.contains("insufficient_vram")
+        || detail.contains("no placeable offload")
+        || detail.contains("live free vram")
+        || detail.contains("won't fit")
+        || detail.contains("cannot host")
     {
         return WeightLoadKind::ResourceLimit;
     }
