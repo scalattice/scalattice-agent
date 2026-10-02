@@ -32,22 +32,31 @@ pub async fn check_for_update() -> Result<UpdateCheckOutcome> {
 }
 
 pub async fn install_latest_update() -> Result<()> {
-    let outcome = check_for_update().await?;
-    let info = outcome.info();
-    if !info.update_available {
-        println!("Already on channel tip (v{}).", info.current_version);
+    let latest = fetch_latest_release().await?;
+    let current = current_version().to_string();
+    let update_available = compare_versions(&latest.version, &current) != Ordering::Equal;
+    if !update_available {
+        println!("Already on channel tip (v{current}).");
         return Ok(());
     }
+    let latest_version = latest.version.clone();
+    let latest_tag = latest.tag.clone();
 
-    println!("Downloading Scalattice setup v{}...", info.latest_version);
-    let installer = download_setup(&info.latest_tag).await?;
+    let need = super::disk_need_for_asset(&latest, INSTALLER_NAME).await;
+    // Model caches often fill the disk; free space before download/extract.
+    super::ensure_disk_for_update(need).await?;
+
+    println!("Downloading Scalattice setup v{latest_version}...");
+    let installer = download_setup(&latest_tag, &latest).await?;
+    super::wait_until_safe_to_apply().await?;
     println!("Installing update silently in the background…");
+    // Drain flag is cleared by the new process; clear best-effort before exit.
+    crate::state::end_update_drain();
     spawn_silent_setup_and_exit(&installer)?;
     Ok(())
 }
 
-async fn download_setup(tag: &str) -> Result<PathBuf> {
-    let latest = fetch_latest_release().await?;
+async fn download_setup(tag: &str, latest: &super::cloud::LatestRelease) -> Result<PathBuf> {
     let expected = latest
         .checksums
         .get(INSTALLER_NAME)

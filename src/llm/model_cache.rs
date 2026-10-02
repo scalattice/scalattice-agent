@@ -361,7 +361,30 @@ fn is_vram_pressure(err: &anyhow::Error) -> bool {
         || detail.contains("failed to allocate")
         || detail.contains("create llama context")
         || detail.contains("null reference")
+        || detail.contains("null result")
+        || detail.contains("insufficient_vram")
+        || detail.contains("no placeable offload")
         || detail.contains("ggml_backend_cuda")
+}
+
+/// Capacity / VRAM refuses must keep their coded text. Wrapping them as
+/// `load model …` used to make Cloud classify them as model_load_failed and
+/// Immediate-isolate the whole machine.
+fn attach_load_context(model_path: &Path, err: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{err:#}").to_lowercase();
+    if detail.contains("insufficient_vram")
+        || detail.contains("no placeable offload")
+        || detail.contains("create llama context")
+        || (detail.contains("null result")
+            && !detail.contains("corrupted")
+            && !detail.contains("incomplete gguf"))
+        || detail.contains("out of memory")
+        || detail.contains("cudamalloc")
+        || detail.contains("failed to allocate")
+    {
+        return err;
+    }
+    err.context(format!("load model {}", model_path.display()))
 }
 
 fn insert_loaded(
@@ -403,21 +426,16 @@ fn ensure_loaded(
             Err(err) if is_vram_pressure(&err) => {
                 info!("model load hit VRAM pressure; clearing GPU cache and retrying");
                 inner.gpu.clear();
-                load_model_for_pool(backend, model_path, pool).with_context(|| {
-                    format!("load model {} after VRAM eviction", model_path.display())
-                })?
+                load_model_for_pool(backend, model_path, pool)
+                    .map_err(|e| attach_load_context(model_path, e))?
             }
             Err(err) => {
-                return Err(err).with_context(|| format!("load model {}", model_path.display()));
+                return Err(attach_load_context(model_path, err));
             }
         }
     } else {
-        load_model_for_pool_starting_at(backend, model_path, pool, start_at).with_context(|| {
-            format!(
-                "load model {} starting at cascade tier {start_at}",
-                model_path.display()
-            )
-        })?
+        load_model_for_pool_starting_at(backend, model_path, pool, start_at)
+            .map_err(|e| attach_load_context(model_path, e))?
     };
     let model_load_ms = load_start.elapsed().as_millis() as u64;
     let after_free = live_free_vram_gb(pool);

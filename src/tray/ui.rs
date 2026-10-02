@@ -520,7 +520,7 @@ impl TrayApp {
         }
         self.update_busy = true;
         self.update_notice =
-            "Downloading update… Scalattice will restart in the background when ready.".to_string();
+            "Downloading update… will wait for jobs to finish, then restart.".to_string();
         self.clear_action_message();
         let _ = self.update_cmd_tx.send(UpdateWorkerCmd::Install);
     }

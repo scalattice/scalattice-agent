@@ -37,12 +37,28 @@ pub async fn check_for_update() -> Result<UpdateCheckOutcome> {
 }
 
 pub async fn install_latest_update() -> Result<()> {
-    let outcome = check_for_update().await?;
-    let info = outcome.info();
-    if !info.update_available {
-        println!("Already on channel tip (v{}).", info.current_version);
+    let latest = fetch_latest_release().await?;
+    let current = current_version().to_string();
+    let update_available = compare_versions(&latest.version, &current) != Ordering::Equal;
+    if !update_available {
+        println!("Already on channel tip (v{current}).");
         return Ok(());
     }
+    let info = UpdateInfo {
+        current_version: current,
+        latest_version: latest.version.clone(),
+        latest_tag: latest.tag.clone(),
+        update_available: true,
+    };
+
+    #[cfg(target_os = "macos")]
+    let asset_name = macos_dmg_name().to_string();
+    #[cfg(target_os = "linux")]
+    let asset_name = unix_archive_name()?;
+
+    let need = super::disk_need_for_asset(&latest, &asset_name).await;
+    // Model caches often fill the disk; free space before download/extract.
+    super::ensure_disk_for_update(need).await?;
 
     // Never stop the live agent (or the CLI's background service) before the
     // download finishes. Doing that on macOS made the machine look frozen as
@@ -59,8 +75,10 @@ pub async fn install_latest_update() -> Result<()> {
             info.latest_version,
             macos_dmg_name()
         );
-        let dmg = download_macos_dmg(&info.latest_tag).await?;
+        let dmg = download_macos_dmg(&info.latest_tag, &latest).await?;
+        super::wait_until_safe_to_apply().await?;
         println!("Installing update from signed DMG...");
+        crate::state::end_update_drain();
         apply_macos_dmg_update(&dmg)?;
     }
     #[cfg(target_os = "linux")]
@@ -70,8 +88,10 @@ pub async fn install_latest_update() -> Result<()> {
             info.latest_version,
             unix_archive_name()?
         );
-        let staging = download_and_extract(&info.latest_tag).await?;
+        let staging = download_and_extract(&info.latest_tag, &latest).await?;
+        super::wait_until_safe_to_apply().await?;
         println!("Installing update...");
+        crate::state::end_update_drain();
         apply_update(&staging)?;
     }
     if running_as_live_agent() {
@@ -167,8 +187,7 @@ fn macos_applications_app() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-async fn download_macos_dmg(tag: &str) -> Result<PathBuf> {
-    let latest = fetch_latest_release().await?;
+async fn download_macos_dmg(tag: &str, latest: &super::cloud::LatestRelease) -> Result<PathBuf> {
     let dmg_name = macos_dmg_name();
     let expected = latest.checksums.get(dmg_name).cloned().with_context(|| {
         format!("Cloud release {tag} has no SHA-256 checksum for {dmg_name}; refusing to update")
@@ -322,8 +341,7 @@ fn link_macos_cli_to_app_binary(app_bin: &Path, local: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn download_and_extract(tag: &str) -> Result<PathBuf> {
-    let latest = fetch_latest_release().await?;
+async fn download_and_extract(tag: &str, latest: &super::cloud::LatestRelease) -> Result<PathBuf> {
     let archive_name = unix_archive_name()?;
     let expected = latest
         .checksums

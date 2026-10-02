@@ -17,6 +17,8 @@ pub(crate) struct LatestRelease {
     pub tag: String,
     pub version: String,
     pub checksums: HashMap<String, String>,
+    /// Compressed download sizes from Cloud/GitHub (bytes), keyed by asset name.
+    pub sizes: HashMap<String, u64>,
 }
 
 pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
@@ -65,10 +67,38 @@ pub(crate) async fn fetch_latest_release() -> Result<LatestRelease> {
             }
         }
     }
+    let mut sizes = HashMap::new();
+    if let Some(obj) = payload.get("sizes").and_then(|v| v.as_object()) {
+        for (name, value) in obj {
+            if let Some(n) = value.as_u64() {
+                if n > 0 {
+                    sizes.insert(name.clone(), n);
+                }
+            } else if let Some(n) = value.as_f64() {
+                if n > 0.0 && n.is_finite() {
+                    sizes.insert(name.clone(), n as u64);
+                }
+            }
+        }
+    }
+    // Prefer per-asset sizes from latestAssets when top-level sizes are missing.
+    if let Some(obj) = payload.get("latestAssets").and_then(|v| v.as_object()) {
+        for (name, value) in obj {
+            if sizes.contains_key(name) {
+                continue;
+            }
+            if let Some(n) = value.get("size").and_then(|v| v.as_u64()) {
+                if n > 0 {
+                    sizes.insert(name.clone(), n);
+                }
+            }
+        }
+    }
     Ok(LatestRelease {
         tag,
         version,
         checksums,
+        sizes,
     })
 }
 
@@ -94,6 +124,20 @@ fn urlencoding_path(value: &str) -> String {
             _ => format!("%{:02X}", c as u8),
         })
         .collect()
+}
+
+/// HEAD (or ranged GET) the download URL to learn Content-Length when `/latest`
+/// did not include `sizes`.
+pub(crate) async fn probe_release_asset_size(tag: &str, asset_name: &str) -> Option<u64> {
+    let url = release_download_url(tag, asset_name);
+    let client = release_download_client().ok()?;
+    let response = client.head(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response
+        .content_length()
+        .filter(|n| *n >= MIN_RELEASE_BYTES)
 }
 
 pub(crate) async fn download_release_asset(

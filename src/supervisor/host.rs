@@ -399,6 +399,49 @@ impl Supervisor {
         &self.plan
     }
 
+    /// Tier 2.5 split uses an in-process engine and used to skip slot fit.
+    /// Refuse before opening llama when no idle card can host the model live.
+    pub async fn preflight_split_model(
+        &self,
+        model: &crate::protocol::CatalogModel,
+        ram_gb: u32,
+        cpu_ram_headroom_gb: u32,
+    ) -> Result<(), anyhow::Error> {
+        let idle = self.routing_idle_slot_ids().await;
+        if idle.is_empty() {
+            return Err(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                format!("no idle compute slot for {}", model.model_id),
+            ));
+        }
+        let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+        let can_live = self.plan.slots.iter().any(|s| {
+            idle.iter().any(|id| id == &s.id)
+                && s.kind != "cpu"
+                && accelerator_live_can_place(s, &live_cuda, model)
+        });
+        if can_live {
+            return Ok(());
+        }
+        let sys_avail = self.available_sys_ram_gb().await;
+        if pick_placement_with_cpu(
+            &self.plan,
+            &idle,
+            model,
+            ram_gb,
+            cpu_ram_headroom_gb,
+            &self.devices,
+            false,
+            crate::specs::cpu_logical_cores(),
+            sys_avail,
+        )
+        .is_some()
+        {
+            return Ok(());
+        }
+        Err(placement_miss_detail(&self.plan, &idle, model, false).into())
+    }
+
     /// `None` is an old server and must not wipe blocks learned earlier.
     pub async fn apply_server_blocks(&self, blocks: Option<Vec<(String, Vec<String>)>>) {
         let Some(blocks) = blocks else {

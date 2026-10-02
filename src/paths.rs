@@ -40,6 +40,12 @@ pub fn agent_state_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("agent.state.json"))
 }
 
+/// Sidecar flag: updater (CLI/tray/timer) asks the live agent to refuse new jobs
+/// and drain in-flight work before the binary is replaced.
+pub fn update_drain_request_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("update-drain.request"))
+}
+
 pub fn settings_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("settings.json"))
 }
