@@ -64,8 +64,12 @@ default = ["gpu"]
 gpu = ["cuda", "vulkan", "dynamic-backends"]
 # Windows release: CUDA + Vulkan (AMD/Intel). Needs Vulkan SDK on the build host (glslc).
 win-gpu = ["cuda", "vulkan", "dynamic-backends"]
-# aarch64 native: NVIDIA CUDA + Vulkan (Jetson, Graviton, Mali, Adreno)
-arm-gpu = ["cuda", "vulkan", "dynamic-backends"]
+# aarch64 native: NVIDIA CUDA + Vulkan (Jetson, Graviton, Mali, Adreno).
+# No dynamic-backends: llama-cpp-sys always sets GGML_CPU_ARM_ARCH=armv8-a on
+# Linux aarch64, which conflicts with GGML_CPU_ALL_VARIANTS from dynamic-backends
+# (CMake: "Cannot use both GGML_CPU_ARM_ARCH and GGML_CPU_ALL_VARIANTS").
+# Jetson images ship libcuda; x86 AMD-only hosts use the `gpu` feature instead.
+arm-gpu = ["cuda", "vulkan"]
 cuda = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]
 metal = ["llama-cpp-2/metal"]
