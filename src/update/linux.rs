@@ -474,6 +474,26 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replace install lib tree (including `backends/` ggml modules) without
+/// truncating mapped inodes of the running updater process.
+#[cfg(target_os = "linux")]
+fn copy_lib_tree(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let dest = to.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_lib_tree(&entry.path(), &dest)
+                .with_context(|| format!("replace library dir {}", name.to_string_lossy()))?;
+        } else {
+            replace_unix_file(&entry.path(), &dest)
+                .with_context(|| format!("replace library {}", name.to_string_lossy()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn resolve_tar_binary() -> Option<PathBuf> {
     const CANDIDATES: &[&str] = &["/usr/bin/tar", "/bin/tar", "/usr/local/bin/tar"];
@@ -543,16 +563,7 @@ fn apply_update(staging: &Path) -> Result<()> {
     if source_lib.is_dir() {
         let dest_lib = lib_dir().context("resolve library directory")?;
         fs::create_dir_all(&dest_lib).context("create library directory")?;
-        for entry in fs::read_dir(&source_lib).context("read bundled lib directory")? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let dest = dest_lib.join(&name);
-            replace_unix_file(&entry.path(), &dest)
-                .with_context(|| format!("replace library {}", name.to_string_lossy()))?;
-        }
+        copy_lib_tree(&source_lib, &dest_lib).context("replace bundled libraries")?;
     }
 
     if self_replace {
