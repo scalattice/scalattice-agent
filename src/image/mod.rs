@@ -341,6 +341,7 @@ pub fn hf_ready_snapshot_path_in(root: &Path) -> Option<PathBuf> {
 /// Hugging Face writes that file first, then the multi-GB weight shards.
 /// Leftover `*.incomplete` blobs from an earlier attempt do not block a
 /// snapshot that already has its weight components.
+#[cfg(test)]
 pub fn hf_snapshot_dir_ready(root: &Path) -> bool {
     hf_ready_snapshot_path_in(root).is_some()
 }

@@ -73,10 +73,12 @@ fn pick_image_placement(
 /// Prefer the smallest idle accelerator that can **fully** host the model
 /// (weights + KV headroom). If none are free, place on the largest idle
 /// accelerator that can still hold the weights (KV may live in RAM), or
-/// layer-offload when the GPU still holds at least half the weights.
+/// layer-offload when the GPU still holds most of the weights
+/// (see LAYER_OFFLOAD_MIN_GPU_FRACTION).
 /// When no accelerator can host, place on the CPU slot if system RAM covers
 /// weights + KV + headroom. Image jobs never use the CPU. A busy accelerator
 /// that could host the model is not replaced by the CPU.
+#[cfg(test)]
 pub fn pick_placement(
     plan: &ComputePlan,
     idle_slot_ids: &[String],
@@ -230,6 +232,19 @@ pub fn pick_placement_with_cpu(
             .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
             .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
         {
+            // GPU-catalog models on a box that has any accelerator must not silently
+            // crawl on cpu-0 (fleet: DESKTOP-SJVL4OL 27B/35B on cpu → invoke_timeout).
+            // Admin/debug can still pin cpu-* via preferredSlotId (idle list already filtered).
+            let machine_has_accel = plan.slots.iter().any(|s| s.kind != "cpu");
+            let weight_gb = model.weight_size_gb.unwrap_or(0.0);
+            let model_expects_gpu = hosting_min_vram_gb(model) > 0 || weight_gb > 2.0;
+            if machine_has_accel && model_expects_gpu {
+                debug!(
+                    slot = %slot.id,
+                    "placement: skip cpu; GPU-class model on a machine with accelerators"
+                );
+                return None;
+            }
             // Idle accelerator that nameplate-hosts this model but lacks live free
             // VRAM → bounce for failover. Do not silently rewrite onto CPU.
             let idle_accel_nameplate_hosts = plan.slots.iter().any(|s| {
@@ -360,14 +375,40 @@ fn resident_slot_can_serve(
     can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
 }
 
-fn slot_available_gb(slot: &ComputeSlot, _live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {
+fn slot_available_gb(slot: &ComputeSlot, live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {
+    // Prefer live free VRAM so we refuse placements that nameplate-fit but cannot
+    // actually offload (fleet: preload loops / insufficient_vram after claim).
+    if let Some(free) = crate::gpu_occupancy::slot_live_free_gb(slot, live_cuda) {
+        return free.max(0.0);
+    }
     f64::from(slot.card.total_vram_gb)
 }
 
 fn tp_available_gb(
     card: &crate::compute_pool::VirtualCard,
-    _live_cuda: &std::collections::HashMap<u32, f64>,
+    live_cuda: &std::collections::HashMap<u32, f64>,
 ) -> f64 {
+    if matches!(card.strategy, PoolStrategy::TensorParallel) && !card.devices.is_empty() {
+        // TP pools: use the tightest live free among member CUDA indices when known.
+        let mut min_free: Option<f64> = None;
+        for device in &card.devices {
+            if let Some(idx) = device
+                .id
+                .strip_prefix("nvidia:")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                if let Some(free) = live_cuda.get(&idx).copied() {
+                    min_free = Some(match min_free {
+                        Some(existing) => existing.min(free),
+                        None => free,
+                    });
+                }
+            }
+        }
+        if let Some(free) = min_free {
+            return free.max(0.0);
+        }
+    }
     f64::from(card.total_vram_gb)
 }
 

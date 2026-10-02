@@ -222,28 +222,6 @@ fn incoming_vram_need_gb(inner: &CacheInner, model_path: &Path) -> f64 {
     crate::models::full_host_need_gb(weight, shape, 4096)
 }
 
-#[allow(dead_code)]
-fn estimated_gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
-    let metal = matches!(pool.strategy, crate::compute_pool::PoolStrategy::Metal);
-    let used: f64 = inner
-        .gpu
-        .iter()
-        .map(|(k, e)| resident_accounted_gb(k, e.occupancy_gb, metal))
-        .sum();
-    (f64::from(pool.total_vram_gb) - used).max(0.0)
-}
-
-/// CUDA/Vulkan occupancy is dedicated VRAM. Metal occupancy lives in the same
-/// RAM as the GGUF mmap, so each resident costs occupancy + on-disk weight.
-#[allow(dead_code)]
-fn resident_accounted_gb(key: &str, occupancy_gb: f64, metal: bool) -> f64 {
-    let occ = occupancy_gb.max(0.0);
-    if !metal {
-        return occ;
-    }
-    occ + gguf_weight_gb(Path::new(path_from_gpu_key(key))).unwrap_or(0.0)
-}
-
 fn live_free_vram_gb(pool: &VirtualCard) -> Option<f64> {
     match pool.strategy {
         crate::compute_pool::PoolStrategy::Single
@@ -263,16 +241,6 @@ fn live_free_vram_gb(pool: &VirtualCard) -> Option<f64> {
         crate::compute_pool::PoolStrategy::CpuOnly => None,
     }
     .filter(|n| n.is_finite() && *n >= 0.0)
-}
-
-#[allow(dead_code)]
-fn gpu_free_gb(inner: &CacheInner, pool: &VirtualCard) -> f64 {
-    // Unified memory: "live free RAM" includes our own Metal buffers, so the
-    // nvidia-smi-style probe is wrong. Subtract cache occupancy from advertised.
-    if matches!(pool.strategy, crate::compute_pool::PoolStrategy::Metal) {
-        return estimated_gpu_free_gb(inner, pool);
-    }
-    live_free_vram_gb(pool).unwrap_or_else(|| estimated_gpu_free_gb(inner, pool))
 }
 
 fn fallback_occupancy_gb(model_path: &Path, pool: &VirtualCard, load_tier: usize) -> f64 {

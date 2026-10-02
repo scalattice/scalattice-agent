@@ -2,8 +2,11 @@ use std::cmp::Ordering;
 
 /// Runtime agent version. Prefer `SCALATTICE_VERSION` from the release tag
 /// (injected by `build.rs`); fall back to `Cargo.toml` for plain local builds.
-pub fn current_version() -> &'static str {
-    option_env!("SCALATTICE_AGENT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+pub const fn current_version() -> &'static str {
+    match option_env!("SCALATTICE_AGENT_VERSION") {
+        Some(v) => v,
+        None => env!("CARGO_PKG_VERSION"),
+    }
 }
 
 pub fn normalize_version(raw: &str) -> String {

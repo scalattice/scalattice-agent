@@ -1,7 +1,10 @@
+use crate::compute_pool::{PoolStrategy, VirtualCard};
+#[cfg(test)]
 use crate::compute_pool::{
-    build_compute_slots, build_tp_card_for_group, build_virtual_card, PoolStrategy, VirtualCard,
+    build_compute_slots, build_tp_card_for_group, build_virtual_card,
 };
 use crate::protocol::CatalogModel;
+#[cfg(test)]
 use crate::specs::ComputeDevice;
 
 use super::vram_plan::{
@@ -271,6 +274,7 @@ pub fn can_serve_vision_on_card(model: &CatalogModel, card: &VirtualCard) -> boo
 }
 
 /// True if any independent slot or homogeneous TP group can run image jobs for this model.
+#[cfg(test)]
 pub fn can_serve_vision_on_machine(
     model: &CatalogModel,
     devices: &[ComputeDevice],
@@ -378,8 +382,10 @@ pub fn can_host_model(
     false
 }
 
-/// GPU must hold at least half the weights or CPU decode stalls.
-const LAYER_OFFLOAD_MIN_GPU_FRACTION: f64 = 0.5;
+/// GPU must hold most of the catalog weight file for offload to be viable.
+/// Keep aligned with scalattice-server
+/// `backend/src/utilities/scalattice/inference/inferencePolicyConstants.ts`.
+const LAYER_OFFLOAD_MIN_GPU_FRACTION: f64 = 0.65;
 
 /// Live free VRAM that still lets this SKU place (layer-offload floor, or
 /// image catalog min). Leftover usage above this is not occupancy.
@@ -387,7 +393,10 @@ pub fn occupancy_min_vram_gb(model: &CatalogModel) -> f64 {
     if model.is_image_job() {
         return f64::from(hosting_min_vram_gb(model)).max(1.0);
     }
-    let weights = gpu_weights_need_gb_for_job(model, false);
+    let weights = model
+        .weight_size_gb
+        .filter(|w| *w > 0.05)
+        .unwrap_or_else(|| gpu_weights_need_gb_for_job(model, false));
     if weights <= 0.0 {
         return f64::from(hosting_min_vram_gb(model)).max(1.0);
     }
@@ -405,7 +414,12 @@ fn layer_offload_fits(
     if vram <= 0.0 || weights_need <= 0.0 {
         return false;
     }
-    if vram + 0.005 < weights_need * LAYER_OFFLOAD_MIN_GPU_FRACTION {
+    // Fraction uses catalog weight file size; spill RAM still uses runtime need.
+    let weight_for_frac = model
+        .weight_size_gb
+        .filter(|w| *w > 0.05)
+        .unwrap_or(weights_need);
+    if vram + 0.005 < weight_for_frac * LAYER_OFFLOAD_MIN_GPU_FRACTION {
         return false;
     }
     let spilled = (weights_need - vram).max(0.0);
@@ -423,6 +437,7 @@ fn layer_offload_fits(
 ///
 /// This uses the card size and installed RAM the agent reports. Whether a
 /// model is enabled or downloaded is the server's decision.
+#[cfg(test)]
 pub fn can_host_on_machine(
     model: &CatalogModel,
     devices: &[ComputeDevice],
@@ -438,6 +453,7 @@ pub fn can_host_on_machine(
     )
 }
 
+#[cfg(test)]
 pub fn can_host_on_machine_ex(
     model: &CatalogModel,
     devices: &[ComputeDevice],
@@ -475,6 +491,7 @@ pub fn can_host_on_machine_ex(
 }
 
 /// Best card for weight download sizing: largest single slot, else homogeneous TP pool.
+#[cfg(test)]
 pub fn preferred_download_card(devices: &[ComputeDevice]) -> anyhow::Result<VirtualCard> {
     let plan = build_compute_slots(devices)?;
     let mut best = plan
@@ -943,10 +960,11 @@ mod tests {
     }
 
     #[test]
-    fn occupancy_floor_is_half_weights_not_the_full_card() {
+    fn occupancy_floor_tracks_offload_fraction_of_weights() {
         let mut model = catalog(24.0, 16.0, 16.0);
         model.gpu_weights_vram_gb = Some(16.0);
-        assert!((occupancy_min_vram_gb(&model) - 8.0).abs() < 0.01);
+        let want = 16.0 * 0.65;
+        assert!((occupancy_min_vram_gb(&model) - want).abs() < 0.01);
         assert_eq!(occupancy_min_vram_gb(&image_catalog(16.0)), 16.0);
     }
 

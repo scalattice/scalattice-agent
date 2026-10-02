@@ -49,6 +49,7 @@ impl OccupancyWatch {
         self.latched.clone()
     }
 
+    #[cfg(test)]
     pub fn is_latched(&self, slot_id: &str) -> bool {
         self.latched.contains(slot_id)
     }
