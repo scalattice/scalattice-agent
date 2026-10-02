@@ -237,6 +237,13 @@ pub fn is_streaming() -> bool {
     state().lock().map(|g| g.streaming).unwrap_or(false)
 }
 
+pub fn is_streaming_verbose() -> bool {
+    state()
+        .lock()
+        .map(|g| g.streaming_verbose)
+        .unwrap_or(false)
+}
+
 /// Snapshot of the local ring (oldest → newest).
 pub fn snapshot(verbose: bool) -> Vec<CloudLogLine> {
     state()

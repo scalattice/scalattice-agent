@@ -98,6 +98,7 @@ pub fn pick_placement(
         need_vision,
         crate::specs::cpu_logical_cores(),
         ram_gb.saturating_sub(crate::specs::detect_ram_used_gb().unwrap_or(0)),
+        &std::collections::HashSet::new(),
     )
 }
 
@@ -111,6 +112,9 @@ pub fn pick_placement_with_cpu(
     need_vision: bool,
     cpu_logical_cores: u32,
     sys_ram_available_gb: u32,
+    // Idle slots holding our warm weights. Live free looks low, but
+    // model_cache will evict them before the cold load.
+    reclaimable_slot_ids: &std::collections::HashSet<String>,
 ) -> Option<Placement> {
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
@@ -132,7 +136,7 @@ pub fn pick_placement_with_cpu(
         .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
         .filter(|s| {
             vram_can_gpu_full(
-                slot_available_gb(s, &live_cuda),
+                slot_available_gb(s, &live_cuda, reclaimable_slot_ids.contains(&s.id)),
                 model,
                 min_vram,
                 need_vision,
@@ -203,7 +207,14 @@ pub fn pick_placement_with_cpu(
             .slots
             .iter()
             .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
-            .filter(|s| accelerator_live_can_place(s, &live_cuda, model))
+            .filter(|s| {
+                accelerator_live_can_place(
+                    s,
+                    &live_cuda,
+                    model,
+                    reclaimable_slot_ids.contains(&s.id),
+                )
+            })
             .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
             .filter(|s| {
                 placement_sys_ram_need_gb(model, &s.card, need_vision, cpu_ram_headroom_gb)
@@ -246,7 +257,7 @@ pub fn pick_placement_with_cpu(
                 return None;
             }
             // Idle accelerator that nameplate-hosts this model but lacks live free
-            // VRAM → bounce for failover. Do not silently rewrite onto CPU.
+            // VRAM (foreign occupancy — not our reclaimable warm) → bounce for failover.
             let idle_accel_nameplate_hosts = plan.slots.iter().any(|s| {
                 s.kind != "cpu"
                     && idle.contains(s.id.as_str())
@@ -302,11 +313,12 @@ pub(crate) fn accelerator_live_can_place(
     slot: &ComputeSlot,
     live_cuda: &std::collections::HashMap<u32, f64>,
     model: &CatalogModel,
+    reclaim_our_warm: bool,
 ) -> bool {
     if slot.kind == "cpu" {
         return false;
     }
-    let available = slot_available_gb(slot, live_cuda);
+    let available = slot_available_gb(slot, live_cuda, reclaim_our_warm);
     available + 0.005 >= occupancy_min_vram_gb(model)
 }
 
@@ -375,7 +387,16 @@ fn resident_slot_can_serve(
     can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
 }
 
-fn slot_available_gb(slot: &ComputeSlot, live_cuda: &std::collections::HashMap<u32, f64>) -> f64 {
+fn slot_available_gb(
+    slot: &ComputeSlot,
+    live_cuda: &std::collections::HashMap<u32, f64>,
+    reclaim_our_warm: bool,
+) -> f64 {
+    // Our idle warm resident will be evicted in make_gpu_room before load —
+    // do not treat that occupancy like a foreign process we must bounce around.
+    if reclaim_our_warm {
+        return f64::from(slot.card.total_vram_gb);
+    }
     // Prefer live free VRAM so we refuse placements that nameplate-fit but cannot
     // actually offload (fleet: preload loops / insufficient_vram after claim).
     if let Some(free) = crate::gpu_occupancy::slot_live_free_gb(slot, live_cuda) {
@@ -420,6 +441,7 @@ pub fn placement_miss_detail(
     idle_slot_ids: &[String],
     model: &CatalogModel,
     need_vision: bool,
+    reclaimable_slot_ids: &std::collections::HashSet<String>,
 ) -> crate::invoke_code::CodedError {
     let model_id = model.model_id.as_str();
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
@@ -481,7 +503,7 @@ pub fn placement_miss_detail(
     let has_fitting_gpu = plan.slots.iter().any(|s| {
         s.kind != "cpu"
             && vram_can_gpu_full(
-                slot_available_gb(s, &live_cuda),
+                slot_available_gb(s, &live_cuda, reclaimable_slot_ids.contains(&s.id)),
                 model,
                 catalog_min,
                 need_vision,
@@ -542,7 +564,13 @@ pub fn placement_miss_detail(
 
     let max_free = idle_accel
         .iter()
-        .map(|slot| slot_available_gb(slot, &live_cuda))
+        .map(|slot| {
+            slot_available_gb(
+                slot,
+                &live_cuda,
+                reclaimable_slot_ids.contains(&slot.id),
+            )
+        })
         .fold(0.0_f64, f64::max);
     let need = occupancy_min_vram_gb(model);
     crate::invoke_code::CodedError::new(
@@ -556,6 +584,7 @@ pub fn placement_miss_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use crate::compute_pool::build_compute_slots;
     use crate::specs::ComputeDevice;
 
@@ -787,11 +816,12 @@ mod tests {
             false,
             16,
             16,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(12.1, 5.0), 6, 2, &devices, false, 16, 6)
+            pick_placement_with_cpu(&plan, &idle, &model(12.1, 5.0), 6, 2, &devices, false, 16, 6, &HashSet::new())
                 .is_none(),
             "6 GB RAM must not start an 8B beside a 2 GB card"
         );
@@ -820,6 +850,7 @@ mod tests {
             false,
             16,
             32,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
@@ -880,7 +911,7 @@ mod tests {
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
         // Consumer cores: do not crawl 30B on CPU just because RAM fits.
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false, 8, 31)
+            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false, 8, 31, &HashSet::new())
                 .is_none()
         );
         let on_cpu = pick_placement_with_cpu(
@@ -893,11 +924,12 @@ mod tests {
             false,
             32,
             31,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 20, 2, &devices, false, 32, 20)
+            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 20, 2, &devices, false, 32, 20, &HashSet::new())
                 .is_none(),
             "20 GB RAM must not start a 19 GB coder"
         );
@@ -937,6 +969,7 @@ mod tests {
             false,
             16,
             16,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
@@ -950,6 +983,7 @@ mod tests {
             false,
             16,
             16,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(
@@ -958,12 +992,12 @@ mod tests {
             "4 GB card must not layer-offload a 14B; capable CPU+RAM can still run it"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8)
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8, &HashSet::new())
                 .is_none(),
             "8 GB RAM must not start a 14B"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16)
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16, &HashSet::new())
                 .is_none(),
             "weak CPU must not claim a 14B even with RAM"
         );
@@ -1018,6 +1052,53 @@ mod tests {
     }
 
     #[test]
+    fn reclaimable_warm_uses_nameplate_not_live_free() {
+        // Idle cuda-0 nameplate-hosts; with reclaimable set we place even though
+        // live free would look too small (our warm Ornith is occupying it).
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "RTX 3050 Ti".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle = vec!["cuda-0".to_string()];
+        let reclaimable = HashSet::from(["cuda-0".to_string()]);
+        let m = model(10.7, 5.0); // ~8B class with RAM offload on 4 GB
+        let placement = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &m,
+            15,
+            2,
+            &devices,
+            false,
+            16,
+            15,
+            &reclaimable,
+        );
+        assert!(
+            placement.is_some(),
+            "warm resident on idle slot must be reclaimable for cold load"
+        );
+        assert_eq!(placement.unwrap().slot_ids, vec!["cuda-0".to_string()]);
+    }
+
+    #[test]
     fn image_job_busy_fitting_gpu_reports_agent_busy() {
         let devices = mixed_1660_3080();
         let plan = build_compute_slots(&devices).unwrap();
@@ -1030,7 +1111,7 @@ mod tests {
             .collect();
         let model = image_model(8.0);
         assert!(pick_placement(&plan, &idle, &model, 64, 2, &devices, false).is_none());
-        let detail = placement_miss_detail(&plan, &idle, &model, false);
+        let detail = placement_miss_detail(&plan, &idle, &model, false, &HashSet::new());
         assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
         assert!(
             detail.detail.contains("waiting for a GPU"),

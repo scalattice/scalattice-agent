@@ -415,10 +415,16 @@ impl Supervisor {
             ));
         }
         let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+        let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
         let can_live = self.plan.slots.iter().any(|s| {
             idle.iter().any(|id| id == &s.id)
                 && s.kind != "cpu"
-                && accelerator_live_can_place(s, &live_cuda, model)
+                && accelerator_live_can_place(
+                    s,
+                    &live_cuda,
+                    model,
+                    reclaimable.contains(&s.id),
+                )
         });
         if can_live {
             return Ok(());
@@ -434,12 +440,13 @@ impl Supervisor {
             false,
             crate::specs::cpu_logical_cores(),
             sys_avail,
+            &reclaimable,
         )
         .is_some()
         {
             return Ok(());
         }
-        Err(placement_miss_detail(&self.plan, &idle, model, false).into())
+        Err(placement_miss_detail(&self.plan, &idle, model, false, &reclaimable).into())
     }
 
     /// `None` is an old server and must not wipe blocks learned earlier.
@@ -599,9 +606,16 @@ impl Supervisor {
         avail + 0.05 >= incoming_weight_gb + reserve
     }
 
-    /// True when the supervisor has real in-flight work (checked-out slots or cancel waiters).
+    /// True when a slot is checked out for real work.
+    /// Cancel waiters alone do not count: a wedged invoke can leave orphans in
+    /// `job_cancels` after workers are idle, which used to block Busy heal forever.
     pub async fn has_in_flight_work(&self) -> bool {
-        !self.checkouts.lock().await.is_empty() || !self.job_cancels.lock().await.is_empty()
+        !self.checkouts.lock().await.is_empty()
+    }
+
+    /// Drop every cancel registration (after notify). Call when healing orphan Busy.
+    pub async fn clear_all_job_cancels(&self) {
+        self.job_cancels.lock().await.clear();
     }
 
     async fn mark_checkout(&self, slot_id: &str, job_id: &str, pid: Option<u32>, loaded_models: Vec<String>) {
@@ -885,6 +899,19 @@ impl Supervisor {
         self.routing_idle_slot_ids().await.len() as u32
     }
 
+    /// Idle slots that already hold our warm weights (safe to reclaim on cold load).
+    async fn reclaimable_warm_slot_ids(&self, idle: &[String]) -> HashSet<String> {
+        let workers = self.workers.lock().await;
+        idle.iter()
+            .filter(|id| {
+                workers
+                    .get(*id)
+                    .is_some_and(|w| w.healthy && !w.busy && !w.loaded_models.is_empty())
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Every placeable GPU is taken by leftover / foreign VRAM — not our job.
     pub async fn gpus_occupied(&self) -> bool {
         if self.occupied_slot_ids().await.is_empty() {
@@ -1160,15 +1187,28 @@ impl Supervisor {
         let _mmap = if self.ram_has_room_for_mmap(incoming_gb) {
             None
         } else {
+            info!(
+                job_id,
+                need_gb = format!("{incoming_gb:.1}"),
+                "waiting for mmap gate (system RAM tight)"
+            );
             tokio::select! {
                 biased;
                 _ = cancel.notified() => {
                     self.clear_job_cancel(job_id).await;
                     bail!("request_canceled");
                 }
+                _ = tokio::time::sleep(Duration::from_secs(45)) => {
+                    self.clear_job_cancel(job_id).await;
+                    return Err(crate::invoke_code::coded(
+                        crate::invoke_code::InvokeErrorCode::AgentBusy,
+                        "timed out waiting for system RAM / mmap gate".to_string(),
+                    ));
+                }
                 guard = self.mmap_gate.lock() => Some(guard),
             }
         };
+        info!(job_id, model = %model_id, "placing job on compute slots");
         let sent_token = Arc::new(AtomicBool::new(false));
         let mut on_delta: Option<Box<dyn FnMut(String) + Send>> = match on_delta {
             None => None,
@@ -1231,8 +1271,15 @@ impl Supervisor {
                     gpu_usable(s)
                         && !skip.contains(&s.id)
                         && !occupied.contains(&s.id)
-                        && workers.get(&s.id).is_some_and(|w| !w.busy)
-                        && accelerator_live_can_place(s, &live_cuda, model)
+                        && workers.get(&s.id).is_some_and(|w| {
+                            !w.busy
+                                && accelerator_live_can_place(
+                                    s,
+                                    &live_cuda,
+                                    model,
+                                    !w.loaded_models.is_empty(),
+                                )
+                        })
                         && crate::models::can_host_model(
                             model,
                             &s.card,
@@ -1345,6 +1392,15 @@ impl Supervisor {
                     })
                     .cloned()
                     .collect();
+                let reclaimable: HashSet<String> = idle
+                    .iter()
+                    .filter(|id| {
+                        workers
+                            .get(*id)
+                            .is_some_and(|w| !w.loaded_models.is_empty())
+                    })
+                    .cloned()
+                    .collect();
                 drop(workers);
                 let sys_avail = self.available_sys_ram_gb().await;
                 let mut workers = self.workers.lock().await;
@@ -1368,6 +1424,7 @@ impl Supervisor {
                         need_vision,
                         crate::specs::cpu_logical_cores(),
                         sys_avail,
+                        &reclaimable,
                     )
                 }) {
                     Some(p) => p,
@@ -1376,7 +1433,13 @@ impl Supervisor {
                         if let Some(err) = last_crash {
                             return Err(err);
                         }
-                        let detail = placement_miss_detail(&self.plan, &idle, model, need_vision);
+                        let detail = placement_miss_detail(
+                            &self.plan,
+                            &idle,
+                            model,
+                            need_vision,
+                            &reclaimable,
+                        );
                         return Err(detail.into());
                     }
                 };
@@ -1514,6 +1577,7 @@ impl Supervisor {
                 .collect();
             drop(workers);
             let sys_avail = self.available_sys_ram_gb().await;
+            let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
             let mut workers = self.workers.lock().await;
             let placement = match pick_placement_with_cpu(
                 &self.plan,
@@ -1525,11 +1589,13 @@ impl Supervisor {
                 false,
                 crate::specs::cpu_logical_cores(),
                 sys_avail,
+                &reclaimable,
             ) {
                 Some(p) => p,
                 None => {
                     self.clear_job_cancel(job_id).await;
-                    let detail = placement_miss_detail(&self.plan, &idle, model, false);
+                    let detail =
+                        placement_miss_detail(&self.plan, &idle, model, false, &reclaimable);
                     return Err(detail.into());
                 }
             };
@@ -1674,12 +1740,27 @@ impl Supervisor {
         let need_vision = crate::protocol::messages_have_images(messages);
         let (n_ctx, offload_kqv) =
             crate::models::llama_context_plan(model, &placement.card, need_vision);
-        let ram_need = crate::models::placement_sys_ram_need_gb(
-            model,
-            &placement.card,
-            need_vision,
-            crate::models::DEFAULT_CPU_RAM_HEADROOM_GB,
-        );
+        let already_loaded = worker.loaded_models.iter().any(|m| {
+            m.eq_ignore_ascii_case(runtime_model) || m.eq_ignore_ascii_case(model_id)
+        });
+        // Warm residents already count against OS "used". Requiring the full
+        // weight-spill budget again double-counts and falsely refuses (laptop
+        // ornith warm → need 11 GB free while weights already resident).
+        let ram_need = if already_loaded {
+            if offload_kqv {
+                0
+            } else {
+                crate::models::kv_offload_ram_gb(model, need_vision)
+                    .saturating_add(1)
+            }
+        } else {
+            crate::models::placement_sys_ram_need_gb(
+                model,
+                &placement.card,
+                need_vision,
+                crate::models::DEFAULT_CPU_RAM_HEADROOM_GB,
+            )
+        };
         let avail = self.available_sys_ram_gb().await;
         if ram_need > avail {
             self.return_worker(slot_id.clone(), worker).await;
