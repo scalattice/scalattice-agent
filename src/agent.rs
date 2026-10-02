@@ -1535,19 +1535,23 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
     let max = supervisor.max_concurrent_jobs().await;
     let loaded = supervisor.loaded_models_union().await;
     let in_flight = supervisor.has_in_flight_work().await;
+    let any_slot_busy = slots.iter().any(|s| s.busy);
     let mut guard = state.lock().await;
     guard.cached_slots = slots;
     guard.cached_idle_slots = idle;
     guard.cached_gpu_occupied = gpu_occupied;
     guard.cached_max_jobs = max;
     guard.cached_loaded_models = loaded;
-    // Heal lied-about busy: counter says jobs remain but supervisor has nothing
-    // checked out and no cancel waiters (WS reconnect / panicked invoke task).
-    if guard.active_job_count > 0 && !in_flight && idle > 0 {
+    // Heal lied-about busy: counter says jobs remain but nothing is checked out
+    // and no worker is busy. Orphan `job_cancels` from a wedged/canceled invoke
+    // must not keep the machine Busy forever.
+    if guard.active_job_count > 0 && !in_flight && !any_slot_busy {
         warn!(
             stale = guard.active_job_count,
             idle, "clearing stale active_job_count; supervisor has no in-flight work"
         );
+        supervisor.cancel_all_invokes().await;
+        supervisor.clear_all_job_cancels().await;
         guard.active_job_count = 0;
         crate::state::set_reported_active_jobs(0);
         guard.job_state = JobState::Idle;
@@ -2049,16 +2053,29 @@ async fn handle_server_message(
 async fn handle_logs_subscribe(write: &SharedWsWrite, action: &str, verbose: bool) -> Result<()> {
     let action = action.trim().to_ascii_lowercase();
     if action == "unsubscribe" || action == "stop" || action == "off" {
-        crate::cloud_log::set_streaming(false);
-        info!("cloud log streaming stopped");
+        if crate::cloud_log::is_streaming() {
+            crate::cloud_log::set_streaming(false);
+            info!("cloud log streaming stopped");
+        }
         return Ok(());
     }
+    let was_streaming = crate::cloud_log::is_streaming();
+    let prev_verbose = crate::cloud_log::is_streaming_verbose();
     crate::cloud_log::set_streaming(true);
     crate::cloud_log::set_streaming_verbose(verbose);
-    info!(
-        "cloud log streaming started ({})",
-        if verbose { "verbose" } else { "simplified" }
-    );
+    // Verbose toggles (and reconnect resumes) re-subscribe often; only log edges
+    // so the dashboard is not flooded with start/stop noise between jobs.
+    if !was_streaming {
+        info!(
+            "cloud log streaming started ({})",
+            if verbose { "verbose" } else { "simplified" }
+        );
+    } else if prev_verbose != verbose {
+        info!(
+            "cloud log mode → {}",
+            if verbose { "verbose" } else { "simplified" }
+        );
+    }
     let lines: Vec<LogsLinePayload> = crate::cloud_log::snapshot(verbose)
         .into_iter()
         .map(|l| LogsLinePayload {

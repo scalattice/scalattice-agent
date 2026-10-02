@@ -119,7 +119,9 @@ pub fn build_runtime(
         downloading_model,
         blocked_enabled_models,
         idle_slots,
+        max_concurrent_jobs.max(1),
         slots.len() as u32,
+        slots.iter().any(|s| s.busy),
         gpu_occupied,
     );
     let disk_full = crate::state::disk_full();
@@ -224,36 +226,41 @@ fn status_label(
     downloading_model: Option<&str>,
     blocked_enabled_models: usize,
     idle_slots: u32,
-    total_slots: u32,
+    // Routing capacity (matches idle_slots; usually excludes hidden CPU).
+    routing_slots: u32,
+    // All compute slots including CPU (Ready label only).
+    display_slots: u32,
+    // True when any worker reports busy. Optimistic idle_slots alone must not
+    // show "N/M slots free".
+    any_slot_busy: bool,
     gpu_occupied: bool,
 ) -> String {
     if job_state == JobState::Busy {
         let model = active_model_id.unwrap_or("inference");
-        if total_slots > 1 {
+        let total = routing_slots.max(1);
+        if total > 1 && any_slot_busy && idle_slots < total {
             if idle_slots == 0 {
-                return format!("Running {model} · all {total_slots} slots busy");
+                return format!("Running {model} · all {total} slots busy");
             }
-            if idle_slots < total_slots {
-                return format!("Running {model} · {idle_slots}/{total_slots} slots free");
-            }
-            // Slot cache still shows all idle: the job has started; don't say Ready.
-            return format!("Running {model}");
+            return format!("Running {model} · {idle_slots}/{total} slots free");
         }
+        // Job accepted but no worker busy yet (placement/load), or all routing
+        // slots still free in the cache — don't invent a free-slot fraction.
         return format!("Running {model}");
     }
     if gpu_occupied {
         return "GPUs in use".to_string();
     }
-    // Do not infer "Running" from idle_slots < total_slots while Idle.
-    // routing_idle_slot_count hides CPU when a GPU is healthy, but total_slots
+    // Do not infer "Running" from idle_slots < display_slots while Idle.
+    // routing_idle_slot_count hides CPU when a GPU is healthy, but display_slots
     // still counts cpu-0 — so a fully idle laptop (2 GPU slots free + CPU)
     // used to show "Running inference · 2/3 slots free".
     if let Some(model) = downloading_model {
         return format!("Downloading {model}");
     }
     if ready {
-        if total_slots > 1 {
-            return format!("Ready · {total_slots} compute slots");
+        if display_slots > 1 {
+            return format!("Ready · {display_slots} compute slots");
         }
         return "Ready for inference".to_string();
     }
@@ -406,6 +413,35 @@ mod tests {
 
     #[test]
     fn busy_partial_slots_still_says_running() {
+        let mut slots = dummy_slots(3);
+        slots[0].busy = true;
+        let runtime = build_runtime(
+            JobState::Busy,
+            Some("job-1".into()),
+            Some("ornith-1.5-9b".into()),
+            &["ornith-ai/Ornith-1.5-9B".into()],
+            3,
+            None,
+            0,
+            16,
+            HashMap::new(),
+            slots,
+            2,
+            1,
+            false,
+            None,
+        );
+        assert_eq!(runtime.job_state, "busy");
+        assert_eq!(
+            runtime.status_label,
+            "Running ornith-1.5-9b · 1/2 slots free"
+        );
+    }
+
+    #[test]
+    fn busy_without_busy_worker_omits_free_fraction() {
+        // Optimistic idle decrement used to show "1/3 slots free" while every
+        // worker was still idle (stuck placement / pre-checkout).
         let runtime = build_runtime(
             JobState::Busy,
             Some("job-1".into()),
@@ -417,15 +453,11 @@ mod tests {
             16,
             HashMap::new(),
             dummy_slots(3),
-            3,
             2,
+            1,
             false,
             None,
         );
-        assert_eq!(runtime.job_state, "busy");
-        assert_eq!(
-            runtime.status_label,
-            "Running ornith-1.5-9b · 2/3 slots free"
-        );
+        assert_eq!(runtime.status_label, "Running ornith-1.5-9b");
     }
 }
