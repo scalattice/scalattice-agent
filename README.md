@@ -78,7 +78,7 @@ When both NVIDIA and AMD/Intel are enabled, the agent prefers **CUDA**. AMD/Inte
 
 Do **not** redistribute `vulkan-1.dll` — providers get it from their GPU driver. Build machines need the [Vulkan SDK](https://vulkan.lunarg.com/) (for `glslc` only).
 
-NVIDIA’s `libcuda.so` / `nvcuda.dll` cannot be redistributed. Machines without a GPU driver still run the agent; GPU inference activates when the driver is present.
+NVIDIA’s `libcuda.so` / `nvcuda.dll` cannot be redistributed. Linux/Windows release builds use **dynamic ggml backends**: the main binary does not hard-link `libcuda`, so AMD-only and CPU-only hosts can start. CUDA/Vulkan modules load from `~/.local/lib/scalattice/backends` (or the Windows `lib` folder) when the host driver is present.
 
 ## Quick start
 

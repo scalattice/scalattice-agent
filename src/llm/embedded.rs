@@ -90,6 +90,58 @@ pub struct GenerateOutput {
     pub timings: GenerateTimings,
 }
 
+/// Load ggml CUDA/Vulkan/CPU modules from the install lib dir (or build-time
+/// backends dir). Must run before [`LlamaBackend::init`] when built with
+/// `dynamic-backends` — otherwise only the CPU backend is available and the
+/// main binary would otherwise DT_NEEDED `libcuda.so.1` (breaks AMD-only hosts).
+fn load_dynamic_ggml_backends() {
+    #[cfg(feature = "dynamic-backends")]
+    {
+        use std::path::PathBuf;
+        use std::sync::Once;
+        static LOADED: Once = Once::new();
+        LOADED.call_once(|| {
+            let mut dirs: Vec<PathBuf> = Vec::new();
+            if let Ok(lib) = crate::paths::lib_dir() {
+                dirs.push(lib.join("backends"));
+                dirs.push(lib);
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    dirs.push(parent.join("../lib/scalattice/backends"));
+                    dirs.push(parent.join("../lib/scalattice"));
+                    dirs.push(parent.join("backends"));
+                    dirs.push(parent.to_path_buf());
+                }
+            }
+            if let Some(dir) = llama_cpp_2::llama_backend::BACKENDS_DIR {
+                dirs.push(PathBuf::from(dir));
+            }
+            let looks_like_backend = |name: &str| {
+                let n = name.to_ascii_lowercase();
+                (n.contains("ggml") || n.starts_with("libggml"))
+                    && (n.contains(".so") || n.ends_with(".dll") || n.ends_with(".dylib"))
+            };
+            for dir in dirs {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                let has = entries.filter_map(|e| e.ok()).any(|e| {
+                    looks_like_backend(&e.file_name().to_string_lossy())
+                });
+                if !has {
+                    continue;
+                }
+                info!(path = %dir.display(), "loading ggml dynamic backends");
+                llama_cpp_2::llama_backend::load_backends_from_path(&dir);
+                return;
+            }
+            // Dev builds: compile-time OUT_DIR/backends via BACKENDS_DIR.
+            llama_cpp_2::llama_backend::load_backends();
+        });
+    }
+}
+
 pub fn init_backend() -> Result<()> {
     llama_cpp_2::send_logs_to_tracing(LogOptions::default());
     if BACKEND.get().is_some() {
@@ -107,6 +159,7 @@ pub fn init_backend() -> Result<()> {
         std::thread::Builder::new()
             .name("llama-backend-init".into())
             .spawn(move || {
+                load_dynamic_ggml_backends();
                 let result = LlamaBackend::init().map_err(|err| err.to_string());
                 let _ = tx.send(result);
             })

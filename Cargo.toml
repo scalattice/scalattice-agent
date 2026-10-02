@@ -58,12 +58,14 @@ image = "0.25"
 
 [features]
 default = ["gpu"]
-# x86_64 Linux: NVIDIA CUDA + AMD/Intel Vulkan; release bundles non-driver .so deps
-gpu = ["cuda", "vulkan"]
+# x86_64 Linux: NVIDIA CUDA + AMD/Intel Vulkan; release bundles non-driver .so deps.
+# dynamic-backends keeps libcuda/libvulkan out of the main binary's DT_NEEDED so
+# AMD-only / CPU-only hosts can start; CUDA/Vulkan modules load at runtime.
+gpu = ["cuda", "vulkan", "dynamic-backends"]
 # Windows release: CUDA + Vulkan (AMD/Intel). Needs Vulkan SDK on the build host (glslc).
-win-gpu = ["cuda", "vulkan"]
+win-gpu = ["cuda", "vulkan", "dynamic-backends"]
 # aarch64 native: NVIDIA CUDA + Vulkan (Jetson, Graviton, Mali, Adreno)
-arm-gpu = ["cuda", "vulkan"]
+arm-gpu = ["cuda", "vulkan", "dynamic-backends"]
 cuda = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]
 metal = ["llama-cpp-2/metal"]
