@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-use crate::paths::{lib_dir, unix_agent_install_targets};
+use crate::paths::{install_dir, lib_dir, unix_agent_install_targets};
 
 #[cfg(target_os = "linux")]
 const UPDATE_SERVICE: &str = "scalattice-agent-update.service";
