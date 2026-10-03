@@ -81,8 +81,15 @@ cargo "${args[@]}"
 
 RELEASE="target/${TARGET}/release"
 BIN="${RELEASE}/scalattice-agent"
+UPDATER="${RELEASE}/scalattice-updater"
+
 if [[ ! -x "$BIN" ]]; then
   echo "Missing binary: $BIN" >&2
+  exit 1
+fi
+
+if [[ ! -x "$UPDATER" ]]; then
+  echo "Missing updater binary: $UPDATER" >&2
   exit 1
 fi
 
@@ -90,14 +97,15 @@ scripts/prune-cargo-target.sh
 
 mkdir -p dist
 cp "$BIN" dist/scalattice-agent
+cp "$UPDATER" dist/scalattice-updater
 chmod +x scripts/bundle-release-libs.sh
 scripts/bundle-release-libs.sh dist/scalattice-agent dist "${RELEASE}"
 
 ARCHIVE="dist/scalattice-agent-${TARGET}.tar.gz"
 if [[ -d dist/lib ]]; then
-  tar -czf "$ARCHIVE" -C dist scalattice-agent lib
+  tar -czf "$ARCHIVE" -C dist scalattice-agent scalattice-updater lib
 else
-  tar -czf "$ARCHIVE" -C dist scalattice-agent
+  tar -czf "$ARCHIVE" -C dist scalattice-agent scalattice-updater
 fi
 
 echo ""

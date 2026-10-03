@@ -16,6 +16,10 @@ categories = ["command-line-utilities", "network-programming"]
 name = "scalattice-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "scalattice-updater"
+path = "src/updater_main.rs"
+
 [build-dependencies]
 winres = "0.1"
 

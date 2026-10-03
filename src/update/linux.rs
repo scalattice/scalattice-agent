@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-use crate::paths::{lib_dir, unix_agent_install_targets};
+use crate::paths::{install_dir, lib_dir, unix_agent_install_targets};
 
 #[cfg(target_os = "linux")]
 const UPDATE_SERVICE: &str = "scalattice-agent-update.service";
@@ -559,6 +559,26 @@ fn apply_update(staging: &Path) -> Result<()> {
         );
     }
 
+    // Install updater binary if present in the archive
+    let source_updater = staging.join("scalattice-updater");
+    if source_updater.is_file() {
+        if let Ok(install) = install_dir() {
+            let dest_updater = install.join("scalattice-updater");
+            match replace_unix_binary(&source_updater, &dest_updater) {
+                Ok(()) => println!("Installed updater binary"),
+                Err(e) => eprintln!("Warning: could not install updater: {e}"),
+            }
+        }
+    }
+
+    // Try using external updater for safer updates with rollback support
+    if let Ok(()) = try_external_updater(&source_bin, staging) {
+        return Ok(());
+    }
+
+    // Fallback to direct update if updater not available
+    println!("External updater not available, using direct update...");
+
     // Remote/website update runs inside `foreground` (the live agent). Stopping the
     // systemd/launchd unit here kills this process before the binary is replaced  -
     // that is why Linux force-update from the dashboard failed while Windows
@@ -618,6 +638,75 @@ fn apply_update(staging: &Path) -> Result<()> {
     } else {
         service::restart_background_after_update()?;
     }
+    fs::remove_dir_all(staging.parent().unwrap_or(staging)).ok();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn try_external_updater(source_bin: &Path, staging: &Path) -> Result<()> {
+    use std::process::Command;
+
+    let install = install_dir().context("resolve install directory")?;
+    let updater = install.join("scalattice-updater");
+    
+    if !updater.is_file() {
+        anyhow::bail!("updater not found at {}", updater.display());
+    }
+
+    println!("Using external updater for safe installation...");
+    
+    // Stop the agent before update
+    let self_replace = running_as_live_agent();
+    let tray_update = crate::service::in_tray_process();
+    if !self_replace && !tray_update {
+        service::stop_background_for_update()?;
+    }
+
+    // Install libraries first
+    let source_lib = staging.join("lib");
+    if source_lib.is_dir() {
+        let dest_lib = lib_dir().context("resolve library directory")?;
+        fs::create_dir_all(&dest_lib).context("create library directory")?;
+        copy_lib_tree(&source_lib, &dest_lib).context("replace bundled libraries")?;
+        create_lib_symlinks(&dest_lib).context("create library symlinks")?;
+    }
+
+    // Delegate agent binary update to external updater
+    let status = Command::new(&updater)
+        .arg("install")
+        .arg(source_bin)
+        .status()
+        .context("failed to run updater")?;
+
+    if !status.success() {
+        anyhow::bail!("updater failed with exit code: {:?}", status.code());
+    }
+
+    println!("\n✓ Update installed successfully with automatic rollback protection.");
+    println!("  The updater will monitor the new version for crashes.");
+    println!("  If problems occur within 10 minutes, automatic rollback will trigger.");
+    println!("\nTo manually rollback: scalattice-updater rollback");
+    println!("To monitor health: scalattice-updater monitor");
+
+    // Restart agent
+    if self_replace {
+        // Remote control will handle restart
+    } else if tray_update {
+        let _ = service::restart_background_after_update();
+        fs::remove_dir_all(staging.parent().unwrap_or(staging)).ok();
+        relaunch_macos_tray_after_update();
+        std::process::exit(0);
+    } else {
+        service::restart_background_after_update()?;
+        
+        // Launch monitor in background
+        println!("\nStarting background health monitor...");
+        Command::new(&updater)
+            .arg("monitor")
+            .spawn()
+            .ok();
+    }
+    
     fs::remove_dir_all(staging.parent().unwrap_or(staging)).ok();
     Ok(())
 }
