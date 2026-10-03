@@ -24,7 +24,7 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use super::ggml_devices::{metal_ggml_device_indices, vulkan_ggml_device_indices};
+use super::ggml_devices::{metal_ggml_device_indices, vulkan_ggml_device_indices, cuda_ggml_device_indices};
 use super::prompt::{build_chat_prompt, sanitize_completion};
 use super::vision::{prefill_vision, prompt_needs_vision};
 
@@ -492,24 +492,67 @@ pub(crate) fn model_params_for_pool(pool: &VirtualCard) -> Result<LlamaModelPara
 
     match pool.strategy {
         PoolStrategy::TensorParallel if ggml_devices.len() > 1 => {
-            if !pool.tensor_split.is_empty() {
-                info!(
-                    devices = ?ggml_devices,
-                    tensor_split = ?pool.tensor_split,
-                    "tensor-parallel load (VRAM proportions; llama.cpp uses equal split when unset via API)"
+            let cuda_indices = cuda_ggml_device_indices();
+            let available_devices: Vec<usize> = ggml_devices.iter()
+                .copied()
+                .filter(|d| cuda_indices.contains(d))
+                .collect();
+            
+            if available_devices.is_empty() {
+                warn!(
+                    requested = ?ggml_devices,
+                    available = ?cuda_indices,
+                    "No requested CUDA devices found in llama.cpp backend; falling back to n_gpu_layers only"
                 );
+                model_params = model_params.with_n_gpu_layers(999);
+            } else if available_devices.len() < ggml_devices.len() {
+                warn!(
+                    requested = ?ggml_devices,
+                    available = ?available_devices,
+                    "Some requested CUDA devices not found in backend; using available devices"
+                );
+                if !pool.tensor_split.is_empty() {
+                    info!(
+                        devices = ?available_devices,
+                        tensor_split = ?pool.tensor_split,
+                        "tensor-parallel load (VRAM proportions; llama.cpp uses equal split when unset via API)"
+                    );
+                }
+                model_params = model_params
+                    .with_split_mode(LlamaSplitMode::Tensor)
+                    .with_devices(&available_devices)
+                    .context("configure multi-GPU tensor parallel devices")?
+                    .with_n_gpu_layers(999);
+            } else {
+                if !pool.tensor_split.is_empty() {
+                    info!(
+                        devices = ?ggml_devices,
+                        tensor_split = ?pool.tensor_split,
+                        "tensor-parallel load (VRAM proportions; llama.cpp uses equal split when unset via API)"
+                    );
+                }
+                model_params = model_params
+                    .with_split_mode(LlamaSplitMode::Tensor)
+                    .with_devices(&ggml_devices)
+                    .context("configure multi-GPU tensor parallel devices")?
+                    .with_n_gpu_layers(999);
             }
-            model_params = model_params
-                .with_split_mode(LlamaSplitMode::Tensor)
-                .with_devices(&ggml_devices)
-                .context("configure multi-GPU tensor parallel devices")?
-                .with_n_gpu_layers(999);
         }
         PoolStrategy::Single if !ggml_devices.is_empty() => {
-            model_params = model_params
-                .with_devices(std::slice::from_ref(&ggml_devices[0]))
-                .context("configure primary GPU device")?
-                .with_n_gpu_layers(999);
+            let cuda_indices = cuda_ggml_device_indices();
+            if cuda_indices.contains(&ggml_devices[0]) {
+                model_params = model_params
+                    .with_devices(std::slice::from_ref(&ggml_devices[0]))
+                    .context("configure primary GPU device")?
+                    .with_n_gpu_layers(999);
+            } else {
+                warn!(
+                    device = ggml_devices[0],
+                    available_devices = ?cuda_indices,
+                    "Primary CUDA device not found in llama.cpp backend; loading with n_gpu_layers only"
+                );
+                model_params = model_params.with_n_gpu_layers(999);
+            }
         }
         PoolStrategy::Vulkan => {
             model_params = vulkan_full_params()?.with_n_gpu_layers(999);
@@ -602,11 +645,25 @@ fn vulkan_offload_params(layers: u32) -> Result<LlamaModelParams> {
 }
 
 fn cuda_offload_params(device: usize, layers: u32) -> Result<LlamaModelParams> {
-    Ok(LlamaModelParams::default()
-        .with_devices(std::slice::from_ref(&device))
-        .context("configure GPU for CPU-offload fallback")?
+    let cuda_indices = cuda_ggml_device_indices();
+    let mut params = LlamaModelParams::default()
         .with_use_mmap(true)
-        .with_n_gpu_layers(layers))
+        .with_n_gpu_layers(layers);
+    
+    // Only pin the device if it exists in the backend
+    if cuda_indices.contains(&device) {
+        params = params
+            .with_devices(std::slice::from_ref(&device))
+            .context("configure GPU for CPU-offload fallback")?;
+    } else {
+        warn!(
+            device,
+            available_devices = ?cuda_indices,
+            "CUDA device not found in llama.cpp backend; loading with n_gpu_layers only"
+        );
+    }
+    
+    Ok(params)
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -946,11 +1003,25 @@ pub(crate) fn should_attempt_gpu_full(pool: &VirtualCard, weight_gb: Option<f64>
 }
 
 fn single_gpu_full_params(device: usize) -> Result<LlamaModelParams> {
-    Ok(LlamaModelParams::default()
-        .with_devices(std::slice::from_ref(&device))
-        .context("configure primary GPU for single-device full load")?
+    let cuda_indices = cuda_ggml_device_indices();
+    let mut params = LlamaModelParams::default()
         .with_use_mmap(true)
-        .with_n_gpu_layers(999))
+        .with_n_gpu_layers(999);
+    
+    // Only pin the device if it exists in the backend
+    if cuda_indices.contains(&device) {
+        params = params
+            .with_devices(std::slice::from_ref(&device))
+            .context("configure primary GPU for single-device full load")?;
+    } else {
+        warn!(
+            device,
+            available_devices = ?cuda_indices,
+            "CUDA device not found in llama.cpp backend; loading with n_gpu_layers only"
+        );
+    }
+    
+    Ok(params)
 }
 
 /// Ordered load configurations. CUDA and Vulkan share the same ladder.

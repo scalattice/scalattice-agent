@@ -25,8 +25,27 @@ pub fn metal_ggml_device_indices() -> Vec<usize> {
         .collect()
 }
 
+/// Indices suitable for [`LlamaModelParams::with_devices`] on a CUDA pool.
+pub fn cuda_ggml_device_indices() -> Vec<usize> {
+    ggml_devices()
+        .into_iter()
+        .filter(is_cuda_gpu_device)
+        .map(|d| d.index)
+        .collect()
+}
+
 fn is_metal_gpu_device(d: &LlamaBackendDevice) -> bool {
     if !d.backend.eq_ignore_ascii_case("metal") {
+        return false;
+    }
+    matches!(
+        d.device_type,
+        LlamaBackendDeviceType::Gpu | LlamaBackendDeviceType::IntegratedGpu
+    )
+}
+
+fn is_cuda_gpu_device(d: &LlamaBackendDevice) -> bool {
+    if !d.backend.eq_ignore_ascii_case("cuda") {
         return false;
     }
     matches!(
@@ -104,6 +123,42 @@ mod tests {
             },
         ]));
         assert_eq!(vulkan_ggml_device_indices(), vec![1, 2]);
+        set_test_ggml_devices(None);
+    }
+
+    #[test]
+    fn picks_cuda_gpus_skips_vulkan_and_cpu() {
+        set_test_ggml_devices(Some(vec![
+            LlamaBackendDevice {
+                index: 0,
+                name: "CUDA0".into(),
+                description: "NVIDIA RTX 3080".into(),
+                backend: "CUDA".into(),
+                memory_total: 10 << 30,
+                memory_free: 9 << 30,
+                device_type: LlamaBackendDeviceType::Gpu,
+            },
+            LlamaBackendDevice {
+                index: 1,
+                name: "CUDA1".into(),
+                description: "NVIDIA RTX 3090".into(),
+                backend: "CUDA".into(),
+                memory_total: 24 << 30,
+                memory_free: 23 << 30,
+                device_type: LlamaBackendDeviceType::Gpu,
+            },
+            vulkan_dev(2, "Vulkan0", false),
+            LlamaBackendDevice {
+                index: 3,
+                name: "CPU".into(),
+                description: "CPU".into(),
+                backend: "CPU".into(),
+                memory_total: 0,
+                memory_free: 0,
+                device_type: LlamaBackendDeviceType::Cpu,
+            },
+        ]));
+        assert_eq!(cuda_ggml_device_indices(), vec![0, 1]);
         set_test_ggml_devices(None);
     }
 }
