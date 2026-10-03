@@ -495,6 +495,43 @@ fn copy_lib_tree(from: &Path, to: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn create_lib_symlinks(lib_dir: &Path) -> Result<()> {
+    let symlinks = [
+        ("libggml-base.so", "libggml.so"),
+        ("libggml-base.so.0", "libggml.so.0"),
+        ("libllama-common.so", "libllama.so"),
+        ("libllama-common.so.0", "libllama.so.0"),
+    ];
+
+    for (target, link_name) in &symlinks {
+        let target_path = lib_dir.join(target);
+        let link_path = lib_dir.join(link_name);
+        
+        if target_path.exists() && !link_path.exists() {
+            std::os::unix::fs::symlink(target, &link_path)
+                .with_context(|| format!("create symlink {} -> {}", link_name, target))?;
+            println!("Created symlink: {} -> {}", link_name, target);
+        }
+    }
+
+    let backends_dir = lib_dir.join("backends");
+    if backends_dir.is_dir() {
+        for (target, link_name) in &symlinks {
+            let target_path = backends_dir.join(target);
+            let link_path = backends_dir.join(link_name);
+            
+            if target_path.exists() && !link_path.exists() {
+                std::os::unix::fs::symlink(target, &link_path)
+                    .with_context(|| format!("create backends symlink {} -> {}", link_name, target))?;
+                println!("Created backends symlink: {} -> {}", link_name, target);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn resolve_tar_binary() -> Option<PathBuf> {
     const CANDIDATES: &[&str] = &["/usr/bin/tar", "/bin/tar", "/usr/local/bin/tar"];
     for path in CANDIDATES {
@@ -564,6 +601,7 @@ fn apply_update(staging: &Path) -> Result<()> {
         let dest_lib = lib_dir().context("resolve library directory")?;
         fs::create_dir_all(&dest_lib).context("create library directory")?;
         copy_lib_tree(&source_lib, &dest_lib).context("replace bundled libraries")?;
+        create_lib_symlinks(&dest_lib).context("create library symlinks")?;
     }
 
     if self_replace {
