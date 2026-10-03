@@ -313,6 +313,46 @@ pub fn remove_path_quiet(path: &Path) {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn ensure_lib_symlinks() -> Result<()> {
+    let lib = lib_dir()?;
+    if !lib.is_dir() {
+        return Ok(());
+    }
+
+    let symlinks = [
+        ("libggml-base.so", "libggml.so"),
+        ("libggml-base.so.0", "libggml.so.0"),
+        ("libllama-common.so", "libllama.so"),
+        ("libllama-common.so.0", "libllama.so.0"),
+    ];
+
+    for (target, link_name) in &symlinks {
+        let target_path = lib.join(target);
+        let link_path = lib.join(link_name);
+        
+        if target_path.exists() && !link_path.exists() {
+            std::os::unix::fs::symlink(target, &link_path)
+                .context(format!("create symlink {} -> {}", link_name, target))?;
+        }
+    }
+
+    let backends_dir = lib.join("backends");
+    if backends_dir.is_dir() {
+        for (target, link_name) in &symlinks {
+            let target_path = backends_dir.join(target);
+            let link_path = backends_dir.join(link_name);
+            
+            if target_path.exists() && !link_path.exists() {
+                std::os::unix::fs::symlink(target, &link_path)
+                    .context(format!("create backends symlink {} -> {}", link_name, target))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;

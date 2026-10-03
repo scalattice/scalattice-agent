@@ -120,6 +120,12 @@ fn main() -> Result<()> {
     refuse_intel_mac()?;
     #[cfg(windows)]
     paths::init_windows_native_search_path();
+    #[cfg(target_os = "linux")]
+    {
+        // Ensure library symlinks exist for backward compatibility
+        // (libggml.so -> libggml-base.so, libllama.so -> libllama-common.so)
+        let _ = paths::ensure_lib_symlinks();
+    }
     init_crypto()?;
 
     let cli = Cli::parse();
