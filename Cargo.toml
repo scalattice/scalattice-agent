@@ -3,7 +3,7 @@ name = "scalattice-agent"
 # Owned by Git tags / release CI. Do not invent versions by hand.
 # Align to the latest published tip: ./scripts/align-cargo-version.sh
 # Next release bump: scripts/ci-prepare-release.sh (production merge).
-version = "1.1.132"
+version = "1.1.134"
 edition = "2021"
 description = "Open-source GPU machine agent for the Scalattice inference network"
 license = "MIT"
