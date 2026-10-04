@@ -324,6 +324,7 @@ pub struct InvokeMessage {
     #[serde(default, rename = "inputImages", deserialize_with = "null_as_empty_vec")]
     pub input_images: Vec<ChatImage>,
     /// Admin/debug may pin a compute slot. Empty = agent picks.
+    /// Router-required slot id. When set the agent claims this slot only (no remap).
     #[serde(default, rename = "preferredSlotId")]
     pub preferred_slot_id: String,
 }

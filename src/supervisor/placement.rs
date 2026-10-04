@@ -70,6 +70,50 @@ fn pick_image_placement(
     })
 }
 
+/// Build a placement that runs **exactly** on the server-chosen slot.
+/// No GPU↔CPU remapping. Tensor-parallel groups expand to all siblings when the
+/// pin is any member of the group (all must be idle — caller checks workers).
+pub fn placement_for_required_slot(
+    plan: &ComputePlan,
+    slot_id: &str,
+    devices: &[crate::specs::ComputeDevice],
+) -> Option<Placement> {
+    let want = slot_id.trim();
+    if want.is_empty() {
+        return None;
+    }
+    let slot = plan.slots.iter().find(|s| s.id == want)?;
+    if let Some(group_id) = slot.tp_group.as_deref().filter(|g| !g.is_empty()) {
+        let siblings: Vec<&ComputeSlot> = plan
+            .slots
+            .iter()
+            .filter(|s| s.tp_group.as_deref() == Some(group_id))
+            .collect();
+        if siblings.len() > 1 {
+            let phys_ids: Vec<u32> = siblings
+                .iter()
+                .flat_map(|s| s.cuda_visible.iter().copied())
+                .collect();
+            if let Ok(tp_card) = crate::compute_pool::build_tp_card_for_group(devices, &phys_ids) {
+                if tp_card.strategy == PoolStrategy::TensorParallel {
+                    return Some(Placement {
+                        slot_ids: siblings.iter().map(|s| s.id.clone()).collect(),
+                        card: tp_card,
+                        cuda_visible: phys_ids,
+                        use_tp_worker: true,
+                    });
+                }
+            }
+        }
+    }
+    Some(Placement {
+        slot_ids: vec![slot.id.clone()],
+        card: slot.card.clone(),
+        cuda_visible: slot.cuda_visible.clone(),
+        use_tp_worker: false,
+    })
+}
+
 /// Prefer the smallest idle accelerator that can **fully** host the model
 /// (weights + KV headroom). If none are free, place on the largest idle
 /// accelerator that can still hold the weights (KV may live in RAM), or
@@ -78,6 +122,9 @@ fn pick_image_placement(
 /// When no accelerator can host, place on the CPU slot if system RAM covers
 /// weights + KV + headroom. Image jobs never use the CPU. A busy accelerator
 /// that could host the model is not replaced by the CPU.
+///
+/// Legacy only: production invokes should pin `preferredSlotId` from the router
+/// and use [`placement_for_required_slot`] instead.
 #[cfg(test)]
 pub fn pick_placement(
     plan: &ComputePlan,
@@ -99,6 +146,7 @@ pub fn pick_placement(
         crate::specs::cpu_logical_cores(),
         ram_gb.saturating_sub(crate::specs::detect_ram_used_gb().unwrap_or(0)),
         &std::collections::HashSet::new(),
+        false,
     )
 }
 
@@ -115,6 +163,8 @@ pub fn pick_placement_with_cpu(
     // Idle slots holding our warm weights. Live free looks low, but
     // model_cache will evict them before the cold load.
     reclaimable_slot_ids: &std::collections::HashSet<String>,
+    /// Admin/debug `preferredSlotId` pinned a CPU slot — honor it even for GPU-class models.
+    force_cpu_pin: bool,
 ) -> Option<Placement> {
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
@@ -245,11 +295,11 @@ pub fn pick_placement_with_cpu(
         {
             // GPU-catalog models on a box that has any accelerator must not silently
             // crawl on cpu-0 (fleet: DESKTOP-SJVL4OL 27B/35B on cpu → invoke_timeout).
-            // Admin/debug can still pin cpu-* via preferredSlotId (idle list already filtered).
+            // preferredSlotId=cpu-* sets force_cpu_pin so admin/debug can still target CPU.
             let machine_has_accel = plan.slots.iter().any(|s| s.kind != "cpu");
             let weight_gb = model.weight_size_gb.unwrap_or(0.0);
             let model_expects_gpu = hosting_min_vram_gb(model) > 0 || weight_gb > 2.0;
-            if machine_has_accel && model_expects_gpu {
+            if machine_has_accel && model_expects_gpu && !force_cpu_pin {
                 debug!(
                     slot = %slot.id,
                     "placement: skip cpu; GPU-class model on a machine with accelerators"
@@ -271,12 +321,12 @@ pub fn pick_placement_with_cpu(
             });
             let cpu_ram_need =
                 placement_sys_ram_need_gb(model, &slot.card, need_vision, cpu_ram_headroom_gb);
-            if idle_accel_nameplate_hosts {
+            if !force_cpu_pin && idle_accel_nameplate_hosts {
                 debug!(
                     slot = %slot.id,
                     "placement: skip cpu; idle accelerator nameplate-hosts but live free is too small"
                 );
-            } else if busy_accel_could_host {
+            } else if !force_cpu_pin && busy_accel_could_host {
                 debug!(slot = %slot.id, "placement: skip cpu; an accelerator can host this model");
             } else if !cpu_slot_may_serve(model, ram_gb, cpu_ram_headroom_gb, cpu_logical_cores)
             {
@@ -293,7 +343,7 @@ pub fn pick_placement_with_cpu(
                     "placement: skip cpu; system RAM already reserved by sibling slots"
                 );
             } else {
-                debug!(slot = %slot.id, "placement: cpu slot");
+                debug!(slot = %slot.id, force_cpu_pin, "placement: cpu slot");
                 return Some(Placement {
                     slot_ids: vec![slot.id.clone()],
                     card: slot.card.clone(),
@@ -774,7 +824,40 @@ mod tests {
     }
 
     #[test]
-    fn dual_2gb_places_eight_b_on_cpu_when_ram_covers_it() {
+    fn preferred_cpu_pin_places_gpu_class_model_on_cpu() {
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle = vec!["cpu-0".to_string()];
+        let placement = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(4.0, 4.68),
+            32,
+            2,
+            &devices,
+            false,
+            16,
+            32,
+            &HashSet::new(),
+            true,
+        )
+        .expect("preferredSlotId=cpu-0 must honor the pin");
+        assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
+    }
+
+    #[test]
+    fn required_slot_placement_is_literal() {
+        let devices = mixed_1660_3080();
+        let plan = build_compute_slots(&devices).unwrap();
+        let on_cpu = placement_for_required_slot(&plan, "cpu-0", &devices).unwrap();
+        assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
+        let on_gpu = placement_for_required_slot(&plan, "cuda-0", &devices).unwrap();
+        assert_eq!(on_gpu.slot_ids, vec!["cuda-0".to_string()]);
+        assert!(placement_for_required_slot(&plan, "cuda-99", &devices).is_none());
+    }
+
+    #[test]
+    fn dual_2gb_refuses_auto_cpu_for_gpu_class_eight_b() {
         let devices = [
             ComputeDevice {
                 id: "nvidia:0".into(),
@@ -806,9 +889,27 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        let placement = pick_placement_with_cpu(
+        // Auto path: do not silently crawl GPU-class models on cpu-0.
+        assert!(
+            pick_placement_with_cpu(
+                &plan,
+                &idle,
+                &model(12.1, 5.0),
+                16,
+                2,
+                &devices,
+                false,
+                16,
+                16,
+                &HashSet::new(),
+                false,
+            )
+            .is_none()
+        );
+        // Explicit preferredSlotId=cpu-* still places when RAM covers it.
+        let pinned = pick_placement_with_cpu(
             &plan,
-            &idle,
+            &["cpu-0".to_string()],
             &model(12.1, 5.0),
             16,
             2,
@@ -817,12 +918,25 @@ mod tests {
             16,
             16,
             &HashSet::new(),
+            true,
         )
         .unwrap();
-        assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
+        assert_eq!(pinned.slot_ids, vec!["cpu-0".to_string()]);
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(12.1, 5.0), 6, 2, &devices, false, 16, 6, &HashSet::new())
-                .is_none(),
+            pick_placement_with_cpu(
+                &plan,
+                &["cpu-0".to_string()],
+                &model(12.1, 5.0),
+                6,
+                2,
+                &devices,
+                false,
+                16,
+                6,
+                &HashSet::new(),
+                true,
+            )
+            .is_none(),
             "6 GB RAM must not start an 8B beside a 2 GB card"
         );
     }
@@ -850,7 +964,7 @@ mod tests {
             false,
             16,
             32,
-            &HashSet::new(),
+            &HashSet::new(), false,
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
@@ -909,14 +1023,27 @@ mod tests {
         ];
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
-        // Consumer cores: do not crawl 30B on CPU just because RAM fits.
+        // Auto path never parks 30B on cpu-0 while a GPU exists.
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 31, 2, &devices, false, 8, 31, &HashSet::new())
-                .is_none()
+            pick_placement_with_cpu(
+                &plan,
+                &idle,
+                &model(22.5, 19.0),
+                31,
+                2,
+                &devices,
+                false,
+                32,
+                31,
+                &HashSet::new(),
+                false,
+            )
+            .is_none()
         );
+        // preferredSlotId=cpu-* + capable CPU cores may still place.
         let on_cpu = pick_placement_with_cpu(
             &plan,
-            &idle,
+            &["cpu-0".to_string()],
             &model(22.5, 19.0),
             31,
             2,
@@ -925,13 +1052,43 @@ mod tests {
             32,
             31,
             &HashSet::new(),
+            true,
         )
         .unwrap();
         assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(22.5, 19.0), 20, 2, &devices, false, 32, 20, &HashSet::new())
-                .is_none(),
+            pick_placement_with_cpu(
+                &plan,
+                &["cpu-0".to_string()],
+                &model(22.5, 19.0),
+                20,
+                2,
+                &devices,
+                false,
+                32,
+                20,
+                &HashSet::new(),
+                true,
+            )
+            .is_none(),
             "20 GB RAM must not start a 19 GB coder"
+        );
+        assert!(
+            pick_placement_with_cpu(
+                &plan,
+                &["cpu-0".to_string()],
+                &model(22.5, 19.0),
+                31,
+                2,
+                &devices,
+                false,
+                8,
+                31,
+                &HashSet::new(),
+                true,
+            )
+            .is_none(),
+            "consumer cores: do not crawl 30B on CPU just because RAM fits"
         );
     }
 
@@ -969,7 +1126,7 @@ mod tests {
             false,
             16,
             16,
-            &HashSet::new(),
+            &HashSet::new(), false,
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
@@ -983,7 +1140,7 @@ mod tests {
             false,
             16,
             16,
-            &HashSet::new(),
+            &HashSet::new(), false,
         )
         .unwrap();
         assert_eq!(
@@ -992,12 +1149,12 @@ mod tests {
             "4 GB card must not layer-offload a 14B; capable CPU+RAM can still run it"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8, &HashSet::new())
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8, &HashSet::new(), false)
                 .is_none(),
             "8 GB RAM must not start a 14B"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16, &HashSet::new())
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16, &HashSet::new(), false)
                 .is_none(),
             "weak CPU must not claim a 14B even with RAM"
         );
@@ -1090,6 +1247,7 @@ mod tests {
             16,
             15,
             &reclaimable,
+            false,
         );
         assert!(
             placement.is_some(),

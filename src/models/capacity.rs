@@ -108,6 +108,20 @@ pub fn kv_offload_ram_gb(model: &CatalogModel, need_vision: bool) -> u32 {
     gb_ceil(Some(job_kv_gb(model, need_vision))).max(1)
 }
 
+/// Pre-claim sys-RAM reserve when weights are already resident and KV is offloaded.
+///
+/// Full-window catalog KV (often 5–6 GiB at 32k) exceeds post-warm free RAM on
+/// typical 16 GB laptops forever (fleet: Laptop / scalattice ornith — need 6 /
+/// have 3–4). Cap the reserve so warm slots keep serving; a true llama OOM still
+/// fails the invoke.
+pub const WARM_KV_OFFLOAD_RAM_CAP_GB: u32 = 3;
+
+pub fn warm_kv_offload_ram_need_gb(model: &CatalogModel, need_vision: bool) -> u32 {
+    kv_offload_ram_gb(model, need_vision)
+        .min(WARM_KV_OFFLOAD_RAM_CAP_GB)
+        .max(1)
+}
+
 fn kv_ram_need_gb(model: &CatalogModel, need_vision: bool, cpu_ram_headroom_gb: u32) -> u32 {
     let kv = job_kv_gb(model, need_vision);
     let min_ram = gb_ceil(model.min_ram_gb);
@@ -588,6 +602,17 @@ mod tests {
         assert!(vram_can_gpu_full(10.0, &qwen, 4, false));
         let eight_gb_ok = catalog(8.0, 5.0, 8.0);
         assert!(vram_can_gpu_full(8.0, &eight_gb_ok, 8, false));
+    }
+
+    #[test]
+    fn warm_kv_offload_reserve_caps_full_window_catalog() {
+        let mut m = catalog(4.0, 5.5, 8.0);
+        m.max_context_tokens = 32768;
+        m.kv_cache_gb = Some(5.0);
+        assert_eq!(kv_offload_ram_gb(&m, false), 5);
+        assert_eq!(warm_kv_offload_ram_need_gb(&m, false), WARM_KV_OFFLOAD_RAM_CAP_GB);
+        m.kv_cache_gb = Some(1.2);
+        assert_eq!(warm_kv_offload_ram_need_gb(&m, false), 2);
     }
 
     #[test]
