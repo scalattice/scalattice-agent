@@ -163,7 +163,7 @@ pub fn pick_placement_with_cpu(
     // Idle slots holding our warm weights. Live free looks low, but
     // model_cache will evict them before the cold load.
     reclaimable_slot_ids: &std::collections::HashSet<String>,
-    /// Admin/debug `preferredSlotId` pinned a CPU slot — honor it even for GPU-class models.
+    // When true, preferredSlotId pinned a CPU slot — honor it even for GPU-class models.
     force_cpu_pin: bool,
 ) -> Option<Placement> {
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
