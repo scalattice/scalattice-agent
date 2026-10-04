@@ -1,6 +1,7 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use super::placement::{
-    accelerator_live_can_place, pick_placement_with_cpu, pick_resident_placement,
+    accelerator_live_can_place, placement_for_required_slot, pick_placement_with_cpu,
+    pick_resident_placement,
     placement_miss_detail,
     Placement,
 };
@@ -441,6 +442,7 @@ impl Supervisor {
             crate::specs::cpu_logical_cores(),
             sys_avail,
             &reclaimable,
+            false,
         )
         .is_some()
         {
@@ -604,6 +606,16 @@ impl Supervisor {
         let reserve = crate::specs::system_ram_reserve_gb(self.ram_gb);
         let avail = (ram - used).max(0.0);
         avail + 0.05 >= incoming_weight_gb + reserve
+    }
+
+    async fn any_slot_has_runtime(&self, runtime_model: &str, model_id: &str) -> bool {
+        let workers = self.workers.lock().await;
+        workers.values().any(|w| {
+            w.loaded_models.iter().any(|m| {
+                (!runtime_model.is_empty() && m.eq_ignore_ascii_case(runtime_model))
+                    || (!model_id.is_empty() && m.eq_ignore_ascii_case(model_id))
+            })
+        })
     }
 
     /// True when a slot is checked out for real work.
@@ -1184,7 +1196,12 @@ impl Supervisor {
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         let cancel = self.register_job_cancel(job_id).await;
         let incoming_gb = warm_model_weight_mb(runtime_model) as f64 / 1024.0;
-        let _mmap = if self.ram_has_room_for_mmap(incoming_gb) {
+        // Warm weights are already faulted in — do not block on a cold-mmap budget
+        // (laptop ornith logged "waiting for mmap gate" on every warm invoke).
+        let already_warm = self
+            .any_slot_has_runtime(runtime_model, model_id)
+            .await;
+        let _mmap = if already_warm || self.ram_has_room_for_mmap(incoming_gb) {
             None
         } else {
             info!(
@@ -1225,19 +1242,80 @@ impl Supervisor {
 
         let mut skip: HashSet<String> = HashSet::new();
         let mut last_crash: Option<anyhow::Error> = None;
-        let accel_slots = self
-            .plan
-            .slots
-            .iter()
-            .filter(|s| s.kind != "cpu")
-            .count()
-            .max(1)
-            .min(4);
+        let required_slot = preferred_slot_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_string());
+        if let Some(ref want) = required_slot {
+            if !self.plan.slots.iter().any(|s| s.id == *want) {
+                self.clear_job_cancel(job_id).await;
+                return Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                    format!("preferred slot {want} is not on this machine"),
+                ));
+            }
+        }
+        // Server-pinned slot: one attempt, no GPU↔CPU remapping / crash failover.
+        let accel_slots = if required_slot.is_some() {
+            1
+        } else {
+            self.plan
+                .slots
+                .iter()
+                .filter(|s| s.kind != "cpu")
+                .count()
+                .max(1)
+                .min(4)
+        };
 
         for attempt in 0..accel_slots {
             let blocked = self.blocked_slot_ids(model_id).await;
             let placement = {
                 let occupied = self.occupied_slot_ids().await;
+
+                // Router chose the slot — claim exactly that (or its TP group). Refuse if busy.
+                if let Some(ref want) = required_slot {
+                    let Some(placement) =
+                        placement_for_required_slot(&self.plan, want, &self.devices)
+                    else {
+                        self.clear_job_cancel(job_id).await;
+                        return Err(crate::invoke_code::coded(
+                            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                            format!("preferred slot {want} is not on this machine"),
+                        ));
+                    };
+                    let mut workers = self.workers.lock().await;
+                    for sid in &placement.slot_ids {
+                        if blocked.contains(sid) || occupied.contains(sid) {
+                            self.clear_job_cancel(job_id).await;
+                            return Err(crate::invoke_code::coded(
+                                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                                format!("preferred slot {sid} is not idle or not healthy"),
+                            ));
+                        }
+                        let worker = match workers.get_mut(sid) {
+                            Some(w) => w,
+                            None => {
+                                self.clear_job_cancel(job_id).await;
+                                return Err(anyhow!("slot worker {sid} missing"));
+                            }
+                        };
+                        if worker.busy || !worker.healthy {
+                            self.clear_job_cancel(job_id).await;
+                            return Err(crate::invoke_code::coded(
+                                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                                format!("preferred slot {sid} is not idle or not healthy"),
+                            ));
+                        }
+                        worker.busy = true;
+                    }
+                    info!(
+                        slot = %want,
+                        slots = ?placement.slot_ids,
+                        "claimed server-required compute slot"
+                    );
+                    placement
+                } else {
                 let inflight_gpu = match self.checkouts.try_lock() {
                     Ok(guard) => guard
                         .keys()
@@ -1329,19 +1407,7 @@ impl Supervisor {
                         cpu_ram_headroom_gb,
                         cpu_cores,
                     );
-                let preferred = preferred_slot_id
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(|id| id.to_string());
-                if let Some(ref want) = preferred {
-                    if !self.plan.slots.iter().any(|s| s.id == *want) {
-                        self.clear_job_cancel(job_id).await;
-                        return Err(crate::invoke_code::coded(
-                            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
-                            format!("preferred slot {want} is not on this machine"),
-                        ));
-                    }
-                }
+                let need_vision = crate::protocol::messages_have_images(messages);
                 let idle: Vec<String> = self
                     .plan
                     .slots
@@ -1349,13 +1415,9 @@ impl Supervisor {
                     .filter(|s| !skip.contains(&s.id))
                     .filter(|s| !blocked.contains(&s.id))
                     .filter(|s| !occupied.contains(&s.id))
-                    .filter(|s| preferred.as_ref().map(|want| s.id == *want).unwrap_or(true))
                     .filter(|s| {
-                        // Auto path: CPU only when no accelerator nameplate-hosts
-                        // (incl. idle-but-tight-VRAM) and the CPU capability gate passes.
-                        // preferredSlotId may still pin cpu-0 for admin/debug.
+                        // Legacy auto path: CPU only when no accelerator can host.
                         s.kind != "cpu"
-                            || preferred.as_ref().map(|want| s.id == *want).unwrap_or(false)
                             || (!idle_gpu_can_place
                                 && !idle_gpu_nameplate_hosts
                                 && !busy_gpu_could_host
@@ -1369,17 +1431,6 @@ impl Supervisor {
                     })
                     .map(|s| s.id.clone())
                     .collect();
-                if preferred.is_some() && idle.is_empty() {
-                    self.clear_job_cancel(job_id).await;
-                    return Err(crate::invoke_code::coded(
-                        crate::invoke_code::InvokeErrorCode::NoIdleSlot,
-                        format!(
-                            "preferred slot {} is not idle or not healthy",
-                            preferred.as_deref().unwrap_or("")
-                        ),
-                    ));
-                }
-                let need_vision = crate::protocol::messages_have_images(messages);
                 let resident: Vec<String> = idle
                     .iter()
                     .filter(|id| {
@@ -1425,6 +1476,7 @@ impl Supervisor {
                         crate::specs::cpu_logical_cores(),
                         sys_avail,
                         &reclaimable,
+                        false,
                     )
                 }) {
                     Some(p) => p,
@@ -1470,6 +1522,7 @@ impl Supervisor {
                     worker.busy = true;
                 }
                 placement
+                }
             };
             self.changed.notify_waiters();
 
@@ -1507,7 +1560,8 @@ impl Supervisor {
                     return Ok(ok);
                 }
                 Err(err)
-                    if worker_crash_retryable(&err)
+                    if required_slot.is_none()
+                        && worker_crash_retryable(&err)
                         && !sent_token.load(Ordering::Relaxed)
                         && attempt + 1 < accel_slots =>
                 {
@@ -1552,14 +1606,54 @@ impl Supervisor {
         ram_gb: u32,
         cpu_ram_headroom_gb: u32,
         mut on_delta: Option<Box<dyn FnMut(String) + Send>>,
+        preferred_slot_id: Option<&str>,
     ) -> Result<(Vec<GeneratedImage>, InvokeTimings, String)> {
         // Before claiming a GPU / killing llama.cpp: image jobs cannot run on a full disk.
         crate::image::refuse_if_disk_full()?;
         let cancel = self.register_job_cancel(job_id).await;
         let started = Instant::now();
         let blocked = self.blocked_slot_ids(&model.model_id).await;
+        let required_slot = preferred_slot_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_string());
         let placement = {
             let occupied = self.occupied_slot_ids().await;
+            if let Some(ref want) = required_slot {
+                let Some(placement) =
+                    placement_for_required_slot(&self.plan, want, &self.devices)
+                else {
+                    self.clear_job_cancel(job_id).await;
+                    return Err(crate::invoke_code::coded(
+                        crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                        format!("preferred slot {want} is not on this machine"),
+                    ));
+                };
+                let mut workers = self.workers.lock().await;
+                for sid in &placement.slot_ids {
+                    if blocked.contains(sid) || occupied.contains(sid) {
+                        self.clear_job_cancel(job_id).await;
+                        return Err(crate::invoke_code::coded(
+                            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                            format!("preferred slot {sid} is not idle or not healthy"),
+                        ));
+                    }
+                    let Some(worker) = workers.get_mut(sid) else {
+                        self.clear_job_cancel(job_id).await;
+                        return Err(anyhow!("slot worker {sid} missing"));
+                    };
+                    if worker.busy || !worker.healthy {
+                        self.clear_job_cancel(job_id).await;
+                        return Err(crate::invoke_code::coded(
+                            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                            format!("preferred slot {sid} is not idle or not healthy"),
+                        ));
+                    }
+                    worker.busy = true;
+                }
+                info!(slot = %want, "claimed server-required image slot");
+                placement
+            } else {
             let workers = self.workers.lock().await;
             let idle: Vec<String> = self
                 .plan
@@ -1590,6 +1684,7 @@ impl Supervisor {
                 crate::specs::cpu_logical_cores(),
                 sys_avail,
                 &reclaimable,
+                false,
             ) {
                 Some(p) => p,
                 None => {
@@ -1614,6 +1709,7 @@ impl Supervisor {
                 worker.busy = true;
             }
             placement
+            }
         };
         self.changed.notify_waiters();
 
@@ -1746,12 +1842,12 @@ impl Supervisor {
         // Warm residents already count against OS "used". Requiring the full
         // weight-spill budget again double-counts and falsely refuses (laptop
         // ornith warm → need 11 GB free while weights already resident).
+        // Offload KV: use the warm-capped reserve (not catalog full-window + 1).
         let ram_need = if already_loaded {
             if offload_kqv {
                 0
             } else {
-                crate::models::kv_offload_ram_gb(model, need_vision)
-                    .saturating_add(1)
+                crate::models::warm_kv_offload_ram_need_gb(model, need_vision)
             }
         } else {
             crate::models::placement_sys_ram_need_gb(

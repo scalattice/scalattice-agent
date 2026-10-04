@@ -11,7 +11,7 @@ pub use capacity::{
     can_host_model, can_serve_vision_on_card, cpu_slot_may_serve, gpu_full_host_need_gb_for_job,
     hosting_min_vram_gb, image_job_min_vram_gb, kv_offload_ram_gb, llama_context_plan,
     occupancy_min_vram_gb, placement_sys_ram_need_gb, vram_can_gpu_full,
-    DEFAULT_CPU_RAM_HEADROOM_GB,
+    warm_kv_offload_ram_need_gb, DEFAULT_CPU_RAM_HEADROOM_GB, WARM_KV_OFFLOAD_RAM_CAP_GB,
 };
 pub use download::is_no_space_error;
 pub use gguf_arch::gguf_shape;
