@@ -601,9 +601,19 @@ impl Supervisor {
         incoming_weight_gb: f64,
     ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         if self.ram_has_room_for_mmap(incoming_weight_gb) {
-            None
-        } else {
-            Some(self.mmap_gate.lock().await)
+            return None;
+        }
+        // Bound wait so a long Warm holding the gate cannot stall the supervisor
+        // forever; preload skips this round and the next tick retries.
+        match tokio::time::timeout(Duration::from_secs(45), self.mmap_gate.lock()).await {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                warn!(
+                    need_gb = format!("{incoming_weight_gb:.1}"),
+                    "timed out waiting for mmap gate; skipping preload this pass"
+                );
+                None
+            }
         }
     }
 
@@ -1050,15 +1060,29 @@ impl Supervisor {
     }
 
     pub async fn evict_all(&self) {
-        let mut workers = self.workers.lock().await;
-        for (id, worker) in workers.iter_mut() {
+        // Never hold `workers` across RPC: Evict can take up to 120s per slot, and
+        // a 3-slot laptop wedged fleet probes for ~6 minutes before place (no
+        // "placing job" log — any_slot_has_runtime starved on this mutex).
+        let slot_ids: Vec<String> = {
+            let workers = self.workers.lock().await;
+            workers.keys().cloned().collect()
+        };
+        for slot_id in slot_ids {
+            let mut worker = {
+                let mut workers = self.workers.lock().await;
+                match workers.remove(&slot_id) {
+                    Some(w) => w,
+                    None => continue,
+                }
+            };
             let req_id = next_req_id();
-            if let Err(err) = worker_rpc(worker, WorkerRequest::Evict { id: req_id }).await {
-                warn!(slot = %id, error = %err, "evict failed");
+            if let Err(err) = worker_rpc(&mut worker, WorkerRequest::Evict { id: req_id }).await {
+                warn!(slot = %slot_id, error = %err, "evict failed");
             }
             worker.loaded_models.clear();
+            worker.busy = false;
+            self.return_worker(slot_id, worker).await;
         }
-        drop(workers);
         self.note_our_vram_activity().await;
     }
 
@@ -1233,12 +1257,31 @@ impl Supervisor {
         preferred_slot_id: Option<&str>,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         let cancel = self.register_job_cancel(job_id).await;
-        let incoming_gb = warm_model_weight_mb(runtime_model) as f64 / 1024.0;
+        // Resolve weight size / warm residency off the hot path's blocking work with
+        // a hard ceiling so a wedged workers mutex or slow FS cannot eat the whole
+        // fleet poll window (Laptop: invoke logged, never reached "placing").
+        let prep = async {
+            let incoming_gb = warm_model_weight_mb(runtime_model) as f64 / 1024.0;
+            let already_warm = self.any_slot_has_runtime(runtime_model, model_id).await;
+            (incoming_gb, already_warm)
+        };
+        let (incoming_gb, already_warm) = tokio::select! {
+            biased;
+            _ = cancel.notified() => {
+                self.clear_job_cancel(job_id).await;
+                bail!("request_canceled");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(20)) => {
+                self.clear_job_cancel(job_id).await;
+                return Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::AgentBusy,
+                    "timed out preparing placement (compute slots busy)".to_string(),
+                ));
+            }
+            ready = prep => ready,
+        };
         // Warm weights are already faulted in — do not block on a cold-mmap budget
         // (laptop ornith logged "waiting for mmap gate" on every warm invoke).
-        let already_warm = self
-            .any_slot_has_runtime(runtime_model, model_id)
-            .await;
         let _mmap = if already_warm || self.ram_has_room_for_mmap(incoming_gb) {
             None
         } else {
