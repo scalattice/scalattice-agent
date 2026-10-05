@@ -431,6 +431,7 @@ impl Supervisor {
             return Ok(());
         }
         let sys_avail = self.available_sys_ram_gb().await;
+        let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
         if pick_placement_with_cpu(
             &self.plan,
             &idle,
@@ -442,13 +443,24 @@ impl Supervisor {
             crate::specs::cpu_logical_cores(),
             sys_avail,
             &reclaimable,
+            &reclaim_ram,
             false,
         )
         .is_some()
         {
             return Ok(());
         }
-        Err(placement_miss_detail(&self.plan, &idle, model, false, &reclaimable).into())
+        Err(placement_miss_detail(
+            &self.plan,
+            &idle,
+            model,
+            false,
+            &reclaimable,
+            sys_avail,
+            &reclaim_ram,
+            cpu_ram_headroom_gb,
+        )
+        .into())
     }
 
     /// `None` is an old server and must not wipe blocks learned earlier.
@@ -922,6 +934,32 @@ impl Supervisor {
             })
             .cloned()
             .collect()
+    }
+
+    /// System RAM (GB) that eviction of each reclaimable warm resident will free.
+    async fn reclaimable_warm_sys_ram_gb(
+        &self,
+        reclaimable: &HashSet<String>,
+    ) -> HashMap<String, u32> {
+        let workers = self.workers.lock().await;
+        let mut out = HashMap::new();
+        for id in reclaimable {
+            let Some(worker) = workers.get(id) else {
+                continue;
+            };
+            let mut credit = 0u32;
+            for model in &worker.loaded_models {
+                let mb = warm_model_weight_mb(model);
+                if mb == 0 || mb >= u64::MAX / 4 {
+                    continue;
+                }
+                credit = credit.saturating_add(((mb + 1023) / 1024) as u32);
+            }
+            if credit > 0 {
+                out.insert(id.clone(), credit);
+            }
+        }
+        out
     }
 
     /// Every placeable GPU is taken by leftover / foreign VRAM — not our job.
@@ -1454,6 +1492,7 @@ impl Supervisor {
                     .collect();
                 drop(workers);
                 let sys_avail = self.available_sys_ram_gb().await;
+                let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
                 let mut workers = self.workers.lock().await;
                 let placement = match pick_resident_placement(
                     &self.plan,
@@ -1476,6 +1515,7 @@ impl Supervisor {
                         crate::specs::cpu_logical_cores(),
                         sys_avail,
                         &reclaimable,
+                        &reclaim_ram,
                         false,
                     )
                 }) {
@@ -1491,6 +1531,9 @@ impl Supervisor {
                             model,
                             need_vision,
                             &reclaimable,
+                            sys_avail,
+                            &reclaim_ram,
+                            cpu_ram_headroom_gb,
                         );
                         return Err(detail.into());
                     }
@@ -1672,6 +1715,7 @@ impl Supervisor {
             drop(workers);
             let sys_avail = self.available_sys_ram_gb().await;
             let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
+            let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
             let mut workers = self.workers.lock().await;
             let placement = match pick_placement_with_cpu(
                 &self.plan,
@@ -1684,13 +1728,22 @@ impl Supervisor {
                 crate::specs::cpu_logical_cores(),
                 sys_avail,
                 &reclaimable,
+                &reclaim_ram,
                 false,
             ) {
                 Some(p) => p,
                 None => {
                     self.clear_job_cancel(job_id).await;
-                    let detail =
-                        placement_miss_detail(&self.plan, &idle, model, false, &reclaimable);
+                    let detail = placement_miss_detail(
+                        &self.plan,
+                        &idle,
+                        model,
+                        false,
+                        &reclaimable,
+                        sys_avail,
+                        &reclaim_ram,
+                        cpu_ram_headroom_gb,
+                    );
                     return Err(detail.into());
                 }
             };
