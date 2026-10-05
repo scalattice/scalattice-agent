@@ -146,6 +146,7 @@ pub fn pick_placement(
         crate::specs::cpu_logical_cores(),
         ram_gb.saturating_sub(crate::specs::detect_ram_used_gb().unwrap_or(0)),
         &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
         false,
     )
 }
@@ -163,6 +164,8 @@ pub fn pick_placement_with_cpu(
     // Idle slots holding our warm weights. Live free looks low, but
     // model_cache will evict them before the cold load.
     reclaimable_slot_ids: &std::collections::HashSet<String>,
+    // System RAM freed when that slot's warm resident is evicted (GB).
+    reclaim_sys_ram_gb: &std::collections::HashMap<String, u32>,
     // When true, preferredSlotId pinned a CPU slot — honor it even for GPU-class models.
     force_cpu_pin: bool,
 ) -> Option<Placement> {
@@ -267,8 +270,9 @@ pub fn pick_placement_with_cpu(
             })
             .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
             .filter(|s| {
+                let credit = reclaim_sys_ram_gb.get(&s.id).copied().unwrap_or(0);
                 placement_sys_ram_need_gb(model, &s.card, need_vision, cpu_ram_headroom_gb)
-                    <= sys_ram_available_gb
+                    <= sys_ram_available_gb.saturating_add(credit)
             })
             .collect();
         offload.sort_by(|a, b| {
@@ -321,6 +325,8 @@ pub fn pick_placement_with_cpu(
             });
             let cpu_ram_need =
                 placement_sys_ram_need_gb(model, &slot.card, need_vision, cpu_ram_headroom_gb);
+            let cpu_sys_avail = sys_ram_available_gb
+                .saturating_add(reclaim_sys_ram_gb.get(&slot.id).copied().unwrap_or(0));
             if !force_cpu_pin && idle_accel_nameplate_hosts {
                 debug!(
                     slot = %slot.id,
@@ -335,11 +341,11 @@ pub fn pick_placement_with_cpu(
                     cores = cpu_logical_cores,
                     "placement: skip cpu; RAM or CPU capability gate"
                 );
-            } else if cpu_ram_need > sys_ram_available_gb {
+            } else if cpu_ram_need > cpu_sys_avail {
                 debug!(
                     slot = %slot.id,
                     need = cpu_ram_need,
-                    available = sys_ram_available_gb,
+                    available = cpu_sys_avail,
                     "placement: skip cpu; system RAM already reserved by sibling slots"
                 );
             } else {
@@ -492,6 +498,9 @@ pub fn placement_miss_detail(
     model: &CatalogModel,
     need_vision: bool,
     reclaimable_slot_ids: &std::collections::HashSet<String>,
+    sys_ram_available_gb: u32,
+    reclaim_sys_ram_gb: &std::collections::HashMap<String, u32>,
+    cpu_ram_headroom_gb: u32,
 ) -> crate::invoke_code::CodedError {
     let model_id = model.model_id.as_str();
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
@@ -623,6 +632,38 @@ pub fn placement_miss_detail(
         })
         .fold(0.0_f64, f64::max);
     let need = occupancy_min_vram_gb(model);
+    // VRAM looks fine but every idle accelerator failed the sys-RAM offload gate
+    // (fleet: Laptop / scalattice "need 3.2 · largest idle 10" while warm mmap held RAM).
+    if max_free + 0.005 >= need {
+        let mut min_sys_need = u32::MAX;
+        let mut best_sys_avail = 0u32;
+        for slot in &idle_accel {
+            if !accelerator_live_can_place(
+                slot,
+                &live_cuda,
+                model,
+                reclaimable_slot_ids.contains(&slot.id),
+            ) {
+                continue;
+            }
+            let sys_need =
+                placement_sys_ram_need_gb(model, &slot.card, need_vision, cpu_ram_headroom_gb);
+            let credit = reclaim_sys_ram_gb.get(&slot.id).copied().unwrap_or(0);
+            let sys_avail = sys_ram_available_gb.saturating_add(credit);
+            if sys_need > sys_avail {
+                min_sys_need = min_sys_need.min(sys_need);
+                best_sys_avail = best_sys_avail.max(sys_avail);
+            }
+        }
+        if min_sys_need != u32::MAX {
+            return crate::invoke_code::CodedError::new(
+                crate::invoke_code::InvokeErrorCode::AgentBusy,
+                format!(
+                    "need {min_sys_need} GB free system RAM to offload {model_id}; have {best_sys_avail} GB"
+                ),
+            );
+        }
+    }
     crate::invoke_code::CodedError::new(
         crate::invoke_code::InvokeErrorCode::InsufficientVram,
         format!(
@@ -634,7 +675,7 @@ pub fn placement_miss_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use crate::compute_pool::build_compute_slots;
     use crate::specs::ComputeDevice;
 
@@ -839,6 +880,7 @@ mod tests {
             16,
             32,
             &HashSet::new(),
+            &HashMap::new(),
             true,
         )
         .expect("preferredSlotId=cpu-0 must honor the pin");
@@ -902,6 +944,7 @@ mod tests {
                 16,
                 16,
                 &HashSet::new(),
+                &HashMap::new(),
                 false,
             )
             .is_none()
@@ -918,6 +961,7 @@ mod tests {
             16,
             16,
             &HashSet::new(),
+            &HashMap::new(),
             true,
         )
         .unwrap();
@@ -934,6 +978,7 @@ mod tests {
                 16,
                 6,
                 &HashSet::new(),
+                &HashMap::new(),
                 true,
             )
             .is_none(),
@@ -964,7 +1009,7 @@ mod tests {
             false,
             16,
             32,
-            &HashSet::new(), false,
+            &HashSet::new(), &HashMap::new(), false,
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
@@ -1036,6 +1081,7 @@ mod tests {
                 32,
                 31,
                 &HashSet::new(),
+                &HashMap::new(),
                 false,
             )
             .is_none()
@@ -1052,6 +1098,7 @@ mod tests {
             32,
             31,
             &HashSet::new(),
+            &HashMap::new(),
             true,
         )
         .unwrap();
@@ -1068,6 +1115,7 @@ mod tests {
                 32,
                 20,
                 &HashSet::new(),
+                &HashMap::new(),
                 true,
             )
             .is_none(),
@@ -1085,6 +1133,7 @@ mod tests {
                 8,
                 31,
                 &HashSet::new(),
+                &HashMap::new(),
                 true,
             )
             .is_none(),
@@ -1126,7 +1175,7 @@ mod tests {
             false,
             16,
             16,
-            &HashSet::new(), false,
+            &HashSet::new(), &HashMap::new(), false,
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
@@ -1140,7 +1189,7 @@ mod tests {
             false,
             16,
             16,
-            &HashSet::new(), false,
+            &HashSet::new(), &HashMap::new(), false,
         )
         .unwrap();
         assert_eq!(
@@ -1149,12 +1198,12 @@ mod tests {
             "4 GB card must not layer-offload a 14B; capable CPU+RAM can still run it"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8, &HashSet::new(), false)
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8, &HashSet::new(), &HashMap::new(), false)
                 .is_none(),
             "8 GB RAM must not start a 14B"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16, &HashSet::new(), false)
+            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16, &HashSet::new(), &HashMap::new(), false)
                 .is_none(),
             "weak CPU must not claim a 14B even with RAM"
         );
@@ -1247,6 +1296,7 @@ mod tests {
             16,
             15,
             &reclaimable,
+            &HashMap::new(),
             false,
         );
         assert!(
@@ -1254,6 +1304,88 @@ mod tests {
             "warm resident on idle slot must be reclaimable for cold load"
         );
         assert_eq!(placement.unwrap().slot_ids, vec!["cuda-0".to_string()]);
+    }
+
+    #[test]
+    fn reclaimable_warm_sys_ram_credit_allows_offload() {
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "Laptop 3050 Ti".into(),
+                vram_gb: Some(4),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle = vec!["cuda-0".to_string()];
+        let reclaimable = HashSet::from(["cuda-0".to_string()]);
+        let m = model(3.9, 5.5);
+        // Live free RAM looks too small for KV/spill — but warm eviction frees ~6 GB.
+        assert!(
+            pick_placement_with_cpu(
+                &plan,
+                &idle,
+                &m,
+                15,
+                2,
+                &devices,
+                false,
+                16,
+                1,
+                &reclaimable,
+                &HashMap::new(),
+                false,
+            )
+            .is_none(),
+            "without reclaim credit, tight sys RAM must refuse"
+        );
+        let credit = HashMap::from([("cuda-0".to_string(), 6u32)]);
+        let placement = pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &m,
+            15,
+            2,
+            &devices,
+            false,
+            16,
+            1,
+            &reclaimable,
+            &credit,
+            false,
+        );
+        assert!(
+            placement.is_some(),
+            "evicting warm resident must credit sys RAM for the cold offload"
+        );
+        let detail = placement_miss_detail(
+            &plan,
+            &idle,
+            &m,
+            false,
+            &reclaimable,
+            1,
+            &HashMap::new(),
+            2,
+        );
+        assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
+        assert!(
+            detail.detail.contains("system RAM"),
+            "miss detail must blame sys RAM when VRAM looks fine: {}",
+            detail.detail
+        );
     }
 
     #[test]
@@ -1269,7 +1401,7 @@ mod tests {
             .collect();
         let model = image_model(8.0);
         assert!(pick_placement(&plan, &idle, &model, 64, 2, &devices, false).is_none());
-        let detail = placement_miss_detail(&plan, &idle, &model, false, &HashSet::new());
+        let detail = placement_miss_detail(&plan, &idle, &model, false, &HashSet::new(), 16, &HashMap::new(), 2);
         assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
         assert!(
             detail.detail.contains("waiting for a GPU"),
