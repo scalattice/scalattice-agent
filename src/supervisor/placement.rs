@@ -656,8 +656,10 @@ pub fn placement_miss_detail(
             }
         }
         if min_sys_need != u32::MAX {
+            // Capacity, not transient busy — debug UI must fail closed (not spin on
+            // agent_busy), and the router should not keep retrying the same box.
             return crate::invoke_code::CodedError::new(
-                crate::invoke_code::InvokeErrorCode::AgentBusy,
+                crate::invoke_code::InvokeErrorCode::InsufficientVram,
                 format!(
                     "need {min_sys_need} GB free system RAM to offload {model_id}; have {best_sys_avail} GB"
                 ),
@@ -1380,7 +1382,10 @@ mod tests {
             &HashMap::new(),
             2,
         );
-        assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
+        assert_eq!(
+            detail.code,
+            crate::invoke_code::InvokeErrorCode::InsufficientVram
+        );
         assert!(
             detail.detail.contains("system RAM"),
             "miss detail must blame sys RAM when VRAM looks fine: {}",
