@@ -1953,7 +1953,19 @@ impl Supervisor {
                 crate::models::DEFAULT_CPU_RAM_HEADROOM_GB,
             )
         };
-        let avail = self.available_sys_ram_gb().await;
+        let mut avail = self.available_sys_ram_gb().await;
+        // Cold load on this slot will evict our warm resident first (make_gpu_room).
+        // OS "used" still counts that mmap — credit it or we refuse after claim
+        // (fleet Laptop: place OK with reclaim credit, then need 11 / have 6).
+        if !already_loaded {
+            for loaded in &worker.loaded_models {
+                let mb = warm_model_weight_mb(loaded);
+                if mb == 0 || mb >= u64::MAX / 4 {
+                    continue;
+                }
+                avail = avail.saturating_add(((mb + 1023) / 1024) as u32);
+            }
+        }
         if ram_need > avail {
             self.return_worker(slot_id.clone(), worker).await;
             return Err(crate::invoke_code::coded(
