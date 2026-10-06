@@ -1076,6 +1076,13 @@ pub(crate) fn offload_layers_for_available(
     if for_weights < 0.01 || vram_guess == 0 {
         return 0;
     }
+    // Fleet LAPTOP/SJVL: 1–2 GB live free after foreign occupancy still produced a
+    // 2–4 layer "offload" that mmap'd a 5+ GB GGUF for minutes and wedged the slot.
+    // A partial offload only helps when free VRAM can host a meaningful weight slice.
+    let min_useful = (w * 0.25).clamp(0.75, 2.0);
+    if for_weights + 0.005 < min_useful {
+        return 0;
+    }
     let layers = n_layer
         .filter(|n| *n > 0)
         .unwrap_or_else(|| estimated_n_layer(w))
@@ -1563,6 +1570,17 @@ mod tests {
         );
         assert!(estimated_n_layer(19.77) < 47);
         assert_eq!(estimated_n_layer(4.7), 9);
+    }
+
+    #[test]
+    fn tiny_live_free_refuses_token_offload_of_large_weight() {
+        // Fleet LAPTOP/SJVL: 1–2 GB free on a 4–8 GB card still produced a
+        // multi-layer offload that mmap'd ~5.5 GB for minutes.
+        assert_eq!(offload_layers_for_available(1, Some(5.5), Some(32)), 0);
+        assert_eq!(offload_layers_for_available(2, Some(5.5), Some(32)), 0);
+        // Enough free for a meaningful slice should still offload.
+        let n = offload_layers_for_available(4, Some(5.5), Some(32));
+        assert!(n > 0, "{n}");
     }
 
     #[test]

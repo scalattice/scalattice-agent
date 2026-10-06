@@ -140,7 +140,10 @@ const WORKER_INVOKE_DEADLINE: Duration = Duration::from_secs(12 * 60);
 /// Decode ceiling, measured from the first token. Slow cards with the cache in
 /// system RAM were still generating when 12 minutes cut them off.
 const WORKER_DECODE_WALL: Duration = Duration::from_secs(10 * 60);
-/// Prefill/load wall — capped under the absolute invoke deadline.
+/// Cold weight load wall. Sharing the 12m prefill wall let LAPTOP/SJVL sit in
+/// `load_from_file` mmap with 1–2 GB free VRAM until the fleet 6m poll timeout.
+const WORKER_LOAD_WALL: Duration = Duration::from_secs(90);
+/// Prefill wall — capped under the absolute invoke deadline.
 const WORKER_PREFILL_WALL: Duration = Duration::from_secs(12 * 60);
 /// Must exceed invoke deadline or Full Debug reclaim kills mid-decode.
 const STUCK_CHECKOUT: Duration = Duration::from_secs(20 * 60);
@@ -148,7 +151,8 @@ const STUCK_CHECKOUT: Duration = Duration::from_secs(20 * 60);
 fn worker_silence_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_SILENCE,
-        // "start" is the gap before the first llama progress line (opening the file).
+        // "start"/"load" — opening + mmap; keep the long quiet window for big GGUFs,
+        // but the load wall below still caps a wedged progress-pinging mmap.
         "prefill" | "context" | "load" | "start" => WORKER_PREFILL_SILENCE,
         _ => WORKER_LOAD_SILENCE,
     }
@@ -320,7 +324,8 @@ fn nvidia_slots_unusable(slots: &[ComputeSlot], unusable: &HashSet<String>) -> b
 fn worker_wall_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_WALL,
-        // start / load / prefill / context — until the first token
+        "load" | "start" => WORKER_LOAD_WALL,
+        // prefill / context — until the first token
         _ => WORKER_PREFILL_WALL,
     }
 }
@@ -2607,7 +2612,7 @@ mod tests {
     use super::{
         nvidia_slots_unusable, worker_crash_retryable, worker_silence_for_phase,
         worker_wall_for_phase, STUCK_CHECKOUT, WORKER_DECODE_SILENCE, WORKER_DECODE_WALL,
-        WORKER_PREFILL_SILENCE, WORKER_PREFILL_WALL,
+        WORKER_INVOKE_DEADLINE, WORKER_LOAD_WALL, WORKER_PREFILL_SILENCE, WORKER_PREFILL_WALL,
     };
     use crate::compute_pool::build_compute_slots;
     use crate::specs::ComputeDevice;
@@ -2663,9 +2668,13 @@ mod tests {
     fn prefill_wall_is_longer_than_decode_and_covers_start() {
         assert_eq!(worker_wall_for_phase("decode"), WORKER_DECODE_WALL);
         assert_eq!(worker_wall_for_phase("prefill"), WORKER_PREFILL_WALL);
-        assert_eq!(worker_wall_for_phase("start"), WORKER_PREFILL_WALL);
+        assert_eq!(worker_wall_for_phase("start"), WORKER_LOAD_WALL);
+        assert_eq!(worker_wall_for_phase("load"), WORKER_LOAD_WALL);
+        assert!(WORKER_LOAD_WALL < WORKER_PREFILL_WALL);
         assert!(WORKER_PREFILL_WALL > WORKER_DECODE_WALL);
-        assert!(STUCK_CHECKOUT > WORKER_PREFILL_WALL + WORKER_DECODE_WALL);
+        // Stuck checkout must outlive the absolute invoke deadline so Full Debug
+        // reclaim does not race a still-legal long prefill.
+        assert!(STUCK_CHECKOUT > WORKER_INVOKE_DEADLINE);
     }
 
     #[test]

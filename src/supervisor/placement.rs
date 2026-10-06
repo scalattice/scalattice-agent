@@ -578,12 +578,43 @@ pub fn placement_miss_detail(
     }
 
     if idle_accel.is_empty() {
-        // Only CPU idle: vision cannot use it; text would have placed CPU.
+        // Only CPU idle: vision cannot use it; text would have placed CPU unless
+        // sys-RAM / capability gates refused — that is capacity, not "no slot".
         if need_vision {
             let need = image_job_min_vram_gb(model);
             return crate::invoke_code::CodedError::new(
                 crate::invoke_code::InvokeErrorCode::InsufficientVram,
                 format!("need {need} GB GPU for vision job {model_id}; no idle accelerator"),
+            );
+        }
+        if !idle_slot_ids.is_empty() {
+            let cpu_slot = plan
+                .slots
+                .iter()
+                .find(|s| idle.contains(s.id.as_str()) && s.kind == "cpu");
+            if let Some(slot) = cpu_slot {
+                let cpu_need = placement_sys_ram_need_gb(
+                    model,
+                    &slot.card,
+                    false,
+                    cpu_ram_headroom_gb,
+                );
+                let credit = reclaim_sys_ram_gb.get(&slot.id).copied().unwrap_or(0);
+                let avail = sys_ram_available_gb.saturating_add(credit);
+                if cpu_need > avail {
+                    return crate::invoke_code::CodedError::new(
+                        crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                        format!(
+                            "need {cpu_need} GB free system RAM to run {model_id} on CPU; have {avail} GB"
+                        ),
+                    );
+                }
+            }
+            return crate::invoke_code::CodedError::new(
+                crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                format!(
+                    "no accelerator can host {model_id}; CPU path refused (RAM or capability)"
+                ),
             );
         }
         return crate::invoke_code::CodedError::new(
