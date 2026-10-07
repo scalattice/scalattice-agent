@@ -50,6 +50,21 @@ if [[ -n "$KEYCHAIN" ]]; then
   CODESIGN_BASE+=(--keychain "$KEYCHAIN")
 fi
 
+# Apple's timestamp service flakes ("The timestamp service is not available").
+codesign_retry() {
+  local n=0 max=6 delay=5
+  until codesign "${CODESIGN_BASE[@]}" "$@"; do
+    n=$((n + 1))
+    if [ "$n" -ge "$max" ]; then
+      echo "codesign failed after ${max} attempts: $*" >&2
+      return 1
+    fi
+    echo "==> codesign failed (attempt ${n}/${max}); retrying in ${delay}s: $*"
+    sleep "$delay"
+    delay=$((delay + 5))
+  done
+}
+
 sign_bin() {
   local bin="$1"
   if [[ ! -f "$bin" ]]; then
@@ -63,7 +78,7 @@ sign_bin() {
     exit 1
   fi
   echo "==> codesign $(basename "$bin")"
-  codesign "${CODESIGN_BASE[@]}" "$bin"
+  codesign_retry "$bin"
   codesign --verify --verbose=2 "$bin"
 }
 
@@ -71,7 +86,7 @@ if [[ -d "$TARGET" ]]; then
   INNER="${TARGET}/Contents/MacOS/scalattice-agent"
   sign_bin "$INNER"
   echo "==> codesign $(basename "$TARGET")"
-  codesign "${CODESIGN_BASE[@]}" "$TARGET"
+  codesign_retry "$TARGET"
   codesign --verify --deep --strict --verbose=2 "$TARGET"
 elif [[ -f "$TARGET" ]]; then
   sign_bin "$TARGET"

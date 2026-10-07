@@ -28,22 +28,8 @@ jobs:
       - name: Install build deps
         run: |
           set -euo pipefail
-          apt_retry() {
-            local n=0 max=5 delay=20
-            until sudo "$@"; do
-              n=$((n + 1))
-              if [ "$n" -ge "$max" ]; then
-                echo "apt command failed after ${max} attempts: $*" >&2
-                return 1
-              fi
-              echo "==> apt failed (attempt ${n}/${max}), retrying in ${delay}s: $*"
-              sudo rm -rf /var/lib/apt/lists/*
-              sleep "$delay"
-              delay=$((delay + 15))
-            done
-          }
-          apt_retry apt-get update
-          apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config
+          chmod +x scripts/ci-apt-linux-build-deps.sh
+          ./scripts/ci-apt-linux-build-deps.sh --minimal
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-check-gate
