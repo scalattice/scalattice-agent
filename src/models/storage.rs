@@ -302,6 +302,13 @@ pub fn resolve_model_gguf(runtime_model: &str) -> Option<PathBuf> {
     Some(target_gguf_path(runtime_model, primary))
 }
 
+/// True for AppleDouble / Finder resource-fork sidecars (`._mmproj-F16.gguf`).
+/// Those are not GGUF and make MTMD init return null (fleet: mac-studio.home).
+fn is_appledouble_sidecar(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base.starts_with("._") || base.starts_with(".ds_store")
+}
+
 /// Projector GGUF next to the language weights (`mmproj*.gguf`).
 pub fn resolve_mmproj(model_path: &Path) -> Option<PathBuf> {
     let dir = model_path.parent()?;
@@ -315,6 +322,9 @@ pub fn resolve_mmproj(model_path: &Path) -> Option<PathBuf> {
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        if is_appledouble_sidecar(&name) {
+            continue;
+        }
         if name.contains("mmproj") && name.ends_with(".gguf") && path.is_file() {
             found.push(path);
         }
@@ -717,5 +727,45 @@ pub fn purge_failed_download(runtime_model: &str) {
             path = %dir.display(),
             "removed incomplete model weights after failed download"
         );
+    }
+}
+
+#[cfg(test)]
+mod mmproj_tests {
+    use super::{is_appledouble_sidecar, resolve_mmproj};
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn appledouble_sidecars_are_skipped() {
+        assert!(is_appledouble_sidecar("._mmproj-f16.gguf"));
+        assert!(is_appledouble_sidecar("._MMProj-F16.GGUF"));
+        assert!(!is_appledouble_sidecar("mmproj-f16.gguf"));
+        assert!(!is_appledouble_sidecar("mmproj-F16.gguf"));
+    }
+
+    #[test]
+    fn resolve_mmproj_ignores_appledouble_and_picks_real_gguf() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("slt_mmproj_test_{stamp}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.gguf");
+        fs::write(&model, b"gguf").unwrap();
+        // Finder AppleDouble sidecar sorts ahead of the real projector if not filtered.
+        let mut evil = fs::File::create(dir.join("._mmproj-F16.gguf")).unwrap();
+        evil.write_all(b"not a gguf").unwrap();
+        let mut good = fs::File::create(dir.join("mmproj-F16.gguf")).unwrap();
+        good.write_all(b"gguf-proj").unwrap();
+        let got = resolve_mmproj(&model).expect("mmproj");
+        assert_eq!(
+            got.file_name().and_then(|n| n.to_str()),
+            Some("mmproj-F16.gguf")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

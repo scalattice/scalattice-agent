@@ -43,9 +43,9 @@ pub fn spawn_catalog_sync(
                 purge_incomplete_model_weights(runtime_model);
                 continue;
             }
+            crate::specs::refresh_disk_full_flag();
             if crate::specs::disk_is_full() {
                 warn!("disk full; pausing remaining model downloads");
-                crate::state::set_disk_full(true);
                 break;
             }
             state::set_downloading_model(Some(&model.model_id));

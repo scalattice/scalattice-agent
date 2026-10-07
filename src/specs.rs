@@ -13,7 +13,7 @@ use host::bytes_to_gb;
 pub use host::disk_avail_bytes;
 pub use host::{
     detect_cpu_model, detect_hostname, detect_install_id, detect_ram_gb, detect_ram_used_gb,
-    disk_is_full,
+    disk_is_full, refresh_disk_full_flag,
 };
 
 /// Logical CPU thread count for CPU-slot capability gating.
@@ -505,9 +505,12 @@ pub fn live_cuda_free_vram_by_index() -> std::collections::HashMap<u32, f64> {
 #[cfg(not(target_os = "macos"))]
 fn live_cuda_free_all_from(bin: &str) -> std::collections::HashMap<u32, f64> {
     let mut map = std::collections::HashMap::new();
+    // Query total+used+free. On Windows WDDM, `memory.free` is often far below
+    // `total - used` (fleet: DESKTOP-SJVL4OL RTX 5050 reported 2.3 GB free with
+    // only ~2 GB used on an 8 GB card). Prefer the larger of the two.
     let Some(output) = configure_nvidia_smi_command(bin)
         .args([
-            "--query-gpu=index,memory.free",
+            "--query-gpu=index,memory.total,memory.used,memory.free",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -531,8 +534,30 @@ fn live_cuda_free_all_from(bin: &str) -> std::collections::HashMap<u32, f64> {
         let Ok(index) = parts[0].trim().parse::<u32>() else {
             continue;
         };
-        let Some(mb) = parse_nvidia_number(&parts[1]) else {
-            continue;
+        let free_mb = if parts.len() >= 4 {
+            parse_nvidia_number(&parts[3])
+        } else {
+            parse_nvidia_number(&parts[1])
+        };
+        let total_mb = if parts.len() >= 3 {
+            parse_nvidia_number(&parts[1])
+        } else {
+            None
+        };
+        let used_mb = if parts.len() >= 3 {
+            parse_nvidia_number(&parts[2])
+        } else {
+            None
+        };
+        let derived_mb = match (total_mb, used_mb) {
+            (Some(total), Some(used)) if total >= used => Some(total - used),
+            _ => None,
+        };
+        let mb = match (derived_mb, free_mb) {
+            (Some(derived), Some(free)) => derived.max(free),
+            (Some(derived), None) => derived,
+            (None, Some(free)) => free,
+            (None, None) => continue,
         };
         map.insert(index, f64::from(mb) / 1024.0);
     }
