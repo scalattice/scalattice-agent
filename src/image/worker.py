@@ -334,7 +334,8 @@ def ensure_venv_and_deps(venv_dir: Path, torch_index: str, extra_pip: list[str])
     if not venv_python.is_file():
         fail("image_runtime_missing", "Could not create a Python venv for Diffusers.")
 
-    marker = venv_dir / ".deps_ok_v4"
+    # Bump when the pip set changes so existing venvs reinstall (torchvision for Qwen-Image).
+    marker = venv_dir / ".deps_ok_v5"
     if marker.is_file():
         return venv_python
 
@@ -343,7 +344,9 @@ def ensure_venv_and_deps(venv_dir: Path, torch_index: str, extra_pip: list[str])
     pip_base = [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"]
     subprocess.check_call(pip_base, stdout=subprocess.DEVNULL, env=env)
     progress("install", 20)
-    torch_cmd = [str(venv_python), "-m", "pip", "install", "torch"]
+    # torchvision must share the same torch index (CUDA/ROCm/XPU) as torch —
+    # Qwen-Image / Qwen3VLVideoProcessor imports it (fleet: OSART33-PC).
+    torch_cmd = [str(venv_python), "-m", "pip", "install", "torch", "torchvision"]
     if torch_index.strip():
         torch_cmd.extend(["--index-url", torch_index.strip()])
     subprocess.check_call(torch_cmd, stdout=subprocess.DEVNULL, env=env)

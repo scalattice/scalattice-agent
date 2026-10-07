@@ -1,8 +1,7 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
 use crate::models::{
-    can_host_model, can_serve_vision_on_card, cpu_slot_may_serve, gpu_full_host_need_gb_for_job,
-    hosting_min_vram_gb, image_job_min_vram_gb, occupancy_min_vram_gb, placement_sys_ram_need_gb,
-    vram_can_gpu_full,
+    can_host_model, can_serve_vision_on_card, cpu_slot_may_serve, hosting_min_vram_gb,
+    image_job_min_vram_gb, occupancy_min_vram_gb, placement_sys_ram_need_gb, vram_can_gpu_full,
 };
 use crate::protocol::CatalogModel;
 use tracing::debug;
@@ -182,11 +181,20 @@ pub fn pick_placement_with_cpu(
     };
 
     let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+    // Soft-estimate iGPUs (AMD "Radeon Graphics" at 2 GB) must not steal placement
+    // when a discrete/Metal card nameplate-hosts the model (fleet: DESKTOP-SJVL4OL).
+    let discrete_nameplate_hosts = plan.slots.iter().any(|s| {
+        s.kind != "cpu"
+            && s.kind != "integrated"
+            && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+            && (!need_vision || can_serve_vision_on_card(model, &s.card))
+    });
 
     let mut full_fit: Vec<&ComputeSlot> = plan
         .slots
         .iter()
         .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
+        .filter(|s| !(discrete_nameplate_hosts && s.kind == "integrated"))
         .filter(|s| {
             vram_can_gpu_full(
                 slot_available_gb(s, &live_cuda, reclaimable_slot_ids.contains(&s.id)),
@@ -260,6 +268,7 @@ pub fn pick_placement_with_cpu(
             .slots
             .iter()
             .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
+            .filter(|s| !(discrete_nameplate_hosts && s.kind == "integrated"))
             .filter(|s| {
                 accelerator_live_can_place(
                     s,
@@ -500,6 +509,7 @@ pub fn placement_miss_detail(
     reclaimable_slot_ids: &std::collections::HashSet<String>,
     sys_ram_available_gb: u32,
     reclaim_sys_ram_gb: &std::collections::HashMap<String, u32>,
+    ram_gb: u32,
     cpu_ram_headroom_gb: u32,
 ) -> crate::invoke_code::CodedError {
     let model_id = model.model_id.as_str();
@@ -553,33 +563,34 @@ pub fn placement_miss_detail(
         );
     }
 
-    let catalog_min = if need_vision {
-        image_job_min_vram_gb(model)
-    } else {
-        hosting_min_vram_gb(model)
-    };
     let live_cuda = crate::specs::live_cuda_free_vram_by_index();
-    let has_fitting_gpu = plan.slots.iter().any(|s| {
-        s.kind != "cpu"
-            && vram_can_gpu_full(
-                slot_available_gb(s, &live_cuda, reclaimable_slot_ids.contains(&s.id)),
-                model,
-                catalog_min,
-                need_vision,
-            )
-            && (!need_vision || can_serve_vision_on_card(model, &s.card))
-    });
-    if has_fitting_gpu {
-        let need = gpu_full_host_need_gb_for_job(model, need_vision);
-        return crate::invoke_code::CodedError::new(
+    // Discrete/Metal nameplate host (ignore soft-estimate iGPUs). Used so a busy
+    // or mis-measured CUDA card hops as agent_busy instead of blaming a 2 GB
+    // iGPU (fleet: DESKTOP-SJVL4OL). Evaluated after sys-RAM capacity misses so
+    // tight offload RAM stays insufficient_vram, not busy.
+    let discrete_nameplate_hosts = || {
+        plan.slots.iter().any(|s| {
+            s.kind != "cpu"
+                && s.kind != "integrated"
+                && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+                && (!need_vision || can_serve_vision_on_card(model, &s.card))
+        })
+    };
+    let agent_busy_waiting_gpu = || {
+        let need = occupancy_min_vram_gb(model);
+        crate::invoke_code::CodedError::new(
             crate::invoke_code::InvokeErrorCode::AgentBusy,
             format!("waiting for a GPU that can fully host {model_id} (need {need:.1} GB)"),
-        );
-    }
+        )
+    };
 
     if idle_accel.is_empty() {
         // Only CPU idle: vision cannot use it; text would have placed CPU unless
         // sys-RAM / capability gates refused — that is capacity, not "no slot".
+        // Prefer hop when a discrete card on this box nameplate-hosts the SKU.
+        if !need_vision && discrete_nameplate_hosts() {
+            return agent_busy_waiting_gpu();
+        }
         if need_vision {
             let need = image_job_min_vram_gb(model);
             return crate::invoke_code::CodedError::new(
@@ -696,6 +707,9 @@ pub fn placement_miss_detail(
                 ),
             );
         }
+    }
+    if discrete_nameplate_hosts() {
+        return agent_busy_waiting_gpu();
     }
     crate::invoke_code::CodedError::new(
         crate::invoke_code::InvokeErrorCode::InsufficientVram,
@@ -1411,6 +1425,7 @@ mod tests {
             &reclaimable,
             1,
             &HashMap::new(),
+            16,
             2,
         );
         assert_eq!(
@@ -1437,11 +1452,164 @@ mod tests {
             .collect();
         let model = image_model(8.0);
         assert!(pick_placement(&plan, &idle, &model, 64, 2, &devices, false).is_none());
-        let detail = placement_miss_detail(&plan, &idle, &model, false, &HashSet::new(), 16, &HashMap::new(), 2);
+        let detail = placement_miss_detail(&plan, &idle, &model, false, &HashSet::new(), 16, &HashMap::new(), 64, 2);
         assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
         assert!(
             detail.detail.contains("waiting for a GPU"),
             "want wait-for-fit, got {}",
+            detail.detail
+        );
+    }
+
+    #[test]
+    fn sjvl_busy_cuda_does_not_auto_pick_igpu_reports_agent_busy() {
+        // Fleet: DESKTOP-SJVL4OL — RTX busy, AMD "Radeon Graphics" ~2 GB idle.
+        // iGPU stays in the plan (server may pin preferredSlotId=igpu-0); local
+        // auto-pick and miss detail must not treat it as the capacity answer.
+        use crate::compute_pool::{ComputePlan, ComputeSlot, PoolDevice, VirtualCard};
+        let devices = [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce RTX 5050".into(),
+                vram_gb: Some(8),
+                vram_used_gb: Some(7),
+                util_pct: Some(95),
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "amd:0".into(),
+                kind: "integrated".into(),
+                name: "AMD Radeon(TM) Graphics".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ];
+        let cuda_card = VirtualCard {
+            devices: vec![PoolDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce RTX 5050".into(),
+                vram_gb: 8,
+                cuda_index: Some(0),
+            }],
+            strategy: PoolStrategy::Single,
+            display_name: "NVIDIA GeForce RTX 5050".into(),
+            total_vram_gb: 8,
+            tensor_split: vec![],
+            cuda_device_ids: vec![0],
+            uses_vulkan: false,
+            gpu_layer_budget: 0,
+        };
+        let igpu_card = VirtualCard {
+            devices: vec![PoolDevice {
+                id: "amd:0".into(),
+                kind: "integrated".into(),
+                name: "AMD Radeon(TM) Graphics".into(),
+                vram_gb: 2,
+                cuda_index: None,
+            }],
+            strategy: PoolStrategy::Vulkan,
+            display_name: "AMD Radeon(TM) Graphics".into(),
+            total_vram_gb: 2,
+            tensor_split: vec![],
+            cuda_device_ids: vec![],
+            uses_vulkan: true,
+            gpu_layer_budget: 0,
+        };
+        let cpu_card = VirtualCard {
+            devices: vec![PoolDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: 0,
+                cuda_index: None,
+            }],
+            strategy: PoolStrategy::CpuOnly,
+            display_name: "CPU".into(),
+            total_vram_gb: 0,
+            tensor_split: vec![],
+            cuda_device_ids: vec![],
+            uses_vulkan: false,
+            gpu_layer_budget: 0,
+        };
+        let plan = ComputePlan {
+            slots: vec![
+                ComputeSlot {
+                    id: "cuda-0".into(),
+                    kind: "discrete_cuda".into(),
+                    priority: 10,
+                    card: cuda_card,
+                    cuda_visible: vec![0],
+                    tp_group: None,
+                },
+                ComputeSlot {
+                    id: "igpu-0".into(),
+                    kind: "integrated".into(),
+                    priority: 40,
+                    card: igpu_card,
+                    cuda_visible: vec![],
+                    tp_group: None,
+                },
+                ComputeSlot {
+                    id: "cpu-0".into(),
+                    kind: "cpu".into(),
+                    priority: 100,
+                    card: cpu_card,
+                    cuda_visible: vec![],
+                    tp_group: None,
+                },
+            ],
+            tp_groups: Default::default(),
+        };
+        let pin = placement_for_required_slot(&plan, "igpu-0", &devices).unwrap();
+        assert_eq!(pin.slot_ids, vec!["igpu-0".to_string()]);
+        let idle = vec!["igpu-0".to_string(), "cpu-0".to_string()];
+        let m = model(6.0, 5.0);
+        assert!(
+            pick_placement_with_cpu(
+                &plan,
+                &idle,
+                &m,
+                32,
+                2,
+                &devices,
+                false,
+                16,
+                24,
+                &HashSet::new(),
+                &HashMap::new(),
+                false,
+            )
+            .is_none(),
+            "auto-pick must not land on soft-estimate iGPU / CPU while discrete nameplate-hosts"
+        );
+        let detail = placement_miss_detail(
+            &plan,
+            &idle,
+            &m,
+            false,
+            &HashSet::new(),
+            24,
+            &HashMap::new(),
+            32,
+            2,
+        );
+        assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
+        assert!(
+            detail.detail.contains("waiting for a GPU"),
+            "want hop-on-busy, got {}",
             detail.detail
         );
     }

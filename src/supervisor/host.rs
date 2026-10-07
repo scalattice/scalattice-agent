@@ -143,8 +143,10 @@ const WORKER_DECODE_WALL: Duration = Duration::from_secs(10 * 60);
 /// Cold weight load wall. Sharing the 12m prefill wall let LAPTOP/SJVL sit in
 /// `load_from_file` mmap with 1–2 GB free VRAM until the fleet 6m poll timeout.
 const WORKER_LOAD_WALL: Duration = Duration::from_secs(90);
-/// Prefill wall — capped under the absolute invoke deadline.
-const WORKER_PREFILL_WALL: Duration = Duration::from_secs(12 * 60);
+/// No first token yet: hop as agent_busy so the router tries another machine
+/// instead of stacking invoke_timeout. Same rule for every accelerator — we do
+/// not special-case GPU SKUs (slow cards, wedged offload, bad drivers all hop).
+const WORKER_FIRST_TOKEN_HOP: Duration = Duration::from_secs(4 * 60);
 /// Must exceed invoke deadline or Full Debug reclaim kills mid-decode.
 const STUCK_CHECKOUT: Duration = Duration::from_secs(20 * 60);
 
@@ -325,9 +327,13 @@ fn worker_wall_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_WALL,
         "load" | "start" => WORKER_LOAD_WALL,
-        // prefill / context — until the first token
-        _ => WORKER_PREFILL_WALL,
+        // prefill / context — soft hop before first token (not a 12‑minute burn)
+        _ => WORKER_FIRST_TOKEN_HOP,
     }
+}
+
+fn phase_before_first_token(phase: &str) -> bool {
+    !matches!(phase.to_ascii_lowercase().as_str(), "decode")
 }
 
 impl Supervisor {
@@ -463,6 +469,7 @@ impl Supervisor {
             &reclaimable,
             sys_avail,
             &reclaim_ram,
+            ram_gb,
             cpu_ram_headroom_gb,
         )
         .into())
@@ -684,6 +691,49 @@ impl Supervisor {
 
     async fn clear_checkout(&self, slot_id: &str) {
         self.checkouts.lock().await.remove(slot_id);
+    }
+
+    /// Claim saw an empty worker map entry. Checked-out slots are busy (not "missing");
+    /// truly gone workers get a best-effort respawn. Always surface AgentBusy so the
+    /// router can failover instead of stacking `slot worker cuda-N missing` damage.
+    async fn err_missing_slot_worker(&self, slot_id: &str) -> anyhow::Error {
+        if self.checkouts.lock().await.contains_key(slot_id) {
+            return crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::AgentBusy,
+                format!("slot {slot_id} is checked out"),
+            );
+        }
+        if let Some(spec) = self.plan.slots.iter().find(|s| s.id == slot_id).cloned() {
+            let workers = self.workers.lock().await;
+            if !workers.contains_key(slot_id) {
+                drop(workers);
+                match spawn_worker(&spec).await {
+                    Ok(mut w) => {
+                        w.busy = false;
+                        let mut workers = self.workers.lock().await;
+                        if !workers.contains_key(slot_id) {
+                            workers.insert(slot_id.to_string(), w);
+                            info!(slot = %slot_id, "respawned missing slot worker after claim miss");
+                            self.changed.notify_waiters();
+                        } else {
+                            let _ = w.child.kill().await;
+                            let _ = w.child.wait().await;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            slot = %slot_id,
+                            error = %err,
+                            "failed to respawn missing slot worker after claim miss"
+                        );
+                    }
+                }
+            }
+        }
+        crate::invoke_code::coded(
+            crate::invoke_code::InvokeErrorCode::AgentBusy,
+            format!("slot {slot_id} temporarily unavailable"),
+        )
     }
 
     /// Live free RAM minus pending reservations from sibling slots that may
@@ -1379,13 +1429,12 @@ impl Supervisor {
                                 format!("preferred slot {sid} is not idle or not healthy"),
                             ));
                         }
-                        let worker = match workers.get_mut(sid) {
-                            Some(w) => w,
-                            None => {
-                                self.clear_job_cancel(job_id).await;
-                                return Err(anyhow!("slot worker {sid} missing"));
-                            }
-                        };
+                        if workers.get_mut(sid).is_none() {
+                            drop(workers);
+                            self.clear_job_cancel(job_id).await;
+                            return Err(self.err_missing_slot_worker(sid).await);
+                        }
+                        let worker = workers.get_mut(sid).expect("worker present after miss check");
                         if worker.busy || !worker.healthy {
                             self.clear_job_cancel(job_id).await;
                             return Err(crate::invoke_code::coded(
@@ -1581,6 +1630,7 @@ impl Supervisor {
                             &reclaimable,
                             sys_avail,
                             &reclaim_ram,
+                            ram_gb,
                             cpu_ram_headroom_gb,
                         );
                         return Err(detail.into());
@@ -1588,13 +1638,20 @@ impl Supervisor {
                 };
 
                 for sid in &placement.slot_ids {
-                    let worker = match workers.get_mut(sid) {
-                        Some(w) => w,
-                        None => {
-                            self.clear_job_cancel(job_id).await;
-                            return Err(anyhow!("slot worker {sid} missing"));
+                    if workers.get_mut(sid).is_none() {
+                        for claimed in &placement.slot_ids {
+                            if claimed == sid {
+                                break;
+                            }
+                            if let Some(w) = workers.get_mut(claimed) {
+                                w.busy = false;
+                            }
                         }
-                    };
+                        drop(workers);
+                        self.clear_job_cancel(job_id).await;
+                        return Err(self.err_missing_slot_worker(sid).await);
+                    }
+                    let worker = workers.get_mut(sid).expect("worker present after miss check");
                     if worker.busy || !worker.healthy {
                         for claimed in &placement.slot_ids {
                             if claimed == sid {
@@ -1729,10 +1786,12 @@ impl Supervisor {
                             format!("preferred slot {sid} is not idle or not healthy"),
                         ));
                     }
-                    let Some(worker) = workers.get_mut(sid) else {
+                    if workers.get_mut(sid).is_none() {
+                        drop(workers);
                         self.clear_job_cancel(job_id).await;
-                        return Err(anyhow!("slot worker {sid} missing"));
-                    };
+                        return Err(self.err_missing_slot_worker(sid).await);
+                    }
+                    let worker = workers.get_mut(sid).expect("worker present after miss check");
                     if worker.busy || !worker.healthy {
                         self.clear_job_cancel(job_id).await;
                         return Err(crate::invoke_code::coded(
@@ -1790,16 +1849,19 @@ impl Supervisor {
                         &reclaimable,
                         sys_avail,
                         &reclaim_ram,
+                        ram_gb,
                         cpu_ram_headroom_gb,
                     );
                     return Err(detail.into());
                 }
             };
             for sid in &placement.slot_ids {
-                let Some(worker) = workers.get_mut(sid) else {
+                if workers.get_mut(sid).is_none() {
+                    drop(workers);
                     self.clear_job_cancel(job_id).await;
-                    return Err(anyhow!("slot worker {sid} missing"));
-                };
+                    return Err(self.err_missing_slot_worker(sid).await);
+                }
+                let worker = workers.get_mut(sid).expect("worker present after miss check");
                 if worker.busy || !worker.healthy {
                     self.clear_job_cancel(job_id).await;
                     return Err(crate::invoke_code::coded(
@@ -1824,9 +1886,14 @@ impl Supervisor {
 
         let mut worker = {
             let mut workers = self.workers.lock().await;
-            workers
-                .remove(&slot_id)
-                .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?
+            match workers.remove(&slot_id) {
+                Some(w) => w,
+                None => {
+                    drop(workers);
+                    self.clear_job_cancel(job_id).await;
+                    return Err(self.err_missing_slot_worker(&slot_id).await);
+                }
+            }
         };
         let pid = worker.child.id();
         let runtime = model.runtime_model.trim();
@@ -1929,9 +1996,13 @@ impl Supervisor {
         // (busy flag was already set under the claim lock in invoke()).
         let mut worker = {
             let mut workers = self.workers.lock().await;
-            workers
-                .remove(&slot_id)
-                .ok_or_else(|| anyhow!("slot worker {slot_id} missing"))?
+            match workers.remove(&slot_id) {
+                Some(w) => w,
+                None => {
+                    drop(workers);
+                    return Err(self.err_missing_slot_worker(&slot_id).await);
+                }
+            }
         };
         let pid = worker.child.id();
         let need_vision = crate::protocol::messages_have_images(messages);
@@ -2397,8 +2468,9 @@ async fn worker_rpc_invoke_cancellable(
     let mut last_progress = Instant::now();
     let mut last_cloud_keepalive = Instant::now();
     let invoke_started = Instant::now();
+    let deadline = WORKER_INVOKE_DEADLINE;
     loop {
-        if invoke_started.elapsed() >= WORKER_INVOKE_DEADLINE {
+        if invoke_started.elapsed() >= deadline {
             warn!(
                 slot = %worker.spec.id,
                 phase = %last_phase,
@@ -2408,11 +2480,22 @@ async fn worker_rpc_invoke_cancellable(
             let _ = worker.child.kill().await;
             let _ = worker.child.wait().await;
             worker.healthy = false;
+            // Pre-decode: hop as busy so the router fails over without damage.
+            // Decode: real timeout — the job started producing tokens.
+            if phase_before_first_token(&last_phase) {
+                return Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::AgentBusy,
+                    format!(
+                        "accelerator too slow before first token ({}s); trying another machine",
+                        deadline.as_secs()
+                    ),
+                ));
+            }
             return Err(crate::invoke_code::coded(
                 crate::invoke_code::InvokeErrorCode::InvokeTimeout,
                 format!(
                     "exceeded absolute invoke deadline ({}s)",
-                    WORKER_INVOKE_DEADLINE.as_secs()
+                    deadline.as_secs()
                 ),
             ));
         }
@@ -2426,6 +2509,14 @@ async fn worker_rpc_invoke_cancellable(
             let _ = worker.child.kill().await;
             let _ = worker.child.wait().await;
             worker.healthy = false;
+            if phase_before_first_token(&last_phase) {
+                return Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::AgentBusy,
+                    format!(
+                        "accelerator stalled in {last_phase}; trying another machine"
+                    ),
+                ));
+            }
             return Err(crate::invoke_code::coded(
                 crate::invoke_code::InvokeErrorCode::InvokeTimeout,
                 "exceeded wall-clock limit",
@@ -2438,7 +2529,7 @@ async fn worker_rpc_invoke_cancellable(
         let wall_left = worker_wall_for_phase(&last_phase)
             .checked_sub(phase_started.elapsed())
             .unwrap_or(Duration::from_millis(1));
-        let deadline_left = WORKER_INVOKE_DEADLINE
+        let deadline_left = deadline
             .checked_sub(invoke_started.elapsed())
             .unwrap_or(Duration::from_millis(1));
         let keepalive_left = WORKER_CLOUD_KEEPALIVE
@@ -2610,9 +2701,10 @@ fn worker_crash_retryable(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        nvidia_slots_unusable, worker_crash_retryable, worker_silence_for_phase,
-        worker_wall_for_phase, STUCK_CHECKOUT, WORKER_DECODE_SILENCE, WORKER_DECODE_WALL,
-        WORKER_INVOKE_DEADLINE, WORKER_LOAD_WALL, WORKER_PREFILL_SILENCE, WORKER_PREFILL_WALL,
+        nvidia_slots_unusable, phase_before_first_token, worker_crash_retryable,
+        worker_silence_for_phase, worker_wall_for_phase, STUCK_CHECKOUT, WORKER_DECODE_SILENCE,
+        WORKER_DECODE_WALL, WORKER_FIRST_TOKEN_HOP, WORKER_INVOKE_DEADLINE, WORKER_LOAD_WALL,
+        WORKER_PREFILL_SILENCE,
     };
     use crate::compute_pool::build_compute_slots;
     use crate::specs::ComputeDevice;
@@ -2667,14 +2759,17 @@ mod tests {
     #[test]
     fn prefill_wall_is_longer_than_decode_and_covers_start() {
         assert_eq!(worker_wall_for_phase("decode"), WORKER_DECODE_WALL);
-        assert_eq!(worker_wall_for_phase("prefill"), WORKER_PREFILL_WALL);
+        assert_eq!(worker_wall_for_phase("prefill"), WORKER_FIRST_TOKEN_HOP);
         assert_eq!(worker_wall_for_phase("start"), WORKER_LOAD_WALL);
         assert_eq!(worker_wall_for_phase("load"), WORKER_LOAD_WALL);
-        assert!(WORKER_LOAD_WALL < WORKER_PREFILL_WALL);
-        assert!(WORKER_PREFILL_WALL > WORKER_DECODE_WALL);
+        assert!(WORKER_LOAD_WALL < WORKER_FIRST_TOKEN_HOP);
+        assert!(WORKER_FIRST_TOKEN_HOP < WORKER_INVOKE_DEADLINE);
         // Stuck checkout must outlive the absolute invoke deadline so Full Debug
-        // reclaim does not race a still-legal long prefill.
+        // reclaim does not race a still-legal long decode.
         assert!(STUCK_CHECKOUT > WORKER_INVOKE_DEADLINE);
+        assert!(phase_before_first_token("prefill"));
+        assert!(phase_before_first_token("load"));
+        assert!(!phase_before_first_token("decode"));
     }
 
     #[test]

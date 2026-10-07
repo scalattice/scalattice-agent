@@ -587,9 +587,24 @@ fn bytes_to_gb_floor(bytes: u64) -> u32 {
 }
 
 /// Free bytes on the volume that holds the agent home / model cache.
+/// Prefer the models cache volume (where GGUF / Diffusers land). Fall back to home.
+/// Windows boxes often put `~` on C: and models on D: — reporting home free space
+/// while ENOSPC sticky-flagged the models drive made OSART33 look "disk full" at 192 GB free.
+fn disk_inventory_path() -> Option<std::path::PathBuf> {
+    let models = std::env::var("SCALATTICE_MODELS_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::paths::models_cache_dir);
+    if models.exists() || models.parent().is_some_and(|p| p.exists()) {
+        return Some(models);
+    }
+    crate::paths::home_dir().ok()
+}
+
 pub fn disk_avail_bytes() -> Option<u64> {
-    let path = crate::paths::home_dir().ok()?;
-    disk_avail_bytes_for_path(&path)
+    disk_avail_bytes_for_path(&disk_inventory_path()?)
 }
 
 /// True when less than 2 GiB is free: too little for another catalog GGUF.
@@ -598,9 +613,13 @@ pub fn disk_is_full() -> bool {
     disk_avail_bytes().is_some_and(|avail| avail < MIN_FREE)
 }
 
+/// Refresh the sticky disk-full flag from live free space on the models volume.
+pub fn refresh_disk_full_flag() {
+    crate::state::set_disk_full(disk_is_full());
+}
+
 pub(super) fn disk_usage_gb() -> Option<(Option<u32>, Option<u32>, Option<u32>)> {
-    let path = crate::paths::home_dir().ok()?;
-    disk_usage_for_path(&path)
+    disk_usage_for_path(&disk_inventory_path()?)
 }
 
 fn disk_avail_bytes_for_path(path: &std::path::Path) -> Option<u64> {

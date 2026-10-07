@@ -459,8 +459,10 @@ fn ensure_worker_script(venv_dir: &Path) -> Result<PathBuf> {
 /// Image jobs write job JSON, worker.py, and PyTorch scratch. Refuse before
 /// claiming a GPU when the model cache volume is already full.
 pub fn refuse_if_disk_full() -> Result<()> {
-    if crate::specs::disk_is_full() || crate::state::disk_full() {
-        crate::state::set_disk_full(true);
+    // Always re-measure the models volume so a prior ENOSPC sticky bit clears
+    // once free space returns (fleet: OSART33-PC diskFull=true with 192 GB free).
+    crate::specs::refresh_disk_full_flag();
+    if crate::specs::disk_is_full() {
         bail!("disk_full: this machine has no free disk space for image jobs");
     }
     Ok(())
@@ -1268,6 +1270,8 @@ mod tests {
         assert!(WORKER_PY.contains("quantization_config"));
         assert!(WORKER_PY.contains("tight_memory_quant_configs"));
         assert!(WORKER_PY.contains("optimum-quanto"));
+        assert!(WORKER_PY.contains("torchvision"));
+        assert!(WORKER_PY.contains(".deps_ok_v5"));
         assert!(WORKER_PY.contains("PYTORCH_MPS_HIGH_WATERMARK_RATIO"));
         assert!(WORKER_PY.contains("image_accelerator_required"));
         assert!(WORKER_PY.contains(r#"want == "xpu""#));

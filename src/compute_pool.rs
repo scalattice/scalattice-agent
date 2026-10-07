@@ -402,6 +402,10 @@ pub fn build_compute_slots(devices: &[ComputeDevice]) -> Result<ComputePlan> {
                 tp_group: None,
             });
         }
+        // Always advertise integrated slots so the server can pin preferredSlotId
+        // (admin/debug / intentional tiny-SKU routing). Local auto-pick must not
+        // steal work onto soft-estimate iGPUs when a discrete card nameplate-hosts
+        // — that filter lives in placement, not here (fleet: DESKTOP-SJVL4OL).
         for (i, device) in integrated.iter().enumerate() {
             let vram = effective_vram_gb(device);
             let pool_dev = PoolDevice {
@@ -1060,6 +1064,47 @@ mod tests {
         } else {
             assert_eq!(card.strategy, PoolStrategy::CpuOnly);
         }
+    }
+
+    #[test]
+    fn cuda_beside_igpu_still_advertises_both_slots_when_vulkan() {
+        // Server controls placement via preferredSlotId — when Vulkan can serve
+        // the iGPU, agent must expose igpu-0 alongside cuda-0 (not hide it).
+        if !vulkan_runtime_supported() {
+            return;
+        }
+        let plan = build_compute_slots(&[
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "NVIDIA GeForce RTX 5050".into(),
+                vram_gb: Some(8),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "amd:0".into(),
+                kind: "integrated".into(),
+                name: "AMD Radeon(TM) Graphics".into(),
+                vram_gb: Some(2),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ])
+        .unwrap();
+        assert!(plan.slots.iter().any(|s| s.id == "cuda-0"));
+        assert!(plan.slots.iter().any(|s| s.id == "igpu-0" && s.kind == "integrated"));
     }
 
     #[test]

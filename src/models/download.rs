@@ -423,6 +423,7 @@ pub async fn download_catalog_model(
         );
         return Ok(());
     }
+    crate::specs::refresh_disk_full_flag();
     if crate::specs::disk_is_full() {
         anyhow::bail!("no space left on device");
     }
