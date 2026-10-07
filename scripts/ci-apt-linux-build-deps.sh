@@ -2,7 +2,10 @@
 # Install Linux release/CI build deps. Safe on Ubuntu 22.04 (jammy) and 24.04.
 # Usage: ci-apt-linux-build-deps.sh [--minimal]
 #   --minimal  clang/cmake only (CI cargo check)
-#   default    + Vulkan / shaderc packages (release builds)
+#   default    + Vulkan / glslc (release builds)
+#
+# Note: jammy has no apt packages for glslc/libshaderc-dev (those land in noble).
+# On 22.04 we install glslc from the LunarG Vulkan SDK tarball instead.
 set -euo pipefail
 
 MINIMAL=0
@@ -45,16 +48,10 @@ apt_retry() {
   done
 }
 
-wait_dpkg
-apt_retry apt-get update -y
+. /etc/os-release
+UBUNTU_CODENAME="${VERSION_CODENAME:-}"
 
-# glslc / libshaderc-dev live in universe on jammy; ensure it is enabled.
-if command -v add-apt-repository >/dev/null 2>&1; then
-  sudo add-apt-repository -y universe || true
-elif apt-cache policy software-properties-common 2>/dev/null | grep -q Candidate; then
-  apt_retry apt-get install -y software-properties-common
-  sudo add-apt-repository -y universe || true
-fi
+wait_dpkg
 apt_retry apt-get update -y
 
 if [[ "$MINIMAL" -eq 1 ]]; then
@@ -62,16 +59,50 @@ if [[ "$MINIMAL" -eq 1 ]]; then
   exit 0
 fi
 
-apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget \
+apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget curl \
   libvulkan-dev spirv-headers spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
 
-# shaderc packages: prefer apt; jammy sometimes needs a second update after universe.
-if ! apt_retry apt-get install -y glslc libshaderc-dev; then
-  echo "==> apt glslc/libshaderc-dev failed; retrying after universe refresh" >&2
-  sudo add-apt-repository -y universe || true
-  apt_retry apt-get update -y
+install_glslc_from_apt() {
   apt_retry apt-get install -y glslc libshaderc-dev
+}
+
+# LunarG ships a ready glslc; jammy apt does not.
+install_glslc_from_lunarg() {
+  local ver="${VULKAN_SDK_VERSION:-1.3.296.0}"
+  local arch
+  arch="$(uname -m)"
+  if [[ "$arch" != "x86_64" ]]; then
+    echo "LunarG Linux SDK glslc fallback is x86_64-only (got ${arch})" >&2
+    return 1
+  fi
+  local url="https://sdk.lunarg.com/sdk/download/${ver}/linux/vulkansdk-linux-x86_64-${ver}.tar.xz"
+  local tarball="/tmp/vulkansdk-linux-x86_64-${ver}.tar.xz"
+  echo "==> downloading LunarG Vulkan SDK ${ver} for glslc"
+  curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" "$url"
+  tar -xJf "$tarball" -C /tmp
+  local glslc_src="/tmp/${ver}/x86_64/bin/glslc"
+  if [[ ! -x "$glslc_src" ]]; then
+    echo "glslc not found in SDK tarball at ${glslc_src}" >&2
+    find "/tmp/${ver}" -name glslc 2>/dev/null | head -20 >&2 || true
+    return 1
+  fi
+  sudo install -m 755 "$glslc_src" /usr/local/bin/glslc
+  # Keep /usr/bin/glslc working for workflows that hardcode that path.
+  sudo ln -sfn /usr/local/bin/glslc /usr/bin/glslc
+  rm -f "$tarball"
+}
+
+if command -v glslc >/dev/null 2>&1; then
+  echo "==> glslc already present: $(command -v glslc)"
+elif [[ "$UBUNTU_CODENAME" == "jammy" ]]; then
+  install_glslc_from_lunarg
+elif install_glslc_from_apt; then
+  :
+else
+  echo "==> apt glslc unavailable; falling back to LunarG SDK" >&2
+  install_glslc_from_lunarg
 fi
 
 command -v glslc >/dev/null
 glslc --version || true
+echo "==> Vulkan_GLSLC_EXECUTABLE=$(command -v glslc)"
