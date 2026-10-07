@@ -69,38 +69,74 @@ fn pick_image_placement(
     })
 }
 
-/// Build a placement that runs **exactly** on the server-chosen slot.
-/// No GPU↔CPU remapping. Tensor-parallel groups expand to all siblings when the
-/// pin is any member of the group (all must be idle — caller checks workers).
+/// Build a placement that runs on the server-chosen slot.
+/// No GPU↔CPU remapping. Dual-mode TP: expand a preferred pin to the full
+/// TpGroup only when the single pin card cannot fully host the model but the
+/// pooled TP card can. Small jobs that fit one sibling stay on that pin so
+/// other siblings remain free. Caller must verify all returned slot_ids are idle.
 pub fn placement_for_required_slot(
     plan: &ComputePlan,
     slot_id: &str,
     devices: &[crate::specs::ComputeDevice],
+    model: &CatalogModel,
+    need_vision: bool,
 ) -> Option<Placement> {
     let want = slot_id.trim();
     if want.is_empty() {
         return None;
     }
     let slot = plan.slots.iter().find(|s| s.id == want)?;
-    if let Some(group_id) = slot.tp_group.as_deref().filter(|g| !g.is_empty()) {
-        let siblings: Vec<&ComputeSlot> = plan
-            .slots
-            .iter()
-            .filter(|s| s.tp_group.as_deref() == Some(group_id))
-            .collect();
-        if siblings.len() > 1 {
-            let phys_ids: Vec<u32> = siblings
+    // Image / Diffusers jobs never use the TP worker path.
+    if !model.is_image_job() {
+        if let Some(group_id) = slot.tp_group.as_deref().filter(|g| !g.is_empty()) {
+            let siblings: Vec<&ComputeSlot> = plan
+                .slots
                 .iter()
-                .flat_map(|s| s.cuda_visible.iter().copied())
+                .filter(|s| s.tp_group.as_deref() == Some(group_id))
                 .collect();
-            if let Ok(tp_card) = crate::compute_pool::build_tp_card_for_group(devices, &phys_ids) {
-                if tp_card.strategy == PoolStrategy::TensorParallel {
-                    return Some(Placement {
-                        slot_ids: siblings.iter().map(|s| s.id.clone()).collect(),
-                        card: tp_card,
-                        cuda_visible: phys_ids,
-                        use_tp_worker: true,
-                    });
+            if siblings.len() > 1 {
+                let min_vram = if need_vision {
+                    image_job_min_vram_gb(model)
+                } else {
+                    hosting_min_vram_gb(model)
+                };
+                let pin_can_full = vram_can_gpu_full(
+                    f64::from(slot.card.total_vram_gb),
+                    model,
+                    min_vram,
+                    need_vision,
+                ) && (!need_vision || can_serve_vision_on_card(model, &slot.card));
+                if !pin_can_full {
+                    let phys_ids: Vec<u32> = siblings
+                        .iter()
+                        .flat_map(|s| s.cuda_visible.iter().copied())
+                        .collect();
+                    if let Ok(tp_card) =
+                        crate::compute_pool::build_tp_card_for_group(devices, &phys_ids)
+                    {
+                        if tp_card.strategy == PoolStrategy::TensorParallel {
+                            let tp_can_full = vram_can_gpu_full(
+                                f64::from(tp_card.total_vram_gb),
+                                model,
+                                min_vram,
+                                need_vision,
+                            ) && (!need_vision
+                                || can_serve_vision_on_card(model, &tp_card));
+                            if tp_can_full {
+                                debug!(
+                                    pin = %slot.id,
+                                    group = %group_id,
+                                    "placement: preferred pin expands to TP (pool required)"
+                                );
+                                return Some(Placement {
+                                    slot_ids: siblings.iter().map(|s| s.id.clone()).collect(),
+                                    card: tp_card,
+                                    cuda_visible: phys_ids,
+                                    use_tp_worker: true,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -636,28 +672,17 @@ pub fn placement_miss_detail(
 
     if need_vision {
         let need = image_job_min_vram_gb(model);
+        // Vision needs one accelerator that fits — never sum sibling nameplates
+        // (fleet: 2×3090 reported "largest idle 48 GB" while each slot is 24 GB).
         let max_slot = idle_accel
             .iter()
             .map(|s| s.card.total_vram_gb)
             .max()
             .unwrap_or(0);
-        let mut max_pool = max_slot;
-        for (group_id, _phys_ids) in &plan.tp_groups {
-            let siblings: Vec<&ComputeSlot> = plan
-                .slots
-                .iter()
-                .filter(|s| s.tp_group.as_deref() == Some(group_id.as_str()))
-                .collect();
-            if siblings.is_empty() || siblings.iter().any(|s| !idle.contains(s.id.as_str())) {
-                continue;
-            }
-            let pooled: u32 = siblings.iter().map(|s| s.card.total_vram_gb).sum();
-            max_pool = max_pool.max(pooled);
-        }
         return crate::invoke_code::CodedError::new(
             crate::invoke_code::InvokeErrorCode::InsufficientVram,
             format!(
-                "need {need} GB GPU for vision job {model_id}; largest idle {max_pool} GB across {} slot(s)",
+                "need {need} GB GPU for vision job {model_id}; largest idle slot {max_slot} GB ({} idle accelerator slot(s))",
                 idle_accel.len()
             ),
         );
@@ -938,11 +963,81 @@ mod tests {
     fn required_slot_placement_is_literal() {
         let devices = mixed_1660_3080();
         let plan = build_compute_slots(&devices).unwrap();
-        let on_cpu = placement_for_required_slot(&plan, "cpu-0", &devices).unwrap();
+        let m = model(4.0, 4.68);
+        let on_cpu = placement_for_required_slot(&plan, "cpu-0", &devices, &m, false).unwrap();
         assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
-        let on_gpu = placement_for_required_slot(&plan, "cuda-0", &devices).unwrap();
+        let on_gpu = placement_for_required_slot(&plan, "cuda-0", &devices, &m, false).unwrap();
         assert_eq!(on_gpu.slot_ids, vec!["cuda-0".to_string()]);
-        assert!(placement_for_required_slot(&plan, "cuda-99", &devices).is_none());
+        assert!(placement_for_required_slot(&plan, "cuda-99", &devices, &m, false).is_none());
+    }
+
+    fn twin_4090() -> [ComputeDevice; 3] {
+        [
+            ComputeDevice {
+                id: "nvidia:0".into(),
+                kind: "discrete".into(),
+                name: "RTX 4090".into(),
+                vram_gb: Some(24),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "nvidia:1".into(),
+                kind: "discrete".into(),
+                name: "RTX 4090".into(),
+                vram_gb: Some(24),
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+            ComputeDevice {
+                id: "cpu:0".into(),
+                kind: "cpu".into(),
+                name: "CPU".into(),
+                vram_gb: None,
+                vram_used_gb: None,
+                util_pct: None,
+                enabled: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn preferred_pin_in_tp_group_keeps_small_model_on_single_sibling() {
+        let devices = twin_4090();
+        let plan = build_compute_slots(&devices).unwrap();
+        assert!(
+            plan.slots
+                .iter()
+                .filter(|s| s.kind != "cpu")
+                .all(|s| s.tp_group.is_some()),
+            "matched 4090s must share a tp_group"
+        );
+        let small = model(8.0, 5.0);
+        let placement =
+            placement_for_required_slot(&plan, "cuda-0", &devices, &small, false).unwrap();
+        assert!(
+            !placement.use_tp_worker,
+            "small model that fits one card must not steal the TpGroup"
+        );
+        assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
+    }
+
+    #[test]
+    fn preferred_pin_in_tp_group_expands_when_model_needs_pool() {
+        let devices = twin_4090();
+        let plan = build_compute_slots(&devices).unwrap();
+        let large = model(40.0, 30.0);
+        let placement =
+            placement_for_required_slot(&plan, "cuda-1", &devices, &large, false).unwrap();
+        assert!(
+            placement.use_tp_worker,
+            "large model that cannot full-host on one card must expand to TP"
+        );
+        assert_eq!(placement.slot_ids.len(), 2);
+        assert!(placement.slot_ids.contains(&"cuda-0".to_string()));
+        assert!(placement.slot_ids.contains(&"cuda-1".to_string()));
     }
 
     #[test]
@@ -1573,7 +1668,8 @@ mod tests {
             ],
             tp_groups: Default::default(),
         };
-        let pin = placement_for_required_slot(&plan, "igpu-0", &devices).unwrap();
+        let pin = placement_for_required_slot(&plan, "igpu-0", &devices, &model(6.0, 5.0), false)
+            .unwrap();
         assert_eq!(pin.slot_ids, vec!["igpu-0".to_string()]);
         let idle = vec!["igpu-0".to_string(), "cpu-0".to_string()];
         let m = model(6.0, 5.0);

@@ -361,8 +361,7 @@ pub fn generate_with_callback(
                 let prompt_token_count = prompt_tokens.len() as u32;
                 let tokens = prompt_tokens;
                 let n = tokens.len();
-                // Context n_batch is already 2048 (clamped to n_ctx). Scratch is
-                // reserved for that. A 64-token chunk only adds kernel launches.
+
                 let prefill_chunk = ctx.n_batch().max(1) as usize;
                 let mut batch = LlamaBatch::new(prefill_chunk, 1);
                 let mut i = 0usize;
@@ -381,7 +380,11 @@ pub fn generate_with_callback(
                     super::progress::report("prefill", end as f32 / n.max(1) as f32);
                     i = end;
                 }
-                let sample_idx = batch.n_tokens() - 1;
+                let sample_idx = if n == 0 {
+                    -1i32
+                } else {
+                    batch.n_tokens() - 1
+                };
                 (prompt_token_count, n as i32, sample_idx)
             };
 

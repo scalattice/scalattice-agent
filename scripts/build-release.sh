@@ -60,10 +60,10 @@ if [[ ! -x "$NVCC" ]]; then
   cat >&2 <<EOF
 CUDA toolkit not found at ${CUDA_PATH}/bin/nvcc
 
-Install CUDA 12.6 dev packages (Ubuntu 24.04 x86_64), then re-run this script:
+Install CUDA 12.6 dev packages (prefer Ubuntu 22.04 for glibc 2.35 ABI), then re-run:
 
   cd /tmp
-  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
   sudo dpkg -i cuda-keyring_1.1-1_all.deb
   sudo apt-get update
   sudo apt-get install -y --no-install-recommends \\

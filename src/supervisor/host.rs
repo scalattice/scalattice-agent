@@ -643,7 +643,15 @@ impl Supervisor {
     }
 
     async fn any_slot_has_runtime(&self, runtime_model: &str, model_id: &str) -> bool {
-        let workers = self.workers.lock().await;
+        // Never block placement prep on a wedged workers mutex (fleet: SJVL /
+        // Laptop "timed out preparing placement" while slots looked idle).
+        let workers = match tokio::time::timeout(Duration::from_secs(2), self.workers.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                warn!("workers lock busy during warm check; treating as cold load");
+                return false;
+            }
+        };
         workers.values().any(|w| {
             w.loaded_models.iter().any(|m| {
                 (!runtime_model.is_empty() && m.eq_ignore_ascii_case(runtime_model))
@@ -1157,6 +1165,7 @@ impl Supervisor {
         let occupied = self.occupied_slot_ids().await;
 
         // Clear residents the server did not authorize for this plan.
+        // Sticky KV leases no longer protect slots from idle eviction.
         let evict_ids: Vec<String> = {
             let workers = self.workers.lock().await;
             self.plan
@@ -1310,8 +1319,11 @@ impl Supervisor {
         cpu_ram_headroom_gb: u32,
         on_delta: Option<Box<dyn FnMut(String) + Send>>,
         preferred_slot_id: Option<&str>,
+        n_ctx_override: u32,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         let cancel = self.register_job_cancel(job_id).await;
+        // Heal orphan busy/checkouts before we wait on locks (SJVL/Laptop stuck-agent).
+        let _ = self.reconcile_slots().await;
         // Resolve weight size / warm residency off the hot path's blocking work with
         // a hard ceiling so a wedged workers mutex or slow FS cannot eat the whole
         // fleet poll window (Laptop: invoke logged, never reached "placing").
@@ -1326,11 +1338,18 @@ impl Supervisor {
                 self.clear_job_cancel(job_id).await;
                 bail!("request_canceled");
             }
-            _ = tokio::time::sleep(Duration::from_secs(20)) => {
+            _ = tokio::time::sleep(Duration::from_secs(8)) => {
                 self.clear_job_cancel(job_id).await;
+                let idle = self.routing_idle_slot_count().await;
                 return Err(crate::invoke_code::coded(
                     crate::invoke_code::InvokeErrorCode::AgentBusy,
-                    "timed out preparing placement (compute slots busy)".to_string(),
+                    if idle > 0 {
+                        format!(
+                            "timed out preparing placement (workers lock wedged; {idle} idle slot(s) visible)"
+                        )
+                    } else {
+                        "timed out preparing placement (compute slots busy)".to_string()
+                    },
                 ));
             }
             ready = prep => ready,
@@ -1378,6 +1397,7 @@ impl Supervisor {
 
         let mut skip: HashSet<String> = HashSet::new();
         let mut last_crash: Option<anyhow::Error> = None;
+        // Prefer server-pinned slot only.
         let required_slot = preferred_slot_id
             .map(str::trim)
             .filter(|id| !id.is_empty())
@@ -1409,11 +1429,17 @@ impl Supervisor {
             let placement = {
                 let occupied = self.occupied_slot_ids().await;
 
-                // Router chose the slot — claim exactly that (or its TP group). Refuse if busy.
+                // Router chose the slot — claim that pin, or its TP group when the
+                // model needs the pooled VRAM. Refuse if any claimed sibling is busy.
                 if let Some(ref want) = required_slot {
-                    let Some(placement) =
-                        placement_for_required_slot(&self.plan, want, &self.devices)
-                    else {
+                    let need_vision = crate::protocol::messages_have_images(messages);
+                    let Some(placement) = placement_for_required_slot(
+                        &self.plan,
+                        want,
+                        &self.devices,
+                        model,
+                        need_vision,
+                    ) else {
                         self.clear_job_cancel(job_id).await;
                         return Err(crate::invoke_code::coded(
                             crate::invoke_code::InvokeErrorCode::NoIdleSlot,
@@ -1578,16 +1604,8 @@ impl Supervisor {
                     })
                     .cloned()
                     .collect();
-                let reclaimable: HashSet<String> = idle
-                    .iter()
-                    .filter(|id| {
-                        workers
-                            .get(*id)
-                            .is_some_and(|w| !w.loaded_models.is_empty())
-                    })
-                    .cloned()
-                    .collect();
                 drop(workers);
+                let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
                 let sys_avail = self.available_sys_ram_gb().await;
                 let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
                 let mut workers = self.workers.lock().await;
@@ -1685,6 +1703,7 @@ impl Supervisor {
                     model,
                     on_delta.as_mut(),
                     &cancel,
+                    n_ctx_override,
                 )
                 .await
             } else {
@@ -1698,6 +1717,7 @@ impl Supervisor {
                     model,
                     on_delta.as_mut(),
                     &cancel,
+                    n_ctx_override,
                 )
                 .await
             };
@@ -1768,9 +1788,13 @@ impl Supervisor {
         let placement = {
             let occupied = self.occupied_slot_ids().await;
             if let Some(ref want) = required_slot {
-                let Some(placement) =
-                    placement_for_required_slot(&self.plan, want, &self.devices)
-                else {
+                let Some(placement) = placement_for_required_slot(
+                    &self.plan,
+                    want,
+                    &self.devices,
+                    model,
+                    false,
+                ) else {
                     self.clear_job_cancel(job_id).await;
                     return Err(crate::invoke_code::coded(
                         crate::invoke_code::InvokeErrorCode::NoIdleSlot,
@@ -1980,6 +2004,7 @@ impl Supervisor {
         model: &CatalogModel,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
         cancel: &Notify,
+        n_ctx_override: u32,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         let slot_id = placement
             .slot_ids
@@ -2006,8 +2031,13 @@ impl Supervisor {
         };
         let pid = worker.child.id();
         let need_vision = crate::protocol::messages_have_images(messages);
-        let (n_ctx, offload_kqv) =
-            crate::models::llama_context_plan(model, &placement.card, need_vision);
+        // Job/lease nCtx drives KV→RAM offload on mid-cards (phase 2 widen).
+        let (n_ctx, offload_kqv) = crate::models::llama_context_plan_for_n_ctx(
+            model,
+            &placement.card,
+            need_vision,
+            n_ctx_override,
+        );
         let already_loaded = worker.loaded_models.iter().any(|m| {
             m.eq_ignore_ascii_case(runtime_model) || m.eq_ignore_ascii_case(model_id)
         });
@@ -2143,6 +2173,7 @@ impl Supervisor {
         model: &CatalogModel,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
         cancel: &Notify,
+        n_ctx_override: u32,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         // Slots already claimed busy by invoke(). Pause siblings, run TP, restore.
         let sibling_pids: Vec<(String, Option<u32>)> = {
@@ -2234,8 +2265,12 @@ impl Supervisor {
         let req_id = next_req_id();
         let stream = on_delta.is_some();
         let need_vision = crate::protocol::messages_have_images(messages);
-        let (n_ctx, offload_kqv) =
-            crate::models::llama_context_plan(model, &placement.card, need_vision);
+        let (n_ctx, offload_kqv) = crate::models::llama_context_plan_for_n_ctx(
+            model,
+            &placement.card,
+            need_vision,
+            n_ctx_override,
+        );
         let outcome = worker_rpc_invoke_cancellable(
             &mut tp_worker,
             WorkerRequest::Invoke {
