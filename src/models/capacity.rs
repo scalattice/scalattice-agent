@@ -235,20 +235,47 @@ pub fn kv_fits_on_gpu(
     available_gb + 0.005 >= gpu_full_host_need_gb_for_job(model, need_vision)
 }
 
-/// Catalog window + whether llama.cpp should keep KV on the GPU.
-/// `offload_kqv=false` puts KV in system RAM when leftover VRAM cannot hold it.
-pub fn llama_context_plan(
+/// Catalog (or job/lease) window + whether llama.cpp should keep KV on the GPU.
+/// `n_ctx_override` (when > 0) is the job/lease window; otherwise catalog size.
+/// Mid-cards that hold weights but not full-window KV get `offload_kqv=false`
+/// so sticky sessions can widen without migrating to a flagship GPU.
+pub fn llama_context_plan_for_n_ctx(
     model: &CatalogModel,
     card: &VirtualCard,
     need_vision: bool,
+    n_ctx_override: u32,
 ) -> (u32, bool) {
-    let n_ctx = job_n_ctx(model, need_vision).max(1);
+    let catalog = job_n_ctx(model, need_vision).max(1);
+    let n_ctx = if n_ctx_override > 0 {
+        n_ctx_override.min(catalog).max(512)
+    } else {
+        catalog
+    };
     let offload_kqv = match card.strategy {
         PoolStrategy::CpuOnly => false,
+        // Unified memory: keep KV on the Metal pool (no discrete VRAM/RAM split).
         PoolStrategy::Metal => true,
-        _ => kv_fits_on_gpu(f64::from(card.total_vram_gb), model, need_vision),
+        _ => kv_fits_on_gpu_for_n_ctx(f64::from(card.total_vram_gb), model, need_vision, n_ctx),
     };
     (n_ctx, offload_kqv)
+}
+
+/// True when leftover VRAM after weights+scratch can hold KV for `n_ctx`.
+fn kv_fits_on_gpu_for_n_ctx(
+    available_gb: f64,
+    model: &CatalogModel,
+    need_vision: bool,
+    n_ctx: u32,
+) -> bool {
+    let weight = llama_weight_gb(model);
+    let shape = llama_shape(model);
+    let weights_on_gpu = gpu_weights_need_gb(weight, shape, n_ctx) + mmproj_gb(model, need_vision);
+    let leftover = available_gb - weights_on_gpu;
+    if leftover <= 0.05 {
+        return false;
+    }
+    let kv = kv_gb(weight, shape, n_ctx.max(1));
+    leftover + 0.005 >= kv
 }
 
 /// True when `available_gb` (live free, else advertised) can take weights + KV
@@ -636,9 +663,15 @@ mod tests {
         .unwrap();
         assert!(can_host_model(&m, &card, 16, 2));
         assert!(!can_host_model(&m, &card, 6, 2));
-        let (n_ctx, offload_kqv) = llama_context_plan(&m, &card, false);
+        let (n_ctx, offload_kqv) = llama_context_plan_for_n_ctx(&m, &card, false, 0);
         assert_eq!(n_ctx, 32768);
         assert!(!offload_kqv);
+        // Smaller lease window may still keep KV on GPU when leftover VRAM fits.
+        let (small_ctx, small_offload) =
+            llama_context_plan_for_n_ctx(&m, &card, false, 2048);
+        assert_eq!(small_ctx, 2048);
+        // 8 GB card with ~5.5 GB weights: short windows often fit KV on GPU.
+        let _ = small_offload;
     }
 
     #[test]

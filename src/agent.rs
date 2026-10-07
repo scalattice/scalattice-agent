@@ -2659,6 +2659,7 @@ async fn respond_invoke(
                         Some(pin)
                     }
                 },
+                invoke.n_ctx,
             )
             .await;
         drop(delta_tx);
@@ -3019,7 +3020,7 @@ mod invoke_error_code_tests {
     #[test]
     fn vision_vram_miss_is_insufficient_vram_not_busy() {
         let err = anyhow::anyhow!(
-            "insufficient_vram: need 8 GB GPU for vision job qwen-3-vl-8b; largest idle 4 GB across 2 slot(s)"
+            "insufficient_vram: need 8 GB GPU for vision job qwen-3-vl-8b; largest idle slot 4 GB (2 idle accelerator slot(s))"
         );
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
     }

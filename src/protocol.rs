@@ -327,6 +327,9 @@ pub struct InvokeMessage {
     /// Router-required slot id. When set the agent claims this slot only (no remap).
     #[serde(default, rename = "preferredSlotId")]
     pub preferred_slot_id: String,
+    /// Optional override for llama n_ctx (0 = agent plans from catalog + card).
+    #[serde(default, rename = "nCtx")]
+    pub n_ctx: u32,
 }
 
 #[derive(Debug, Deserialize)]
