@@ -32,7 +32,7 @@ jobs:
           ./scripts/ci-apt-linux-build-deps.sh --minimal
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-check-gate
+          shared-key: ci-check-gate-jammy
           cache-targets: true
           cache-workspace-crates: true
       - name: cargo check
