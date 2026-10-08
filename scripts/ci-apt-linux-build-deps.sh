@@ -4,8 +4,9 @@
 #   --minimal  clang/cmake only (CI cargo check)
 #   default    + Vulkan / glslc (release builds)
 #
-# Note: jammy has no apt packages for glslc/libshaderc-dev (those land in noble).
-# On 22.04 we install glslc from the LunarG Vulkan SDK tarball instead.
+# Jammy apt Vulkan headers are 1.3.204 — too old for current llama.cpp Vulkan.
+# On 22.04 we install the full LunarG Vulkan SDK (headers + glslc + libs) and
+# export VULKAN_SDK so CMake prefers it over /usr.
 set -euo pipefail
 
 MINIMAL=0
@@ -14,6 +15,7 @@ if [[ "${1:-}" == "--minimal" ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+VULKAN_SDK_VERSION="${VULKAN_SDK_VERSION:-1.3.296.0}"
 
 wait_dpkg() {
   local i=0
@@ -48,6 +50,15 @@ apt_retry() {
   done
 }
 
+export_github_env() {
+  local key="$1" val="$2"
+  if [[ -n "${GITHUB_ENV:-}" ]]; then
+    # multiline-safe: values here are single-line paths
+    echo "${key}=${val}" >>"$GITHUB_ENV"
+  fi
+  export "${key}=${val}"
+}
+
 . /etc/os-release
 UBUNTU_CODENAME="${VERSION_CODENAME:-}"
 
@@ -61,49 +72,70 @@ fi
 
 apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget curl \
   gcc g++ libgomp1 \
-  libvulkan-dev spirv-headers spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
+  libvulkan1 patchelf mesa-vulkan-drivers
 
-install_glslc_from_apt() {
-  apt_retry apt-get install -y glslc libshaderc-dev
-}
+# On jammy, skip apt libvulkan-dev / spirv (ancient headers). Prefer LunarG SDK.
+if [[ "$UBUNTU_CODENAME" != "jammy" ]]; then
+  apt_retry apt-get install -y libvulkan-dev spirv-headers spirv-tools || true
+  apt_retry apt-get install -y glslc libshaderc-dev || true
+fi
 
-# LunarG ships a ready glslc; jammy apt does not.
-install_glslc_from_lunarg() {
-  local ver="${VULKAN_SDK_VERSION:-1.3.296.0}"
+install_vulkan_sdk_from_lunarg() {
+  local ver="$VULKAN_SDK_VERSION"
   local arch
   arch="$(uname -m)"
   if [[ "$arch" != "x86_64" ]]; then
-    echo "LunarG Linux SDK glslc fallback is x86_64-only (got ${arch})" >&2
+    echo "LunarG Linux SDK fallback is x86_64-only (got ${arch})" >&2
     return 1
   fi
   local url="https://sdk.lunarg.com/sdk/download/${ver}/linux/vulkansdk-linux-x86_64-${ver}.tar.xz"
   local tarball="/tmp/vulkansdk-linux-x86_64-${ver}.tar.xz"
-  echo "==> downloading LunarG Vulkan SDK ${ver} for glslc"
+  local sdk_root="/opt/vulkan-sdk/${ver}/x86_64"
+  echo "==> downloading LunarG Vulkan SDK ${ver} (headers + glslc)"
   curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" "$url"
-  tar -xJf "$tarball" -C /tmp
-  local glslc_src="/tmp/${ver}/x86_64/bin/glslc"
-  if [[ ! -x "$glslc_src" ]]; then
-    echo "glslc not found in SDK tarball at ${glslc_src}" >&2
-    find "/tmp/${ver}" -name glslc 2>/dev/null | head -20 >&2 || true
+  sudo mkdir -p /opt/vulkan-sdk
+  sudo tar -xJf "$tarball" -C /opt/vulkan-sdk
+  rm -f "$tarball"
+  if [[ ! -d "$sdk_root" ]]; then
+    echo "SDK root missing after extract: ${sdk_root}" >&2
+    find /opt/vulkan-sdk -maxdepth 3 -type d 2>/dev/null | head -40 >&2 || true
     return 1
   fi
-  sudo install -m 755 "$glslc_src" /usr/local/bin/glslc
-  # Keep /usr/bin/glslc working for workflows that hardcode that path.
+  if [[ ! -x "${sdk_root}/bin/glslc" ]]; then
+    echo "glslc missing in SDK at ${sdk_root}/bin/glslc" >&2
+    return 1
+  fi
+  if [[ ! -f "${sdk_root}/include/vulkan/vulkan.hpp" && ! -f "${sdk_root}/include/vulkan/vulkan_core.h" ]]; then
+    echo "Vulkan headers missing under ${sdk_root}/include/vulkan" >&2
+    ls -la "${sdk_root}/include" 2>/dev/null | head -20 >&2 || true
+    return 1
+  fi
+  sudo ln -sfn "$sdk_root" /opt/vulkan-sdk/current
+  sudo install -m 755 "${sdk_root}/bin/glslc" /usr/local/bin/glslc
   sudo ln -sfn /usr/local/bin/glslc /usr/bin/glslc
-  rm -f "$tarball"
+
+  export_github_env VULKAN_SDK "$sdk_root"
+  export_github_env Vulkan_GLSLC_EXECUTABLE "${sdk_root}/bin/glslc"
+  # SDK first so FindVulkan does not pick jammy's 1.3.204 headers from /usr.
+  export_github_env CMAKE_PREFIX_PATH "${sdk_root}:/usr"
+  export_github_env LD_LIBRARY_PATH "${sdk_root}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  # Prepend SDK bin for subsequent steps.
+  if [[ -n "${GITHUB_PATH:-}" ]]; then
+    echo "${sdk_root}/bin" >>"$GITHUB_PATH"
+  fi
+  echo "==> VULKAN_SDK=${sdk_root}"
+  echo "==> vulkan.hpp present: $(test -f "${sdk_root}/include/vulkan/vulkan.hpp" && echo yes || echo no)"
 }
 
-if command -v glslc >/dev/null 2>&1; then
-  echo "==> glslc already present: $(command -v glslc)"
-elif [[ "$UBUNTU_CODENAME" == "jammy" ]]; then
-  install_glslc_from_lunarg
-elif install_glslc_from_apt; then
-  :
-else
+if [[ "$UBUNTU_CODENAME" == "jammy" ]]; then
+  install_vulkan_sdk_from_lunarg
+elif ! command -v glslc >/dev/null 2>&1; then
   echo "==> apt glslc unavailable; falling back to LunarG SDK" >&2
-  install_glslc_from_lunarg
+  install_vulkan_sdk_from_lunarg
 fi
 
 command -v glslc >/dev/null
 glslc --version || true
-echo "==> Vulkan_GLSLC_EXECUTABLE=$(command -v glslc)"
+echo "==> Vulkan_GLSLC_EXECUTABLE=${Vulkan_GLSLC_EXECUTABLE:-$(command -v glslc)}"
+echo "==> VULKAN_SDK=${VULKAN_SDK:-}"
+echo "==> CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}"

@@ -115,16 +115,15 @@ jobs:
           method: auto
       - uses: Swatinem/rust-cache@v2
         with:
-          # Jammy-only key: 24.04 caches ship GLIBC_2.39 build-scripts + gcc-13
-          # paths that break Ubuntu 22.04 (glibc 2.35) builds.
-          shared-key: release-x86_64-gpu-jammy
+          # Jammy + LunarG SDK key (24.04 caches / old cmake vulkan paths break jammy).
+          shared-key: release-x86_64-gpu-jammy-vulkansdk
           cache-targets: true
           cache-workspace-crates: true
       - name: Build + package
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
-          CMAKE_PREFIX_PATH: /usr
-          Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
+          # VULKAN_SDK / CMAKE_PREFIX_PATH / Vulkan_GLSLC_EXECUTABLE come from
+          # ci-apt-linux-build-deps.sh via GITHUB_ENV (LunarG SDK on jammy).
           CARGO_INCREMENTAL: "0"
           # Pin host compiler to jammy's gcc (CUDA/cmake must not chase gcc-13).
           CC: gcc
@@ -132,7 +131,12 @@ jobs:
           CUDAHOSTCXX: g++
         run: |
           set -euo pipefail
-          export PATH="${CUDA_PATH}/bin:$PATH"
+          export PATH="${CUDA_PATH}/bin:${VULKAN_SDK:+$VULKAN_SDK/bin:}$PATH"
+          if [[ -n "${VULKAN_SDK:-}" ]]; then
+            echo "==> building with VULKAN_SDK=${VULKAN_SDK}"
+            test -f "${VULKAN_SDK}/include/vulkan/vulkan_core.h" \
+              || test -f "${VULKAN_SDK}/include/vulkan/vulkan.hpp"
+          fi
           chmod +x scripts/build-release.sh scripts/bundle-release-libs.sh scripts/prune-cargo-target.sh
           ./scripts/build-release.sh x86_64-unknown-linux-gnu
       - name: Vet auto-update and remote restart

@@ -51,9 +51,16 @@ args+=(--features "$FEATURES")
 echo "==> cargo ${args[*]}"
 echo "    (llama.cpp + CUDA/Vulkan dominate build time; clap is seconds, not an hour)"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
-export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-/usr}"
 export CUDA_PATH="${CUDA_PATH:-/usr/local/cuda-12.6}"
-export Vulkan_GLSLC_EXECUTABLE="${Vulkan_GLSLC_EXECUTABLE:-/usr/bin/glslc}"
+if [[ -n "${VULKAN_SDK:-}" ]]; then
+  export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-${VULKAN_SDK}:/usr}"
+  export Vulkan_GLSLC_EXECUTABLE="${Vulkan_GLSLC_EXECUTABLE:-${VULKAN_SDK}/bin/glslc}"
+  export PATH="${VULKAN_SDK}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${VULKAN_SDK}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+else
+  export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-/usr}"
+  export Vulkan_GLSLC_EXECUTABLE="${Vulkan_GLSLC_EXECUTABLE:-/usr/bin/glslc}"
+fi
 
 NVCC="${CUDA_PATH}/bin/nvcc"
 if [[ ! -x "$NVCC" ]]; then
