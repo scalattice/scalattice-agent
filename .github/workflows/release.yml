@@ -115,7 +115,9 @@ jobs:
           method: auto
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-x86_64-gpu
+          # Jammy-only key: 24.04 caches ship GLIBC_2.39 build-scripts + gcc-13
+          # paths that break Ubuntu 22.04 (glibc 2.35) builds.
+          shared-key: release-x86_64-gpu-jammy
           cache-targets: true
           cache-workspace-crates: true
       - name: Build + package
@@ -124,6 +126,10 @@ jobs:
           CMAKE_PREFIX_PATH: /usr
           Vulkan_GLSLC_EXECUTABLE: /usr/bin/glslc
           CARGO_INCREMENTAL: "0"
+          # Pin host compiler to jammy's gcc (CUDA/cmake must not chase gcc-13).
+          CC: gcc
+          CXX: g++
+          CUDAHOSTCXX: g++
         run: |
           set -euo pipefail
           export PATH="${CUDA_PATH}/bin:$PATH"

@@ -60,6 +60,7 @@ if [[ "$MINIMAL" -eq 1 ]]; then
 fi
 
 apt_retry apt-get install -y clang libclang-dev cmake build-essential pkg-config wget curl \
+  gcc g++ libgomp1 \
   libvulkan-dev spirv-headers spirv-tools libvulkan1 patchelf mesa-vulkan-drivers
 
 install_glslc_from_apt() {
