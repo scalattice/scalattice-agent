@@ -121,6 +121,8 @@ pub struct Supervisor {
     server_blocks: Mutex<HashMap<String, HashSet<String>>>,
     /// Slot ids this process has already seen fail. Kept across pongs.
     local_blocks: Mutex<HashMap<String, HashSet<String>>>,
+    /// Metal slots whose GPU decode collapsed/failed; respawned workers skip GPU tiers.
+    metal_gpu_unreliable: Mutex<HashSet<String>>,
 }
 
 /// Give up only when the worker stops sending progress/token lines.
@@ -364,7 +366,7 @@ impl Supervisor {
                 unusable_slots.insert(slot.id.clone());
                 continue;
             }
-            match spawn_worker(slot).await {
+            match spawn_worker(slot, false).await {
                 Ok(w) => {
                     if w.healthy {
                         info!(slot = %slot.id, kind = %slot.kind, "slot worker ready");
@@ -404,7 +406,120 @@ impl Supervisor {
             unusable_slots,
             server_blocks: Mutex::new(HashMap::new()),
             local_blocks: Mutex::new(HashMap::new()),
+            metal_gpu_unreliable: Mutex::new(HashSet::new()),
         }))
+    }
+
+    async fn metal_gpu_unreliable_for(&self, slot_id: &str) -> bool {
+        self.metal_gpu_unreliable.lock().await.contains(slot_id)
+    }
+
+    async fn note_metal_decode_failure(&self, slot_id: &str, error: &str) {
+        let is_metal = self
+            .plan
+            .slots
+            .iter()
+            .any(|s| s.id == slot_id && matches!(s.card.strategy, PoolStrategy::Metal));
+        if !is_metal {
+            return;
+        }
+        let detail = error.to_ascii_lowercase();
+        if !(detail.contains("vocab_zero_collapse")
+            || detail.contains("decode error -3")
+            || detail.contains("unknown(-3)")
+            || (detail.contains("decode prompt") && detail.contains("decode error")))
+        {
+            return;
+        }
+        if self
+            .metal_gpu_unreliable
+            .lock()
+            .await
+            .insert(slot_id.to_string())
+        {
+            info!(
+                slot = %slot_id,
+                "Metal GPU decode marked unreliable; future workers skip GPU tiers"
+            );
+        }
+    }
+
+    async fn spawn_plan_worker(&self, slot: &ComputeSlot) -> Result<SlotWorker> {
+        let metal = self.metal_gpu_unreliable_for(&slot.id).await;
+        spawn_worker(slot, metal).await
+    }
+
+    /// Prefer a healthy idle worker for a pinned claim. Respawn once if unhealthy.
+    async fn claim_pin_slot_error(
+        &self,
+        sid: &str,
+        blocked: &HashSet<String>,
+        occupied: &HashSet<String>,
+    ) -> Option<anyhow::Error> {
+        if blocked.contains(sid) {
+            return Some(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                format!("preferred slot {sid} is blocked for this model"),
+            ));
+        }
+        if occupied.contains(sid) {
+            return Some(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                format!("preferred slot {sid} is occupied externally"),
+            ));
+        }
+        {
+            let workers = self.workers.lock().await;
+            if workers.get(sid).is_none() {
+                drop(workers);
+                return Some(self.err_missing_slot_worker(sid).await);
+            }
+            let worker = workers.get(sid).expect("worker present");
+            if worker.busy {
+                return Some(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                    format!("preferred slot {sid} is busy"),
+                ));
+            }
+            if worker.healthy {
+                return None;
+            }
+        }
+        // Unhealthy: kill + respawn once, then re-check.
+        let Some(spec) = self.plan.slots.iter().find(|s| s.id == sid).cloned() else {
+            return Some(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                format!("preferred slot {sid} is not on this machine"),
+            ));
+        };
+        {
+            let mut workers = self.workers.lock().await;
+            if let Some(mut old) = workers.remove(sid) {
+                let _ = old.child.kill().await;
+                let _ = old.child.wait().await;
+            }
+        }
+        match self.spawn_plan_worker(&spec).await {
+            Ok(mut w) => {
+                w.busy = false;
+                w.healthy = true;
+                self.workers.lock().await.insert(sid.to_string(), w);
+                info!(slot = %sid, "respawned unhealthy slot worker before pin claim");
+                self.changed.notify_waiters();
+                None
+            }
+            Err(err) => {
+                warn!(
+                    slot = %sid,
+                    error = %err,
+                    "failed to respawn unhealthy slot worker before pin claim"
+                );
+                Some(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::NoIdleSlot,
+                    format!("preferred slot {sid} is unhealthy"),
+                ))
+            }
+        }
     }
 
     pub fn plan(&self) -> &ComputePlan {
@@ -715,7 +830,7 @@ impl Supervisor {
             let workers = self.workers.lock().await;
             if !workers.contains_key(slot_id) {
                 drop(workers);
-                match spawn_worker(&spec).await {
+                match self.spawn_plan_worker(&spec).await {
                     Ok(mut w) => {
                         w.busy = false;
                         let mut workers = self.workers.lock().await;
@@ -848,7 +963,7 @@ impl Supervisor {
             drop(workers);
 
             if let Some(spec) = self.plan.slots.iter().find(|s| s.id == slot_id) {
-                match spawn_worker(spec).await {
+                match self.spawn_plan_worker(spec).await {
                     Ok(mut w) => {
                         w.busy = false;
                         self.workers.lock().await.insert(slot_id.clone(), w);
@@ -875,7 +990,7 @@ impl Supervisor {
         };
         for spec in missing {
             warn!(slot = %spec.id, "slot worker missing; respawning");
-            match spawn_worker(&spec).await {
+            match self.spawn_plan_worker(&spec).await {
                 Ok(mut w) => {
                     w.busy = false;
                     self.workers.lock().await.insert(spec.id.clone(), w);
@@ -1150,13 +1265,10 @@ impl Supervisor {
     }
 
     /// Execute a server warm plan: preload `runtime_model` only on `slot_ids`.
-    /// Evicts residents on every other idle slot. Empty `slot_ids` means stay cold.
+    /// Evicts residents on every other idle slot. Empty runtime and/or empty
+    /// `slot_ids` means stay cold (clear unauthorized idle residents only).
     pub async fn preload_slots(&self, runtime_model: &str, slot_ids: &[String]) -> Result<bool> {
-        let runtime = runtime_model.trim();
-        if runtime.is_empty() {
-            return Ok(false);
-        }
-        let runtime = runtime.to_string();
+        let runtime = runtime_model.trim().to_string();
         let wanted: HashSet<String> = slot_ids
             .iter()
             .map(|id| id.trim().to_string())
@@ -1221,7 +1333,9 @@ impl Supervisor {
             self.return_worker(slot_id, worker).await;
         }
 
-        if wanted.is_empty() {
+        // Empty runtime = stay cold (evict-only). Empty wanted with a named
+        // runtime also means no preload targets this pass.
+        if runtime.is_empty() || wanted.is_empty() {
             return Ok(false);
         }
 
@@ -1446,29 +1560,21 @@ impl Supervisor {
                             format!("preferred slot {want} is not on this machine"),
                         ));
                     };
-                    let mut workers = self.workers.lock().await;
                     for sid in &placement.slot_ids {
-                        if blocked.contains(sid) || occupied.contains(sid) {
+                        if let Some(err) =
+                            self.claim_pin_slot_error(sid, &blocked, &occupied).await
+                        {
                             self.clear_job_cancel(job_id).await;
-                            return Err(crate::invoke_code::coded(
-                                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
-                                format!("preferred slot {sid} is not idle or not healthy"),
-                            ));
+                            return Err(err);
                         }
-                        if workers.get_mut(sid).is_none() {
-                            drop(workers);
-                            self.clear_job_cancel(job_id).await;
-                            return Err(self.err_missing_slot_worker(sid).await);
+                    }
+                    {
+                        let mut workers = self.workers.lock().await;
+                        for sid in &placement.slot_ids {
+                            if let Some(worker) = workers.get_mut(sid) {
+                                worker.busy = true;
+                            }
                         }
-                        let worker = workers.get_mut(sid).expect("worker present after miss check");
-                        if worker.busy || !worker.healthy {
-                            self.clear_job_cancel(job_id).await;
-                            return Err(crate::invoke_code::coded(
-                                crate::invoke_code::InvokeErrorCode::NoIdleSlot,
-                                format!("preferred slot {sid} is not idle or not healthy"),
-                            ));
-                        }
-                        worker.busy = true;
                     }
                     info!(
                         slot = %want,
@@ -1801,29 +1907,19 @@ impl Supervisor {
                         format!("preferred slot {want} is not on this machine"),
                     ));
                 };
-                let mut workers = self.workers.lock().await;
                 for sid in &placement.slot_ids {
-                    if blocked.contains(sid) || occupied.contains(sid) {
+                    if let Some(err) = self.claim_pin_slot_error(sid, &blocked, &occupied).await {
                         self.clear_job_cancel(job_id).await;
-                        return Err(crate::invoke_code::coded(
-                            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
-                            format!("preferred slot {sid} is not idle or not healthy"),
-                        ));
+                        return Err(err);
                     }
-                    if workers.get_mut(sid).is_none() {
-                        drop(workers);
-                        self.clear_job_cancel(job_id).await;
-                        return Err(self.err_missing_slot_worker(sid).await);
+                }
+                {
+                    let mut workers = self.workers.lock().await;
+                    for sid in &placement.slot_ids {
+                        if let Some(worker) = workers.get_mut(sid) {
+                            worker.busy = true;
+                        }
                     }
-                    let worker = workers.get_mut(sid).expect("worker present after miss check");
-                    if worker.busy || !worker.healthy {
-                        self.clear_job_cancel(job_id).await;
-                        return Err(crate::invoke_code::coded(
-                            crate::invoke_code::InvokeErrorCode::NoIdleSlot,
-                            format!("preferred slot {sid} is not idle or not healthy"),
-                        ));
-                    }
-                    worker.busy = true;
                 }
                 info!(slot = %want, "claimed server-required image slot");
                 placement
@@ -1965,7 +2061,7 @@ impl Supervisor {
             ) => result,
         };
 
-        match spawn_worker(&worker.spec).await {
+        match self.spawn_plan_worker(&worker.spec).await {
             Ok(new_w) => worker = new_w,
             Err(err) => {
                 warn!(slot = %slot_id, error = %err, "failed to respawn llama worker after image job");
@@ -2147,13 +2243,15 @@ impl Supervisor {
             worker.loaded_models = loaded.clone();
         }
         if outcome.is_err() || worker.child.try_wait().ok().flatten().is_some() {
-            if outcome.is_err() {
+            if let Err(err) = &outcome {
                 warn!(slot = %slot_id, "slot worker invoke ended with error; respawning");
+                self.note_metal_decode_failure(&slot_id, &format!("{err:#}"))
+                    .await;
             } else {
                 warn!(slot = %slot_id, "slot worker exited; respawning");
             }
             worker.healthy = false;
-            if let Ok(new_w) = spawn_worker(&worker.spec).await {
+            if let Ok(new_w) = self.spawn_plan_worker(&worker.spec).await {
                 worker = new_w;
             }
         }
@@ -2227,14 +2325,15 @@ impl Supervisor {
             tp_group: None,
         };
 
-        let mut tp_worker = match spawn_worker(&tp_spec).await {
+        let mut tp_worker = match spawn_worker(&tp_spec, false).await {
             Ok(w) => w,
             Err(err) => {
                 // Restore siblings so slots aren't stuck busy after a failed claim.
                 let mut workers = self.workers.lock().await;
                 for sid in &placement.slot_ids {
                     if let Some(spec) = self.plan.slots.iter().find(|s| s.id == *sid) {
-                        match spawn_worker(spec).await {
+                        let metal = self.metal_gpu_unreliable_for(&spec.id).await;
+                        match spawn_worker(spec, metal).await {
                             Ok(mut w) => {
                                 w.busy = false;
                                 workers.insert(sid.clone(), w);
@@ -2297,7 +2396,8 @@ impl Supervisor {
         let mut workers = self.workers.lock().await;
         for sid in &placement.slot_ids {
             if let Some(spec) = self.plan.slots.iter().find(|s| s.id == *sid) {
-                match spawn_worker(spec).await {
+                let metal = self.metal_gpu_unreliable_for(&spec.id).await;
+                match spawn_worker(spec, metal).await {
                     Ok(mut w) => {
                         w.busy = false;
                         workers.insert(sid.clone(), w);
@@ -2317,11 +2417,16 @@ impl Supervisor {
     }
 }
 
-async fn spawn_worker(slot: &ComputeSlot) -> Result<SlotWorker> {
+async fn spawn_worker(
+    slot: &ComputeSlot,
+    metal_gpu_decode_unreliable: bool,
+) -> Result<SlotWorker> {
     let boot = WorkerBootConfig {
         slot_id: slot.id.clone(),
         card: slot.card.clone(),
         cuda_visible: slot.cuda_visible.clone(),
+        metal_gpu_decode_unreliable: metal_gpu_decode_unreliable
+            && matches!(slot.card.strategy, PoolStrategy::Metal),
     };
     let boot_json = serde_json::to_string(&boot)?;
     // Always re-exec this binary so PATH can't pick an older agent without `worker`.

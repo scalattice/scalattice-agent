@@ -284,6 +284,13 @@ impl SessionState {
         Some((runtime.to_string(), slots))
     }
 
+    /// Server sent an explicit empty warm runtime ("stay cold").
+    fn wants_cold_warm_plan(&self) -> bool {
+        self.warm_runtime_model
+            .as_ref()
+            .is_some_and(|runtime| runtime.trim().is_empty())
+    }
+
     fn effective_hf_token(&self, server_token: Option<String>) -> Option<String> {
         server_token
             .or_else(|| self.hf_token.clone())
@@ -1606,13 +1613,17 @@ async fn apply_warm_plan(state: Arc<Mutex<SessionState>>) {
         if !guard.vram_lifecycle.should_preload(&config) {
             return;
         }
-        let Some((runtime, slot_ids)) = guard.instructed_warm_plan() else {
-            return;
-        };
         let Some(supervisor) = guard.supervisor.clone() else {
             return;
         };
-        (runtime, slot_ids, supervisor)
+        if let Some((runtime, slot_ids)) = guard.instructed_warm_plan() {
+            (runtime, slot_ids, supervisor)
+        } else if guard.wants_cold_warm_plan() {
+            // Server: empty runtime means stay cold (evict unauthorized residents).
+            (String::new(), Vec::new(), supervisor)
+        } else {
+            return;
+        }
     };
     if supervisor.has_in_flight_work().await {
         return;

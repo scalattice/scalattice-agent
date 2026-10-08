@@ -7,6 +7,9 @@ pub struct WorkerBootConfig {
     pub slot_id: String,
     pub card: VirtualCard,
     pub cuda_visible: Vec<u32>,
+    /// Supervisor saw Metal GPU decode collapse/fail on this slot; skip GPU tiers.
+    #[serde(default)]
+    pub metal_gpu_decode_unreliable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
