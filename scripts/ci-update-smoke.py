@@ -951,35 +951,58 @@ def windows_nvcuda_exports(bindir: Path, libdir: Path) -> list[str]:
 
 
 def windows_vcvars64() -> Optional[Path]:
+    # Prefer well-known VS2022 paths — vswhere.exe sometimes hangs >30s on GHA.
+    for bat in (
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"),
+    ):
+        if bat.is_file():
+            return bat
+
     vswhere = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")
     if not vswhere.is_file():
         return None
     kwargs: dict = {
         "capture_output": True,
         "text": True,
-        "timeout": 30,
+        "timeout": 120,
         "check": False,
     }
     if sys.platform in ("win32", "cygwin"):
         kwargs["creationflags"] = CREATE_NO_WINDOW
-    result = subprocess.run(
-        [
-            str(vswhere),
-            "-latest",
-            "-products",
-            "*",
-            "-requires",
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-property",
-            "installationPath",
-        ],
-        **kwargs,
-    )
-    line = (result.stdout or "").strip().splitlines()
-    if not line:
-        return None
-    bat = Path(line[0].strip()) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
-    return bat if bat.is_file() else None
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, 4):
+        try:
+            result = subprocess.run(
+                [
+                    str(vswhere),
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+                **kwargs,
+            )
+            line = (result.stdout or "").strip().splitlines()
+            if line:
+                bat = Path(line[0].strip()) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if bat.is_file():
+                    return bat
+            return None
+        except subprocess.TimeoutExpired as err:
+            last_err = err
+            print(
+                f"==> vswhere timed out (attempt {attempt}/3); retrying",
+                flush=True,
+            )
+    if last_err is not None:
+        print(f"==> vswhere failed after retries: {last_err}", flush=True)
+    return None
 
 
 def _c_ident(name: str, idx: int) -> str:
