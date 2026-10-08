@@ -239,6 +239,29 @@ pub(crate) fn is_vocab_zero_collapse(err: &anyhow::Error) -> bool {
         .contains(VOCAB_ZERO_COLLAPSE)
 }
 
+/// Prefill/decode GPU failures that should drop the resident and cascade tiers
+/// (Metal `GGML_STATUS_FAILED` surfaces as `Decode Error -3`).
+pub(crate) fn is_gpu_decode_failure(err: &anyhow::Error) -> bool {
+    let detail = format!("{err:#}").to_ascii_lowercase();
+    detail.contains("decode error -3")
+        || detail.contains("decode error: unknown(-3)")
+        || (detail.contains("decode prompt")
+            && (detail.contains("decode error")
+                || detail.contains("ggml_status_failed")
+                || detail.contains("unknown(-3)")))
+}
+
+pub(crate) fn mark_metal_gpu_decode_unreliable() {
+    METAL_GPU_DECODE_UNRELIABLE.store(true, Ordering::Relaxed);
+}
+
+/// Apply supervisor boot hint so respawned Metal workers skip broken GPU tiers.
+pub fn apply_metal_gpu_decode_unreliable_hint(enabled: bool) {
+    if enabled {
+        METAL_GPU_DECODE_UNRELIABLE.store(true, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn bump_vocab_zero_run(token: LlamaToken, piece: &str, run: &mut u32) -> bool {
     let collapsed = token.0 == 0 || (!piece.is_empty() && piece.chars().all(|c| c == '!'));
     if collapsed {
@@ -414,7 +437,7 @@ pub fn generate_with_callback(
                 }
                 if bump_vocab_zero_run(token, &piece, &mut vocab_zero_run) {
                     if matches!(config.pool.strategy, PoolStrategy::Metal) {
-                        METAL_GPU_DECODE_UNRELIABLE.store(true, Ordering::Relaxed);
+                        mark_metal_gpu_decode_unreliable();
                     }
                     warn!(
                         generated,

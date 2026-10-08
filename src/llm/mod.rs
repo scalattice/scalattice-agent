@@ -6,7 +6,9 @@ mod prompt;
 mod split;
 mod vision;
 
-pub use embedded::{generate_with_callback, init_backend, GenerateConfig};
+pub use embedded::{
+    apply_metal_gpu_decode_unreliable_hint, generate_with_callback, init_backend, GenerateConfig,
+};
 pub use model_cache::{evict_all, evict_all_for_path, list_gpu_resident_runtime_models, preload_model};
 pub use progress::report as report_work_progress;
 pub use progress::with_sink as with_work_progress;

@@ -16,7 +16,7 @@
 //! when on-disk weights + headroom exceed available VRAM — llama.cpp CUDA often
 //! abort()s on OOM (kills the agent) instead of returning Err.
 
-use crate::compute_pool::VirtualCard;
+use crate::compute_pool::{PoolStrategy, VirtualCard};
 use crate::specs::{detect_ram_gb, detect_ram_used_gb};
 use anyhow::{Context, Result};
 use llama_cpp_2::model::LlamaModel;
@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::embedded::{
-    backend, estimated_n_layer, gguf_weight_gb, is_cpu_load_label, is_vocab_zero_collapse,
+    backend, estimated_n_layer, gguf_weight_gb, is_cpu_load_label, is_gpu_decode_failure,
+    is_vocab_zero_collapse, mark_metal_gpu_decode_unreliable,
     load_candidate_label, load_candidate_labels, load_cpu_mmap_model, load_model_for_pool,
     load_model_for_pool_starting_at, offload_layers_for_available,
 };
@@ -520,15 +521,25 @@ pub fn with_loaded_weights<R>(
 
         match out {
             Ok(result) => return Ok((result, model_load_ms)),
-            Err(err) if is_vocab_zero_collapse(&err) => {
+            Err(err)
+                if is_vocab_zero_collapse(&err) || is_gpu_decode_failure(&err) =>
+            {
                 oom_hops += 1;
                 let failed = labels.get(load_tier).copied().unwrap_or("gpu-full");
+                let reason = if is_vocab_zero_collapse(&err) {
+                    "GPU decode collapsed"
+                } else {
+                    "GPU decode failed"
+                };
                 warn!(
                     failed_tier = failed,
                     hop = oom_hops,
                     error = %err,
-                    "GPU decode collapsed; dropping resident and skipping remaining GPU tiers"
+                    "{reason}; dropping resident and skipping remaining GPU tiers"
                 );
+                if matches!(pool.strategy, PoolStrategy::Metal) {
+                    mark_metal_gpu_decode_unreliable();
+                }
                 guard.gpu.clear();
                 if oom_hops > 4 {
                     return Err(err);
@@ -539,7 +550,7 @@ pub fn with_loaded_weights<R>(
                     return Err(err);
                 }
                 let label = new_labels.get(start).copied().unwrap_or("next");
-                warn!("GPU decode collapsed; reloading via '{label}'");
+                warn!("{reason}; reloading via '{label}'");
                 let (ms, new_tier) =
                     ensure_loaded(&mut guard, backend, model_path, pool, &key, start)?;
                 model_load_ms = model_load_ms.saturating_add(ms);
@@ -750,5 +761,14 @@ mod tests {
         assert_eq!(next_cpu_cascade_index(&metal), 3);
         let cuda = ["gpu-full", "gpu-offload", "gpu-offload-reduced"];
         assert_eq!(next_cpu_cascade_index(&cuda), 3);
+    }
+
+    #[test]
+    fn gpu_decode_failure_matches_metal_unknown_minus_three() {
+        let err = anyhow::anyhow!("decode prompt: Decode Error -3: unknown");
+        assert!(is_gpu_decode_failure(&err));
+        assert!(!is_vocab_zero_collapse(&err));
+        let other = anyhow::anyhow!("out of memory");
+        assert!(!is_gpu_decode_failure(&other));
     }
 }

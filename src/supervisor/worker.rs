@@ -23,6 +23,7 @@ pub fn run_worker(config_json: &str) -> Result<()> {
         // compile + embedded metallib mismatch yields inf MUL_MAT. Disable the
         // tensor fast-path on every Metal worker, not a single chip name.
         std::env::set_var("GGML_METAL_TENSOR_DISABLE", "1");
+        crate::llm::apply_metal_gpu_decode_unreliable_hint(boot.metal_gpu_decode_unreliable);
     }
     info!(
         slot = %boot.slot_id,
