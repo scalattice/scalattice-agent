@@ -85,6 +85,11 @@ pub fn in_tray_process() -> bool {
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+pub fn acquire_agent_runtime_lock() -> Result<crate::service::AgentRuntimeLock> {
+    // Cross-session mutex is acquired elsewhere on Windows; nothing extra here.
+    Ok(crate::service::AgentRuntimeLock { _priv: () })
+}
+
 pub fn invoked_by_systemd() -> bool {
     false
 }

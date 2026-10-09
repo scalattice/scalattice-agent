@@ -34,6 +34,21 @@ pub enum BackgroundStatus {
     NotInstalled,
 }
 
+/// Held while this process owns the agent GPU/runtime loop. Dropping closes the
+/// lock file so another instance may start.
+pub struct AgentRuntimeLock {
+    #[cfg(unix)]
+    pub(crate) _file: std::fs::File,
+    #[cfg(not(unix))]
+    pub(crate) _priv: (),
+}
+
+/// Exclusive runtime lock (Linux/macOS flock). Windows relies on the existing
+/// background mutex; this is a no-op success there.
+pub fn acquire_agent_runtime_lock() -> Result<AgentRuntimeLock> {
+    platform::acquire_agent_runtime_lock()
+}
+
 pub struct UninstallOptions {
     pub yes: bool,
     pub purge_models: bool,

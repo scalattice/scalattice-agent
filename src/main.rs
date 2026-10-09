@@ -377,6 +377,9 @@ fn clear_background_pid() {
 
 async fn run_foreground(token: Option<String>, verbose: bool) -> Result<()> {
     if service::invoked_by_systemd() || service::invoked_by_background_service() {
+        // Refuse a second GPU runtime if something else already holds the lock
+        // (stray foreground, overlapping systemd restart, etc.).
+        let _runtime_lock = service::acquire_agent_runtime_lock()?;
         let _ = update::maybe_sync_auto_update_timer();
         let _ = service::ensure_reconnect_watchdog();
         let token = token
@@ -395,9 +398,15 @@ async fn run_foreground(token: Option<String>, verbose: bool) -> Result<()> {
         }
         if service::service_active() {
             if verbose {
-                println!("following background agent · verbose (Ctrl+C to stop watching only)");
+                println!(
+                    "following background agent · verbose (Ctrl+C stops watching only; \
+                     does not start a second agent)"
+                );
             } else {
-                println!("following background agent · simplified (Ctrl+C to stop watching only; use --verbose for full detail)");
+                println!(
+                    "following background agent · simplified (Ctrl+C stops watching only; \
+                     use --verbose for full detail; does not start a second agent)"
+                );
             }
             return service::follow_service_logs(verbose);
         }
@@ -406,6 +415,7 @@ async fn run_foreground(token: Option<String>, verbose: bool) -> Result<()> {
         );
     }
 
+    let _runtime_lock = service::acquire_agent_runtime_lock()?;
     let config = config::AgentConfig::from_env_and_cli(token)?;
     agent::run_agent(config).await
 }

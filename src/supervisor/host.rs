@@ -526,14 +526,16 @@ impl Supervisor {
         &self.plan
     }
 
-    /// Tier 2.5 split uses an in-process engine and used to skip slot fit.
-    /// Refuse before opening llama when no idle card can host the model live.
-    pub async fn preflight_split_model(
+    /// Devices for in-process tier-2.5 split: always **one** idle slot.
+    ///
+    /// Never hand the parent the full multi-GPU TP pool — that loads every card
+    /// in-process (fleet: ornith tier2.5 → OOM / WebSocket reset / false DAMAGED).
+    pub async fn devices_for_split(
         &self,
         model: &crate::protocol::CatalogModel,
         ram_gb: u32,
         cpu_ram_headroom_gb: u32,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Vec<ComputeDevice>, anyhow::Error> {
         let idle = self.routing_idle_slot_ids().await;
         if idle.is_empty() {
             return Err(crate::invoke_code::coded(
@@ -543,51 +545,124 @@ impl Supervisor {
         }
         let live_cuda = crate::specs::live_cuda_free_vram_by_index();
         let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
-        let can_live = self.plan.slots.iter().any(|s| {
-            idle.iter().any(|id| id == &s.id)
-                && s.kind != "cpu"
-                && accelerator_live_can_place(
-                    s,
-                    &live_cuda,
+
+        // Prefer a single accelerator that can place on live free VRAM.
+        let mut best_live: Option<&crate::compute_pool::ComputeSlot> = None;
+        for slot in &self.plan.slots {
+            if slot.kind == "cpu" || !idle.iter().any(|id| id == &slot.id) {
+                continue;
+            }
+            if !accelerator_live_can_place(
+                slot,
+                &live_cuda,
+                model,
+                reclaimable.contains(&slot.id),
+            ) {
+                continue;
+            }
+            best_live = Some(match best_live {
+                None => slot,
+                Some(cur) => {
+                    if slot.card.total_vram_gb > cur.card.total_vram_gb {
+                        slot
+                    } else if slot.card.total_vram_gb == cur.card.total_vram_gb
+                        && slot.priority < cur.priority
+                    {
+                        slot
+                    } else {
+                        cur
+                    }
+                }
+            });
+        }
+
+        let slot = if let Some(slot) = best_live {
+            slot
+        } else {
+            let sys_avail = self.available_sys_ram_gb().await;
+            let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
+            let placement = pick_placement_with_cpu(
+                &self.plan,
+                &idle,
+                model,
+                ram_gb,
+                cpu_ram_headroom_gb,
+                &self.devices,
+                false,
+                crate::specs::cpu_logical_cores(),
+                sys_avail,
+                &reclaimable,
+                &reclaim_ram,
+                false,
+            );
+            let Some(placement) = placement else {
+                return Err(placement_miss_detail(
+                    &self.plan,
+                    &idle,
                     model,
-                    reclaimable.contains(&s.id),
+                    false,
+                    &reclaimable,
+                    sys_avail,
+                    &reclaim_ram,
+                    ram_gb,
+                    cpu_ram_headroom_gb,
                 )
-        });
-        if can_live {
-            return Ok(());
+                .into());
+            };
+            // Collapse TP / multi-slot placements to the first sibling only.
+            let sid = placement
+                .slot_ids
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            self.plan
+                .slots
+                .iter()
+                .find(|s| s.id == sid)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("split placement slot {sid} missing from compute plan")
+                })?
+        };
+
+        let device = self
+            .device_for_slot(slot)
+            .ok_or_else(|| anyhow::anyhow!("no compute device for split slot {}", slot.id))?;
+        Ok(vec![device])
+    }
+
+    fn device_for_slot(&self, slot: &crate::compute_pool::ComputeSlot) -> Option<ComputeDevice> {
+        if let Some(pd) = slot.card.devices.first() {
+            if let Some(d) = self.devices.iter().find(|d| d.id == pd.id) {
+                let mut out = d.clone();
+                out.enabled = true;
+                return Some(out);
+            }
         }
-        let sys_avail = self.available_sys_ram_gb().await;
-        let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
-        if pick_placement_with_cpu(
-            &self.plan,
-            &idle,
-            model,
-            ram_gb,
-            cpu_ram_headroom_gb,
-            &self.devices,
-            false,
-            crate::specs::cpu_logical_cores(),
-            sys_avail,
-            &reclaimable,
-            &reclaim_ram,
-            false,
-        )
-        .is_some()
-        {
-            return Ok(());
+        if let Some(idx) = slot.cuda_visible.first() {
+            let want = format!("nvidia:{idx}");
+            if let Some(d) = self.devices.iter().find(|d| d.id == want) {
+                let mut out = d.clone();
+                out.enabled = true;
+                return Some(out);
+            }
         }
-        Err(placement_miss_detail(
-            &self.plan,
-            &idle,
-            model,
-            false,
-            &reclaimable,
-            sys_avail,
-            &reclaim_ram,
-            ram_gb,
-            cpu_ram_headroom_gb,
-        )
-        .into())
+        self.devices.iter().find(|d| d.id == slot.id).map(|d| {
+            let mut out = d.clone();
+            out.enabled = true;
+            out
+        })
+    }
+
+    /// Serialize heavy GGUF mmaps (including in-process split) so two loads cannot
+    /// OOM the parent and drop the cloud WebSocket.
+    pub async fn lock_mmap_gate(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, anyhow::Error> {
+        match tokio::time::timeout(Duration::from_secs(45), self.mmap_gate.lock()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::AgentBusy,
+                "agent_busy: waiting for mmap gate",
+            )),
+        }
     }
 
     /// `None` is an old server and must not wipe blocks learned earlier.
@@ -2244,7 +2319,11 @@ impl Supervisor {
         }
         if outcome.is_err() || worker.child.try_wait().ok().flatten().is_some() {
             if let Err(err) = &outcome {
-                warn!(slot = %slot_id, "slot worker invoke ended with error; respawning");
+                warn!(
+                    slot = %slot_id,
+                    error = %format!("{err:#}"),
+                    "slot worker invoke ended with error; respawning"
+                );
                 self.note_metal_decode_failure(&slot_id, &format!("{err:#}"))
                     .await;
             } else {
