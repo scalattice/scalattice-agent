@@ -46,6 +46,30 @@ pub fn ensure_reconnect_watchdog() -> Result<()> {
     load_watchdog_plist()
 }
 
+pub fn acquire_agent_runtime_lock() -> Result<crate::service::AgentRuntimeLock> {
+    use std::os::unix::io::AsRawFd;
+    let dir = crate::paths::config_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("agent.runtime.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        bail!(
+            "another scalattice-agent is already running (holds {}). \
+             Stop it first: launchctl bootout gui/$UID/com.scalattice.agent \
+             (or close a stray foreground runtime).",
+            path.display()
+        );
+    }
+    let _ = fs::write(&path, format!("{}\n", std::process::id()));
+    Ok(crate::service::AgentRuntimeLock { _file: file })
+}
+
 pub fn invoked_by_systemd() -> bool {
     invoked_by_background_service()
 }

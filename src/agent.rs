@@ -6,11 +6,11 @@ use crate::models::{
     sweep_staged_purge_dirs,
 };
 use crate::protocol::{
-    parse_envelope, parse_error, parse_invoke, parse_invoke_cancel, parse_invoke_split, parse_pong,
-    parse_ready, parse_registered, AgentSchedule, CatalogModel, ComputeDevicePolicy,
-    ControlAckMessage, ControlMessage, HeartbeatMessage, InvokeDeltaMessage, InvokeErrorMessage,
-    InvokeResultMessage, LogsBatchMessage, LogsLinePayload, LogsSubscribeMessage, ModelPolicyEntry,
-    RegisterMessage,
+    parse_envelope, parse_error, parse_invoke, parse_invoke_cancel, parse_invoke_split,
+    parse_invoke_split_state_chunk, parse_pong, parse_ready, parse_registered, AgentSchedule,
+    CatalogModel, ComputeDevicePolicy, ControlAckMessage, ControlMessage, HeartbeatMessage,
+    InvokeDeltaMessage, InvokeErrorMessage, InvokeResultMessage, InvokeSplitStateChunkMessage,
+    LogsBatchMessage, LogsLinePayload, LogsSubscribeMessage, ModelPolicyEntry, RegisterMessage,
 };
 use crate::runtime::{build_runtime, JobState};
 use crate::specs::{
@@ -27,14 +27,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
@@ -94,6 +96,9 @@ struct SessionState {
     max_completion_tokens: u32,
     /// Server-controlled RAM headroom for CPU / offload fit (from ready).
     cpu_ram_headroom_gb: u32,
+    /// Cloud one-message WS ceiling from ready/pong (`maxWsMessageBytes`).
+    /// Used before sending large tier-2.5 state blobs.
+    cloud_ws_max_bytes: u64,
     job_state: JobState,
     active_job_id: Option<String>,
     active_model_id: Option<String>,
@@ -130,6 +135,15 @@ struct SessionState {
     /// Slot ids the hypervisor authorized for that runtime. `None` = not set yet
     /// (older router). Empty vec = stay cold / clear unauthorized residents.
     warm_slot_ids: Option<Vec<String>>,
+    /// Inbound cloud→agent tier-2.5 state chunks keyed by invoke id.
+    inbound_split_state: HashMap<String, InboundSplitState>,
+}
+
+struct InboundSplitState {
+    total: u32,
+    parts: Vec<Option<String>>,
+    have: u32,
+    notify: Arc<Notify>,
 }
 
 impl SessionState {
@@ -140,6 +154,7 @@ impl SessionState {
             model_policy: Vec::new(),
             max_completion_tokens: 1024,
             cpu_ram_headroom_gb: crate::models::DEFAULT_CPU_RAM_HEADROOM_GB,
+            cloud_ws_max_bytes: WS_DEFAULT_CLOUD_MAX_BYTES,
             job_state: JobState::Idle,
             active_job_id: None,
             active_model_id: None,
@@ -168,7 +183,63 @@ impl SessionState {
             last_server_activity_ms: wall_now_ms(),
             warm_runtime_model: None,
             warm_slot_ids: None,
+            inbound_split_state: HashMap::new(),
         }
+    }
+
+    fn push_inbound_split_chunk(&mut self, msg: &InvokeSplitStateChunkMessage) -> Result<()> {
+        if msg.total == 0 || msg.index >= msg.total {
+            bail!("invalid split state chunk index/total");
+        }
+        if msg.data.len() > WS_STATE_CHUNK_CHARS + 1024 {
+            bail!("split state chunk payload too large");
+        }
+        let entry = self
+            .inbound_split_state
+            .entry(msg.id.clone())
+            .or_insert_with(|| InboundSplitState {
+                total: msg.total,
+                parts: vec![None; msg.total as usize],
+                have: 0,
+                notify: Arc::new(Notify::new()),
+            });
+        if entry.total != msg.total {
+            bail!("split state chunk total mismatch");
+        }
+        let idx = msg.index as usize;
+        if entry.parts[idx].is_none() {
+            let mut nbytes: usize = entry.parts.iter().flatten().map(|s| s.len()).sum();
+            nbytes = nbytes.saturating_add(msg.data.len());
+            if nbytes as u64 > self.cloud_ws_max_bytes {
+                self.inbound_split_state.remove(&msg.id);
+                bail!(
+                    "assembled split state exceeds cloud WS limit {} bytes",
+                    self.cloud_ws_max_bytes
+                );
+            }
+            entry.parts[idx] = Some(msg.data.clone());
+            entry.have += 1;
+            entry.notify.notify_waiters();
+        }
+        Ok(())
+    }
+
+    fn take_complete_inbound_split_state(&mut self, id: &str, total: u32) -> Option<String> {
+        let ready = self
+            .inbound_split_state
+            .get(id)
+            .is_some_and(|e| e.total == total && e.have == total);
+        if !ready {
+            return None;
+        }
+        let entry = self.inbound_split_state.remove(id)?;
+        let mut out = String::with_capacity(
+            entry.parts.iter().flatten().map(|s| s.len()).sum::<usize>(),
+        );
+        for part in entry.parts {
+            out.push_str(&part?);
+        }
+        Some(out)
     }
 
     fn touch_server_activity(&mut self) {
@@ -419,6 +490,25 @@ impl SessionState {
             self.sync_image_runtime_presence();
         }
         cancelled
+    }
+
+    /// Adopt cloud `maxWsMessageBytes` from ready/pong. Clamp to the local hard
+    /// max so a buggy/malicious advertise cannot force multi‑GiB allocations.
+    fn apply_cloud_ws_max_bytes(&mut self, advertised: Option<u64>) {
+        let Some(raw) = advertised else {
+            return;
+        };
+        if raw == 0 {
+            return;
+        }
+        let capped = raw.min(WS_HARD_MAX_BYTES as u64);
+        if capped != self.cloud_ws_max_bytes {
+            info!(
+                max_ws_message_bytes = capped,
+                "applied cloud WS message ceiling"
+            );
+            self.cloud_ws_max_bytes = capped;
+        }
     }
 
     /// Replace the in-memory catalog from a live policy/catalog push (no reconnect).
@@ -1204,12 +1294,34 @@ fn next_reconnect_delay(current: Duration) -> Duration {
         .clamp(RECONNECT_BACKOFF_MIN, RECONNECT_BACKOFF_MAX)
 }
 
+/// Local hard ceiling for one assembled tier-2.5 KV transfer (and legacy
+/// single-frame path). Never accept more than this even if a buggy server
+/// advertises a larger value. Bootstrap connect uses this so an old router
+/// can still deliver a large inline frame; new paths send chunks instead.
+const WS_HARD_MAX_BYTES: usize = 1 << 30; // 1 GiB — matches current cloud default
+/// Fallback product send limit when talking to older routers that omit the field.
+const WS_DEFAULT_CLOUD_MAX_BYTES: u64 = WS_HARD_MAX_BYTES as u64;
+/// Max `data` chars per invoke_split_state_chunk (proxy-friendly frame size).
+const WS_STATE_CHUNK_CHARS: usize = 768 << 10; // 768 KiB
+/// At or below this, state still rides in one invoke_split_result / stateB64.
+const WS_STATE_INLINE_MAX: usize = WS_STATE_CHUNK_CHARS;
+/// How long the upper segment waits for cloud→agent state chunks.
+const WS_STATE_CHUNK_WAIT: Duration = Duration::from_secs(180);
+
+fn agent_websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(WS_HARD_MAX_BYTES),
+        max_frame_size: Some(WS_HARD_MAX_BYTES),
+        ..WebSocketConfig::default()
+    }
+}
+
 async fn connect_agent_websocket(
     request: impl IntoClientRequest + Unpin,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     match timeout(
         WS_CONNECT_TIMEOUT,
-        connect_async_with_config(request, None, true),
+        connect_async_with_config(request, Some(agent_websocket_config()), true),
     )
     .await
     {
@@ -1803,6 +1915,7 @@ async fn handle_server_message(
                         guard.apply_compute_devices(&ready.compute_devices);
                         guard.apply_max_completion_tokens(ready.max_completion_tokens);
                         guard.cpu_ram_headroom_gb = ready.cpu_ram_headroom_gb;
+                        guard.apply_cloud_ws_max_bytes(ready.max_ws_message_bytes);
                         // Catalog before policy: image teardown looks at enabled
                         // image SKUs in catalog. An empty catalog on reconnect
                         // used to delete CPython/venv and then re-download them.
@@ -1951,6 +2064,23 @@ async fn handle_server_message(
                         }
                     });
                 }
+                "invoke_split_state_chunk" => {
+                    match parse_invoke_split_state_chunk(data) {
+                        Ok(chunk) => {
+                            if let Err(err) =
+                                state.lock().await.push_inbound_split_chunk(&chunk)
+                            {
+                                warn!(
+                                    "split state chunk {} rejected: {err:#}",
+                                    chunk.id
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!("malformed invoke_split_state_chunk (keeping socket): {err:#}");
+                        }
+                    }
+                }
                 "pong" | "policy" => {
                         if let Ok(pong) = parse_pong(data) {
                         if let Some(groups) = pong.blocked_slots.as_ref() {
@@ -1972,6 +2102,7 @@ async fn handle_server_message(
                             if let Some(catalog) = pong.catalog.clone() {
                                 guard.apply_catalog(catalog, pong.cpu_ram_headroom_gb);
                             }
+                            guard.apply_cloud_ws_max_bytes(pong.max_ws_message_bytes);
                             let cancelled_policy = guard.apply_model_policy(&pong.enabled_models);
                             let cancelled_purge =
                                 guard.cancel_installs_for_purge(&pong.purge_models);
@@ -2751,6 +2882,26 @@ async fn respond_invoke_split(
         invoke.id, invoke.segment, invoke.model_id
     );
 
+    let mut invoke = invoke;
+    if invoke.state_chunk_total > 0 {
+        match wait_inbound_split_state(state, &invoke.id, invoke.state_chunk_total).await {
+            Ok(assembled) => {
+                invoke.state_b64 = assembled;
+            }
+            Err(err) => {
+                let msg = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke.id.clone(),
+                    error: "prompt_too_long".into(),
+                    detail: Some(format!("{err:#}")),
+                    slot_id: None,
+                };
+                ws_send_text(write, &serde_json::to_string(&msg)?).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let (supervisor, catalog_model, runtime_model, ram_gb, headroom) = {
         let guard = state.lock().await;
         let (catalog_model, runtime_model) =
@@ -2778,27 +2929,40 @@ async fn respond_invoke_split(
         return Ok(());
     }
 
-    if let Some(ref supervisor) = supervisor {
-        if let Err(err) = supervisor
-            .preflight_split_model(&catalog_model, ram_gb, headroom)
+    // Pick one placeable slot (never the full TP pool) before marking busy.
+    let split_devices = if let Some(ref supervisor) = supervisor {
+        match supervisor
+            .devices_for_split(&catalog_model, ram_gb, headroom)
             .await
         {
-            let code = invoke_error_code(&err);
-            info!(
-                "invoke_split {} capacity miss · {code}: {err:#}",
-                invoke.id
-            );
-            let msg = InvokeErrorMessage {
-                kind: "invoke_error",
-                id: invoke.id.clone(),
-                error: code.to_string(),
-                detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
-                slot_id: slot_id_from_error(&err),
-            };
-            ws_send_text(write, &serde_json::to_string(&msg)?).await?;
-            return Ok(());
+            Ok(devices) => devices,
+            Err(err) => {
+                let code = invoke_error_code(&err);
+                info!(
+                    "invoke_split {} capacity miss · {code}: {err:#}",
+                    invoke.id
+                );
+                let msg = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke.id.clone(),
+                    error: code.to_string(),
+                    detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+                    slot_id: slot_id_from_error(&err),
+                };
+                ws_send_text(write, &serde_json::to_string(&msg)?).await?;
+                return Ok(());
+            }
         }
-    }
+    } else {
+        let specs = state.lock().await.enabled_devices();
+        // No supervisor: still avoid loading every GPU — take the first enabled accel.
+        let mut devices = specs.compute_devices;
+        devices.retain(|d| d.enabled);
+        if devices.len() > 1 {
+            devices.truncate(1);
+        }
+        devices
+    };
 
     {
         let mut guard = state.lock().await;
@@ -2825,8 +2989,41 @@ async fn respond_invoke_split(
         guard.vram_lifecycle.on_job_started();
     }
 
-    let specs = state.lock().await.enabled_devices();
-    let engine = InferenceEngine::new(&specs.compute_devices)
+    // Hold the mmap gate for the whole split so concurrent tier2.5 jobs cannot
+    // double-mmap a large GGUF in the parent and drop the cloud WebSocket.
+    let _mmap_gate = if let Some(ref supervisor) = supervisor {
+        match supervisor.lock_mmap_gate().await {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                let code = invoke_error_code(&err);
+                let msg = InvokeErrorMessage {
+                    kind: "invoke_error",
+                    id: invoke.id.clone(),
+                    error: code.to_string(),
+                    detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+                    slot_id: None,
+                };
+                // Undo busy accounting before returning.
+                {
+                    let mut guard = state.lock().await;
+                    guard.active_job_count = guard.active_job_count.saturating_sub(1);
+                    crate::state::set_reported_active_jobs(guard.active_job_count);
+                    if guard.active_job_count == 0 {
+                        guard.job_state = JobState::Idle;
+                        guard.active_job_id = None;
+                        guard.active_model_id = None;
+                        guard.vram_lifecycle.on_job_finished();
+                    }
+                }
+                ws_send_text(write, &serde_json::to_string(&msg)?).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    let engine = InferenceEngine::new(&split_devices)
         .context("no enabled compute devices for split inference")?;
 
     let segment = invoke.segment.to_lowercase();
@@ -2839,18 +3036,13 @@ async fn respond_invoke_split(
                 Ok(output) => {
                     let result = crate::protocol::InvokeSplitResultMessage {
                         kind: "invoke_split_result",
-                        id: invoke.id,
+                        id: invoke.id.clone(),
                         state_b64: output.state_b64,
                         content: String::new(),
                         prompt_tokens: output.prompt_tokens,
                         completion_tokens: 0,
                     };
-                    write
-                        .lock()
-                        .await
-                        .send(Message::Text(serde_json::to_string(&result)?))
-                        .await?;
-                    Ok(())
+                    send_invoke_split_result(state, write, &engine, result).await
                 }
                 Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
             },
@@ -2866,18 +3058,13 @@ async fn respond_invoke_split(
                     Ok(output) => {
                         let result = crate::protocol::InvokeSplitResultMessage {
                             kind: "invoke_split_result",
-                            id: invoke.id,
+                            id: invoke.id.clone(),
                             state_b64: String::new(),
                             content: output.content,
                             prompt_tokens: output.prompt_tokens,
                             completion_tokens: output.completion_tokens,
                         };
-                        write
-                            .lock()
-                            .await
-                            .send(Message::Text(serde_json::to_string(&result)?))
-                            .await?;
-                        Ok(())
+                        send_invoke_split_result(state, write, &engine, result).await
                     }
                     Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
                 }
@@ -2886,18 +3073,13 @@ async fn respond_invoke_split(
                 Ok(()) => {
                     let result = crate::protocol::InvokeSplitResultMessage {
                         kind: "invoke_split_result",
-                        id: invoke.id,
+                        id: invoke.id.clone(),
                         state_b64: String::new(),
                         content: String::new(),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                     };
-                    write
-                        .lock()
-                        .await
-                        .send(Message::Text(serde_json::to_string(&result)?))
-                        .await?;
-                    Ok(())
+                    send_invoke_split_result(state, write, &engine, result).await
                 }
                 Err(err) => send_invoke_split_error(write, &invoke.id, &engine, err).await,
             },
@@ -2932,6 +3114,96 @@ async fn respond_invoke_split(
         }
     }
     result
+}
+
+async fn wait_inbound_split_state(
+    state: &Arc<Mutex<SessionState>>,
+    id: &str,
+    total: u32,
+) -> Result<String> {
+    let deadline = Instant::now() + WS_STATE_CHUNK_WAIT;
+    loop {
+        let notify = {
+            let mut guard = state.lock().await;
+            if let Some(assembled) = guard.take_complete_inbound_split_state(id, total) {
+                return Ok(assembled);
+            }
+            let entry = guard
+                .inbound_split_state
+                .entry(id.to_string())
+                .or_insert_with(|| InboundSplitState {
+                    total,
+                    parts: vec![None; total as usize],
+                    have: 0,
+                    notify: Arc::new(Notify::new()),
+                });
+            if entry.total != total {
+                bail!("split state chunk total mismatch for {id}");
+            }
+            entry.notify.clone()
+        };
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            state.lock().await.inbound_split_state.remove(id);
+            bail!("timed out waiting for split state chunks ({total} pieces)");
+        }
+        let _ = timeout(remain, notify.notified()).await;
+    }
+}
+
+async fn send_invoke_split_result(
+    state: &Arc<Mutex<SessionState>>,
+    write: &SharedWsWrite,
+    engine: &InferenceEngine,
+    result: crate::protocol::InvokeSplitResultMessage,
+) -> Result<()> {
+    let max = state.lock().await.cloud_ws_max_bytes;
+    let state_len = result.state_b64.len() as u64;
+    if state_len > max {
+        let id = result.id.clone();
+        let err = crate::invoke_code::coded(
+            crate::invoke_code::InvokeErrorCode::PromptTooLong,
+            format!("split state {state_len} bytes exceeds cloud WS limit {max} bytes"),
+        );
+        return send_invoke_split_error(write, &id, engine, err).await;
+    }
+    if result.state_b64.len() <= WS_STATE_INLINE_MAX {
+        return ws_send_text(write, &serde_json::to_string(&result)?).await;
+    }
+
+    // Large KV: send proxy-friendly chunks instead of one giant JSON frame.
+    // state_b64 is ASCII base64 — byte chunks are character-safe.
+    let id = result.id.clone();
+    let parts: Vec<&str> = result
+        .state_b64
+        .as_bytes()
+        .chunks(WS_STATE_CHUNK_CHARS)
+        .map(|c| std::str::from_utf8(c).expect("stateB64 is ascii base64"))
+        .collect();
+    let total = parts.len() as u32;
+    if total == 0 {
+        return ws_send_text(write, &serde_json::to_string(&result)?).await;
+    }
+    for (i, part) in parts.into_iter().enumerate() {
+        let last = i + 1 == total as usize;
+        let chunk = InvokeSplitStateChunkMessage {
+            kind: "invoke_split_state_chunk".into(),
+            id: id.clone(),
+            index: i as u32,
+            total,
+            data: part.to_string(),
+            is_final: last,
+            prompt_tokens: if last { result.prompt_tokens } else { 0 },
+            completion_tokens: if last { result.completion_tokens } else { 0 },
+            content: if last {
+                result.content.clone()
+            } else {
+                String::new()
+            },
+        };
+        ws_send_text(write, &serde_json::to_string(&chunk)?).await?;
+    }
+    Ok(())
 }
 
 async fn send_invoke_split_error(
@@ -3234,5 +3506,68 @@ mod image_purge_tests {
             Some(v) => std::env::set_var("SCALATTICE_RUNTIMES_DIR", v),
             None => std::env::remove_var("SCALATTICE_RUNTIMES_DIR"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cloud_ws_max_tests {
+    use super::{SessionState, WS_DEFAULT_CLOUD_MAX_BYTES, WS_HARD_MAX_BYTES};
+    use crate::protocol::InvokeSplitStateChunkMessage;
+
+    #[test]
+    fn apply_cloud_ws_max_clamps_and_ignores_empty() {
+        let mut session = SessionState::new();
+        assert_eq!(session.cloud_ws_max_bytes, WS_DEFAULT_CLOUD_MAX_BYTES);
+
+        session.apply_cloud_ws_max_bytes(None);
+        assert_eq!(session.cloud_ws_max_bytes, WS_DEFAULT_CLOUD_MAX_BYTES);
+
+        session.apply_cloud_ws_max_bytes(Some(0));
+        assert_eq!(session.cloud_ws_max_bytes, WS_DEFAULT_CLOUD_MAX_BYTES);
+
+        session.apply_cloud_ws_max_bytes(Some(64 << 20));
+        assert_eq!(session.cloud_ws_max_bytes, 64 << 20);
+
+        session.apply_cloud_ws_max_bytes(Some((WS_HARD_MAX_BYTES as u64) * 4));
+        assert_eq!(session.cloud_ws_max_bytes, WS_HARD_MAX_BYTES as u64);
+    }
+
+    #[test]
+    fn inbound_split_chunks_assemble() {
+        let mut session = SessionState::new();
+        let id = "job-1";
+        session
+            .push_inbound_split_chunk(&InvokeSplitStateChunkMessage {
+                kind: "invoke_split_state_chunk".into(),
+                id: id.into(),
+                index: 0,
+                total: 2,
+                data: "AAA".into(),
+                is_final: false,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                content: String::new(),
+            })
+            .unwrap();
+        assert!(session
+            .take_complete_inbound_split_state(id, 2)
+            .is_none());
+        session
+            .push_inbound_split_chunk(&InvokeSplitStateChunkMessage {
+                kind: "invoke_split_state_chunk".into(),
+                id: id.into(),
+                index: 1,
+                total: 2,
+                data: "BBB".into(),
+                is_final: true,
+                prompt_tokens: 3,
+                completion_tokens: 0,
+                content: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            session.take_complete_inbound_split_state(id, 2).as_deref(),
+            Some("AAABBB")
+        );
     }
 }

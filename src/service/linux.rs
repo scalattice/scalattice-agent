@@ -61,6 +61,33 @@ pub fn invoked_by_systemd() -> bool {
     std::env::var("INVOCATION_ID").is_ok() || std::env::var("JOURNAL_STREAM").is_ok()
 }
 
+/// Exclusive lock for the real agent runtime (GPU owner). Held for the process
+/// lifetime so a second `foreground` / systemd start cannot fight over VRAM.
+/// Log-follow mode must not take this lock.
+pub fn acquire_agent_runtime_lock() -> Result<crate::service::AgentRuntimeLock> {
+    use std::os::unix::io::AsRawFd;
+    let dir = crate::paths::config_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("agent.runtime.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        bail!(
+            "another scalattice-agent is already running (holds {}). \
+             Stop it first: systemctl --user stop scalattice-agent.service \
+             (or close a stray `scalattice-agent foreground` that is not log-follow).",
+            path.display()
+        );
+    }
+    let _ = fs::write(&path, format!("{}\n", std::process::id()));
+    Ok(crate::service::AgentRuntimeLock { _file: file })
+}
+
 pub fn invoked_by_background_service() -> bool {
     false
 }

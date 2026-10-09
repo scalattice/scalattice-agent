@@ -188,6 +188,9 @@ pub struct ReadyMessage {
     /// Server always sends this; default matches platform settings.
     #[serde(rename = "cpuRamHeadroomGb", default = "default_cpu_ram_headroom_gb")]
     pub cpu_ram_headroom_gb: u32,
+    /// Cloud one-message WebSocket ceiling (tier-2.5 KV). Omitted on older routers.
+    #[serde(rename = "maxWsMessageBytes", default)]
+    pub max_ws_message_bytes: Option<u64>,
     #[serde(rename = "huggingFaceToken", default)]
     pub hugging_face_token: Option<String>,
     /// Runtime the Go hypervisor wants preloaded. Empty / omitted = stay empty.
@@ -216,6 +219,9 @@ pub struct PongMessage {
     pub purge_models: Vec<String>,
     #[serde(rename = "maxCompletionTokens", default)]
     pub max_completion_tokens: u32,
+    /// Cloud one-message WebSocket ceiling. Omitted on older routers.
+    #[serde(rename = "maxWsMessageBytes", default)]
+    pub max_ws_message_bytes: Option<u64>,
     /// Live catalog refresh (omit on ordinary heartbeats). Same shape as `ready.catalog`.
     #[serde(default)]
     pub catalog: Option<Vec<CatalogModel>>,
@@ -277,6 +283,9 @@ pub struct InvokeSplitMessage {
     pub prompt_token_ids: Vec<u32>,
     #[serde(rename = "stateB64", default)]
     pub state_b64: String,
+    /// When > 0, `stateB64` is empty and state arrives as `invoke_split_state_chunk`.
+    #[serde(rename = "stateChunkTotal", default)]
+    pub state_chunk_total: u32,
     #[serde(rename = "maxTokens", default)]
     pub max_tokens: u32,
 }
@@ -294,6 +303,29 @@ pub struct InvokeSplitResultMessage {
     pub prompt_tokens: u32,
     #[serde(rename = "completionTokens")]
     pub completion_tokens: u32,
+}
+
+/// One piece of a tier-2.5 state blob (agent ↔ cloud). Concatenate `data` by `index`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvokeSplitStateChunkMessage {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub index: u32,
+    pub total: u32,
+    pub data: String,
+    #[serde(rename = "final", default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_final: bool,
+    #[serde(rename = "promptTokens", default, skip_serializing_if = "is_zero_u32")]
+    pub prompt_tokens: u32,
+    #[serde(rename = "completionTokens", default, skip_serializing_if = "is_zero_u32")]
+    pub completion_tokens: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content: String,
+}
+
+pub fn parse_invoke_split_state_chunk(data: &[u8]) -> anyhow::Result<InvokeSplitStateChunkMessage> {
+    Ok(serde_json::from_slice(data)?)
 }
 
 #[derive(Debug, Deserialize)]

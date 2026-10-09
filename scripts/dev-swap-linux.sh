@@ -9,6 +9,8 @@
 #   - Shipping to prod uses the normal release + install path, not this script.
 #   - Use --cloud on this box to clear the loopback override and use the
 #     default cloud endpoint again.
+#   - Stops every agent runtime before swap and asserts exactly one parent
+#     after restart (systemd only). Never leaves a second GPU owner running.
 #
 # Usage:
 #   ./scripts/dev-swap-linux.sh                 # local WS + build + swap + restart
@@ -155,35 +157,90 @@ fi
 
 mkdir -p "$(dirname "$DEST")"
 
-echo "==> stopping background agent (so the binary is not busy)"
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user stop "$WATCHDOG_TIMER" 2>/dev/null || true
-  systemctl --user stop "$UNIT" 2>/dev/null || true
-fi
-# Workers orphaned by process::exit; also any stray foreground.
-pkill -f 'scalattice-agent worker' 2>/dev/null || true
-pkill -x scalattice-agent 2>/dev/null || true
-sleep 0.5
-# Last resort if something still holds the inode.
-if [[ -e "$DEST" ]] && fuser "$DEST" >/dev/null 2>&1; then
-  fuser -k "$DEST" 2>/dev/null || true
-  sleep 0.3
-fi
+# Count parent agent runtimes (exclude workers and this script's shell helpers).
+count_agent_runtimes() {
+  # Parents show cmdline ending in "foreground" (systemd) or bare binary.
+  # Workers always have "worker" in argv.
+  ps -eo pid=,args= 2>/dev/null \
+    | awk '/scalattice-agent/ && $0 !~ /awk/ && $0 !~ /worker/ { c++ } END { print c+0 }'
+}
+
+stop_all_agents() {
+  echo "==> stopping every agent runtime (systemd + strays) so only one can own the GPUs"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop "$WATCHDOG_TIMER" 2>/dev/null || true
+    systemctl --user stop "$UNIT" 2>/dev/null || true
+  fi
+  # Workers orphaned by process::exit; also any stray foreground runtime.
+  pkill -f 'scalattice-agent worker' 2>/dev/null || true
+  pkill -x scalattice-agent 2>/dev/null || true
+  # Match installed path too (some shells show full path as argv0).
+  if [[ -x "$DEST" ]]; then
+    pkill -f "${DEST}( |$)" 2>/dev/null || true
+  fi
+  # Drop stale flock holder pid file; next start recreates it.
+  rm -f "${CFG_DIR}/agent.runtime.lock"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    local n
+    n="$(count_agent_runtimes)"
+    if [[ "$n" -eq 0 ]]; then
+      break
+    fi
+    echo "    waiting for agent exit… ($n still running)"
+    pkill -9 -f 'scalattice-agent worker' 2>/dev/null || true
+    pkill -9 -x scalattice-agent 2>/dev/null || true
+    [[ -x "$DEST" ]] && pkill -9 -f "${DEST}( |$)" 2>/dev/null || true
+    sleep 0.4
+  done
+  if [[ -e "$DEST" ]] && command -v fuser >/dev/null 2>&1 && fuser "$DEST" >/dev/null 2>&1; then
+    fuser -k "$DEST" 2>/dev/null || true
+    sleep 0.3
+  fi
+  local left
+  left="$(count_agent_runtimes)"
+  if [[ "$left" -ne 0 ]]; then
+    echo "error: still $left scalattice-agent process(es) after stop; refuse to swap" >&2
+    ps -eo pid,ppid,args= | awk '/scalattice-agent/ && $0 !~ /awk/' >&2 || true
+    exit 1
+  fi
+}
+
+assert_single_agent_runtime() {
+  local n
+  n="$(count_agent_runtimes)"
+  if [[ "$n" -ne 1 ]]; then
+    echo "error: expected exactly 1 agent runtime after restart, found $n" >&2
+    ps -eo pid,ppid,args= | awk '/scalattice-agent/ && $0 !~ /awk/' >&2 || true
+    echo "hint: do not also run a second GPU owner. \`scalattice-agent foreground\` with" >&2
+    echo "      systemd installed only follows logs; if you see two owners, stop strays." >&2
+    exit 1
+  fi
+  echo "==> single agent runtime OK (pid $(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || echo '?'))"
+}
+
+stop_all_agents
 
 echo "==> install $SRC -> $DEST"
 cp -f "$SRC" "$DEST"
 chmod +x "$DEST"
 
-echo "==> restart"
+echo "==> restart (systemd only — never leave a second foreground owner)"
 if command -v systemctl >/dev/null 2>&1 && systemctl --user cat "$UNIT" >/dev/null 2>&1; then
   systemctl --user daemon-reload 2>/dev/null || true
   systemctl --user start "$WATCHDOG_TIMER" 2>/dev/null || true
   systemctl --user restart "$UNIT"
+  # Give MainPID a moment to appear before the single-instance check.
+  sleep 1
   systemctl --user --no-pager --full status "$UNIT" | head -20 || true
+  assert_single_agent_runtime
 elif command -v scalattice-agent >/dev/null 2>&1; then
   scalattice-agent restart
+  sleep 1
+  assert_single_agent_runtime
 else
   echo "No systemd unit found; start manually: $DEST foreground" >&2
+  echo "(only one foreground — do not start a second copy)" >&2
   exit 1
 fi
 
@@ -198,6 +255,8 @@ if [[ "$CLOUD_MODE" -eq 0 ]]; then
 else
   echo "==> agent WS target: cloud default"
 fi
+echo "==> tip: \`scalattice-agent foreground\` with systemd installed only follows logs;"
+echo "    it does not start a second GPU agent. Use journalctl --user -u $UNIT -f to watch."
 # Quick log peek for register/connect
 if command -v journalctl >/dev/null 2>&1; then
   sleep 1
