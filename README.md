@@ -4,7 +4,7 @@
 
 # Scalattice Agent
 
-Open-source GPU agent for the [Scalattice](https://scalattice.com) inference network,
+GPU agent for the [Scalattice](https://scalattice.com) inference network,
 a product of [Robottik Ltd](https://robottik.co.uk).
 
 Install it on a machine with a GPU, connect with a provider token, and Scalattice Cloud can route inference jobs to you.
@@ -138,4 +138,8 @@ CI release binaries: **CUDA + Vulkan** on x86_64/aarch64 Linux and x86_64 Window
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+See [LICENSE](LICENSE).
+
+You may view the code, build and run it (including modified builds) to connect
+to Scalattice, and help via issues or patches. You may not use it to run a
+competing network, or redistribute it as a substitute product.
