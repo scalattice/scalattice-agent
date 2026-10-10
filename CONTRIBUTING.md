@@ -1,11 +1,14 @@
 # Contributing to Scalattice Agent
 
-Thank you for your interest in **scalattice-agent**, the open-source GPU agent for
+Thank you for your interest in **scalattice-agent**, the GPU agent for
 [Scalattice](https://scalattice.com), a product of
 [Robottik Ltd](https://robottik.co.uk).
 
-This repository is published under the [MIT License](LICENSE). You may read,
-study, build, and run the software freely. Day-to-day development is done by
+This repository uses the [Scalattice Agent Source-Available License](LICENSE).
+You may view the code, build and run it to connect to
+Scalattice, and help via issues or patches. You may not use it for a competing
+network or redistribute it as a substitute product. Official binaries remain
+usable under Scalattice provider terms. Day-to-day development is done by
 Robottik Ltd to keep the agent aligned with Scalattice Cloud and supported
 hardware targets.
 

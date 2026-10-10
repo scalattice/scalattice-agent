@@ -1,21 +1,86 @@
-MIT License
+Copyright (c) 2026 Robottik Ltd. All rights reserved.
 
-Copyright (c) 2026 Robottik Ltd
+SCALATTICE AGENT SOURCE-AVAILABLE LICENSE
+Version 1.0
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This is not an open-source license. The Software is proprietary to Robottik Ltd
+("Robottik"). Rights not expressly granted below are reserved.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Definitions
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+  "Software" means this repository and all source code, object code, binaries,
+  documentation, scripts, configuration, and other materials in it, including
+  modified versions you create under this license.
+
+  "Scalattice Network" means the Scalattice inference network operated by
+  Robottik (including Scalattice Cloud and servers Robottik designates as part
+  of that network).
+
+  "You" means any individual or entity exercising rights under this license.
+
+2. Grant: view, build, run, and improve for Scalattice
+
+  Subject to this license, Robottik grants You a non-exclusive,
+  non-transferable, royalty-free, worldwide license to:
+
+  (a) view and study the Software;
+  (b) build, install, and run the Software, including modified builds, solely
+      to connect machines You control to the Scalattice Network as a provider
+      or for local development, debugging, testing, and security review of
+      that use;
+  (c) modify the Software for those same purposes; and
+  (d) report issues and propose changes (including patches and pull requests)
+      to Robottik.
+
+  Official binaries distributed by Robottik or Scalattice may also be used
+  under the then-current Scalattice provider terms; this license does not
+  reduce those terms.
+
+3. Contributions
+
+  By submitting a contribution (issue text, patch, pull request, or similar),
+  You grant Robottik a perpetual, worldwide, royalty-free license to use,
+  modify, distribute, and relicense that contribution as part of the Software
+  or related products, and You represent that You have the rights to grant
+  this. Robottik may require a separate contributor agreement before merging
+  substantial changes.
+
+4. Restrictions
+
+  You may not, and may not permit others to:
+
+  (a) use the Software to operate, offer, or power any inference, GPU-rental,
+      or agent network other than the Scalattice Network;
+  (b) redistribute the Software, or a substantial portion of it, to the public
+      as a competing product, fork, mirror, or substitute agent (publishing a
+      fork solely to propose a pull request back to Robottik is allowed);
+  (c) sell, rent, lease, or sublicense the Software except as Robottik
+      expressly agrees in writing;
+  (d) remove or alter proprietary notices; or
+  (e) claim that the Software is open source or that this license grants
+      OSI-approved open-source rights.
+
+5. No trademark license
+
+  This license does not grant rights to Robottik or Scalattice names, logos,
+  or trademarks, except as needed to describe accurate compatibility with the
+  Scalattice Network.
+
+6. No warranty
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+  ROBOTTIK OR ITS LICENSORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+  LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
+
+7. Termination
+
+  This license terminates automatically if You breach it. On termination You
+  must stop using the Software and destroy copies in Your possession, except
+  where retention is required by law. Sections 3, 5, 6, and 8 survive.
+
+8. Other licensing
+
+  For rights beyond this license (commercial redistribution, embedding in
+  another product, competing-network use, etc.), contact admin@robottik.co.uk.

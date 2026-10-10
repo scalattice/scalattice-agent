@@ -5,8 +5,9 @@ name = "scalattice-agent"
 # Next release bump: scripts/ci-prepare-release.sh (production merge).
 version = "1.1.145"
 edition = "2021"
-description = "Open-source GPU machine agent for the Scalattice inference network"
-license = "MIT"
+description = "GPU machine agent for the Scalattice inference network"
+license = "LicenseRef-Scalattice-Source-Available"
+license-file = "LICENSE"
 repository = "https://github.com/scalattice/scalattice-agent"
 readme = "README.md"
 keywords = ["scalattice", "gpu", "inference", "websocket"]
