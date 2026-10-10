@@ -155,9 +155,10 @@ const STUCK_CHECKOUT: Duration = Duration::from_secs(20 * 60);
 fn worker_silence_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_SILENCE,
-        // "start"/"load" — opening + mmap; keep the long quiet window for big GGUFs,
-        // but the load wall below still caps a wedged progress-pinging mmap.
-        "prefill" | "context" | "load" | "start" => WORKER_PREFILL_SILENCE,
+        // "start"/"load"/"evict" — opening, mmap, or tearing down a large GGUF can
+        // sit quiet well past 30s (fleet: poorweave 27B unload → one-strike damage).
+        // The phase wall below still caps a wedged progress-pinging mmap.
+        "prefill" | "context" | "load" | "start" | "evict" => WORKER_PREFILL_SILENCE,
         _ => WORKER_LOAD_SILENCE,
     }
 }
@@ -328,7 +329,8 @@ fn nvidia_slots_unusable(slots: &[ComputeSlot], unusable: &HashSet<String>) -> b
 fn worker_wall_for_phase(phase: &str) -> Duration {
     match phase.to_ascii_lowercase().as_str() {
         "decode" => WORKER_DECODE_WALL,
-        "load" | "start" => WORKER_LOAD_WALL,
+        // Evict is weight teardown (same class as cold load), not decode.
+        "load" | "start" | "evict" => WORKER_LOAD_WALL,
         // prefill / context — soft hop before first token (not a 12‑minute burn)
         _ => WORKER_FIRST_TOKEN_HOP,
     }
@@ -336,6 +338,54 @@ fn worker_wall_for_phase(phase: &str) -> Duration {
 
 fn phase_before_first_token(phase: &str) -> bool {
     !matches!(phase.to_ascii_lowercase().as_str(), "decode")
+}
+
+/// Phases that may sit quiet for a long time without a real progress tick — still
+/// ping the cloud so the router stall timer does not cancel a healthy cold path.
+fn phase_sends_cloud_keepalive(phase: &str) -> bool {
+    matches!(
+        phase.to_ascii_lowercase().as_str(),
+        "start" | "load" | "prefill" | "context" | "evict"
+    )
+}
+
+/// Pre-token phases (incl. evict/load) hop as agent_busy; decode is a real timeout.
+fn phase_limit_error(phase: &str, timeout_detail: &str) -> anyhow::Error {
+    if phase_before_first_token(phase) {
+        crate::invoke_code::coded(
+            crate::invoke_code::InvokeErrorCode::AgentBusy,
+            format!("accelerator stalled in {phase}; trying another machine"),
+        )
+    } else {
+        crate::invoke_code::coded(
+            crate::invoke_code::InvokeErrorCode::InvokeTimeout,
+            timeout_detail.to_string(),
+        )
+    }
+}
+
+fn silence_kill_error(phase: &str) -> anyhow::Error {
+    phase_limit_error(phase, "worker made no progress")
+}
+
+fn wall_kill_error(phase: &str) -> anyhow::Error {
+    phase_limit_error(phase, "exceeded wall-clock limit")
+}
+
+fn deadline_kill_error(phase: &str, deadline_secs: u64) -> anyhow::Error {
+    if phase_before_first_token(phase) {
+        crate::invoke_code::coded(
+            crate::invoke_code::InvokeErrorCode::AgentBusy,
+            format!(
+                "accelerator too slow before first token ({deadline_secs}s); trying another machine"
+            ),
+        )
+    } else {
+        crate::invoke_code::coded(
+            crate::invoke_code::InvokeErrorCode::InvokeTimeout,
+            format!("exceeded absolute invoke deadline ({deadline_secs}s)"),
+        )
+    }
 }
 
 impl Supervisor {
@@ -2701,22 +2751,7 @@ async fn worker_rpc_invoke_cancellable(
             worker.healthy = false;
             // Pre-decode: hop as busy so the router fails over without damage.
             // Decode: real timeout — the job started producing tokens.
-            if phase_before_first_token(&last_phase) {
-                return Err(crate::invoke_code::coded(
-                    crate::invoke_code::InvokeErrorCode::AgentBusy,
-                    format!(
-                        "accelerator too slow before first token ({}s); trying another machine",
-                        deadline.as_secs()
-                    ),
-                ));
-            }
-            return Err(crate::invoke_code::coded(
-                crate::invoke_code::InvokeErrorCode::InvokeTimeout,
-                format!(
-                    "exceeded absolute invoke deadline ({}s)",
-                    deadline.as_secs()
-                ),
-            ));
+            return Err(deadline_kill_error(&last_phase, deadline.as_secs()));
         }
         if phase_started.elapsed() >= worker_wall_for_phase(&last_phase) {
             warn!(
@@ -2728,18 +2763,7 @@ async fn worker_rpc_invoke_cancellable(
             let _ = worker.child.kill().await;
             let _ = worker.child.wait().await;
             worker.healthy = false;
-            if phase_before_first_token(&last_phase) {
-                return Err(crate::invoke_code::coded(
-                    crate::invoke_code::InvokeErrorCode::AgentBusy,
-                    format!(
-                        "accelerator stalled in {last_phase}; trying another machine"
-                    ),
-                ));
-            }
-            return Err(crate::invoke_code::coded(
-                crate::invoke_code::InvokeErrorCode::InvokeTimeout,
-                "exceeded wall-clock limit",
-            ));
+            return Err(wall_kill_error(&last_phase));
         }
         buf.clear();
         let silence_left = silence
@@ -2841,11 +2865,7 @@ async fn worker_rpc_invoke_cancellable(
             _ = tokio::time::sleep(wait) => {
                 // Keep the router stall timer alive during long mmap/load without
                 // resetting the worker silence clock (still kill at 180s of no real progress).
-                let loadish = matches!(
-                    last_phase.to_ascii_lowercase().as_str(),
-                    "start" | "load" | "prefill" | "context"
-                );
-                if loadish
+                if phase_sends_cloud_keepalive(&last_phase)
                     && last_cloud_keepalive.elapsed() >= WORKER_CLOUD_KEEPALIVE
                     && last_progress.elapsed() < silence
                 {
@@ -2866,10 +2886,9 @@ async fn worker_rpc_invoke_cancellable(
                 let _ = worker.child.kill().await;
                 let _ = worker.child.wait().await;
                 worker.healthy = false;
-                return Err(crate::invoke_code::coded(
-                    crate::invoke_code::InvokeErrorCode::InvokeTimeout,
-                    "worker made no progress",
-                ));
+                // Match wall/deadline: silence before first token is a hop, not a
+                // one-strike invoke_timeout (fleet: poorweave phase=evict).
+                return Err(silence_kill_error(&last_phase));
             }
         }
     }
@@ -2920,14 +2939,21 @@ fn worker_crash_retryable(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        nvidia_slots_unusable, phase_before_first_token, worker_crash_retryable,
-        worker_silence_for_phase, worker_wall_for_phase, STUCK_CHECKOUT, WORKER_DECODE_SILENCE,
-        WORKER_DECODE_WALL, WORKER_FIRST_TOKEN_HOP, WORKER_INVOKE_DEADLINE, WORKER_LOAD_WALL,
-        WORKER_PREFILL_SILENCE,
+        deadline_kill_error, nvidia_slots_unusable, phase_before_first_token,
+        phase_sends_cloud_keepalive, silence_kill_error, wall_kill_error, worker_crash_retryable,
+        worker_silence_for_phase, worker_wall_for_phase, STUCK_CHECKOUT, WORKER_CLOUD_KEEPALIVE,
+        WORKER_DECODE_SILENCE, WORKER_DECODE_WALL, WORKER_FIRST_TOKEN_HOP, WORKER_INVOKE_DEADLINE,
+        WORKER_LOAD_SILENCE, WORKER_LOAD_WALL, WORKER_PREFILL_SILENCE,
     };
     use crate::compute_pool::build_compute_slots;
+    use crate::invoke_code::{code_of, wire_code, InvokeErrorCode};
     use crate::specs::ComputeDevice;
     use std::collections::HashSet;
+    use std::time::Duration;
+
+    const KNOWN_PHASES: &[&str] = &[
+        "start", "load", "evict", "prefill", "context", "decode",
+    ];
 
     #[test]
     fn amd_slot_failure_is_not_a_nvidia_driver_fault() {
@@ -2976,25 +3002,212 @@ mod tests {
     }
 
     #[test]
-    fn prefill_wall_is_longer_than_decode_and_covers_start() {
-        assert_eq!(worker_wall_for_phase("decode"), WORKER_DECODE_WALL);
+    fn silence_and_wall_budgets_for_every_known_phase() {
+        // Silence: long quiet window for weight open/unload + prefill; short for decode.
+        for phase in ["start", "load", "evict", "prefill", "context"] {
+            assert_eq!(
+                worker_silence_for_phase(phase),
+                WORKER_PREFILL_SILENCE,
+                "silence[{phase}]"
+            );
+        }
+        assert_eq!(worker_silence_for_phase("decode"), WORKER_DECODE_SILENCE);
+        // Unknown phase stays on the short load-silence default (not decode).
+        assert_eq!(worker_silence_for_phase("unknown"), WORKER_LOAD_SILENCE);
+        assert_eq!(worker_silence_for_phase(""), WORKER_LOAD_SILENCE);
+
+        // Wall: load/start/evict share the cold-weight wall; prefill hops sooner.
+        for phase in ["start", "load", "evict"] {
+            assert_eq!(
+                worker_wall_for_phase(phase),
+                WORKER_LOAD_WALL,
+                "wall[{phase}]"
+            );
+        }
         assert_eq!(worker_wall_for_phase("prefill"), WORKER_FIRST_TOKEN_HOP);
-        assert_eq!(worker_wall_for_phase("start"), WORKER_LOAD_WALL);
-        assert_eq!(worker_wall_for_phase("load"), WORKER_LOAD_WALL);
+        assert_eq!(worker_wall_for_phase("context"), WORKER_FIRST_TOKEN_HOP);
+        assert_eq!(worker_wall_for_phase("decode"), WORKER_DECODE_WALL);
+        assert_eq!(worker_wall_for_phase("unknown"), WORKER_FIRST_TOKEN_HOP);
+
+        assert!(WORKER_PREFILL_SILENCE > WORKER_DECODE_SILENCE);
+        assert!(WORKER_PREFILL_SILENCE > WORKER_LOAD_SILENCE);
         assert!(WORKER_LOAD_WALL < WORKER_FIRST_TOKEN_HOP);
         assert!(WORKER_FIRST_TOKEN_HOP < WORKER_INVOKE_DEADLINE);
+        assert!(WORKER_CLOUD_KEEPALIVE < WORKER_PREFILL_SILENCE);
         // Stuck checkout must outlive the absolute invoke deadline so Full Debug
         // reclaim does not race a still-legal long decode.
         assert!(STUCK_CHECKOUT > WORKER_INVOKE_DEADLINE);
-        assert!(phase_before_first_token("prefill"));
-        assert!(phase_before_first_token("load"));
-        assert!(!phase_before_first_token("decode"));
     }
 
     #[test]
-    fn cold_load_is_not_killed_at_the_decode_missed_beat() {
-        assert_eq!(worker_silence_for_phase("start"), WORKER_PREFILL_SILENCE);
-        assert_eq!(worker_silence_for_phase("load"), WORKER_PREFILL_SILENCE);
-        assert_eq!(worker_silence_for_phase("decode"), WORKER_DECODE_SILENCE);
+    fn phase_helpers_are_case_insensitive() {
+        for phase in ["Evict", "EVICT", "eViCt", "Load", "DECODE", "Prefill"] {
+            let lower = phase.to_ascii_lowercase();
+            assert_eq!(
+                worker_silence_for_phase(phase),
+                worker_silence_for_phase(&lower),
+                "silence case {phase}"
+            );
+            assert_eq!(
+                worker_wall_for_phase(phase),
+                worker_wall_for_phase(&lower),
+                "wall case {phase}"
+            );
+            assert_eq!(
+                phase_before_first_token(phase),
+                phase_before_first_token(&lower),
+                "before_token case {phase}"
+            );
+            assert_eq!(
+                phase_sends_cloud_keepalive(phase),
+                phase_sends_cloud_keepalive(&lower),
+                "keepalive case {phase}"
+            );
+            assert_eq!(
+                wire_code(&silence_kill_error(phase)),
+                wire_code(&silence_kill_error(&lower)),
+                "silence_kill case {phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_keepalive_covers_long_quiet_phases_not_decode() {
+        for phase in ["start", "load", "evict", "prefill", "context"] {
+            assert!(
+                phase_sends_cloud_keepalive(phase),
+                "keepalive expected for {phase}"
+            );
+        }
+        assert!(!phase_sends_cloud_keepalive("decode"));
+        assert!(!phase_sends_cloud_keepalive("unknown"));
+        // Keepalive interval must be short enough to beat a typical 30s router stall.
+        assert!(WORKER_CLOUD_KEEPALIVE <= Duration::from_secs(15));
+    }
+
+    #[test]
+    fn silence_wall_and_deadline_hops_before_token_and_times_out_in_decode() {
+        for phase in ["start", "load", "evict", "prefill", "context", "unknown", ""] {
+            assert!(
+                phase_before_first_token(phase),
+                "{phase} is before first token"
+            );
+            for (label, err) in [
+                ("silence", silence_kill_error(phase)),
+                ("wall", wall_kill_error(phase)),
+                ("deadline", deadline_kill_error(phase, WORKER_INVOKE_DEADLINE.as_secs())),
+            ] {
+                assert_eq!(
+                    code_of(&err),
+                    InvokeErrorCode::AgentBusy,
+                    "{label} kill [{phase}] must hop, not damage"
+                );
+                assert_eq!(wire_code(&err), "agent_busy");
+                // Router may retry another machine; must not look like a crash retry.
+                assert!(!worker_crash_retryable(&err));
+                // Server one-strike damage keys off invoke_timeout — never agent_busy.
+                assert_ne!(wire_code(&err), "invoke_timeout");
+                assert_ne!(wire_code(&err), "provider_timeout");
+            }
+        }
+
+        assert!(!phase_before_first_token("decode"));
+        let silence_err = silence_kill_error("decode");
+        let wall_err = wall_kill_error("decode");
+        let deadline_err = deadline_kill_error("decode", WORKER_INVOKE_DEADLINE.as_secs());
+        for (label, err, needle) in [
+            ("silence", &silence_err, "worker made no progress"),
+            ("wall", &wall_err, "exceeded wall-clock limit"),
+            ("deadline", &deadline_err, "exceeded absolute invoke deadline"),
+        ] {
+            assert_eq!(
+                code_of(err),
+                InvokeErrorCode::InvokeTimeout,
+                "{label} decode"
+            );
+            assert_eq!(wire_code(err), "invoke_timeout");
+            assert!(!worker_crash_retryable(err));
+            assert!(
+                format!("{err:#}").contains(needle),
+                "{label} detail missing {needle}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn evict_matches_load_not_decode_on_every_changed_axis() {
+        // The fleet bug: evict used the short silence + invoke_timeout path.
+        assert_eq!(
+            worker_silence_for_phase("evict"),
+            worker_silence_for_phase("load")
+        );
+        assert_eq!(
+            worker_wall_for_phase("evict"),
+            worker_wall_for_phase("load")
+        );
+        assert_ne!(
+            worker_silence_for_phase("evict"),
+            worker_silence_for_phase("decode")
+        );
+        assert_ne!(
+            worker_wall_for_phase("evict"),
+            worker_wall_for_phase("decode")
+        );
+        assert_eq!(
+            phase_sends_cloud_keepalive("evict"),
+            phase_sends_cloud_keepalive("load")
+        );
+        assert_ne!(
+            phase_sends_cloud_keepalive("evict"),
+            phase_sends_cloud_keepalive("decode")
+        );
+        assert_eq!(
+            wire_code(&silence_kill_error("evict")),
+            wire_code(&silence_kill_error("load"))
+        );
+        assert_ne!(
+            wire_code(&silence_kill_error("evict")),
+            wire_code(&silence_kill_error("decode"))
+        );
+        assert_eq!(
+            wire_code(&wall_kill_error("evict")),
+            wire_code(&wall_kill_error("load"))
+        );
+        assert_ne!(
+            wire_code(&wall_kill_error("evict")),
+            wire_code(&wall_kill_error("decode"))
+        );
+        assert_eq!(
+            wire_code(&deadline_kill_error("evict", 60)),
+            wire_code(&deadline_kill_error("load", 60))
+        );
+        assert_ne!(
+            wire_code(&deadline_kill_error("evict", 60)),
+            wire_code(&deadline_kill_error("decode", 60))
+        );
+    }
+
+    #[test]
+    fn changed_helpers_cover_all_known_phases_without_panic() {
+        for phase in KNOWN_PHASES {
+            let _ = worker_silence_for_phase(phase);
+            let _ = worker_wall_for_phase(phase);
+            let _ = phase_before_first_token(phase);
+            let _ = phase_sends_cloud_keepalive(phase);
+            for err in [
+                silence_kill_error(phase),
+                wall_kill_error(phase),
+                deadline_kill_error(phase, WORKER_INVOKE_DEADLINE.as_secs()),
+            ] {
+                assert!(
+                    matches!(
+                        code_of(&err),
+                        InvokeErrorCode::AgentBusy | InvokeErrorCode::InvokeTimeout
+                    ),
+                    "unexpected code for {phase}: {}",
+                    wire_code(&err)
+                );
+            }
+        }
     }
 }
