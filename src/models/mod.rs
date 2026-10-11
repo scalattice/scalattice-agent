@@ -8,10 +8,10 @@ mod sync;
 mod vram_plan;
 
 pub use capacity::{
-    can_host_model, can_serve_vision_on_card, cpu_slot_may_serve, hosting_min_vram_gb,
-    image_job_min_vram_gb, kv_offload_ram_gb, llama_context_plan_for_n_ctx,
-    occupancy_min_vram_gb, placement_sys_ram_need_gb, vram_can_gpu_full, warm_kv_offload_ram_need_gb,
-    DEFAULT_CPU_RAM_HEADROOM_GB,
+    can_host_model, can_host_model_at, can_serve_vision_on_card, cpu_slot_may_serve,
+    gpu_full_host_need_gb_at, hosting_min_vram_gb, image_job_min_vram_gb, kv_offload_ram_gb,
+    llama_context_plan_for_n_ctx, occupancy_min_vram_gb, placement_sys_ram_need_gb,
+    vram_can_gpu_full_at, warm_kv_offload_ram_need_gb, DEFAULT_CPU_RAM_HEADROOM_GB,
 };
 pub use download::is_no_space_error;
 pub use gguf_arch::gguf_shape;

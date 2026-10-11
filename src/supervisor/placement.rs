@@ -1,7 +1,7 @@
 use crate::compute_pool::{ComputePlan, ComputeSlot, PoolStrategy};
 use crate::models::{
-    can_host_model, can_serve_vision_on_card, cpu_slot_may_serve, hosting_min_vram_gb,
-    image_job_min_vram_gb, occupancy_min_vram_gb, placement_sys_ram_need_gb, vram_can_gpu_full,
+    can_host_model_at, can_serve_vision_on_card, cpu_slot_may_serve, hosting_min_vram_gb,
+    image_job_min_vram_gb, occupancy_min_vram_gb, placement_sys_ram_need_gb, vram_can_gpu_full_at,
 };
 use crate::protocol::CatalogModel;
 use tracing::debug;
@@ -80,6 +80,7 @@ pub fn placement_for_required_slot(
     devices: &[crate::specs::ComputeDevice],
     model: &CatalogModel,
     need_vision: bool,
+    n_ctx: u32,
 ) -> Option<Placement> {
     let want = slot_id.trim();
     if want.is_empty() {
@@ -100,12 +101,14 @@ pub fn placement_for_required_slot(
                 } else {
                     hosting_min_vram_gb(model)
                 };
-                let pin_can_full = vram_can_gpu_full(
+                let pin_can_full = vram_can_gpu_full_at(
                     f64::from(slot.card.total_vram_gb),
                     model,
                     min_vram,
                     need_vision,
-                ) && (!need_vision || can_serve_vision_on_card(model, &slot.card));
+                    n_ctx,
+                ) && (!need_vision
+                    || can_serve_vision_on_card(model, &slot.card));
                 if !pin_can_full {
                     let phys_ids: Vec<u32> = siblings
                         .iter()
@@ -115,11 +118,12 @@ pub fn placement_for_required_slot(
                         crate::compute_pool::build_tp_card_for_group(devices, &phys_ids)
                     {
                         if tp_card.strategy == PoolStrategy::TensorParallel {
-                            let tp_can_full = vram_can_gpu_full(
+                            let tp_can_full = vram_can_gpu_full_at(
                                 f64::from(tp_card.total_vram_gb),
                                 model,
                                 min_vram,
                                 need_vision,
+                                n_ctx,
                             ) && (!need_vision
                                 || can_serve_vision_on_card(model, &tp_card));
                             if tp_can_full {
@@ -183,6 +187,7 @@ pub fn pick_placement(
         &std::collections::HashSet::new(),
         &std::collections::HashMap::new(),
         false,
+        0,
     )
 }
 
@@ -203,6 +208,8 @@ pub fn pick_placement_with_cpu(
     reclaim_sys_ram_gb: &std::collections::HashMap<String, u32>,
     // When true, preferredSlotId pinned a CPU slot — honor it even for GPU-class models.
     force_cpu_pin: bool,
+    // Job llama n_ctx (0 = catalog maxContextTokens).
+    n_ctx: u32,
 ) -> Option<Placement> {
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
@@ -222,7 +229,7 @@ pub fn pick_placement_with_cpu(
     let discrete_nameplate_hosts = plan.slots.iter().any(|s| {
         s.kind != "cpu"
             && s.kind != "integrated"
-            && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+            && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
             && (!need_vision || can_serve_vision_on_card(model, &s.card))
     });
 
@@ -232,14 +239,15 @@ pub fn pick_placement_with_cpu(
         .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
         .filter(|s| !(discrete_nameplate_hosts && s.kind == "integrated"))
         .filter(|s| {
-            vram_can_gpu_full(
+            vram_can_gpu_full_at(
                 slot_available_gb(s, &live_cuda, reclaimable_slot_ids.contains(&s.id)),
                 model,
                 min_vram,
                 need_vision,
+                n_ctx,
             )
         })
-        .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
+        .filter(|s| can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx))
         .filter(|s| !need_vision || can_serve_vision_on_card(model, &s.card))
         .collect();
     full_fit.sort_by(|a, b| {
@@ -278,15 +286,16 @@ pub fn pick_placement_with_cpu(
         if need_vision && !can_serve_vision_on_card(model, &tp_card) {
             continue;
         }
-        if !vram_can_gpu_full(
+        if !vram_can_gpu_full_at(
             tp_available_gb(&tp_card, &live_cuda),
             model,
             min_vram,
             need_vision,
+            n_ctx,
         ) {
             continue;
         }
-        if !can_host_model(model, &tp_card, ram_gb, cpu_ram_headroom_gb) {
+        if !can_host_model_at(model, &tp_card, ram_gb, cpu_ram_headroom_gb, n_ctx) {
             continue;
         }
         debug!(group = %group_id, "placement: tensor-parallel group");
@@ -313,7 +322,7 @@ pub fn pick_placement_with_cpu(
                     reclaimable_slot_ids.contains(&s.id),
                 )
             })
-            .filter(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
+            .filter(|s| can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx))
             .filter(|s| {
                 let credit = reclaim_sys_ram_gb.get(&s.id).copied().unwrap_or(0);
                 placement_sys_ram_need_gb(model, &s.card, need_vision, cpu_ram_headroom_gb)
@@ -340,7 +349,7 @@ pub fn pick_placement_with_cpu(
             .slots
             .iter()
             .filter(|s| idle.contains(s.id.as_str()) && s.kind == "cpu")
-            .find(|s| can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb))
+            .find(|s| can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx))
         {
             // GPU-catalog models on a box that has any accelerator must not silently
             // crawl on cpu-0 (fleet: DESKTOP-SJVL4OL 27B/35B on cpu → invoke_timeout).
@@ -360,13 +369,13 @@ pub fn pick_placement_with_cpu(
             let idle_accel_nameplate_hosts = plan.slots.iter().any(|s| {
                 s.kind != "cpu"
                     && idle.contains(s.id.as_str())
-                    && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+                    && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
             });
             // A busy card that could host keeps the job off the CPU.
             let busy_accel_could_host = plan.slots.iter().any(|s| {
                 s.kind != "cpu"
                     && !idle.contains(s.id.as_str())
-                    && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+                    && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
             });
             let cpu_ram_need =
                 placement_sys_ram_need_gb(model, &slot.card, need_vision, cpu_ram_headroom_gb);
@@ -379,8 +388,7 @@ pub fn pick_placement_with_cpu(
                 );
             } else if !force_cpu_pin && busy_accel_could_host {
                 debug!(slot = %slot.id, "placement: skip cpu; an accelerator can host this model");
-            } else if !cpu_slot_may_serve(model, ram_gb, cpu_ram_headroom_gb, cpu_logical_cores)
-            {
+            } else if !cpu_slot_may_serve(model, ram_gb, cpu_ram_headroom_gb, cpu_logical_cores) {
                 debug!(
                     slot = %slot.id,
                     cores = cpu_logical_cores,
@@ -433,6 +441,7 @@ pub fn pick_resident_placement(
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
     need_vision: bool,
+    n_ctx: u32,
 ) -> Option<Placement> {
     if resident_slot_ids.is_empty() || idle_slot_ids.is_empty() {
         return None;
@@ -445,7 +454,7 @@ pub fn pick_resident_placement(
             resident_slot_ids.iter().any(|id| id == &slot.id) && idle.contains(slot.id.as_str())
         })
         .filter(|slot| {
-            resident_slot_can_serve(slot, model, ram_gb, cpu_ram_headroom_gb, need_vision)
+            resident_slot_can_serve(slot, model, ram_gb, cpu_ram_headroom_gb, need_vision, n_ctx)
         })
         .collect();
     if hits.is_empty() {
@@ -473,6 +482,7 @@ fn resident_slot_can_serve(
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
     need_vision: bool,
+    n_ctx: u32,
 ) -> bool {
     if slot.kind == "cpu" {
         return cpu_slot_may_serve(
@@ -485,7 +495,7 @@ fn resident_slot_can_serve(
     if need_vision && !can_serve_vision_on_card(model, &slot.card) {
         return false;
     }
-    can_host_model(model, &slot.card, ram_gb, cpu_ram_headroom_gb)
+    can_host_model_at(model, &slot.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
 }
 
 fn slot_available_gb(
@@ -547,6 +557,7 @@ pub fn placement_miss_detail(
     reclaim_sys_ram_gb: &std::collections::HashMap<String, u32>,
     ram_gb: u32,
     cpu_ram_headroom_gb: u32,
+    n_ctx: u32,
 ) -> crate::invoke_code::CodedError {
     let model_id = model.model_id.as_str();
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
@@ -593,9 +604,7 @@ pub fn placement_miss_detail(
             .unwrap_or(0);
         return crate::invoke_code::CodedError::new(
             crate::invoke_code::InvokeErrorCode::InsufficientVram,
-            format!(
-                "need {min_vram} GB GPU for image job {model_id}; largest idle {max_idle} GB"
-            ),
+            format!("need {min_vram} GB GPU for image job {model_id}; largest idle {max_idle} GB"),
         );
     }
 
@@ -608,7 +617,7 @@ pub fn placement_miss_detail(
         plan.slots.iter().any(|s| {
             s.kind != "cpu"
                 && s.kind != "integrated"
-                && can_host_model(model, &s.card, ram_gb, cpu_ram_headroom_gb)
+                && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
                 && (!need_vision || can_serve_vision_on_card(model, &s.card))
         })
     };
@@ -628,7 +637,9 @@ pub fn placement_miss_detail(
             return agent_busy_waiting_gpu();
         }
         if need_vision {
-            let need = image_job_min_vram_gb(model);
+            let need = crate::models::gpu_full_host_need_gb_at(model, true, n_ctx)
+                .ceil()
+                .max(f64::from(image_job_min_vram_gb(model))) as u32;
             return crate::invoke_code::CodedError::new(
                 crate::invoke_code::InvokeErrorCode::InsufficientVram,
                 format!("need {need} GB GPU for vision job {model_id}; no idle accelerator"),
@@ -640,12 +651,8 @@ pub fn placement_miss_detail(
                 .iter()
                 .find(|s| idle.contains(s.id.as_str()) && s.kind == "cpu");
             if let Some(slot) = cpu_slot {
-                let cpu_need = placement_sys_ram_need_gb(
-                    model,
-                    &slot.card,
-                    false,
-                    cpu_ram_headroom_gb,
-                );
+                let cpu_need =
+                    placement_sys_ram_need_gb(model, &slot.card, false, cpu_ram_headroom_gb);
                 let credit = reclaim_sys_ram_gb.get(&slot.id).copied().unwrap_or(0);
                 let avail = sys_ram_available_gb.saturating_add(credit);
                 if cpu_need > avail {
@@ -659,9 +666,7 @@ pub fn placement_miss_detail(
             }
             return crate::invoke_code::CodedError::new(
                 crate::invoke_code::InvokeErrorCode::InsufficientVram,
-                format!(
-                    "no accelerator can host {model_id}; CPU path refused (RAM or capability)"
-                ),
+                format!("no accelerator can host {model_id}; CPU path refused (RAM or capability)"),
             );
         }
         return crate::invoke_code::CodedError::new(
@@ -671,7 +676,9 @@ pub fn placement_miss_detail(
     }
 
     if need_vision {
-        let need = image_job_min_vram_gb(model);
+        let need = crate::models::gpu_full_host_need_gb_at(model, true, n_ctx)
+            .ceil()
+            .max(f64::from(image_job_min_vram_gb(model))) as u32;
         // Vision needs one accelerator that fits — never sum sibling nameplates
         // (fleet: 2×3090 reported "largest idle 48 GB" while each slot is 24 GB).
         let max_slot = idle_accel
@@ -690,13 +697,7 @@ pub fn placement_miss_detail(
 
     let max_free = idle_accel
         .iter()
-        .map(|slot| {
-            slot_available_gb(
-                slot,
-                &live_cuda,
-                reclaimable_slot_ids.contains(&slot.id),
-            )
-        })
+        .map(|slot| slot_available_gb(slot, &live_cuda, reclaimable_slot_ids.contains(&slot.id)))
         .fold(0.0_f64, f64::max);
     let need = occupancy_min_vram_gb(model);
     // VRAM looks fine but every idle accelerator failed the sys-RAM offload gate
@@ -747,9 +748,9 @@ pub fn placement_miss_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use crate::compute_pool::build_compute_slots;
     use crate::specs::ComputeDevice;
+    use std::collections::{HashMap, HashSet};
 
     fn model(min_vram: f64, weight: f64) -> CatalogModel {
         CatalogModel {
@@ -848,9 +849,17 @@ mod tests {
         let cold =
             pick_placement(&plan, &gpu_idle, &loaded, 64, 2, &devices, false).expect("card size");
         assert_eq!(cold.slot_ids, vec!["cuda-0".to_string()]);
-        let placement =
-            pick_resident_placement(&plan, &idle, &["cuda-0".to_string()], &loaded, 64, 2, false)
-                .expect("resident slot is placeable");
+        let placement = pick_resident_placement(
+            &plan,
+            &idle,
+            &["cuda-0".to_string()],
+            &loaded,
+            64,
+            2,
+            false,
+            0,
+        )
+        .expect("resident slot is placeable");
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
         assert!(pick_resident_placement(
             &plan,
@@ -860,6 +869,7 @@ mod tests {
             64,
             2,
             false,
+            0
         )
         .is_none());
     }
@@ -954,6 +964,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             true,
+            0,
         )
         .expect("preferredSlotId=cpu-0 must honor the pin");
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
@@ -964,11 +975,11 @@ mod tests {
         let devices = mixed_1660_3080();
         let plan = build_compute_slots(&devices).unwrap();
         let m = model(4.0, 4.68);
-        let on_cpu = placement_for_required_slot(&plan, "cpu-0", &devices, &m, false).unwrap();
+        let on_cpu = placement_for_required_slot(&plan, "cpu-0", &devices, &m, false, 0).unwrap();
         assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
-        let on_gpu = placement_for_required_slot(&plan, "cuda-0", &devices, &m, false).unwrap();
+        let on_gpu = placement_for_required_slot(&plan, "cuda-0", &devices, &m, false, 0).unwrap();
         assert_eq!(on_gpu.slot_ids, vec!["cuda-0".to_string()]);
-        assert!(placement_for_required_slot(&plan, "cuda-99", &devices, &m, false).is_none());
+        assert!(placement_for_required_slot(&plan, "cuda-99", &devices, &m, false, 0).is_none());
     }
 
     fn twin_4090() -> [ComputeDevice; 3] {
@@ -1016,7 +1027,7 @@ mod tests {
         );
         let small = model(8.0, 5.0);
         let placement =
-            placement_for_required_slot(&plan, "cuda-0", &devices, &small, false).unwrap();
+            placement_for_required_slot(&plan, "cuda-0", &devices, &small, false, 0).unwrap();
         assert!(
             !placement.use_tp_worker,
             "small model that fits one card must not steal the TpGroup"
@@ -1030,7 +1041,7 @@ mod tests {
         let plan = build_compute_slots(&devices).unwrap();
         let large = model(40.0, 30.0);
         let placement =
-            placement_for_required_slot(&plan, "cuda-1", &devices, &large, false).unwrap();
+            placement_for_required_slot(&plan, "cuda-1", &devices, &large, false, 0).unwrap();
         assert!(
             placement.use_tp_worker,
             "large model that cannot full-host on one card must expand to TP"
@@ -1074,23 +1085,22 @@ mod tests {
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
         // Auto path: do not silently crawl GPU-class models on cpu-0.
-        assert!(
-            pick_placement_with_cpu(
-                &plan,
-                &idle,
-                &model(12.1, 5.0),
-                16,
-                2,
-                &devices,
-                false,
-                16,
-                16,
-                &HashSet::new(),
-                &HashMap::new(),
-                false,
-            )
-            .is_none()
-        );
+        assert!(pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(12.1, 5.0),
+            16,
+            2,
+            &devices,
+            false,
+            16,
+            16,
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            0
+        )
+        .is_none());
         // Explicit preferredSlotId=cpu-* still places when RAM covers it.
         let pinned = pick_placement_with_cpu(
             &plan,
@@ -1105,6 +1115,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             true,
+            0,
         )
         .unwrap();
         assert_eq!(pinned.slot_ids, vec!["cpu-0".to_string()]);
@@ -1122,6 +1133,7 @@ mod tests {
                 &HashSet::new(),
                 &HashMap::new(),
                 true,
+                0
             )
             .is_none(),
             "6 GB RAM must not start an 8B beside a 2 GB card"
@@ -1151,7 +1163,10 @@ mod tests {
             false,
             16,
             32,
-            &HashSet::new(), &HashMap::new(), false,
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            0,
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cpu-0".to_string()]);
@@ -1211,23 +1226,22 @@ mod tests {
         let plan = build_compute_slots(&devices).unwrap();
         let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
         // Auto path never parks 30B on cpu-0 while a GPU exists.
-        assert!(
-            pick_placement_with_cpu(
-                &plan,
-                &idle,
-                &model(22.5, 19.0),
-                31,
-                2,
-                &devices,
-                false,
-                32,
-                31,
-                &HashSet::new(),
-                &HashMap::new(),
-                false,
-            )
-            .is_none()
-        );
+        assert!(pick_placement_with_cpu(
+            &plan,
+            &idle,
+            &model(22.5, 19.0),
+            31,
+            2,
+            &devices,
+            false,
+            32,
+            31,
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            0
+        )
+        .is_none());
         // preferredSlotId=cpu-* + capable CPU cores may still place.
         let on_cpu = pick_placement_with_cpu(
             &plan,
@@ -1242,6 +1256,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             true,
+            0,
         )
         .unwrap();
         assert_eq!(on_cpu.slot_ids, vec!["cpu-0".to_string()]);
@@ -1259,6 +1274,7 @@ mod tests {
                 &HashSet::new(),
                 &HashMap::new(),
                 true,
+                0
             )
             .is_none(),
             "20 GB RAM must not start a 19 GB coder"
@@ -1277,6 +1293,7 @@ mod tests {
                 &HashSet::new(),
                 &HashMap::new(),
                 true,
+                0
             )
             .is_none(),
             "consumer cores: do not crawl 30B on CPU just because RAM fits"
@@ -1317,7 +1334,10 @@ mod tests {
             false,
             16,
             16,
-            &HashSet::new(), &HashMap::new(), false,
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            0,
         )
         .unwrap();
         assert_eq!(placement.slot_ids, vec!["cuda-0".to_string()]);
@@ -1331,7 +1351,10 @@ mod tests {
             false,
             16,
             16,
-            &HashSet::new(), &HashMap::new(), false,
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -1340,13 +1363,41 @@ mod tests {
             "4 GB card must not layer-offload a 14B; capable CPU+RAM can still run it"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 8, 2, &devices, false, 16, 8, &HashSet::new(), &HashMap::new(), false)
-                .is_none(),
+            pick_placement_with_cpu(
+                &plan,
+                &idle,
+                &model(13.2, 9.0),
+                8,
+                2,
+                &devices,
+                false,
+                16,
+                8,
+                &HashSet::new(),
+                &HashMap::new(),
+                false,
+                0
+            )
+            .is_none(),
             "8 GB RAM must not start a 14B"
         );
         assert!(
-            pick_placement_with_cpu(&plan, &idle, &model(13.2, 9.0), 16, 2, &devices, false, 4, 16, &HashSet::new(), &HashMap::new(), false)
-                .is_none(),
+            pick_placement_with_cpu(
+                &plan,
+                &idle,
+                &model(13.2, 9.0),
+                16,
+                2,
+                &devices,
+                false,
+                4,
+                16,
+                &HashSet::new(),
+                &HashMap::new(),
+                false,
+                0
+            )
+            .is_none(),
             "weak CPU must not claim a 14B even with RAM"
         );
     }
@@ -1440,6 +1491,7 @@ mod tests {
             &reclaimable,
             &HashMap::new(),
             false,
+            0,
         );
         assert!(
             placement.is_some(),
@@ -1489,6 +1541,7 @@ mod tests {
                 &reclaimable,
                 &HashMap::new(),
                 false,
+                0
             )
             .is_none(),
             "without reclaim credit, tight sys RAM must refuse"
@@ -1507,6 +1560,7 @@ mod tests {
             &reclaimable,
             &credit,
             false,
+            0,
         );
         assert!(
             placement.is_some(),
@@ -1522,6 +1576,7 @@ mod tests {
             &HashMap::new(),
             16,
             2,
+            0,
         );
         assert_eq!(
             detail.code,
@@ -1547,7 +1602,18 @@ mod tests {
             .collect();
         let model = image_model(8.0);
         assert!(pick_placement(&plan, &idle, &model, 64, 2, &devices, false).is_none());
-        let detail = placement_miss_detail(&plan, &idle, &model, false, &HashSet::new(), 16, &HashMap::new(), 64, 2);
+        let detail = placement_miss_detail(
+            &plan,
+            &idle,
+            &model,
+            false,
+            &HashSet::new(),
+            16,
+            &HashMap::new(),
+            64,
+            2,
+            0,
+        );
         assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
         assert!(
             detail.detail.contains("waiting for a GPU"),
@@ -1668,8 +1734,9 @@ mod tests {
             ],
             tp_groups: Default::default(),
         };
-        let pin = placement_for_required_slot(&plan, "igpu-0", &devices, &model(6.0, 5.0), false)
-            .unwrap();
+        let pin =
+            placement_for_required_slot(&plan, "igpu-0", &devices, &model(6.0, 5.0), false, 0)
+                .unwrap();
         assert_eq!(pin.slot_ids, vec!["igpu-0".to_string()]);
         let idle = vec!["igpu-0".to_string(), "cpu-0".to_string()];
         let m = model(6.0, 5.0);
@@ -1687,6 +1754,7 @@ mod tests {
                 &HashSet::new(),
                 &HashMap::new(),
                 false,
+                0
             )
             .is_none(),
             "auto-pick must not land on soft-estimate iGPU / CPU while discrete nameplate-hosts"
@@ -1701,6 +1769,7 @@ mod tests {
             &HashMap::new(),
             32,
             2,
+            0,
         );
         assert_eq!(detail.code, crate::invoke_code::InvokeErrorCode::AgentBusy);
         assert!(
