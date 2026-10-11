@@ -105,7 +105,7 @@ pub fn classify_load_failure_for_path(
         return from_err;
     }
     let detail = format!("{err:#}").to_lowercase();
-    // Capacity / device failures must never fall through to the GGUF structural check  - 
+    // Capacity / device failures must never fall through to the GGUF structural check  -
     // that path can false-positive and delete healthy weights after a GPU is disabled.
     if is_capacity_or_device_error(&detail) {
         crate::llm::evict_all();

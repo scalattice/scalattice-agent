@@ -1,13 +1,11 @@
 use super::ipc::{WorkerBootConfig, WorkerRequest, WorkerResponse};
 use super::placement::{
-    accelerator_live_can_place, placement_for_required_slot, pick_placement_with_cpu,
-    pick_resident_placement,
-    placement_miss_detail,
-    Placement,
+    accelerator_live_can_place, pick_placement_with_cpu, pick_resident_placement,
+    placement_for_required_slot, placement_miss_detail, Placement,
 };
 use crate::compute_pool::{build_compute_slots, ComputePlan, ComputeSlot, PoolStrategy};
 use crate::gpu_occupancy::{
-    smallest_advertised_need_gb, slot_live_free_gb, OccupancyWatch, SlotOccupancyView,
+    slot_live_free_gb, smallest_advertised_need_gb, OccupancyWatch, SlotOccupancyView,
 };
 use crate::protocol::{CatalogModel, ChatMessage, GeneratedImage, InvokeTimings};
 use crate::specs::ComputeDevice;
@@ -74,7 +72,10 @@ pub struct SlotStatus {
     #[serde(rename = "tpGroup", skip_serializing_if = "Option::is_none")]
     pub tp_group: Option<String>,
     /// Foreign / leftover VRAM is using this idle GPU; not a Scalattice job.
-    #[serde(rename = "occupiedExternal", skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "occupiedExternal",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub occupied_external: bool,
 }
 
@@ -183,7 +184,9 @@ fn slot_resource_failure(text: &str) -> bool {
         || text.contains("failed to allocate")
         || text.contains("out of device memory")
         || text.contains("mps backend out of memory")
-        || text.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "oom")
+        || text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == "oom")
 }
 
 fn shared_weight_failure(text: &str) -> bool {
@@ -506,25 +509,39 @@ impl Supervisor {
         placement: &Placement,
         model: &CatalogModel,
         need_vision: bool,
+        n_ctx: u32,
         workers: &Mutex<HashMap<String, SlotWorker>>,
     ) -> Option<anyhow::Error> {
         if matches!(placement.card.strategy, PoolStrategy::CpuOnly) {
             return None;
         }
-        if need_vision && !crate::models::can_serve_vision_on_card(model, &placement.card) {
-            return Some(crate::invoke_code::coded(
-                crate::invoke_code::InvokeErrorCode::InsufficientVram,
-                format!(
-                    "preferred slot {} cannot serve vision for {} (need {} GB GPU)",
-                    placement
-                        .slot_ids
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("?"),
-                    model.model_id,
-                    crate::models::image_job_min_vram_gb(model)
-                ),
-            ));
+        let pin_label = placement
+            .slot_ids
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        if need_vision {
+            let min_vram = crate::models::image_job_min_vram_gb(model);
+            let need = crate::models::gpu_full_host_need_gb_at(model, true, n_ctx)
+                .ceil()
+                .max(f64::from(min_vram)) as u32;
+            if !crate::models::can_serve_vision_on_card(model, &placement.card)
+                || !crate::models::vram_can_gpu_full_at(
+                    f64::from(placement.card.total_vram_gb),
+                    model,
+                    min_vram,
+                    true,
+                    n_ctx,
+                )
+            {
+                return Some(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                    format!(
+                        "preferred slot {pin_label} cannot serve vision for {} (need {need} GB GPU)",
+                        model.model_id
+                    ),
+                ));
+            }
         }
         let live_cuda = crate::specs::live_cuda_free_vram_by_index();
         let guard = workers.lock().await;
@@ -532,9 +549,7 @@ impl Supervisor {
             let Some(slot) = plan.slots.iter().find(|s| s.id == *sid) else {
                 continue;
             };
-            let reclaim_our_warm = guard
-                .get(sid)
-                .is_some_and(|w| !w.loaded_models.is_empty());
+            let reclaim_our_warm = guard.get(sid).is_some_and(|w| !w.loaded_models.is_empty());
             if !accelerator_live_can_place(slot, &live_cuda, model, reclaim_our_warm) {
                 let free = slot_live_free_gb(slot, &live_cuda)
                     .map(|v| format!("{v:.1}"))
@@ -653,12 +668,8 @@ impl Supervisor {
             if slot.kind == "cpu" || !idle.iter().any(|id| id == &slot.id) {
                 continue;
             }
-            if !accelerator_live_can_place(
-                slot,
-                &live_cuda,
-                model,
-                reclaimable.contains(&slot.id),
-            ) {
+            if !accelerator_live_can_place(slot, &live_cuda, model, reclaimable.contains(&slot.id))
+            {
                 continue;
             }
             best_live = Some(match best_live {
@@ -695,6 +706,7 @@ impl Supervisor {
                 &reclaimable,
                 &reclaim_ram,
                 false,
+                0,
             );
             let Some(placement) = placement else {
                 return Err(placement_miss_detail(
@@ -707,15 +719,12 @@ impl Supervisor {
                     &reclaim_ram,
                     ram_gb,
                     cpu_ram_headroom_gb,
+                    0,
                 )
                 .into());
             };
             // Collapse TP / multi-slot placements to the first sibling only.
-            let sid = placement
-                .slot_ids
-                .first()
-                .cloned()
-                .unwrap_or_default();
+            let sid = placement.slot_ids.first().cloned().unwrap_or_default();
             self.plan
                 .slots
                 .iter()
@@ -936,7 +945,8 @@ impl Supervisor {
     async fn any_slot_has_runtime(&self, runtime_model: &str, model_id: &str) -> bool {
         // Never block placement prep on a wedged workers mutex (fleet: SJVL /
         // Laptop "timed out preparing placement" while slots looked idle).
-        let workers = match tokio::time::timeout(Duration::from_secs(2), self.workers.lock()).await {
+        let workers = match tokio::time::timeout(Duration::from_secs(2), self.workers.lock()).await
+        {
             Ok(guard) => guard,
             Err(_) => {
                 warn!("workers lock busy during warm check; treating as cold load");
@@ -963,7 +973,13 @@ impl Supervisor {
         self.job_cancels.lock().await.clear();
     }
 
-    async fn mark_checkout(&self, slot_id: &str, job_id: &str, pid: Option<u32>, loaded_models: Vec<String>) {
+    async fn mark_checkout(
+        &self,
+        slot_id: &str,
+        job_id: &str,
+        pid: Option<u32>,
+        loaded_models: Vec<String>,
+    ) {
         self.mark_checkout_reserved(slot_id, job_id, pid, 0, loaded_models)
             .await;
     }
@@ -1252,9 +1268,10 @@ impl Supervisor {
     /// A graphics slot that started. One stderr warning does not make this false
     /// while that slot is still taking jobs.
     pub fn usable_accelerator_slot(&self) -> bool {
-        self.plan.slots.iter().any(|slot| {
-            slot.kind != "cpu" && !self.unusable_slots.contains(&slot.id)
-        })
+        self.plan
+            .slots
+            .iter()
+            .any(|slot| slot.kind != "cpu" && !self.unusable_slots.contains(&slot.id))
     }
 
     /// Idle slots the router may fill. CPU is hidden while a healthy graphics
@@ -1358,9 +1375,7 @@ impl Supervisor {
                         kind: slot.kind.clone(),
                         strategy: slot.card.strategy,
                         worker_busy: worker.map(|w| w.busy).unwrap_or(true),
-                        loaded_models: worker
-                            .map(|w| w.loaded_models.clone())
-                            .unwrap_or_default(),
+                        loaded_models: worker.map(|w| w.loaded_models.clone()).unwrap_or_default(),
                         live_free_gb: slot_live_free_gb(slot, &live_cuda),
                         min_need_gb: smallest_advertised_need_gb(
                             &slot.card,
@@ -1504,7 +1519,9 @@ impl Supervisor {
                     warn!(slot = %slot_id, error = %error, "evict outside warm plan failed");
                 }
                 Ok(_) => {}
-                Err(err) => warn!(slot = %slot_id, error = %err, "evict outside warm plan rpc failed"),
+                Err(err) => {
+                    warn!(slot = %slot_id, error = %err, "evict outside warm plan rpc failed")
+                }
             }
             self.return_worker(slot_id, worker).await;
         }
@@ -1729,6 +1746,7 @@ impl Supervisor {
                         &self.devices,
                         model,
                         need_vision,
+                        n_ctx_override,
                     ) else {
                         self.clear_job_cancel(job_id).await;
                         return Err(crate::invoke_code::coded(
@@ -1744,6 +1762,7 @@ impl Supervisor {
                         &placement,
                         model,
                         need_vision,
+                        n_ctx_override,
                         &self.workers,
                     )
                     .await
@@ -1752,8 +1771,7 @@ impl Supervisor {
                         return Err(err);
                     }
                     for sid in &placement.slot_ids {
-                        if let Some(err) =
-                            self.claim_pin_slot_error(sid, &blocked, &occupied).await
+                        if let Some(err) = self.claim_pin_slot_error(sid, &blocked, &occupied).await
                         {
                             self.clear_job_cancel(job_id).await;
                             return Err(err);
@@ -1774,217 +1792,224 @@ impl Supervisor {
                     );
                     placement
                 } else {
-                let inflight_gpu = match self.checkouts.try_lock() {
-                    Ok(guard) => guard
-                        .keys()
-                        .filter(|id| {
-                            self.plan.slots.iter().any(|slot| {
-                                slot.id == **id
-                                    && slot.kind != "cpu"
-                                    && !self.unusable_slots.contains(&slot.id)
+                    let inflight_gpu = match self.checkouts.try_lock() {
+                        Ok(guard) => guard
+                            .keys()
+                            .filter(|id| {
+                                self.plan.slots.iter().any(|slot| {
+                                    slot.id == **id
+                                        && slot.kind != "cpu"
+                                        && !self.unusable_slots.contains(&slot.id)
+                                })
                             })
-                        })
-                        .cloned()
-                        .collect::<HashSet<_>>(),
-                    // Another task holds the checkout map. Assume a GPU job is in flight
-                    // rather than loading a second copy onto the processor.
-                    Err(_) => self
+                            .cloned()
+                            .collect::<HashSet<_>>(),
+                        // Another task holds the checkout map. Assume a GPU job is in flight
+                        // rather than loading a second copy onto the processor.
+                        Err(_) => self
+                            .plan
+                            .slots
+                            .iter()
+                            .filter(|slot| {
+                                slot.kind != "cpu" && !self.unusable_slots.contains(&slot.id)
+                            })
+                            .map(|slot| slot.id.clone())
+                            .collect::<HashSet<_>>(),
+                    };
+                    let workers = self.workers.lock().await;
+                    let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+                    let gpu_usable = |s: &ComputeSlot| {
+                        s.kind != "cpu"
+                            && !self.unusable_slots.contains(&s.id)
+                            && workers.get(&s.id).is_some_and(|w| w.healthy)
+                    };
+                    let idle_gpu_can_place = self.plan.slots.iter().any(|s| {
+                        gpu_usable(s)
+                            && !skip.contains(&s.id)
+                            && !occupied.contains(&s.id)
+                            && workers.get(&s.id).is_some_and(|w| {
+                                !w.busy
+                                    && accelerator_live_can_place(
+                                        s,
+                                        &live_cuda,
+                                        model,
+                                        !w.loaded_models.is_empty(),
+                                    )
+                            })
+                            && crate::models::can_host_model(
+                                model,
+                                &s.card,
+                                ram_gb,
+                                cpu_ram_headroom_gb,
+                            )
+                    });
+                    let idle_gpu_nameplate_hosts = self.plan.slots.iter().any(|s| {
+                        gpu_usable(s)
+                            && !skip.contains(&s.id)
+                            && !occupied.contains(&s.id)
+                            && workers.get(&s.id).is_some_and(|w| !w.busy)
+                            && crate::models::can_host_model(
+                                model,
+                                &s.card,
+                                ram_gb,
+                                cpu_ram_headroom_gb,
+                            )
+                    });
+                    // Only our own in-flight GPU job blocks the processor. VRAM held
+                    // by other software is not a job we can wait out, and a card the
+                    // driver cannot run is not a card that could host this model.
+                    let busy_gpu_could_host = self.plan.slots.iter().any(|s| {
+                        inflight_gpu.contains(&s.id)
+                            && crate::models::can_host_model(
+                                model,
+                                &s.card,
+                                ram_gb,
+                                cpu_ram_headroom_gb,
+                            )
+                    }) || self.plan.slots.iter().any(|s| {
+                        gpu_usable(s)
+                            && workers.get(&s.id).is_some_and(|w| w.busy)
+                            && crate::models::can_host_model(
+                                model,
+                                &s.card,
+                                ram_gb,
+                                cpu_ram_headroom_gb,
+                            )
+                    });
+                    let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
+                    let cpu_cores = crate::specs::cpu_logical_cores();
+                    let cpu_ram_ok = !has_accel
+                        || crate::models::cpu_slot_may_serve(
+                            model,
+                            ram_gb,
+                            cpu_ram_headroom_gb,
+                            cpu_cores,
+                        );
+                    let need_vision = crate::protocol::messages_have_images(messages);
+                    let idle: Vec<String> = self
                         .plan
                         .slots
                         .iter()
-                        .filter(|slot| slot.kind != "cpu" && !self.unusable_slots.contains(&slot.id))
-                        .map(|slot| slot.id.clone())
-                        .collect::<HashSet<_>>(),
-                };
-                let workers = self.workers.lock().await;
-                let live_cuda = crate::specs::live_cuda_free_vram_by_index();
-                let gpu_usable = |s: &ComputeSlot| {
-                    s.kind != "cpu"
-                        && !self.unusable_slots.contains(&s.id)
-                        && workers.get(&s.id).is_some_and(|w| w.healthy)
-                };
-                let idle_gpu_can_place = self.plan.slots.iter().any(|s| {
-                    gpu_usable(s)
-                        && !skip.contains(&s.id)
-                        && !occupied.contains(&s.id)
-                        && workers.get(&s.id).is_some_and(|w| {
-                            !w.busy
-                                && accelerator_live_can_place(
-                                    s,
-                                    &live_cuda,
-                                    model,
-                                    !w.loaded_models.is_empty(),
-                                )
+                        .filter(|s| !skip.contains(&s.id))
+                        .filter(|s| !blocked.contains(&s.id))
+                        .filter(|s| !occupied.contains(&s.id))
+                        .filter(|s| {
+                            // Legacy auto path: CPU only when no accelerator can host.
+                            s.kind != "cpu"
+                                || (!idle_gpu_can_place
+                                    && !idle_gpu_nameplate_hosts
+                                    && !busy_gpu_could_host
+                                    && cpu_ram_ok)
                         })
-                        && crate::models::can_host_model(
-                            model,
-                            &s.card,
-                            ram_gb,
-                            cpu_ram_headroom_gb,
-                        )
-                });
-                let idle_gpu_nameplate_hosts = self.plan.slots.iter().any(|s| {
-                    gpu_usable(s)
-                        && !skip.contains(&s.id)
-                        && !occupied.contains(&s.id)
-                        && workers.get(&s.id).is_some_and(|w| !w.busy)
-                        && crate::models::can_host_model(
-                            model,
-                            &s.card,
-                            ram_gb,
-                            cpu_ram_headroom_gb,
-                        )
-                });
-                // Only our own in-flight GPU job blocks the processor. VRAM held
-                // by other software is not a job we can wait out, and a card the
-                // driver cannot run is not a card that could host this model.
-                let busy_gpu_could_host = self.plan.slots.iter().any(|s| {
-                    inflight_gpu.contains(&s.id)
-                        && crate::models::can_host_model(
-                            model,
-                            &s.card,
-                            ram_gb,
-                            cpu_ram_headroom_gb,
-                        )
-                }) || self.plan.slots.iter().any(|s| {
-                    gpu_usable(s)
-                        && workers.get(&s.id).is_some_and(|w| w.busy)
-                        && crate::models::can_host_model(
-                            model,
-                            &s.card,
-                            ram_gb,
-                            cpu_ram_headroom_gb,
-                        )
-                });
-                let has_accel = self.plan.slots.iter().any(|s| s.kind != "cpu");
-                let cpu_cores = crate::specs::cpu_logical_cores();
-                let cpu_ram_ok = !has_accel
-                    || crate::models::cpu_slot_may_serve(
-                        model,
-                        ram_gb,
-                        cpu_ram_headroom_gb,
-                        cpu_cores,
-                    );
-                let need_vision = crate::protocol::messages_have_images(messages);
-                let idle: Vec<String> = self
-                    .plan
-                    .slots
-                    .iter()
-                    .filter(|s| !skip.contains(&s.id))
-                    .filter(|s| !blocked.contains(&s.id))
-                    .filter(|s| !occupied.contains(&s.id))
-                    .filter(|s| {
-                        // Legacy auto path: CPU only when no accelerator can host.
-                        s.kind != "cpu"
-                            || (!idle_gpu_can_place
-                                && !idle_gpu_nameplate_hosts
-                                && !busy_gpu_could_host
-                                && cpu_ram_ok)
-                    })
-                    .filter(|s| {
-                        workers
-                            .get(&s.id)
-                            .map(|w| w.healthy && !w.busy)
-                            .unwrap_or(false)
-                    })
-                    .map(|s| s.id.clone())
-                    .collect();
-                let resident: Vec<String> = idle
-                    .iter()
-                    .filter(|id| {
-                        workers.get(*id).is_some_and(|worker| {
-                            worker.loaded_models.iter().any(|loaded| {
-                                loaded.eq_ignore_ascii_case(runtime_model)
-                                    || loaded.eq_ignore_ascii_case(model_id)
+                        .filter(|s| {
+                            workers
+                                .get(&s.id)
+                                .map(|w| w.healthy && !w.busy)
+                                .unwrap_or(false)
+                        })
+                        .map(|s| s.id.clone())
+                        .collect();
+                    let resident: Vec<String> = idle
+                        .iter()
+                        .filter(|id| {
+                            workers.get(*id).is_some_and(|worker| {
+                                worker.loaded_models.iter().any(|loaded| {
+                                    loaded.eq_ignore_ascii_case(runtime_model)
+                                        || loaded.eq_ignore_ascii_case(model_id)
+                                })
                             })
                         })
-                    })
-                    .cloned()
-                    .collect();
-                drop(workers);
-                let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
-                let sys_avail = self.available_sys_ram_gb().await;
-                let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
-                let mut workers = self.workers.lock().await;
-                let placement = match pick_resident_placement(
-                    &self.plan,
-                    &idle,
-                    &resident,
-                    model,
-                    ram_gb,
-                    cpu_ram_headroom_gb,
-                    need_vision,
-                )
-                .or_else(|| {
-                    pick_placement_with_cpu(
+                        .cloned()
+                        .collect();
+                    drop(workers);
+                    let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
+                    let sys_avail = self.available_sys_ram_gb().await;
+                    let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
+                    let mut workers = self.workers.lock().await;
+                    let placement = match pick_resident_placement(
                         &self.plan,
                         &idle,
+                        &resident,
                         model,
                         ram_gb,
                         cpu_ram_headroom_gb,
-                        &self.devices,
                         need_vision,
-                        crate::specs::cpu_logical_cores(),
-                        sys_avail,
-                        &reclaimable,
-                        &reclaim_ram,
-                        false,
+                        n_ctx_override,
                     )
-                }) {
-                    Some(p) => p,
-                    None => {
-                        self.clear_job_cancel(job_id).await;
-                        if let Some(err) = last_crash {
-                            return Err(err);
-                        }
-                        let detail = placement_miss_detail(
+                    .or_else(|| {
+                        pick_placement_with_cpu(
                             &self.plan,
                             &idle,
                             model,
-                            need_vision,
-                            &reclaimable,
-                            sys_avail,
-                            &reclaim_ram,
                             ram_gb,
                             cpu_ram_headroom_gb,
-                        );
-                        return Err(detail.into());
-                    }
-                };
+                            &self.devices,
+                            need_vision,
+                            crate::specs::cpu_logical_cores(),
+                            sys_avail,
+                            &reclaimable,
+                            &reclaim_ram,
+                            false,
+                            n_ctx_override,
+                        )
+                    }) {
+                        Some(p) => p,
+                        None => {
+                            self.clear_job_cancel(job_id).await;
+                            if let Some(err) = last_crash {
+                                return Err(err);
+                            }
+                            let detail = placement_miss_detail(
+                                &self.plan,
+                                &idle,
+                                model,
+                                need_vision,
+                                &reclaimable,
+                                sys_avail,
+                                &reclaim_ram,
+                                ram_gb,
+                                cpu_ram_headroom_gb,
+                                n_ctx_override,
+                            );
+                            return Err(detail.into());
+                        }
+                    };
 
-                for sid in &placement.slot_ids {
-                    if workers.get_mut(sid).is_none() {
-                        for claimed in &placement.slot_ids {
-                            if claimed == sid {
-                                break;
+                    for sid in &placement.slot_ids {
+                        if workers.get_mut(sid).is_none() {
+                            for claimed in &placement.slot_ids {
+                                if claimed == sid {
+                                    break;
+                                }
+                                if let Some(w) = workers.get_mut(claimed) {
+                                    w.busy = false;
+                                }
                             }
-                            if let Some(w) = workers.get_mut(claimed) {
-                                w.busy = false;
-                            }
+                            drop(workers);
+                            self.clear_job_cancel(job_id).await;
+                            return Err(self.err_missing_slot_worker(sid).await);
                         }
-                        drop(workers);
-                        self.clear_job_cancel(job_id).await;
-                        return Err(self.err_missing_slot_worker(sid).await);
-                    }
-                    let worker = workers.get_mut(sid).expect("worker present after miss check");
-                    if worker.busy || !worker.healthy {
-                        for claimed in &placement.slot_ids {
-                            if claimed == sid {
-                                break;
+                        let worker = workers
+                            .get_mut(sid)
+                            .expect("worker present after miss check");
+                        if worker.busy || !worker.healthy {
+                            for claimed in &placement.slot_ids {
+                                if claimed == sid {
+                                    break;
+                                }
+                                if let Some(w) = workers.get_mut(claimed) {
+                                    w.busy = false;
+                                }
                             }
-                            if let Some(w) = workers.get_mut(claimed) {
-                                w.busy = false;
-                            }
+                            self.clear_job_cancel(job_id).await;
+                            return Err(crate::invoke_code::coded(
+                                crate::invoke_code::InvokeErrorCode::AgentBusy,
+                                format!("slot {sid} not available"),
+                            ));
                         }
-                        self.clear_job_cancel(job_id).await;
-                        return Err(crate::invoke_code::coded(
-                            crate::invoke_code::InvokeErrorCode::AgentBusy,
-                            format!("slot {sid} not available"),
-                        ));
+                        worker.busy = true;
                     }
-                    worker.busy = true;
-                }
-                placement
+                    placement
                 }
             };
             self.changed.notify_waiters();
@@ -2043,11 +2068,7 @@ impl Supervisor {
                 }
                 Err(err) => {
                     self.clear_job_cancel(job_id).await;
-                    let slot = placement
-                        .slot_ids
-                        .first()
-                        .cloned()
-                        .unwrap_or_default();
+                    let slot = placement.slot_ids.first().cloned().unwrap_or_default();
                     if !slot.is_empty() {
                         let code = crate::invoke_code::wire_code(&err);
                         self.note_slot_failure(model_id, &slot, code, &format!("{err:#}"))
@@ -2085,13 +2106,9 @@ impl Supervisor {
         let placement = {
             let occupied = self.occupied_slot_ids().await;
             if let Some(ref want) = required_slot {
-                let Some(placement) = placement_for_required_slot(
-                    &self.plan,
-                    want,
-                    &self.devices,
-                    model,
-                    false,
-                ) else {
+                let Some(placement) =
+                    placement_for_required_slot(&self.plan, want, &self.devices, model, false, 0)
+                else {
                     self.clear_job_cancel(job_id).await;
                     return Err(crate::invoke_code::coded(
                         crate::invoke_code::InvokeErrorCode::NoIdleSlot,
@@ -2103,6 +2120,7 @@ impl Supervisor {
                     &placement,
                     model,
                     false,
+                    0,
                     &self.workers,
                 )
                 .await
@@ -2127,74 +2145,78 @@ impl Supervisor {
                 info!(slot = %want, "claimed server-required image slot");
                 placement
             } else {
-            let workers = self.workers.lock().await;
-            let idle: Vec<String> = self
-                .plan
-                .slots
-                .iter()
-                .filter(|s| !blocked.contains(&s.id))
-                .filter(|s| !occupied.contains(&s.id))
-                .filter(|s| {
-                    workers
-                        .get(&s.id)
-                        .map(|w| w.healthy && !w.busy)
-                        .unwrap_or(false)
-                })
-                .map(|s| s.id.clone())
-                .collect();
-            drop(workers);
-            let sys_avail = self.available_sys_ram_gb().await;
-            let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
-            let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
-            let mut workers = self.workers.lock().await;
-            let placement = match pick_placement_with_cpu(
-                &self.plan,
-                &idle,
-                model,
-                ram_gb,
-                cpu_ram_headroom_gb,
-                &self.devices,
-                false,
-                crate::specs::cpu_logical_cores(),
-                sys_avail,
-                &reclaimable,
-                &reclaim_ram,
-                false,
-            ) {
-                Some(p) => p,
-                None => {
-                    self.clear_job_cancel(job_id).await;
-                    let detail = placement_miss_detail(
-                        &self.plan,
-                        &idle,
-                        model,
-                        false,
-                        &reclaimable,
-                        sys_avail,
-                        &reclaim_ram,
-                        ram_gb,
-                        cpu_ram_headroom_gb,
-                    );
-                    return Err(detail.into());
+                let workers = self.workers.lock().await;
+                let idle: Vec<String> = self
+                    .plan
+                    .slots
+                    .iter()
+                    .filter(|s| !blocked.contains(&s.id))
+                    .filter(|s| !occupied.contains(&s.id))
+                    .filter(|s| {
+                        workers
+                            .get(&s.id)
+                            .map(|w| w.healthy && !w.busy)
+                            .unwrap_or(false)
+                    })
+                    .map(|s| s.id.clone())
+                    .collect();
+                drop(workers);
+                let sys_avail = self.available_sys_ram_gb().await;
+                let reclaimable = self.reclaimable_warm_slot_ids(&idle).await;
+                let reclaim_ram = self.reclaimable_warm_sys_ram_gb(&reclaimable).await;
+                let mut workers = self.workers.lock().await;
+                let placement = match pick_placement_with_cpu(
+                    &self.plan,
+                    &idle,
+                    model,
+                    ram_gb,
+                    cpu_ram_headroom_gb,
+                    &self.devices,
+                    false,
+                    crate::specs::cpu_logical_cores(),
+                    sys_avail,
+                    &reclaimable,
+                    &reclaim_ram,
+                    false,
+                    0,
+                ) {
+                    Some(p) => p,
+                    None => {
+                        self.clear_job_cancel(job_id).await;
+                        let detail = placement_miss_detail(
+                            &self.plan,
+                            &idle,
+                            model,
+                            false,
+                            &reclaimable,
+                            sys_avail,
+                            &reclaim_ram,
+                            ram_gb,
+                            cpu_ram_headroom_gb,
+                            0,
+                        );
+                        return Err(detail.into());
+                    }
+                };
+                for sid in &placement.slot_ids {
+                    if workers.get_mut(sid).is_none() {
+                        drop(workers);
+                        self.clear_job_cancel(job_id).await;
+                        return Err(self.err_missing_slot_worker(sid).await);
+                    }
+                    let worker = workers
+                        .get_mut(sid)
+                        .expect("worker present after miss check");
+                    if worker.busy || !worker.healthy {
+                        self.clear_job_cancel(job_id).await;
+                        return Err(crate::invoke_code::coded(
+                            crate::invoke_code::InvokeErrorCode::AgentBusy,
+                            format!("slot {sid} not available"),
+                        ));
+                    }
+                    worker.busy = true;
                 }
-            };
-            for sid in &placement.slot_ids {
-                if workers.get_mut(sid).is_none() {
-                    drop(workers);
-                    self.clear_job_cancel(job_id).await;
-                    return Err(self.err_missing_slot_worker(sid).await);
-                }
-                let worker = workers.get_mut(sid).expect("worker present after miss check");
-                if worker.busy || !worker.healthy {
-                    self.clear_job_cancel(job_id).await;
-                    return Err(crate::invoke_code::coded(
-                        crate::invoke_code::InvokeErrorCode::AgentBusy,
-                        format!("slot {sid} not available"),
-                    ));
-                }
-                worker.busy = true;
-            }
-            placement
+                placement
             }
         };
         self.changed.notify_waiters();
@@ -2337,9 +2359,10 @@ impl Supervisor {
             need_vision,
             n_ctx_override,
         );
-        let already_loaded = worker.loaded_models.iter().any(|m| {
-            m.eq_ignore_ascii_case(runtime_model) || m.eq_ignore_ascii_case(model_id)
-        });
+        let already_loaded = worker
+            .loaded_models
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(runtime_model) || m.eq_ignore_ascii_case(model_id));
         // Warm residents already count against OS "used". Requiring the full
         // weight-spill budget again double-counts and falsely refuses (laptop
         // ornith warm → need 11 GB free while weights already resident).
@@ -2408,9 +2431,10 @@ impl Supervisor {
             && ram_need == 0
         {
             let used = crate::specs::detect_ram_used_gb().unwrap_or(0);
-            let free = self.available_sys_ram_gb().await.max(
-                self.ram_gb.saturating_sub(used),
-            );
+            let free = self
+                .available_sys_ram_gb()
+                .await
+                .max(self.ram_gb.saturating_sub(used));
             let need = crate::models::kv_offload_ram_gb(model, need_vision);
             if free < need {
                 self.return_worker(slot_id.clone(), worker).await;
@@ -2624,10 +2648,7 @@ impl Supervisor {
     }
 }
 
-async fn spawn_worker(
-    slot: &ComputeSlot,
-    metal_gpu_decode_unreliable: bool,
-) -> Result<SlotWorker> {
+async fn spawn_worker(slot: &ComputeSlot, metal_gpu_decode_unreliable: bool) -> Result<SlotWorker> {
     let boot = WorkerBootConfig {
         slot_id: slot.id.clone(),
         card: slot.card.clone(),
@@ -2986,10 +3007,11 @@ fn request_id(req: &WorkerRequest) -> String {
 /// Worker process died (CUDA abort / stdout close). Retry on another slot
 /// unless the client already received tokens or the error is a real reject.
 fn worker_crash_retryable(err: &anyhow::Error) -> bool {
-    if err
-        .chain()
-        .any(|cause| cause.downcast_ref::<crate::invoke_code::CodedError>().is_some())
-    {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::invoke_code::CodedError>()
+            .is_some()
+    }) {
         return crate::invoke_code::crash_retryable(err);
     }
     // A worker that still sends a bare sentence (no code). Our own failures are coded above.
@@ -3029,9 +3051,7 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
-    const KNOWN_PHASES: &[&str] = &[
-        "start", "load", "evict", "prefill", "context", "decode",
-    ];
+    const KNOWN_PHASES: &[&str] = &["start", "load", "evict", "prefill", "context", "decode"];
 
     #[test]
     fn amd_slot_failure_is_not_a_nvidia_driver_fault() {
@@ -3165,7 +3185,9 @@ mod tests {
 
     #[test]
     fn silence_wall_and_deadline_hops_before_token_and_times_out_in_decode() {
-        for phase in ["start", "load", "evict", "prefill", "context", "unknown", ""] {
+        for phase in [
+            "start", "load", "evict", "prefill", "context", "unknown", "",
+        ] {
             assert!(
                 phase_before_first_token(phase),
                 "{phase} is before first token"
@@ -3173,7 +3195,10 @@ mod tests {
             for (label, err) in [
                 ("silence", silence_kill_error(phase)),
                 ("wall", wall_kill_error(phase)),
-                ("deadline", deadline_kill_error(phase, WORKER_INVOKE_DEADLINE.as_secs())),
+                (
+                    "deadline",
+                    deadline_kill_error(phase, WORKER_INVOKE_DEADLINE.as_secs()),
+                ),
             ] {
                 assert_eq!(
                     code_of(&err),
@@ -3196,7 +3221,11 @@ mod tests {
         for (label, err, needle) in [
             ("silence", &silence_err, "worker made no progress"),
             ("wall", &wall_err, "exceeded wall-clock limit"),
-            ("deadline", &deadline_err, "exceeded absolute invoke deadline"),
+            (
+                "deadline",
+                &deadline_err,
+                "exceeded absolute invoke deadline",
+            ),
         ] {
             assert_eq!(
                 code_of(err),
