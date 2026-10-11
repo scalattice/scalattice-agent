@@ -263,16 +263,16 @@ fn cloud_connection_line_from(state: &AgentLocalState, now: u64, process_alive: 
     let recent = is_recent_at(state.updated_at_ms, now);
 
     if !process_alive {
-        if let Some(err) = state.last_error.as_deref().filter(|s| !s.is_empty()) {
-            return format!("Scalattice Cloud: not connected ({err})");
+        if let Some(hint) = friendly_disconnect_hint(state.last_error.as_deref()) {
+            return format!("Scalattice Cloud: not connected ({hint})");
         }
         return "Scalattice Cloud: not connected".to_string();
     }
 
     // Process is up but has not refreshed state — not a live cloud session.
     if !recent {
-        if let Some(err) = state.last_error.as_deref().filter(|s| !s.is_empty()) {
-            return format!("Scalattice Cloud: not connected ({err})");
+        if let Some(hint) = friendly_disconnect_hint(state.last_error.as_deref()) {
+            return format!("Scalattice Cloud: not connected ({hint})");
         }
         return "Scalattice Cloud: not connected (no recent heartbeat)".to_string();
     }
@@ -285,8 +285,8 @@ fn cloud_connection_line_from(state: &AgentLocalState, now: u64, process_alive: 
         return "Scalattice Cloud: connecting…".to_string();
     }
 
-    if let Some(err) = state.last_error.as_deref().filter(|s| !s.is_empty()) {
-        return format!("Scalattice Cloud: not connected ({err})");
+    if let Some(hint) = friendly_disconnect_hint(state.last_error.as_deref()) {
+        return format!("Scalattice Cloud: not connected ({hint})");
     }
 
     "Scalattice Cloud: not connected".to_string()
@@ -314,23 +314,16 @@ fn agent_activity_summary_from(
     let recent = is_recent_at(state.updated_at_ms, now);
 
     if !process_alive {
-        let status = match state.last_error.as_deref().filter(|s| !s.is_empty()) {
-            Some(err) => format!("not connected ({err})"),
-            None => "not connected".to_string(),
-        };
+        // Detail lives on the Cloud line — Status stays a short label.
         return AgentActivitySummary {
-            status,
+            status: "not connected".to_string(),
             node_id: None,
         };
     }
 
     if !recent {
-        let status = match state.last_error.as_deref().filter(|s| !s.is_empty()) {
-            Some(err) => format!("not connected ({err})"),
-            None => "no recent heartbeat".to_string(),
-        };
         return AgentActivitySummary {
-            status,
+            status: "no recent heartbeat".to_string(),
             node_id: None,
         };
     }
@@ -354,12 +347,8 @@ fn agent_activity_summary_from(
         };
     }
 
-    let status = match state.last_error.as_deref().filter(|s| !s.is_empty()) {
-        Some(err) => format!("not connected ({err})"),
-        None => "not connected".to_string(),
-    };
     AgentActivitySummary {
-        status,
+        status: "not connected".to_string(),
         node_id: None,
     }
 }
@@ -371,6 +360,46 @@ fn normalize_status_label(label: &str) -> String {
         .or_else(|| trimmed.strip_prefix("Connected - "))
         .unwrap_or(trimmed);
     stripped.to_string()
+}
+
+/// Short tray/CLI hint from a raw reconnect error. Never paste the full
+/// `anyhow` chain into the menu (HTTP 521 dumps used to wrap twice).
+fn friendly_disconnect_hint(err: Option<&str>) -> Option<&'static str> {
+    let err = err.map(str::trim).filter(|s| !s.is_empty())?;
+    let lower = err.to_ascii_lowercase();
+
+    if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("invalid_agent_token")
+        || lower.contains("invalid token")
+        || lower.contains("unauthorized")
+    {
+        return Some("check token");
+    }
+    if lower.contains("521") || lower.contains("origin is down") {
+        return Some("cloud unreachable");
+    }
+    if lower.contains("502") || lower.contains("503") || lower.contains("504") {
+        return Some("cloud temporarily unavailable");
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return Some("connection timed out");
+    }
+    if lower.contains("name resolution")
+        || lower.contains("dns")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("connection refused")
+    {
+        return Some("network error");
+    }
+    if lower.contains("certificate") || lower.contains("tls") || lower.contains("ssl") {
+        return Some("TLS error");
+    }
+    if lower.contains("websocket") || lower.contains("connect failed") {
+        return Some("connection failed");
+    }
+    Some("connection failed")
 }
 
 fn service_hint() -> bool {
@@ -461,8 +490,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod wedge_tests {
     use super::{
-        agent_activity_summary_from, cloud_connection_line_from, state_looks_wedged,
-        AgentLocalState, WEDGE_AFTER_MS,
+        agent_activity_summary_from, cloud_connection_line_from, friendly_disconnect_hint,
+        state_looks_wedged, AgentLocalState, WEDGE_AFTER_MS,
     };
 
     fn sample(connected: bool, updated_at_ms: u64) -> AgentLocalState {
@@ -550,5 +579,50 @@ mod wedge_tests {
             cloud_connection_line_from(&state, 50_500, true),
             "Scalattice Cloud: connected"
         );
+    }
+
+    #[test]
+    fn tray_cloud_line_uses_short_disconnect_hint() {
+        let mut state = sample(false, 50_000);
+        state.last_error = Some(
+            "WebSocket connect failed (check token and network): HTTP error: 521 <unknown status code>"
+                .into(),
+        );
+        let line = cloud_connection_line_from(&state, 50_500, true);
+        assert_eq!(
+            line,
+            "Scalattice Cloud: not connected (cloud unreachable)"
+        );
+        let summary = agent_activity_summary_from(&state, 50_500, true);
+        assert_eq!(summary.status, "not connected");
+        assert!(
+            !summary.status.contains("WebSocket") && !summary.status.contains("521"),
+            "Status must not dump the raw error chain, got {}",
+            summary.status
+        );
+    }
+
+    #[test]
+    fn friendly_disconnect_hint_maps_common_failures() {
+        assert_eq!(
+            friendly_disconnect_hint(Some(
+                "WebSocket connect failed (check token and network): HTTP error: 521 <unknown status code>"
+            )),
+            Some("cloud unreachable")
+        );
+        assert_eq!(
+            friendly_disconnect_hint(Some(
+                "WebSocket connect failed (check token and network): IO error: failed to lookup address information: Temporary failure in name resolution"
+            )),
+            Some("network error")
+        );
+        assert_eq!(
+            friendly_disconnect_hint(Some(
+                "WebSocket connect timed out after 25s (DNS or network not ready yet)"
+            )),
+            Some("connection timed out")
+        );
+        assert_eq!(friendly_disconnect_hint(None), None);
+        assert_eq!(friendly_disconnect_hint(Some("")), None);
     }
 }
