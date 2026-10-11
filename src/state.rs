@@ -246,25 +246,35 @@ pub fn read_state() -> Option<AgentLocalState> {
 }
 
 pub fn cloud_connection_line() -> String {
+    let process_alive = service_hint();
     let Some(state) = read_state() else {
-        if service_hint() {
+        if process_alive {
             // Service is up but has not written state yet (common right after install).
             return "Scalattice Cloud: agent started, connecting…".to_string();
         }
         return "Scalattice Cloud: not connected".to_string();
     };
+    cloud_connection_line_from(&state, now_ms(), process_alive)
+}
 
-    if let Some(err) = &state.last_error {
-        if !is_recent(state.updated_at_ms) && !service_hint() {
+/// Tray / CLI cloud line. Never reports "connected" from a stale state file —
+/// that lied after remote restart self-killed the agent (fleet: DESKTOP-SJVL4OL).
+fn cloud_connection_line_from(state: &AgentLocalState, now: u64, process_alive: bool) -> String {
+    let recent = is_recent_at(state.updated_at_ms, now);
+
+    if !process_alive {
+        if let Some(err) = state.last_error.as_deref().filter(|s| !s.is_empty()) {
             return format!("Scalattice Cloud: not connected ({err})");
         }
+        return "Scalattice Cloud: not connected".to_string();
     }
 
-    if !is_recent(state.updated_at_ms) {
-        if state.server_registered && service_hint() {
-            return "Scalattice Cloud: connected".to_string();
+    // Process is up but has not refreshed state — not a live cloud session.
+    if !recent {
+        if let Some(err) = state.last_error.as_deref().filter(|s| !s.is_empty()) {
+            return format!("Scalattice Cloud: not connected ({err})");
         }
-        return "Scalattice Cloud: not connected".to_string();
+        return "Scalattice Cloud: not connected (no recent heartbeat)".to_string();
     }
 
     if state.server_registered {
@@ -273,6 +283,10 @@ pub fn cloud_connection_line() -> String {
 
     if state.server_connected {
         return "Scalattice Cloud: connecting…".to_string();
+    }
+
+    if let Some(err) = state.last_error.as_deref().filter(|s| !s.is_empty()) {
+        return format!("Scalattice Cloud: not connected ({err})");
     }
 
     "Scalattice Cloud: not connected".to_string()
@@ -285,45 +299,40 @@ pub struct AgentActivitySummary {
 
 pub fn agent_activity_summary() -> Option<AgentActivitySummary> {
     let state = read_state()?;
+    Some(agent_activity_summary_from(
+        &state,
+        now_ms(),
+        service_hint(),
+    ))
+}
 
-    if let Some(err) = &state.last_error {
-        if !is_recent(state.updated_at_ms) {
-            return Some(AgentActivitySummary {
-                status: format!("not connected ({err})"),
-                node_id: None,
-            });
-        }
+fn agent_activity_summary_from(
+    state: &AgentLocalState,
+    now: u64,
+    process_alive: bool,
+) -> AgentActivitySummary {
+    let recent = is_recent_at(state.updated_at_ms, now);
+
+    if !process_alive {
+        let status = match state.last_error.as_deref().filter(|s| !s.is_empty()) {
+            Some(err) => format!("not connected ({err})"),
+            None => "not connected".to_string(),
+        };
+        return AgentActivitySummary {
+            status,
+            node_id: None,
+        };
     }
 
-    if !is_recent(state.updated_at_ms) {
-        if state.server_registered && service_hint() {
-            let status = state
-                .status_label
-                .as_deref()
-                .map(normalize_status_label)
-                .unwrap_or_else(|| "Ready".to_string());
-            return Some(AgentActivitySummary {
-                status,
-                node_id: state.node_id,
-            });
-        }
-        if service_hint() {
-            #[cfg(unix)]
-            let status =
-                "not registered (check: journalctl --user -u scalattice-agent -n 30)".to_string();
-            #[cfg(windows)]
-            let status = "not registered (open the tray icon and check the live log)".to_string();
-            #[cfg(not(any(unix, windows)))]
-            let status = "not registered".to_string();
-            return Some(AgentActivitySummary {
-                status,
-                node_id: state.node_id,
-            });
-        }
-        return Some(AgentActivitySummary {
-            status: "not connected".to_string(),
+    if !recent {
+        let status = match state.last_error.as_deref().filter(|s| !s.is_empty()) {
+            Some(err) => format!("not connected ({err})"),
+            None => "no recent heartbeat".to_string(),
+        };
+        return AgentActivitySummary {
+            status,
             node_id: None,
-        });
+        };
     }
 
     if state.server_registered {
@@ -332,23 +341,27 @@ pub fn agent_activity_summary() -> Option<AgentActivitySummary> {
             .as_deref()
             .map(normalize_status_label)
             .unwrap_or_else(|| "registered".to_string());
-        return Some(AgentActivitySummary {
+        return AgentActivitySummary {
             status,
-            node_id: state.node_id,
-        });
+            node_id: state.node_id.clone(),
+        };
     }
 
     if state.server_connected {
-        return Some(AgentActivitySummary {
+        return AgentActivitySummary {
             status: "connecting".to_string(),
-            node_id: state.node_id,
-        });
+            node_id: state.node_id.clone(),
+        };
     }
 
-    Some(AgentActivitySummary {
-        status: "not connected".to_string(),
+    let status = match state.last_error.as_deref().filter(|s| !s.is_empty()) {
+        Some(err) => format!("not connected ({err})"),
+        None => "not connected".to_string(),
+    };
+    AgentActivitySummary {
+        status,
         node_id: None,
-    })
+    }
 }
 
 fn normalize_status_label(label: &str) -> String {
@@ -380,7 +393,11 @@ fn service_hint() -> bool {
 }
 
 fn is_recent(updated_at_ms: u64) -> bool {
-    now_ms().saturating_sub(updated_at_ms) < 120_000
+    is_recent_at(updated_at_ms, now_ms())
+}
+
+fn is_recent_at(updated_at_ms: u64, now: u64) -> bool {
+    now.saturating_sub(updated_at_ms) < 120_000
 }
 
 const WEDGE_AFTER_MS: u64 = 180_000;
@@ -443,13 +460,16 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod wedge_tests {
-    use super::{state_looks_wedged, AgentLocalState, WEDGE_AFTER_MS};
+    use super::{
+        agent_activity_summary_from, cloud_connection_line_from, state_looks_wedged,
+        AgentLocalState, WEDGE_AFTER_MS,
+    };
 
     fn sample(connected: bool, updated_at_ms: u64) -> AgentLocalState {
         AgentLocalState {
-            status_label: None,
+            status_label: Some("Ready · 3 compute slots".into()),
             downloading_model: None,
-            node_id: None,
+            node_id: Some("agent-test".into()),
             server_connected: connected,
             server_registered: connected,
             compute_devices: Vec::new(),
@@ -484,5 +504,51 @@ mod wedge_tests {
     #[test]
     fn never_written_state_is_not_wedged() {
         assert!(!state_looks_wedged(&sample(false, 0), 1_000_000));
+    }
+
+    #[test]
+    fn tray_never_shows_connected_when_process_is_dead() {
+        let state = sample(true, 50_000);
+        let line = cloud_connection_line_from(&state, 50_500, false);
+        assert!(
+            line.contains("not connected"),
+            "dead process must not look online, got {line}"
+        );
+        let summary = agent_activity_summary_from(&state, 50_500, false);
+        assert!(
+            summary.status.contains("not connected"),
+            "dead process must not show Ready, got {}",
+            summary.status
+        );
+        assert!(summary.node_id.is_none());
+    }
+
+    #[test]
+    fn tray_never_shows_connected_from_stale_registered_state() {
+        // Previously: stale + server_registered + process_alive → "connected" / Ready.
+        let state = sample(true, 10_000);
+        let now = 10_000 + 180_000;
+        let line = cloud_connection_line_from(&state, now, true);
+        assert!(
+            line.starts_with("Scalattice Cloud: not connected"),
+            "stale heartbeat must not report cloud connected, got {line}"
+        );
+        assert!(line.contains("no recent heartbeat"));
+        let summary = agent_activity_summary_from(&state, now, true);
+        assert!(
+            !summary.status.eq_ignore_ascii_case("ready")
+                && !summary.status.starts_with("Ready"),
+            "stale state must not show Ready, got {}",
+            summary.status
+        );
+    }
+
+    #[test]
+    fn fresh_registered_state_reports_connected() {
+        let state = sample(true, 50_000);
+        assert_eq!(
+            cloud_connection_line_from(&state, 50_500, true),
+            "Scalattice Cloud: connected"
+        );
     }
 }

@@ -2321,6 +2321,9 @@ async fn handle_remote_control(
                 let _ = ws_send_text(write, &serde_json::to_string(&ack)?).await;
                 return Ok(());
             }
+            // Clear tray "connected/Ready" immediately so a failed handoff cannot
+            // leave the UI claiming cloud is up (fleet: DESKTOP-SJVL4OL).
+            crate::state::mark_disconnected(Some("Restarting…".to_string()));
             let ack = ControlAckMessage {
                 kind: "control_ack",
                 action: "restart".to_string(),
@@ -2338,15 +2341,22 @@ async fn handle_remote_control(
                 .await
                 {
                     Ok(Ok(())) => {
-                        // Process should be going down; exit as a fallback.
+                        // Helper (Windows) or systemd (Linux) brings us back; exit.
+                        info!("remote control: restart scheduled; exiting");
                         std::process::exit(0);
                     }
                     Ok(Err(err)) => {
                         crate::state::end_lifecycle_control();
+                        crate::state::mark_disconnected(Some(format!(
+                            "restart failed: {err:#}"
+                        )));
                         warn!("remote restart failed: {err:#}");
                     }
                     Err(err) => {
                         crate::state::end_lifecycle_control();
+                        crate::state::mark_disconnected(Some(format!(
+                            "restart failed: {err:#}"
+                        )));
                         warn!("remote restart task failed: {err:#}");
                     }
                 }
