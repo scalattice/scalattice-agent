@@ -509,7 +509,7 @@ impl Supervisor {
         placement: &Placement,
         model: &CatalogModel,
         need_vision: bool,
-        n_ctx: u32,
+        _n_ctx: u32,
         workers: &Mutex<HashMap<String, SlotWorker>>,
     ) -> Option<anyhow::Error> {
         if matches!(placement.card.strategy, PoolStrategy::CpuOnly) {
@@ -521,19 +521,11 @@ impl Supervisor {
             .map(|s| s.as_str())
             .unwrap_or("?");
         if need_vision {
-            let min_vram = crate::models::image_job_min_vram_gb(model);
-            let need = crate::models::gpu_full_host_need_gb_at(model, true, n_ctx)
-                .ceil()
-                .max(f64::from(min_vram)) as u32;
-            if !crate::models::can_serve_vision_on_card(model, &placement.card)
-                || !crate::models::vram_can_gpu_full_at(
-                    f64::from(placement.card.total_vram_gb),
-                    model,
-                    min_vram,
-                    true,
-                    n_ctx,
-                )
-            {
+            // Image-job floor / nameplate only. Requiring gpu_full here falsely
+            // refuses mid-cards (RTX 5050 8 GB) that serve VL with KV offload —
+            // same hosts pass the unpinned path (fleet: DESKTOP-SJVL4OL).
+            let need = crate::models::image_job_min_vram_gb(model);
+            if !crate::models::can_serve_vision_on_card(model, &placement.card) {
                 return Some(crate::invoke_code::coded(
                     crate::invoke_code::InvokeErrorCode::InsufficientVram,
                     format!(
