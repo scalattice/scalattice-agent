@@ -499,6 +499,57 @@ impl Supervisor {
         spawn_worker(slot, metal).await
     }
 
+    /// Refuse a router preferred pin that cannot host this job on nameplate or
+    /// live free VRAM — before claim / progress so stream failover can hop.
+    async fn preferred_pin_capacity_error(
+        plan: &ComputePlan,
+        placement: &Placement,
+        model: &CatalogModel,
+        need_vision: bool,
+        workers: &Mutex<HashMap<String, SlotWorker>>,
+    ) -> Option<anyhow::Error> {
+        if matches!(placement.card.strategy, PoolStrategy::CpuOnly) {
+            return None;
+        }
+        if need_vision && !crate::models::can_serve_vision_on_card(model, &placement.card) {
+            return Some(crate::invoke_code::coded(
+                crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                format!(
+                    "preferred slot {} cannot serve vision for {} (need {} GB GPU)",
+                    placement
+                        .slot_ids
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("?"),
+                    model.model_id,
+                    crate::models::image_job_min_vram_gb(model)
+                ),
+            ));
+        }
+        let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+        let guard = workers.lock().await;
+        for sid in &placement.slot_ids {
+            let Some(slot) = plan.slots.iter().find(|s| s.id == *sid) else {
+                continue;
+            };
+            let reclaim_our_warm = guard
+                .get(sid)
+                .is_some_and(|w| !w.loaded_models.is_empty());
+            if !accelerator_live_can_place(slot, &live_cuda, model, reclaim_our_warm) {
+                let free = slot_live_free_gb(slot, &live_cuda)
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "unknown".into());
+                return Some(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                    format!(
+                        "preferred slot {sid}: insufficient_vram: GPU slot has no placeable offload (live free VRAM too small, free={free} GB)"
+                    ),
+                ));
+            }
+        }
+        None
+    }
+
     /// Prefer a healthy idle worker for a pinned claim. Respawn once if unhealthy.
     async fn claim_pin_slot_error(
         &self,
@@ -1685,6 +1736,21 @@ impl Supervisor {
                             format!("preferred slot {want} is not on this machine"),
                         ));
                     };
+                    // Nameplate / live-free gate before claim. Router packing should
+                    // avoid undersized pins (igpu for VL); without this we claim,
+                    // emit progress, then die mid-load and stream cannot failover.
+                    if let Some(err) = Self::preferred_pin_capacity_error(
+                        &self.plan,
+                        &placement,
+                        model,
+                        need_vision,
+                        &self.workers,
+                    )
+                    .await
+                    {
+                        self.clear_job_cancel(job_id).await;
+                        return Err(err);
+                    }
                     for sid in &placement.slot_ids {
                         if let Some(err) =
                             self.claim_pin_slot_error(sid, &blocked, &occupied).await
@@ -2032,6 +2098,18 @@ impl Supervisor {
                         format!("preferred slot {want} is not on this machine"),
                     ));
                 };
+                if let Some(err) = Self::preferred_pin_capacity_error(
+                    &self.plan,
+                    &placement,
+                    model,
+                    false,
+                    &self.workers,
+                )
+                .await
+                {
+                    self.clear_job_cancel(job_id).await;
+                    return Err(err);
+                }
                 for sid in &placement.slot_ids {
                     if let Some(err) = self.claim_pin_slot_error(sid, &blocked, &occupied).await {
                         self.clear_job_cancel(job_id).await;
