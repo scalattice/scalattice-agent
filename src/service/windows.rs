@@ -51,15 +51,57 @@ pub fn ensure_reconnect_watchdog() -> Result<()> {
     try_create_retry_task()
 }
 
-/// Force-stop then start background + tray using the saved provider token.
-/// Used after silent in-place updates so the new binary always comes back up.
+/// Restart the live agent using the saved provider token.
+///
+/// When called **from inside** the background agent (remote control `restart`),
+/// we must not `taskkill` our own PID mid-function — that aborted the restart
+/// before a replacement was spawned (fleet: DESKTOP-SJVL4OL). Schedule a helper
+/// that starts the new process after this PID exits; the caller then `exit(0)`.
+///
+/// External callers (updater / CLI) still use stop-then-start.
 pub fn restart_runtime_from_saved_token() -> Result<()> {
     let token = crate::config::read_saved_agent_token()
         .context("no saved provider token; run scalattice-agent set-token first")?;
     let config = AgentConfig::from_env_and_cli(Some(token))?;
+    let _ = crate::service::persist_agent_token(&config.token)?;
+    let _ = write_background_runner_with_token(&config.token)?;
+    sync_launch_scripts()?;
+    ensure_agent_autostart_registered()?;
+
+    let self_pid = std::process::id();
+    let we_are_live_agent = invoked_by_background_service()
+        || background_pid_path()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            == Some(self_pid);
+    if we_are_live_agent {
+        // Kill slot-worker siblings only; leave this process and the tray alone.
+        kill_non_tray_agent_processes();
+        schedule_restart_after_pid_exits(self_pid)?;
+        return Ok(());
+    }
+
     stop_agents_for_update();
     std::thread::sleep(std::time::Duration::from_millis(500));
     force_restart_background(&config, false)
+}
+
+/// Detached helper: wait until `pid` is gone, then launch background (+ tray).
+fn schedule_restart_after_pid_exits(pid: u32) -> Result<()> {
+    let install = install_dir()?;
+    let vbs = install.join("launch-restart-after-exit.vbs");
+    if !vbs.is_file() {
+        sync_launch_scripts()?;
+    }
+    if !vbs.is_file() {
+        bail!("launch-restart-after-exit.vbs missing under {}", install.display());
+    }
+    spawn_detached(Command::new("wscript.exe").args([
+        "//nologo",
+        &vbs.display().to_string(),
+        &pid.to_string(),
+    ]))?;
+    Ok(())
 }
 
 fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()> {
@@ -561,10 +603,15 @@ fn stop_background_agent_only() {
         stop_smoke_background_only();
         return;
     }
+    let self_pid = std::process::id();
     if let Some(path) = background_pid_path() {
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(pid) = raw.trim().parse::<u32>() {
-                let _ = taskkill_pid(pid);
+                // Never taskkill ourselves — remote restart used to die here
+                // before spawn_background_detached ran.
+                if pid != self_pid {
+                    let _ = taskkill_pid(pid);
+                }
             }
         }
         let _ = fs::remove_file(&path);
@@ -779,6 +826,10 @@ exit /b 0\r\n";
             LAUNCH_BACKGROUND_DELAYED_VBS,
         ),
         ("launch-watchdog.vbs", LAUNCH_WATCHDOG_VBS),
+        (
+            "launch-restart-after-exit.vbs",
+            LAUNCH_RESTART_AFTER_EXIT_VBS,
+        ),
     ] {
         fs::write(install.join(name), content)?;
     }
@@ -939,6 +990,42 @@ target = install & "\launch-background.vbs"
 If Not fso.FileExists(target) Then WScript.Quit 0
 WScript.Sleep 45000
 sh.Run "wscript.exe //nologo """ & target & """", 0, False
+"#;
+
+/// Remote-control restart helper: wait for the dying agent PID, then start a
+/// fresh background process (and tray if needed). Avoids taskkill-of-self.
+const LAUNCH_RESTART_AFTER_EXIT_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+If WScript.Arguments.Count < 1 Then WScript.Quit 1
+pid = WScript.Arguments(0)
+install = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Scalattice\bin")
+If Not fso.FolderExists(install) Then install = fso.GetParentFolderName(WScript.ScriptFullName)
+bg = install & "\launch-background.vbs"
+tray = install & "\launch-tray.vbs"
+' Cap wait so a stuck PID cannot hang forever (~60s).
+For i = 1 To 240
+  If Not ProcessExists(pid) Then Exit For
+  WScript.Sleep 250
+Next
+WScript.Sleep 400
+If fso.FileExists(bg) Then
+  sh.Run "wscript.exe //nologo """ & bg & """", 0, False
+End If
+WScript.Sleep 600
+If fso.FileExists(tray) Then
+  sh.Run "wscript.exe //nologo """ & tray & """", 0, False
+End If
+
+Function ProcessExists(pid)
+  Dim shell, exec, out
+  On Error Resume Next
+  Set shell = CreateObject("WScript.Shell")
+  Set exec = shell.Exec("tasklist /FI ""PID eq " & pid & """ /NH")
+  out = ""
+  If Not exec Is Nothing Then out = exec.StdOut.ReadAll
+  On Error Goto 0
+  ProcessExists = (InStr(1, out, CStr(pid), 1) > 0)
+End Function
 "#;
 
 const LAUNCH_WATCHDOG_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
