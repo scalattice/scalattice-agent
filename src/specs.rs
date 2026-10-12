@@ -504,24 +504,47 @@ pub fn live_cuda_free_vram_by_index() -> std::collections::HashMap<u32, f64> {
 
 #[cfg(not(target_os = "macos"))]
 fn live_cuda_free_all_from(bin: &str) -> std::collections::HashMap<u32, f64> {
-    let mut map = std::collections::HashMap::new();
-    // Query total+used+free. On Windows WDDM, `memory.free` is often far below
+    // Prefer total+used+free. On Windows WDDM, `memory.free` is often far below
     // `total - used` (fleet: DESKTOP-SJVL4OL RTX 5050 reported 2.3 GB free with
     // only ~2 GB used on an 8 GB card). Prefer the larger of the two.
+    //
+    // Some drivers (fleet: RTX PRO 4000 Blackwell) fail or return nothing when
+    // `memory.free` is in the query while total/used still work — fall back.
+    let with_free = query_nvidia_smi_free_map(bin, true);
+    if !with_free.is_empty() {
+        return with_free;
+    }
+    query_nvidia_smi_free_map(bin, false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_nvidia_smi_free_map(
+    bin: &str,
+    include_free_field: bool,
+) -> std::collections::HashMap<u32, f64> {
+    let query = if include_free_field {
+        "--query-gpu=index,memory.total,memory.used,memory.free"
+    } else {
+        "--query-gpu=index,memory.total,memory.used"
+    };
     let Some(output) = configure_nvidia_smi_command(bin)
-        .args([
-            "--query-gpu=index,memory.total,memory.used,memory.free",
-            "--format=csv,noheader,nounits",
-        ])
+        .args([query, "--format=csv,noheader,nounits"])
         .output()
         .ok()
     else {
-        return map;
+        return std::collections::HashMap::new();
     };
     if !output.status.success() {
-        return map;
+        return std::collections::HashMap::new();
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_nvidia_free_csv(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `nvidia-smi --query-gpu=index,memory.total,memory.used[,memory.free]` CSV.
+/// Free GiB is max(total-used, memory.free) when both are present.
+#[cfg(not(target_os = "macos"))]
+fn parse_nvidia_free_csv(stdout: &str) -> std::collections::HashMap<u32, f64> {
+    let mut map = std::collections::HashMap::new();
     for line in stdout
         .lines()
         .map(str::trim)
@@ -537,7 +560,7 @@ fn live_cuda_free_all_from(bin: &str) -> std::collections::HashMap<u32, f64> {
         let free_mb = if parts.len() >= 4 {
             parse_nvidia_number(&parts[3])
         } else {
-            parse_nvidia_number(&parts[1])
+            None
         };
         let total_mb = if parts.len() >= 3 {
             parse_nvidia_number(&parts[1])
@@ -1972,6 +1995,32 @@ GPU[1]		: VRAM Total Memory (B): 2147483648
         let mut out = std::collections::HashMap::new();
         parse_amd_vram_by_index(stdout, &mut out);
         assert_eq!(out.get(&0).copied(), Some(24));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_free_csv_prefers_larger_of_derived_and_reported_free() {
+        // WDDM-style: memory.free under-reports vs total-used.
+        let map = parse_nvidia_free_csv("0, 24576, 1024, 2048\n");
+        let free = map.get(&0).copied().unwrap();
+        assert!((free - 23.0).abs() < 0.01, "free {free}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_free_csv_works_without_memory_free_column() {
+        // Fallback query used when memory.free breaks the driver (Blackwell).
+        let map = parse_nvidia_free_csv("0, 24576, 1024\n");
+        let free = map.get(&0).copied().unwrap();
+        assert!((free - 23.0).abs() < 0.01, "free {free}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_free_csv_tolerates_na_memory_free() {
+        let map = parse_nvidia_free_csv("0, 24576, 1024, [N/A]\n");
+        let free = map.get(&0).copied().unwrap();
+        assert!((free - 23.0).abs() < 0.01, "free {free}");
     }
 
     #[test]

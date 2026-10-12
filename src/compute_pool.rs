@@ -755,6 +755,11 @@ pub fn is_vulkan_accelerator(device: &ComputeDevice) -> bool {
             || device.name.to_ascii_lowercase().contains("arc"))
 }
 
+/// Soft discrete/Metal nameplate when nvidia-smi/procfs did not report VRAM yet.
+/// Placement must not treat this as a real 1 GB card once live telemetry arrives —
+/// see [`cuda_slots_underreport_device_vram`].
+pub const SOFT_DISCRETE_VRAM_GB: u32 = 1;
+
 fn effective_vram_gb(device: &ComputeDevice) -> u32 {
     if let Some(v) = device.vram_gb.filter(|v| *v > 0) {
         return v;
@@ -762,9 +767,42 @@ fn effective_vram_gb(device: &ComputeDevice) -> u32 {
     match device.kind.as_str() {
         // Soft estimate for shared iGPU memory: cascade + RAM checks are the real gate.
         "integrated" => 2,
-        "discrete" | "metal" => 1,
+        "discrete" | "metal" => SOFT_DISCRETE_VRAM_GB,
         _ => 0,
     }
+}
+
+/// True when live device telemetry shows substantially more VRAM than a running
+/// CUDA slot nameplate (usually the soft 1 GB estimate left after procfs detect
+/// or a failed nvidia-smi at supervisor start). Callers should rebuild slots.
+pub fn cuda_slots_underreport_device_vram<S: AsRef<str>>(
+    slots: &[(S, u32)],
+    devices: &[ComputeDevice],
+) -> bool {
+    for device in devices {
+        if !device.enabled || device.kind != "discrete" {
+            continue;
+        }
+        let Some(dev_vram) = device.vram_gb.filter(|v| *v >= 4) else {
+            continue;
+        };
+        let Some(idx) = device
+            .id
+            .strip_prefix("nvidia:")
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let slot_id = format!("cuda-{idx}");
+        let Some((_, slot_vram)) = slots.iter().find(|(id, _)| id.as_ref() == slot_id) else {
+            continue;
+        };
+        // Soft estimate (1 GB) or any severe under-report vs live nvidia-smi.
+        if *slot_vram > 0 && *slot_vram + 2 < dev_vram {
+            return true;
+        }
+    }
+    false
 }
 
 /// Linux release builds compile Vulkan in; Windows CUDA-only builds fall back to CPU
@@ -1243,6 +1281,41 @@ mod tests {
         assert!(plan.slots.iter().any(|s| s.id == "cpu-0"));
         assert!(cuda.iter().all(|s| s.tp_group.is_none()));
         assert_eq!(cuda[0].card.cuda_device_ids, vec![0]);
+    }
+
+    #[test]
+    fn missing_nvidia_vram_uses_soft_discrete_estimate() {
+        let plan = build_compute_slots(&[ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "NVIDIA RTX PRO 4000 Blackwell".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }])
+        .unwrap();
+        let cuda = plan.slots.iter().find(|s| s.id == "cuda-0").expect("cuda-0");
+        assert_eq!(cuda.card.total_vram_gb, SOFT_DISCRETE_VRAM_GB);
+    }
+
+    #[test]
+    fn soft_slot_nameplate_is_flagged_when_device_telemetry_catches_up() {
+        let devices = [ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "NVIDIA RTX PRO 4000 Blackwell".into(),
+            vram_gb: Some(24),
+            vram_used_gb: Some(1),
+            util_pct: Some(0),
+            enabled: true,
+        }];
+        let soft = [("cuda-0".to_string(), SOFT_DISCRETE_VRAM_GB)];
+        assert!(cuda_slots_underreport_device_vram(&soft, &devices));
+        let healthy = [("cuda-0".to_string(), 24u32)];
+        assert!(!cuda_slots_underreport_device_vram(&healthy, &devices));
+        let close = [("cuda-0".to_string(), 22u32)];
+        assert!(!cuda_slots_underreport_device_vram(&close, &devices));
     }
 
     #[test]

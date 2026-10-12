@@ -549,7 +549,8 @@ impl Supervisor {
                 return Some(crate::invoke_code::coded(
                     crate::invoke_code::InvokeErrorCode::InsufficientVram,
                     format!(
-                        "preferred slot {sid}: insufficient_vram: GPU slot has no placeable offload (live free VRAM too small, free={free} GB)"
+                        "preferred slot {sid}: insufficient_vram: GPU slot has no placeable offload (live free VRAM too small, free={free} GB, nameplate={} GB)",
+                        slot.card.total_vram_gb
                     ),
                 ));
             }
