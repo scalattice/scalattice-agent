@@ -1568,11 +1568,30 @@ impl Drop for MaintenanceGuard {
 }
 
 async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
-    // Restart workers when provider toggles devices.
+    // Restart workers when provider toggles devices, or when live device VRAM
+    // has outgrown soft CUDA slot nameplates (see refresh_specs_cache).
     // Claim the pending flag immediately so concurrent refresh callers don't
     // start a second Supervisor::start in parallel.
     let policy = {
         let mut guard = state.lock().await;
+        if !guard.pending_supervisor_restart {
+            if let Some(specs) = guard.cached_specs() {
+                let slot_nameplates: Vec<(String, u32)> = guard
+                    .cached_slots
+                    .iter()
+                    .map(|s| (s.id.clone(), s.vram_gb))
+                    .collect();
+                if crate::compute_pool::cuda_slots_underreport_device_vram(
+                    &slot_nameplates,
+                    &specs.compute_devices,
+                ) {
+                    info!(
+                        "compute device VRAM exceeds CUDA slot nameplates; scheduling supervisor rebuild"
+                    );
+                    guard.pending_supervisor_restart = true;
+                }
+            }
+        }
         if !(guard.pending_supervisor_restart && guard.active_job_count == 0) {
             None
         } else {
@@ -1598,7 +1617,7 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
                 Ok(supervisor) => {
                     let mut guard = state.lock().await;
                     guard.supervisor = Some(supervisor);
-                    info!("compute supervisor restarted after device policy change");
+                    info!("compute supervisor restarted (device policy or VRAM nameplate refresh)");
                 }
                 Err(err) => {
                     warn!("supervisor restart failed: {err:#}");
@@ -1712,7 +1731,26 @@ async fn refresh_specs_cache(state: &Arc<Mutex<SessionState>>) {
             return;
         }
     };
-    state.lock().await.store_specs_cache(specs);
+    let mut guard = state.lock().await;
+    let slot_nameplates: Vec<(String, u32)> = guard
+        .cached_slots
+        .iter()
+        .map(|s| (s.id.clone(), s.vram_gb))
+        .collect();
+    let needs_vram_rebuild = crate::compute_pool::cuda_slots_underreport_device_vram(
+        &slot_nameplates,
+        &specs.compute_devices,
+    );
+    guard.store_specs_cache(specs);
+    // Fleet: RTX PRO 4000 Blackwell — procfs/soft 1 GB slots while heartbeats
+    // later report 24 GB used-nearly-empty. Rebuild so placement stops refusing
+    // 3 GB models with "largest idle card is 1.0 GB".
+    if needs_vram_rebuild && !guard.pending_supervisor_restart {
+        info!(
+            "compute device VRAM now exceeds CUDA slot nameplates; scheduling supervisor rebuild"
+        );
+        guard.pending_supervisor_restart = true;
+    }
 }
 
 async fn apply_warm_plan(state: Arc<Mutex<SessionState>>) {
