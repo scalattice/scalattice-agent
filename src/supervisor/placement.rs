@@ -40,6 +40,7 @@ fn pick_image_placement(
         .iter()
         .filter(|s| idle.contains(s.id.as_str()))
         .filter(|s| s.kind != "cpu" && crate::image::image_card_eligible(&s.card))
+        .filter(|s| !crate::compute_pool::card_has_soft_vram_nameplate(&s.card))
         .filter(|s| min_vram == 0 || s.card.total_vram_gb >= min_vram)
         .collect();
     candidates.sort_by(|a, b| {
@@ -229,6 +230,7 @@ pub fn pick_placement_with_cpu(
     let discrete_nameplate_hosts = plan.slots.iter().any(|s| {
         s.kind != "cpu"
             && s.kind != "integrated"
+            && !crate::compute_pool::card_has_soft_vram_nameplate(&s.card)
             && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
             && (!need_vision || can_serve_vision_on_card(model, &s.card))
     });
@@ -237,6 +239,8 @@ pub fn pick_placement_with_cpu(
         .slots
         .iter()
         .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
+        // Soft 1 GB = VRAM never measured. Never place on a guess.
+        .filter(|s| !crate::compute_pool::card_has_soft_vram_nameplate(&s.card))
         .filter(|s| !(discrete_nameplate_hosts && s.kind == "integrated"))
         .filter(|s| {
             vram_can_gpu_full_at(
@@ -313,6 +317,7 @@ pub fn pick_placement_with_cpu(
             .slots
             .iter()
             .filter(|s| idle.contains(s.id.as_str()) && s.kind != "cpu")
+            .filter(|s| !crate::compute_pool::card_has_soft_vram_nameplate(&s.card))
             .filter(|s| !(discrete_nameplate_hosts && s.kind == "integrated"))
             .filter(|s| {
                 accelerator_live_can_place(
@@ -369,12 +374,14 @@ pub fn pick_placement_with_cpu(
             let idle_accel_nameplate_hosts = plan.slots.iter().any(|s| {
                 s.kind != "cpu"
                     && idle.contains(s.id.as_str())
+                    && !crate::compute_pool::card_has_soft_vram_nameplate(&s.card)
                     && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
             });
             // A busy card that could host keeps the job off the CPU.
             let busy_accel_could_host = plan.slots.iter().any(|s| {
                 s.kind != "cpu"
                     && !idle.contains(s.id.as_str())
+                    && !crate::compute_pool::card_has_soft_vram_nameplate(&s.card)
                     && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
             });
             let cpu_ram_need =
@@ -513,6 +520,10 @@ fn slot_available_gb(
     if let Some(free) = crate::gpu_occupancy::slot_live_free_gb(slot, live_cuda) {
         return free.max(0.0);
     }
+    // Soft 1 GB = VRAM never measured. Do not treat it as real capacity (0).
+    if crate::compute_pool::card_has_soft_vram_nameplate(&slot.card) {
+        return 0.0;
+    }
     f64::from(slot.card.total_vram_gb)
 }
 
@@ -575,12 +586,25 @@ pub fn placement_miss_detail(
     }
 
     if model.is_image_job() {
+        let soft_only_idle = !idle_accel.is_empty()
+            && idle_accel
+                .iter()
+                .all(|s| crate::compute_pool::card_has_soft_vram_nameplate(&s.card));
+        if soft_only_idle {
+            return crate::invoke_code::CodedError::new(
+                crate::invoke_code::InvokeErrorCode::InsufficientVram,
+                format!(
+                    "GPU memory size not detected on this machine yet; cannot place {model_id} until nvidia-smi reports VRAM"
+                ),
+            );
+        }
         let min_vram = hosting_min_vram_gb(model);
         let image_slots: Vec<&ComputeSlot> = plan
             .slots
             .iter()
             .filter(|s| {
                 s.kind != "cpu"
+                    && !crate::compute_pool::card_has_soft_vram_nameplate(&s.card)
                     && crate::image::image_card_eligible(&s.card)
                     && (min_vram == 0 || s.card.total_vram_gb >= min_vram)
             })
@@ -599,6 +623,7 @@ pub fn placement_miss_detail(
         }
         let max_idle = idle_accel
             .iter()
+            .filter(|s| !crate::compute_pool::card_has_soft_vram_nameplate(&s.card))
             .map(|s| s.card.total_vram_gb)
             .max()
             .unwrap_or(0);
@@ -617,6 +642,7 @@ pub fn placement_miss_detail(
         plan.slots.iter().any(|s| {
             s.kind != "cpu"
                 && s.kind != "integrated"
+                && !crate::compute_pool::card_has_soft_vram_nameplate(&s.card)
                 && can_host_model_at(model, &s.card, ram_gb, cpu_ram_headroom_gb, n_ctx)
                 && (!need_vision || can_serve_vision_on_card(model, &s.card))
         })
@@ -695,7 +721,26 @@ pub fn placement_miss_detail(
         );
     }
 
-    let max_free = idle_accel
+    let soft_unknown: Vec<&ComputeSlot> = idle_accel
+        .iter()
+        .copied()
+        .filter(|s| crate::compute_pool::card_has_soft_vram_nameplate(&s.card))
+        .collect();
+    let measured_idle: Vec<&ComputeSlot> = idle_accel
+        .iter()
+        .copied()
+        .filter(|s| !crate::compute_pool::card_has_soft_vram_nameplate(&s.card))
+        .collect();
+    if !soft_unknown.is_empty() && measured_idle.is_empty() {
+        return crate::invoke_code::CodedError::new(
+            crate::invoke_code::InvokeErrorCode::InsufficientVram,
+            format!(
+                "GPU memory size not detected on this machine yet; cannot place {model_id} until nvidia-smi reports VRAM"
+            ),
+        );
+    }
+
+    let max_free = measured_idle
         .iter()
         .map(|slot| slot_available_gb(slot, &live_cuda, reclaimable_slot_ids.contains(&slot.id)))
         .fold(0.0_f64, f64::max);
@@ -1775,6 +1820,69 @@ mod tests {
         assert!(
             detail.detail.contains("waiting for a GPU"),
             "want hop-on-busy, got {}",
+            detail.detail
+        );
+    }
+
+    #[test]
+    fn soft_unknown_vram_refuses_place_and_reports_not_detected() {
+        // Detect found the GPU name but never measured size → soft 1 GB.
+        // Placement must not guess; miss text must say VRAM was not detected.
+        let devices = [ComputeDevice {
+            id: "nvidia:0".into(),
+            kind: "discrete".into(),
+            name: "NVIDIA RTX PRO 4000 Blackwell".into(),
+            vram_gb: None,
+            vram_used_gb: None,
+            util_pct: None,
+            enabled: true,
+        }];
+        let plan = build_compute_slots(&devices).unwrap();
+        let idle: Vec<String> = plan.slots.iter().map(|s| s.id.clone()).collect();
+        let m = model(4.0, 3.5);
+        assert!(
+            pick_placement_with_cpu(
+                &plan,
+                &idle,
+                &m,
+                64,
+                2,
+                &devices,
+                false,
+                16,
+                32,
+                &HashSet::new(),
+                &HashMap::new(),
+                false,
+                0
+            )
+            .is_none(),
+            "must not place on soft-estimate VRAM"
+        );
+        let detail = placement_miss_detail(
+            &plan,
+            &idle,
+            &m,
+            false,
+            &HashSet::new(),
+            32,
+            &HashMap::new(),
+            64,
+            2,
+            0,
+        );
+        assert_eq!(
+            detail.code,
+            crate::invoke_code::InvokeErrorCode::InsufficientVram
+        );
+        assert!(
+            detail.detail.contains("not detected"),
+            "want honest detect miss, got {}",
+            detail.detail
+        );
+        assert!(
+            !detail.detail.contains("1.0 GB") && !detail.detail.contains("largest idle card is 1"),
+            "must not blame soft 1 GB as real capacity: {}",
             detail.detail
         );
     }

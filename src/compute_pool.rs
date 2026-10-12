@@ -756,8 +756,8 @@ pub fn is_vulkan_accelerator(device: &ComputeDevice) -> bool {
 }
 
 /// Soft discrete/Metal nameplate when nvidia-smi/procfs did not report VRAM yet.
-/// Placement must not treat this as a real 1 GB card once live telemetry arrives —
-/// see [`cuda_slots_underreport_device_vram`].
+/// Placement must not treat this as a real 1 GB card — see
+/// [`card_has_soft_vram_nameplate`] and [`cuda_slots_underreport_device_vram`].
 pub const SOFT_DISCRETE_VRAM_GB: u32 = 1;
 
 fn effective_vram_gb(device: &ComputeDevice) -> u32 {
@@ -770,6 +770,19 @@ fn effective_vram_gb(device: &ComputeDevice) -> u32 {
         "discrete" | "metal" => SOFT_DISCRETE_VRAM_GB,
         _ => 0,
     }
+}
+
+/// True when a CUDA card's VRAM is the soft 1 GB estimate (detect never saw a
+/// real nameplate). Not a real 1 GB GPU — placement must not refuse on that floor.
+/// Vulkan/iGPU soft sizes stay strict (real small cards exist there).
+pub fn card_has_soft_vram_nameplate(card: &VirtualCard) -> bool {
+    if card.total_vram_gb > SOFT_DISCRETE_VRAM_GB {
+        return false;
+    }
+    matches!(
+        card.strategy,
+        PoolStrategy::Single | PoolStrategy::TensorParallel
+    )
 }
 
 /// True when live device telemetry shows substantially more VRAM than a running
