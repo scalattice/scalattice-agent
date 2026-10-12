@@ -1401,12 +1401,16 @@ fn detect_apple_metal_device() -> Vec<ComputeDevice> {
     } else {
         format!("Apple Silicon GPU ({cpu})")
     };
+    // Do not report system RAM pressure as Metal vramUsedGb. Unified memory
+    // looks "full" while the GPU is idle; the control plane then treats free
+    // VRAM as ~0 and skips the machine for packing (Bedrock forever). Slot
+    // busy / loadedModels / occupiedExternal already convey real occupancy.
     vec![ComputeDevice {
         id: "metal:0".to_string(),
         kind: "metal".to_string(),
         name,
         vram_gb: Some(usable),
-        vram_used_gb: detect_ram_used_gb().map(|used| used.min(usable)),
+        vram_used_gb: None,
         util_pct: None,
         enabled: true,
     }]
