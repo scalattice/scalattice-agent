@@ -372,13 +372,204 @@ fn sum_option(values: impl Iterator<Item = u32>) -> Option<u32> {
 
 #[cfg(not(target_os = "macos"))]
 fn detect_nvidia_devices() -> Vec<ComputeDevice> {
+    let mut devices = Vec::new();
     for bin in nvidia_smi_bins() {
-        let devices = detect_nvidia_devices_from(&bin);
+        devices = detect_nvidia_devices_from(&bin);
         if !devices.is_empty() {
-            return devices;
+            break;
         }
     }
-    detect_nvidia_devices_from_procfs()
+    if devices.is_empty() {
+        devices = detect_nvidia_devices_from_procfs();
+    }
+    // Fill any missing nameplates: per-index memory query, then nvidia-smi -q.
+    fill_nvidia_vram_gaps(&mut devices);
+    devices
+}
+
+/// When a GPU was found by name but without memory.total, keep probing until we
+/// know the size — never invent capacity or place on a soft 1 GB lie.
+#[cfg(not(target_os = "macos"))]
+fn fill_nvidia_vram_gaps(devices: &mut [ComputeDevice]) {
+    if devices.iter().all(|d| d.vram_gb.is_some()) {
+        return;
+    }
+    for bin in nvidia_smi_bins() {
+        for device in devices.iter_mut() {
+            if device.vram_gb.is_some() {
+                continue;
+            }
+            let Some(idx) = device
+                .id
+                .strip_prefix("nvidia:")
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some((total, used)) = query_nvidia_index_memory_mb(&bin, idx) {
+                device.vram_gb = mb_to_gb(total);
+                if device.vram_used_gb.is_none() {
+                    device.vram_used_gb = mb_to_gb(used);
+                }
+            }
+        }
+        if devices.iter().all(|d| d.vram_gb.is_some()) {
+            return;
+        }
+        if let Some(by_index) = query_nvidia_smi_q_memory_by_index(&bin) {
+            for device in devices.iter_mut() {
+                if device.vram_gb.is_some() {
+                    continue;
+                }
+                let Some(idx) = device
+                    .id
+                    .strip_prefix("nvidia:")
+                    .and_then(|s| s.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if let Some((total, used)) = by_index.get(&idx).copied() {
+                    device.vram_gb = mb_to_gb(total);
+                    if device.vram_used_gb.is_none() {
+                        device.vram_used_gb = mb_to_gb(used);
+                    }
+                }
+            }
+        }
+        if devices.iter().all(|d| d.vram_gb.is_some()) {
+            return;
+        }
+        let table = detect_nvidia_devices_from_smi_table(&bin);
+        merge_nvidia_vram_from_table(devices, &table);
+        if devices.iter().any(|d| d.vram_gb.is_some()) {
+            return;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_nvidia_index_memory_mb(bin: &str, index: u32) -> Option<(f32, f32)> {
+    let output = configure_nvidia_smi_command(bin)
+        .args([
+            "-i",
+            &index.to_string(),
+            "--query-gpu=memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let line = line.lines().next()?.trim();
+    let parts = parse_csv_fields(line);
+    let total = parse_nvidia_number(parts.first()?)?;
+    let used = parts
+        .get(1)
+        .and_then(|p| parse_nvidia_number(p))
+        .unwrap_or(0.0);
+    Some((total, used))
+}
+
+/// Parse `nvidia-smi -q -d Memory` (or full `-q`) FB Memory Usage blocks.
+#[cfg(not(target_os = "macos"))]
+fn query_nvidia_smi_q_memory_by_index(bin: &str) -> Option<std::collections::HashMap<u32, (f32, f32)>> {
+    let output = configure_nvidia_smi_command(bin)
+        .args(["-q", "-d", "Memory"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        // Some builds reject -d Memory; try full query.
+        let output = configure_nvidia_smi_command(bin).arg("-q").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return Some(parse_nvidia_smi_q_memory(&String::from_utf8_lossy(&output.stdout)));
+    }
+    Some(parse_nvidia_smi_q_memory(&String::from_utf8_lossy(&output.stdout)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_nvidia_smi_q_memory(stdout: &str) -> std::collections::HashMap<u32, (f32, f32)> {
+    let mut map = std::collections::HashMap::new();
+    let mut gpu_index: Option<u32> = None;
+    let mut next_index = 0u32;
+    let mut total_mb: Option<f32> = None;
+    let mut used_mb: Option<f32> = None;
+    let mut free_mb: Option<f32> = None;
+    let mut in_fb = false;
+
+    let flush = |map: &mut std::collections::HashMap<u32, (f32, f32)>,
+                 gpu_index: &mut Option<u32>,
+                 next_index: &mut u32,
+                 total_mb: &mut Option<f32>,
+                 used_mb: &mut Option<f32>,
+                 free_mb: &mut Option<f32>| {
+        if let Some(total) = *total_mb {
+            let used = used_mb
+                .or_else(|| free_mb.map(|free| (total - free).max(0.0)))
+                .unwrap_or(0.0);
+            let idx = gpu_index.unwrap_or(*next_index);
+            map.insert(idx, (total, used));
+            *next_index = (*next_index).saturating_add(1);
+        }
+        *gpu_index = None;
+        *total_mb = None;
+        *used_mb = None;
+        *free_mb = None;
+    };
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("GPU ") {
+            flush(
+                &mut map,
+                &mut gpu_index,
+                &mut next_index,
+                &mut total_mb,
+                &mut used_mb,
+                &mut free_mb,
+            );
+            in_fb = false;
+            // GPU 00000000:01:00.0 — index is sequential appearance order.
+            gpu_index = Some(next_index);
+            continue;
+        }
+        if trimmed.starts_with("FB Memory Usage") {
+            in_fb = true;
+            continue;
+        }
+        if trimmed.starts_with("BAR1 Memory Usage")
+            || trimmed.starts_with("Conf Compute Protected")
+            || trimmed.starts_with("GPU Memory Usage")
+        {
+            in_fb = false;
+            continue;
+        }
+        if !in_fb {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Total") {
+            let rest = rest.trim().trim_start_matches(':').trim();
+            total_mb = parse_mib_token(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("Used") {
+            let rest = rest.trim().trim_start_matches(':').trim();
+            used_mb = parse_mib_token(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("Free") {
+            let rest = rest.trim().trim_start_matches(':').trim();
+            free_mb = parse_mib_token(rest);
+        }
+    }
+    flush(
+        &mut map,
+        &mut gpu_index,
+        &mut next_index,
+        &mut total_mb,
+        &mut used_mb,
+        &mut free_mb,
+    );
+    map
 }
 
 /// Absolute `nvidia-smi` paths first (Windows PATH is often incomplete for tray agents).
@@ -796,45 +987,234 @@ fn detect_nvidia_devices_from_procfs() -> Vec<ComputeDevice> {
 
 #[cfg(not(target_os = "macos"))]
 fn detect_nvidia_devices_from(bin: &str) -> Vec<ComputeDevice> {
-    let Ok(output) = configure_nvidia_smi_command(bin)
-        .args([
+    // Progressive queries: optional fields (util / used) must not nuke VRAM detect
+    // when a driver answers [N/A] or rejects the wide query (fleet: RTX PRO Blackwell
+    // fell through to procfs → soft 1 GB slots while the card was empty).
+    const QUERIES: &[&[&str]] = &[
+        &[
             "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
             "--format=csv,noheader,nounits",
-        ])
-        .output()
-    else {
+        ],
+        &[
+            "--query-gpu=index,name,memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        &[
+            "--query-gpu=index,name,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        &["--query-gpu=index,name", "--format=csv,noheader,nounits"],
+    ];
+
+    let mut best_without_vram = Vec::new();
+    for args in QUERIES {
+        let devices = query_nvidia_devices_csv(bin, args);
+        if devices.is_empty() {
+            continue;
+        }
+        if devices.iter().any(|d| d.vram_gb.is_some()) {
+            return devices;
+        }
+        if best_without_vram.is_empty() {
+            best_without_vram = devices;
+        }
+    }
+    // Name-only CSV must not skip the human table — that is often where memory
+    // still appears when --query-gpu=memory.total fails (Blackwell / WDDM).
+    let table = detect_nvidia_devices_from_smi_table(bin);
+    if !best_without_vram.is_empty() {
+        merge_nvidia_vram_from_table(&mut best_without_vram, &table);
+        return best_without_vram;
+    }
+    table
+}
+
+/// Copy measured VRAM from table rows onto CSV name-only devices by index.
+#[cfg(not(target_os = "macos"))]
+fn merge_nvidia_vram_from_table(devices: &mut [ComputeDevice], table: &[ComputeDevice]) {
+    for device in devices.iter_mut() {
+        if device.vram_gb.is_some() {
+            continue;
+        }
+        let Some(idx) = device
+            .id
+            .strip_prefix("nvidia:")
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(src) = table.iter().find(|d| {
+            d.id.strip_prefix("nvidia:")
+                .and_then(|s| s.parse::<u32>().ok())
+                == Some(idx)
+        }) else {
+            continue;
+        };
+        if let Some(vram) = src.vram_gb {
+            device.vram_gb = Some(vram);
+            if device.vram_used_gb.is_none() {
+                device.vram_used_gb = src.vram_used_gb;
+            }
+            if device.name.is_empty() || device.name.eq_ignore_ascii_case("[N/A]") {
+                device.name = src.name.clone();
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_nvidia_devices_csv(bin: &str, args: &[&str]) -> Vec<ComputeDevice> {
+    let Some(output) = configure_nvidia_smi_command(bin).args(args).output().ok() else {
         return Vec::new();
     };
-
     if !output.status.success() {
         return Vec::new();
     }
+    parse_nvidia_detect_csv(&String::from_utf8_lossy(&output.stdout))
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+/// Parse `nvidia-smi --query-gpu=index,name[,memory.total[,memory.used[,utilization.gpu]]]`.
+/// Keeps the row when optional cells are `[N/A]` or omitted.
+#[cfg(not(target_os = "macos"))]
+fn parse_nvidia_detect_csv(stdout: &str) -> Vec<ComputeDevice> {
     let mut devices = Vec::new();
-
     for line in stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
         let parts = parse_csv_fields(line);
-        if parts.len() < 5 {
+        if parts.len() < 2 {
             continue;
         }
         let index = parts[0].trim();
+        if index.parse::<u32>().is_err() {
+            continue;
+        }
+        let name = parts[1].trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("[N/A]") {
+            continue;
+        }
         devices.push(ComputeDevice {
             id: format!("nvidia:{index}"),
             kind: "discrete".to_string(),
-            name: parts[1].trim().to_string(),
-            vram_gb: parse_nvidia_number(&parts[2]).and_then(mb_to_gb),
-            vram_used_gb: parse_nvidia_number(&parts[3]).and_then(mb_to_gb),
-            util_pct: parse_util_pct(&parts[4]),
+            name: name.to_string(),
+            vram_gb: parts
+                .get(2)
+                .and_then(|p| parse_nvidia_number(p))
+                .and_then(mb_to_gb),
+            vram_used_gb: parts
+                .get(3)
+                .and_then(|p| parse_nvidia_number(p))
+                .and_then(mb_to_gb),
+            util_pct: parts.get(4).and_then(|p| parse_util_pct(p)),
             enabled: true,
         });
     }
-
     devices
+}
+
+/// Last-resort: parse the human `nvidia-smi` table (`MiB / MiB` memory column).
+#[cfg(not(target_os = "macos"))]
+fn detect_nvidia_devices_from_smi_table(bin: &str) -> Vec<ComputeDevice> {
+    let Some(output) = configure_nvidia_smi_command(bin).output().ok() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_nvidia_smi_table(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_nvidia_smi_table(stdout: &str) -> Vec<ComputeDevice> {
+    // Human table splits name and memory across two `|` rows:
+    //   | 0  NVIDIA RTX … | Bus-Id | …
+    //   | 30%  42C …      | 1024MiB / 24576MiB | …
+    let mut devices = Vec::new();
+    let mut pending_name: Option<String> = None;
+    let mut index: u32 = 0;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        if let Some(name) = parse_smi_table_gpu_name(trimmed) {
+            pending_name = Some(name);
+            continue;
+        }
+        let Some((used_mb, total_mb)) = parse_smi_table_memory_mib(trimmed) else {
+            continue;
+        };
+        let name = pending_name
+            .take()
+            .unwrap_or_else(|| format!("NVIDIA GPU {index}"));
+        devices.push(ComputeDevice {
+            id: format!("nvidia:{index}"),
+            kind: "discrete".to_string(),
+            name,
+            vram_gb: mb_to_gb(total_mb),
+            vram_used_gb: mb_to_gb(used_mb),
+            util_pct: None,
+            enabled: true,
+        });
+        index = index.saturating_add(1);
+    }
+    devices
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_smi_table_memory_mib(line: &str) -> Option<(f32, f32)> {
+    // Prefer "usedMiB / totalMiB".
+    for chunk in line.split('|') {
+        let c = chunk.trim();
+        if !c.contains('/') || !c.to_ascii_lowercase().contains("mib") {
+            continue;
+        }
+        let parts: Vec<&str> = c.split('/').map(str::trim).collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let used = parse_mib_token(parts[0])?;
+        let total = parse_mib_token(parts[1])?;
+        if total > 0.0 {
+            return Some((used, total));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_mib_token(raw: &str) -> Option<f32> {
+    let s = raw
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == ' ')
+        .trim();
+    parse_nvidia_number(s)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_smi_table_gpu_name(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.split('|').map(str::trim).collect();
+    // Typical: | GPU  Name | ... |  OR  | 0  NVIDIA GeForce ... |
+    for part in parts {
+        let lower = part.to_ascii_lowercase();
+        if lower.contains("nvidia") || lower.contains("tesla") || lower.contains("quadro") {
+            // Strip leading index.
+            let mut tokens = part.split_whitespace();
+            let first = tokens.next()?;
+            let name = if first.chars().all(|c| c.is_ascii_digit()) {
+                tokens.collect::<Vec<_>>().join(" ")
+            } else {
+                part.to_string()
+            };
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
@@ -2021,6 +2401,98 @@ GPU[1]		: VRAM Total Memory (B): 2147483648
         let map = parse_nvidia_free_csv("0, 24576, 1024, [N/A]\n");
         let free = map.get(&0).copied().unwrap();
         assert!((free - 23.0).abs() < 0.01, "free {free}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_detect_csv_keeps_row_when_util_omitted_or_na() {
+        let wide = parse_nvidia_detect_csv("0, NVIDIA RTX PRO 4000 Blackwell, 24576, 1024, [N/A]\n");
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].vram_gb, Some(24));
+        assert_eq!(wide[0].vram_used_gb, Some(1));
+        assert!(wide[0].util_pct.is_none());
+
+        let narrow = parse_nvidia_detect_csv("0, NVIDIA GeForce RTX 4090, 24576\n");
+        assert_eq!(narrow.len(), 1);
+        assert_eq!(narrow[0].vram_gb, Some(24));
+        assert!(narrow[0].vram_used_gb.is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_smi_table_parses_memory_column() {
+        let stdout = r#"
+|-----------------------------------------+------------------------+----------------------+
+|   0  NVIDIA RTX PRO 4000 Black...  On   | 00000000:01:00.0 Off |                  N/A |
+| 30%   42C    P2             45W /  140W |    1024MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+"#;
+        let devices = parse_nvidia_smi_table(stdout);
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        assert_eq!(devices[0].vram_gb, Some(24));
+        assert_eq!(devices[0].vram_used_gb, Some(1));
+        assert!(devices[0].name.to_ascii_lowercase().contains("nvidia"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_smi_q_memory_parses_fb_blocks() {
+        let stdout = r#"
+==============NVSMI LOG==============
+
+Timestamp                                 : Mon Oct 12 13:00:00 2026
+Driver Version                            : 580.00
+CUDA Version                              : 13.0
+
+Attached GPUs                             : 1
+GPU 00000000:01:00.0
+    FB Memory Usage
+        Total                             : 24564 MiB
+        Reserved                          : 331 MiB
+        Used                              : 12 MiB
+        Free                              : 24220 MiB
+    BAR1 Memory Usage
+        Total                             : 256 MiB
+        Used                              : 2 MiB
+        Free                              : 254 MiB
+"#;
+        let map = parse_nvidia_smi_q_memory(stdout);
+        let (total, used) = map.get(&0).copied().expect("gpu 0");
+        assert!((total - 24564.0).abs() < 0.1, "total {total}");
+        assert!((used - 12.0).abs() < 0.1, "used {used}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_smi_q_memory_uses_free_when_used_missing() {
+        let stdout = r#"
+GPU 00000000:01:00.0
+    FB Memory Usage
+        Total                             : 24576 MiB
+        Free                              : 24000 MiB
+"#;
+        let map = parse_nvidia_smi_q_memory(stdout);
+        let (total, used) = map.get(&0).copied().expect("gpu 0");
+        assert!((total - 24576.0).abs() < 0.1);
+        assert!((used - 576.0).abs() < 0.1, "used {used}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn merge_table_vram_onto_name_only_csv_devices() {
+        let mut devices = parse_nvidia_detect_csv("0, NVIDIA RTX PRO 4000 Blackwell\n");
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].vram_gb.is_none());
+        let table = parse_nvidia_smi_table(
+            r#"
+|   0  NVIDIA RTX PRO 4000 Black...  On   | 00000000:01:00.0 Off |                  N/A |
+| 30%   42C    P2             45W /  140W |    1024MiB /  24576MiB |      0%      Default |
+"#,
+        );
+        merge_nvidia_vram_from_table(&mut devices, &table);
+        assert_eq!(devices[0].vram_gb, Some(24));
+        assert_eq!(devices[0].vram_used_gb, Some(1));
     }
 
     #[test]
