@@ -226,6 +226,9 @@ pub fn restart_background_after_update() -> Result<()> {
     if !systemd_user_unit_path(&os_home).is_file() {
         return Ok(());
     }
+    // Reap orphans before systemd respawns us. process::exit / prior crashes can
+    // leave `scalattice-agent worker` CUDA contexts outside the unit cgroup.
+    kill_non_tray_agent_processes();
     let _ = write_user_unit(&os_home, &crate::paths::home_dir()?);
     let _ = write_watchdog_units(&os_home, &crate::paths::home_dir()?);
     let _ = run_systemctl(&["--user", "daemon-reload"]);

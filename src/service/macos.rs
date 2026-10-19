@@ -201,6 +201,8 @@ pub fn restart_background_after_update() -> Result<()> {
     if !launch_agent_plist_path()?.is_file() {
         return Ok(());
     }
+    // process::exit skips kill_on_drop — reap CUDA workers before KeepAlive respawn.
+    kill_non_tray_agent_processes();
     write_watchdog_plist()?;
     let _ = load_watchdog_plist();
     reload_launch_agent()

@@ -66,6 +66,15 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
     platform::restart_background_from_config(config)
 }
 
+/// Reap slot workers before any `process::exit`.
+///
+/// Workers share the `scalattice-agent` binary name and use `kill_on_drop(true)`.
+/// `process::exit` skips Drop, so without this nvidia-smi fills with orphaned
+/// CUDA contexts and the next supervisor spawn adds another set on top.
+pub fn prepare_process_exit_cleanup() {
+    platform::kill_non_tray_agent_processes();
+}
+
 /// Best-effort cleanup before `process::exit` on a wedged event loop.
 /// `exit` skips Drop, so slot workers with `kill_on_drop` would otherwise orphan
 /// and (on Windows) look like a still-running background agent.
@@ -73,7 +82,7 @@ pub fn prepare_wedge_restart(hung_secs: u64) {
     crate::state::mark_disconnected(Some(format!(
         "event loop wedged for {hung_secs}s; restarting"
     )));
-    platform::kill_non_tray_agent_processes();
+    prepare_process_exit_cleanup();
 }
 
 /// OS scheduler tick: start a dead agent, or kill one that has frozen mid-session.
