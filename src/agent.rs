@@ -2380,7 +2380,9 @@ async fn handle_remote_control(
                 {
                     Ok(Ok(())) => {
                         // Helper (Windows) or systemd (Linux) brings us back; exit.
+                        // Must reap workers first: process::exit skips kill_on_drop.
                         info!("remote control: restart scheduled; exiting");
+                        crate::service::prepare_process_exit_cleanup();
                         std::process::exit(0);
                     }
                     Ok(Err(err)) => {
@@ -2467,6 +2469,8 @@ async fn handle_remote_control(
                                     );
                                 }
                             }
+                            // process::exit skips Drop — reap CUDA workers or they orphan.
+                            crate::service::prepare_process_exit_cleanup();
                             std::process::exit(0);
                         }
                         crate::state::end_lifecycle_control();
