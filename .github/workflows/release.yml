@@ -349,6 +349,7 @@ jobs:
           arch: x64
       - name: Ensure Artifact Signing Client Tools
         shell: powershell
+        timeout-minutes: 10
         run: .\scripts\ensure-artifact-signing-tools.ps1
       - name: Build + package
         shell: cmd
@@ -419,8 +420,10 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      # winget on windows-2022 has hung for the full job timeout; fail fast instead.
       - name: Ensure Artifact Signing Client Tools
         shell: powershell
+        timeout-minutes: 10
         run: .\scripts\ensure-artifact-signing-tools.ps1
       - name: Build + package
         shell: cmd
