@@ -1,5 +1,9 @@
 # Ensure Azure Artifact Signing Client Tools are available for SignTool.
 # Skips install when Azure.CodeSigning.Dlib.dll is already on the machine.
+#
+# Order matters on GitHub-hosted Windows: winget often hangs for hours with no
+# progress (see release job timeouts). Prefer NuGet there; keep winget for
+# self-hosted boxes where it is already reliable.
 param(
     [switch]$Quiet
 )
@@ -11,6 +15,10 @@ function Write-InstallLog {
     if (-not $Quiet) {
         Write-Host $Message
     }
+}
+
+function Test-IsGitHubActions {
+    return [bool]$env:GITHUB_ACTIONS
 }
 
 function Get-ArtifactSigningDlibSearchRoots {
@@ -74,17 +82,67 @@ function Install-ArtifactSigningDlibFromNuGet {
 }
 
 function Install-ArtifactSigningToolsFromMsi {
-    param([Parameter(Mandatory = $true)][string]$Url)
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutSeconds = 180
+    )
 
     $msiPath = Join-Path $env:TEMP 'ArtifactSigningClientTools.msi'
     Write-InstallLog "==> Installing Artifact Signing Client Tools via MSI ($Url)"
     $ProgressPreference = 'SilentlyContinue'
     Invoke-WebRequest -Uri $Url -OutFile $msiPath
-    $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-        '/i', $msiPath, '/quiet', '/norestart'
+    $proc = Start-Process msiexec.exe -PassThru -ArgumentList @(
+        '/i', $msiPath, '/quiet', '/norestart', '/qn'
     )
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+        Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
+        throw "msiexec timed out after ${TimeoutSeconds}s for $Url"
+    }
     Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
-    return $install.ExitCode
+    return $proc.ExitCode
+}
+
+function Install-ArtifactSigningToolsFromWinget {
+    param([int]$TimeoutSeconds = 120)
+
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    Write-InstallLog "==> Installing Artifact Signing Client Tools via winget (timeout ${TimeoutSeconds}s)"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'winget'
+    $psi.Arguments = 'install -e --id Microsoft.Azure.ArtifactSigningClientTools --accept-package-agreements --accept-source-agreements --disable-interactivity'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $proc.Kill() } catch {}
+        Write-InstallLog "==> winget timed out after ${TimeoutSeconds}s; falling through"
+        return $false
+    }
+
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    if ($stdout) { Write-Host $stdout }
+    if ($stderr) { Write-Host $stderr }
+
+    if ($proc.ExitCode -eq 0) {
+        $installed = Find-ArtifactSigningDlib
+        if ($installed) {
+            Write-InstallLog "==> Installed: $installed"
+            Publish-ArtifactSigningDlibPath -Path $installed
+            return $true
+        }
+    }
+    Write-InstallLog "==> winget install did not complete successfully (exit $($proc.ExitCode)); falling through"
+    return $false
 }
 
 $existing = Find-ArtifactSigningDlib
@@ -94,19 +152,23 @@ if ($existing) {
     exit 0
 }
 
-if (Get-Command winget -ErrorAction SilentlyContinue) {
-    Write-InstallLog '==> Installing Artifact Signing Client Tools via winget'
-    winget install -e --id Microsoft.Azure.ArtifactSigningClientTools `
-        --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -eq 0) {
+# GitHub-hosted: NuGet is the path that actually works. Skip winget — it hangs.
+if (Test-IsGitHubActions) {
+    try {
+        Install-ArtifactSigningDlibFromNuGet
         $installed = Find-ArtifactSigningDlib
         if ($installed) {
-            Write-InstallLog "==> Installed: $installed"
+            Write-InstallLog "==> Installed from NuGet: $installed"
             Publish-ArtifactSigningDlibPath -Path $installed
             exit 0
         }
+    } catch {
+        Write-InstallLog "==> NuGet install failed: $_"
     }
-    Write-InstallLog "==> winget install did not complete successfully (exit $LASTEXITCODE); trying MSI"
+} else {
+    if (Install-ArtifactSigningToolsFromWinget) {
+        exit 0
+    }
 }
 
 $msiUrls = @(
@@ -131,16 +193,19 @@ foreach ($msiUrl in $msiUrls) {
     }
 }
 
-try {
-    Install-ArtifactSigningDlibFromNuGet
-    $installed = Find-ArtifactSigningDlib
-    if ($installed) {
-        Write-InstallLog "==> Installed from NuGet: $installed"
-        Publish-ArtifactSigningDlibPath -Path $installed
-        exit 0
+# Self-hosted / MSI miss: try NuGet as last resort when not already tried above.
+if (-not (Test-IsGitHubActions)) {
+    try {
+        Install-ArtifactSigningDlibFromNuGet
+        $installed = Find-ArtifactSigningDlib
+        if ($installed) {
+            Write-InstallLog "==> Installed from NuGet: $installed"
+            Publish-ArtifactSigningDlibPath -Path $installed
+            exit 0
+        }
+    } catch {
+        Write-InstallLog "==> NuGet install failed: $_"
     }
-} catch {
-    Write-InstallLog "==> NuGet install failed: $_"
 }
 
 Write-Error @"
