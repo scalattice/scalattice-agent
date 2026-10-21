@@ -5,7 +5,7 @@ WebSocket protocol used by `scalattice-agent` (and compatible agents) to connect
 ## Connect
 
 ```
-wss://api.scalattice.cloud/v1/operators/agent/ws
+wss://api.scalattice.cloud/v1/providers/agent/ws
 Authorization: Bearer <provider_token>
 ```
 
