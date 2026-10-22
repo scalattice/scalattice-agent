@@ -1613,6 +1613,14 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
             }
         };
         if let Some(specs) = specs {
+            // Drop the live supervisor from session state and shut it down
+            // *before* spawning replacements. Other Arcs may keep the old
+            // value alive briefly; shutdown+reap still kills its slot kids so
+            // we never end up with two scalattice-slot-cuda-0 processes.
+            let previous = state.lock().await.supervisor.take();
+            if let Some(prev) = previous {
+                prev.shutdown().await;
+            }
             match Supervisor::start(&specs.compute_devices).await {
                 Ok(supervisor) => {
                     let mut guard = state.lock().await;

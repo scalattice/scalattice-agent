@@ -392,6 +392,22 @@ fn deadline_kill_error(phase: &str, deadline_secs: u64) -> anyhow::Error {
 }
 
 impl Supervisor {
+    /// Kill every tracked slot worker and reap leftover role-image processes.
+    /// Safe to call while other Arcs still exist — clears this instance's map.
+    pub async fn shutdown(&self) {
+        let mut workers = self.workers.lock().await;
+        let ids: Vec<String> = workers.keys().cloned().collect();
+        for id in ids {
+            if let Some(mut w) = workers.remove(&id) {
+                let _ = w.child.kill().await;
+                let _ = w.child.wait().await;
+            }
+            crate::supervisor::worker_job::reap_slot_image_processes(&id);
+        }
+        workers.clear();
+        self.checkouts.lock().await.clear();
+    }
+
     pub async fn start(devices: &[ComputeDevice]) -> Result<Arc<Self>> {
         let plan = build_compute_slots(devices)?;
         info!(
@@ -399,6 +415,11 @@ impl Supervisor {
             tp_groups = plan.tp_groups.len(),
             "compute supervisor partitioning slots"
         );
+        // Reap orphans from a previous supervisor Arc / failed handshake before
+        // we spawn — otherwise Task Manager shows two scalattice-slot-cuda-0.
+        for slot in &plan.slots {
+            crate::supervisor::worker_job::reap_slot_image_processes(&slot.id);
+        }
         let cuda_version = crate::specs::detect_cuda_version();
         let block_nvidia = crate::specs::nvidia_driver_too_old(cuda_version.as_deref());
         if block_nvidia {
@@ -2478,6 +2499,11 @@ impl Supervisor {
                 warn!(slot = %slot_id, "slot worker exited; respawning");
             }
             worker.healthy = false;
+            // Kill+wait+reap before replace. kill_on_drop alone races the new
+            // spawn (especially Windows/CUDA) and leaves a second role image.
+            let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            crate::supervisor::worker_job::reap_slot_image_processes(&slot_id);
             if let Ok(new_w) = self.spawn_plan_worker(&worker.spec).await {
                 worker = new_w;
             }
@@ -2649,6 +2675,10 @@ async fn spawn_worker(
     metal_gpu_decode_unreliable: bool,
     worker_job: &crate::supervisor::worker_job::WorkerJob,
 ) -> Result<SlotWorker> {
+    // Always clear same-named leftovers before create — covers respawn and
+    // supervisor-rebuild races on every OS.
+    crate::supervisor::worker_job::reap_slot_image_processes(&slot.id);
+
     let boot = WorkerBootConfig {
         slot_id: slot.id.clone(),
         card: slot.card.clone(),
@@ -2753,10 +2783,14 @@ async fn spawn_worker(
         }
         Ok(other) => {
             let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            crate::supervisor::worker_job::reap_slot_image_processes(&slot.id);
             bail!("unexpected ping response: {other:?}");
         }
         Err(err) => {
             let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            crate::supervisor::worker_job::reap_slot_image_processes(&slot.id);
             Err(err)
         }
     }
