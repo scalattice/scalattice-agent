@@ -31,7 +31,9 @@ fn assert_allowed_mirror_url(raw: &str) -> Result<()> {
         bail!("mirror URL host not allowed: {host}");
     }
     let path = url.path();
-    if !path.contains("/v1/operators/agent/models/") {
+    // Prod mirror is `/v1/providers/agent/models/...` (provider token auth).
+    // Reject `/v1/operators/...` — that is the developer inference gateway.
+    if !path.contains("/v1/providers/agent/models/") {
         bail!("mirror URL path is not a Scalattice model mirror");
     }
     Ok(())

@@ -328,7 +328,8 @@ async fn run_async(cli: Cli, verbose: bool) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn spawn_tray_hidden() -> Result<()> {
-    let bin = crate::paths::resolve_agent_binary()?;
+    let agent_bin = crate::paths::resolve_agent_binary()?;
+    let bin = crate::supervisor::worker_job::tray_image(&agent_bin);
     std::process::Command::new(&bin)
         .arg("tray")
         .env("SCALATTICE_TRAY", "1")
@@ -341,7 +342,8 @@ fn spawn_tray_hidden() -> Result<()> {
 fn spawn_tray_hidden() -> Result<()> {
     use std::os::windows::process::CommandExt;
     crate::service::prevent_stdio_handle_inheritance();
-    let bin = crate::paths::resolve_agent_binary()?;
+    let agent_bin = crate::paths::resolve_agent_binary()?;
+    let bin = crate::supervisor::worker_job::tray_image(&agent_bin);
     std::process::Command::new(&bin)
         .arg("tray")
         .env("SCALATTICE_TRAY_HIDDEN", "1")

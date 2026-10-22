@@ -56,7 +56,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 CloseApplications=force
-CloseApplicationsFilter=scalattice-agent.exe,*.dll,*.exe
+CloseApplicationsFilter=scalattice-agent.exe,scalattice-tray.exe,scalattice-slot-*.exe,*.dll,*.exe
 AppMutex=ScalatticeAgentSetup
 SetupMutex=ScalatticeAgentSetupGlobal
 
@@ -86,6 +86,9 @@ Source: "..\..\dist\scalattice-agent.exe"; DestDir: "{app}"; Flags: ignoreversio
 [InstallDelete]
 Type: files; Name: "{autoprograms}\{#MyAppName} (debug).lnk"
 Type: files; Name: "{app}\open-tray-debug.cmd"
+; Role hardlinks pin the previous inode across exe replace — wipe so spawn recreates.
+Type: files; Name: "{app}\scalattice-tray.exe"
+Type: files; Name: "{app}\scalattice-slot-*.exe"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "wscript.exe"; Parameters: "//nologo ""{app}\launch-tray-interactive.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Open Scalattice Agent control panel"; AppUserModelID: "{#MyAppUserModelId}"
@@ -274,6 +277,8 @@ begin
   for I := 1 to 10 do
   begin
     Exec('taskkill.exe', '/IM scalattice-agent.exe /F /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec('taskkill.exe', '/IM scalattice-tray.exe /F /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    { Slot hardlinks: wildcard IM is unsupported; agent uninstall/notify sweeps by PID. }
     Sleep(400);
   end;
   Sleep(1500);

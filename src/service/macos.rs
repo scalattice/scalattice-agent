@@ -175,22 +175,76 @@ pub fn stop_background_for_update() -> Result<()> {
     Ok(())
 }
 
-/// Slot workers share this binary. `process::exit` skips kill_on_drop, so kill
-/// leftover workers before KeepAlive / tray brings the supervisor back.
+/// Slot hardlinks/`worker` kids present while the LaunchAgent is not running.
+pub fn background_looks_orphaned() -> bool {
+    if service_active() {
+        return false;
+    }
+    Command::new("pgrep")
+        .args(["-f", "scalattice-slot-"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success() && !o.stdout.is_empty())
+        .is_some()
+        || Command::new("pgrep")
+            .args(["-f", "scalattice-agent worker"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success() && !o.stdout.is_empty())
+            .is_some()
+}
+
+/// Reap supervisor + slot workers (Metal / CPU / any future backend).
+/// Named images: `scalattice-slot-*`. Legacy: `scalattice-agent … worker`.
+/// Never touch the menu-bar tray (`scalattice-tray`).
 pub fn kill_non_tray_agent_processes() {
     let me = std::process::id();
-    let _ = Command::new("pkill")
-        .args(["-f", "scalattice-agent worker"])
-        .status();
-    // Best-effort: kill direct children that are still our binary.
+    for pattern in [
+        "scalattice-slot-",
+        "scalattice-agent worker",
+        "scalattice-agent.*worker",
+    ] {
+        let _ = Command::new("pkill").args(["-9", "-f", pattern]).status();
+    }
+    // Direct children of this process (supervisor mid-cleanup).
     let output = Command::new("pgrep")
         .args(["-P", &me.to_string()])
         .output();
     if let Ok(output) = output {
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if let Ok(pid) = line.trim().parse::<i32>() {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
+                if (pid as u32) == me {
+                    continue;
+                }
+                // Skip tray if somehow parented here.
+                let name = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "comm="])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if name.contains("scalattice-tray") {
+                    continue;
+                }
+                if name.contains("scalattice-slot")
+                    || name.contains("scalattice-agent")
+                    || name.is_empty()
+                {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+    // Orphans reparented to launchd/init after process::exit — match by name.
+    if let Ok(output) = Command::new("pgrep").args(["-f", "scalattice-slot-"]).output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                if (pid as u32) != me {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                 }
             }
         }
@@ -338,7 +392,10 @@ fn write_launch_agent() -> Result<()> {
 }
 
 fn write_tray_plist() -> Result<()> {
-    let bin = resolve_agent_binary().unwrap_or_else(|_| crate::paths::bundled_macos_agent_binary());
+    let agent_bin =
+        resolve_agent_binary().unwrap_or_else(|_| crate::paths::bundled_macos_agent_binary());
+    // Distinct process name in Activity Monitor (hardlink/symlink of same bytes).
+    let bin = crate::supervisor::worker_job::tray_image(&agent_bin);
     let plist_path = tray_plist_path()?;
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

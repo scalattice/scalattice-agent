@@ -182,14 +182,50 @@ pub fn stop_background_for_update() -> Result<()> {
     Ok(())
 }
 
-/// Slot workers share this binary name. `process::exit` skips kill_on_drop, so
-/// kill leftover `worker` processes before a service restart.
+/// Slot hardlinks/`worker` kids present while the systemd unit is not active.
+pub fn background_looks_orphaned() -> bool {
+    if service_active() {
+        return false;
+    }
+    slot_worker_processes_listed()
+}
+
+fn slot_worker_processes_listed() -> bool {
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+            let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            let comm = comm.trim();
+            if comm.starts_with("scalattice-slot")
+                || cmdline.contains("scalattice-slot-")
+                || (cmdline.contains("scalattice-agent") && cmdline.contains("worker"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Reap supervisor + slot workers (any vendor: cuda/vulkan/metal/cpu).
+/// Named hardlinks show up as `scalattice-slot-*`; legacy kids still match
+/// `scalattice-agent … worker`. Never touch `scalattice-tray`.
 pub fn kill_non_tray_agent_processes() {
     let me = std::process::id();
-    let _ = Command::new("pkill")
-        .args(["-f", "scalattice-agent worker"])
-        .status();
-    // Also reap any direct children still listed under /proc (best-effort).
+    for pattern in [
+        "scalattice-slot-",
+        "scalattice-agent worker",
+        "scalattice-agent.*worker",
+    ] {
+        let _ = Command::new("pkill").args(["-9", "-f", pattern]).status();
+    }
+    // /proc sweep: catch kids whose cmdline is a hardlink basename or our PPID.
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
@@ -198,21 +234,32 @@ pub fn kill_non_tray_agent_processes() {
             if pid == me {
                 continue;
             }
-            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-            // Field 4 is PPID in /proc/pid/stat.
-            let ppid = stat
-                .rsplit(')')
-                .next()
-                .and_then(|rest| rest.split_whitespace().nth(1))
-                .and_then(|s| s.parse::<u32>().ok());
-            if ppid != Some(me) {
+            let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            let comm = comm.trim();
+            let is_slot = comm.starts_with("scalattice-slot")
+                || cmdline.contains("scalattice-slot-")
+                || (cmdline.contains("scalattice-agent") && cmdline.contains("worker"));
+            if !is_slot {
+                // Direct child of this supervisor still running our binary?
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                let ppid = stat
+                    .rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.split_whitespace().nth(1))
+                    .and_then(|s| s.parse::<u32>().ok());
+                if ppid != Some(me) {
+                    continue;
+                }
+                if !(cmdline.contains("scalattice-agent") || cmdline.contains("scalattice-slot")) {
+                    continue;
+                }
+            }
+            if cmdline.contains("scalattice-tray") || comm == "scalattice-tray" {
                 continue;
             }
-            let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-            if cmdline.contains("scalattice-agent") {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
             }
         }
     }
@@ -310,6 +357,12 @@ Type=simple
 Environment=PATH={path}
 {home_override}EnvironmentFile={env}
 ExecStart={bin} foreground
+# Reap slot workers (cuda/vulkan/cpu hardlinks) with the supervisor cgroup —
+# process::exit skips kill_on_drop and must not leave orphan GPU contexts.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=25
+FinalKillSignal=SIGKILL
 Restart=always
 RestartSec=2
 StartLimitIntervalSec=0

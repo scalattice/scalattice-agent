@@ -1,5 +1,6 @@
-use crate::config::{read_saved_agent_token, SCALATTICE_API_BASE};
+use crate::config::{read_saved_agent_token, SCALATTICE_LIFECYCLE_API_BASE};
 use std::time::Duration;
+use tracing::{info, warn};
 
 /// Best-effort HTTPS notify before local wipe. Never fails uninstall.
 pub fn notify_server_uninstall(reason: &str) {
@@ -7,6 +8,7 @@ pub fn notify_server_uninstall(reason: &str) {
         return;
     }
     let Some(token) = read_saved_agent_token() else {
+        warn!("uninstall notify skipped: no saved provider token");
         return;
     };
     let reason = reason.trim();
@@ -16,15 +18,18 @@ pub fn notify_server_uninstall(reason: &str) {
         reason
     };
 
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
             Ok(rt) => rt,
-            Err(_) => return,
+            Err(err) => {
+                warn!(error = %err, "uninstall notify: runtime build failed");
+                return;
+            }
         };
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             let client = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
                 .connect_timeout(Duration::from_secs(4))
@@ -32,16 +37,39 @@ pub fn notify_server_uninstall(reason: &str) {
                 .build()
             {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(err) => {
+                    warn!(error = %err, "uninstall notify: http client build failed");
+                    return;
+                }
             };
-            let url = format!("{SCALATTICE_API_BASE}/uninstall");
+            // Must be cloud providers lifecycle — NOT api.*/operators (inference gateway).
+            let url = format!("{SCALATTICE_LIFECYCLE_API_BASE}/uninstall");
             let body = serde_json::json!({
                 "reason": reason,
                 "agentVersion": crate::update::current_version(),
                 "platform": std::env::consts::OS,
             });
-            let _ = client.post(url).bearer_auth(token).json(&body).send().await;
+            match client.post(&url).bearer_auth(&token).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(%url, "notified Scalattice Cloud of uninstall");
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    warn!(
+                        %url,
+                        %status,
+                        body = %text.chars().take(240).collect::<String>(),
+                        "uninstall notify rejected by Cloud"
+                    );
+                }
+                Err(err) => {
+                    warn!(%url, error = %err, "uninstall notify request failed");
+                }
+            }
         });
-    });
-    let _ = result;
+    }));
+    if result.is_err() {
+        warn!("uninstall notify panicked; continuing local uninstall");
+    }
 }

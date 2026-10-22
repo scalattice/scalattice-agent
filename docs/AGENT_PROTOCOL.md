@@ -5,11 +5,13 @@ WebSocket protocol used by `scalattice-agent` (and compatible agents) to connect
 ## Connect
 
 ```
-wss://api.scalattice.cloud/v1/operators/agent/ws
+wss://api.scalattice.cloud/v1/providers/agent/ws
 Authorization: Bearer <provider_token>
 ```
 
 Provider tokens are created on the **Providers** dashboard (`slt_provider_…` prefix).
+Do not use `/v1/operators/agent/ws` — that path is the developer inference gateway
+and rejects provider tokens with HTTP 401.
 
 ## Message flow
 
@@ -217,6 +219,17 @@ scalattice-agent uninstall --yes                   # remove agent, service, and 
 scalattice-agent uninstall --yes --purge           # also delete cached model weights
 sudo loginctl enable-linger $USER                  # optional: start at boot without login
 ```
+
+Before wiping local files the agent POSTs
+`https://scalattice.cloud/api/v1/providers/agent/uninstall` with the provider
+token so dashboards mark the machine uninstalled on every OS. (Do not use the
+api.*/operators path — that is the developer inference gateway and rejects
+`slt_provider_…`.)
+
+Process roles (all OSes; hardlink/symlink of the same binary):
+`scalattice-agent` (supervisor), `scalattice-slot-{id}` (cuda/vulkan/metal/cpu
+workers), `scalattice-tray` (Windows/macOS UI). Orphan prevention is OS-native
+(Job Object / PDEATHSIG+systemd cgroup / tracked PID+watchdog).
 
 The curl installer with `--token` writes `agent.env` and starts the background agent automatically.
 

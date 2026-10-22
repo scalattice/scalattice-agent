@@ -45,12 +45,13 @@ done
 
 UNIT="scalattice-agent.service"
 WATCHDOG_TIMER="scalattice-agent-watchdog.timer"
-SRC="target/release/scalattice-agent"
+# Honor CARGO_TARGET_DIR (Cursor sandbox / CI often redirect away from ./target).
+SRC="${CARGO_TARGET_DIR:-target}/release/scalattice-agent"
 DEST="${HOME}/.local/bin/scalattice-agent"
 CFG_DIR="${HOME}/.config/scalattice"
 SYSTEMD_ENV="${CFG_DIR}/agent.systemd.env"
 AGENT_ENV="${CFG_DIR}/agent.env"
-LOCAL_WS_DEFAULT="ws://127.0.0.1:8080/v1/operators/agent/ws"
+LOCAL_WS_DEFAULT="ws://127.0.0.1:8080/v1/providers/agent/ws"
 
 upsert_env_key() {
   local file="$1" key="$2" value="$3"
@@ -159,10 +160,38 @@ mkdir -p "$(dirname "$DEST")"
 
 # Count parent agent runtimes (exclude workers and this script's shell helpers).
 count_agent_runtimes() {
-  # Parents show cmdline ending in "foreground" (systemd) or bare binary.
-  # Workers always have "worker" in argv.
+  # Match the binary argv0, not repo paths like .../scalattice-agent/scripts/...
+  # Parents: foreground / bare binary. Workers have "worker" in argv.
   ps -eo pid=,args= 2>/dev/null \
-    | awk '/scalattice-agent/ && $0 !~ /awk/ && $0 !~ /worker/ { c++ } END { print c+0 }'
+    | awk '
+      /\/scalattice-agent( |$)/ && $0 !~ /awk/ && $0 !~ / worker( |$)/ && $0 !~ /dev-swap-linux/ {
+        c++
+      }
+      END { print c+0 }
+    '
+}
+
+kill_agent_tree() {
+  local sig="${1:--TERM}"
+  # Legacy kids + named slot hardlinks (cuda/vulkan/cpu) + supervisor.
+  pkill "$sig" -f 'scalattice-agent worker' 2>/dev/null || true
+  pkill "$sig" -f 'scalattice-slot-' 2>/dev/null || true
+  pkill "$sig" -x scalattice-agent 2>/dev/null || true
+  pkill "$sig" -x scalattice-slot-cuda-0 2>/dev/null || true
+  pkill "$sig" -x scalattice-slot-cuda-1 2>/dev/null || true
+  if [[ -x "$DEST" ]]; then
+    pkill "$sig" -f "${DEST}( |$)" 2>/dev/null || true
+  fi
+  local bin_dir
+  bin_dir="$(dirname "$DEST")"
+  if [[ -d "$bin_dir" ]]; then
+    # Kill by exact hardlink basename if still running.
+    local link
+    for link in "$bin_dir"/scalattice-slot-*; do
+      [[ -e "$link" ]] || continue
+      pkill "$sig" -f "$(basename "$link")" 2>/dev/null || true
+    done
+  fi
 }
 
 stop_all_agents() {
@@ -171,37 +200,33 @@ stop_all_agents() {
     systemctl --user stop "$WATCHDOG_TIMER" 2>/dev/null || true
     systemctl --user stop "$UNIT" 2>/dev/null || true
   fi
-  # Workers orphaned by process::exit; also any stray foreground runtime.
-  pkill -f 'scalattice-agent worker' 2>/dev/null || true
-  pkill -x scalattice-agent 2>/dev/null || true
-  # Match installed path too (some shells show full path as argv0).
-  if [[ -x "$DEST" ]]; then
-    pkill -f "${DEST}( |$)" 2>/dev/null || true
-  fi
+  kill_agent_tree -TERM
   # Drop stale flock holder pid file; next start recreates it.
   rm -f "${CFG_DIR}/agent.runtime.lock"
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
     local n
     n="$(count_agent_runtimes)"
-    if [[ "$n" -eq 0 ]]; then
+    local slots
+    # pipefail: pgrep exits 1 when nothing matches — swallow that.
+    slots="$(pgrep -f 'scalattice-slot-' 2>/dev/null | wc -l | tr -d ' ' || true)"
+    slots="${slots:-0}"
+    if [[ "$n" -eq 0 && "$slots" -eq 0 ]]; then
       break
     fi
-    echo "    waiting for agent exit… ($n still running)"
-    pkill -9 -f 'scalattice-agent worker' 2>/dev/null || true
-    pkill -9 -x scalattice-agent 2>/dev/null || true
-    [[ -x "$DEST" ]] && pkill -9 -f "${DEST}( |$)" 2>/dev/null || true
+    echo "    waiting for agent exit… (parents=$n slots=$slots)"
+    kill_agent_tree -KILL
     sleep 0.4
   done
-  if [[ -e "$DEST" ]] && command -v fuser >/dev/null 2>&1 && fuser "$DEST" >/dev/null 2>&1; then
-    fuser -k "$DEST" 2>/dev/null || true
+  if [[ -e "$DEST" ]] && command -v fuser >/dev/null 2>&1; then
+    fuser "$DEST" >/dev/null 2>&1 && fuser -k "$DEST" 2>/dev/null || true
     sleep 0.3
   fi
   local left
   left="$(count_agent_runtimes)"
   if [[ "$left" -ne 0 ]]; then
     echo "error: still $left scalattice-agent process(es) after stop; refuse to swap" >&2
-    ps -eo pid,ppid,args= | awk '/scalattice-agent/ && $0 !~ /awk/' >&2 || true
+    ps -eo pid,ppid,comm,args= | awk '/scalattice/ && $0 !~ /awk/' >&2 || true
     exit 1
   fi
 }
@@ -224,6 +249,8 @@ stop_all_agents
 echo "==> install $SRC -> $DEST"
 cp -f "$SRC" "$DEST"
 chmod +x "$DEST"
+# Drop stale role hardlinks (old inode) so the new binary recreates them.
+rm -f "$(dirname "$DEST")"/scalattice-slot-* "$(dirname "$DEST")"/scalattice-tray 2>/dev/null || true
 
 echo "==> restart (systemd only — never leave a second foreground owner)"
 if command -v systemctl >/dev/null 2>&1 && systemctl --user cat "$UNIT" >/dev/null 2>&1; then
@@ -257,9 +284,16 @@ else
 fi
 echo "==> tip: \`scalattice-agent foreground\` with systemd installed only follows logs;"
 echo "    it does not start a second GPU agent. Use journalctl --user -u $UNIT -f to watch."
+echo "==> process names (Task Manager equivalent):"
+echo "    ps -eo pid,ppid,comm,args | grep -E 'scalattice|PID'"
+echo "    htop   # F4 filter: scalattice   (COMM column = short name)"
+echo "    pstree -ap | grep -A5 scalattice"
 # Quick log peek for register/connect
 if command -v journalctl >/dev/null 2>&1; then
-  sleep 1
+  sleep 2
   echo "==> recent agent log:"
   journalctl --user -u "$UNIT" -n 15 --no-pager 2>/dev/null | tail -15 || true
 fi
+echo "==> after swap process tree:"
+ps -eo pid,ppid,comm,args= | awk 'NR==1 || (/scalattice/ && $0 !~ /awk/)' || true
+ls -la "$(dirname "$DEST")"/scalattice-slot-* 2>/dev/null || echo "(no slot hardlinks yet — check again after workers spawn)"

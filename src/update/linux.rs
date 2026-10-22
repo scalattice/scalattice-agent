@@ -599,7 +599,12 @@ fn apply_update(staging: &Path) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for dest_bin in &targets {
         match replace_unix_binary(&source_bin, dest_bin) {
-            Ok(()) => replaced += 1,
+            Ok(()) => {
+                // Role hardlinks (scalattice-slot-*, scalattice-tray) pin the old
+                // inode across rename — drop stale ones so kids/tray re-link.
+                crate::supervisor::worker_job::clear_role_images(dest_bin);
+                replaced += 1;
+            }
             Err(err) => {
                 eprintln!(
                     "self-update: could not replace {}: {err:#}",
