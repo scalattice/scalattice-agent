@@ -231,6 +231,35 @@ pub fn worker_image_for_slot(agent_bin: &Path, slot_id: &str) -> PathBuf {
     ensure_role_image(agent_bin, &slot_link_name(slot_id))
 }
 
+/// Kill any leftover processes still running under this slot's role image name.
+///
+/// Supervisor rebuild (VRAM nameplate refresh) and failed-handshake respawns can
+/// leave a second `scalattice-slot-cuda-0` beside the live worker when the old
+/// `Supervisor` Arc is still held. Reap by image name before every spawn.
+pub fn reap_slot_image_processes(slot_id: &str) {
+    let name = slot_link_name(slot_id);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", &name, "/F", "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // `-x` = exact comm match (hardlink basename). Ignore exit status when none.
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", &name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// Tray / menu-bar control panel as `scalattice-tray` (same bytes as the agent).
 /// Linux has no tray UI — only Windows + macOS create this role image.
 #[cfg(any(windows, target_os = "macos"))]
