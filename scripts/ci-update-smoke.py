@@ -1570,7 +1570,7 @@ def main() -> int:
     http_thread.start()
     ws_thread, ws_port = start_ws_server(state)
     http_base = f"http://127.0.0.1:{http_port}"
-    ws_url = f"ws://127.0.0.1:{ws_port}/v1/operators/agent/ws"
+    ws_url = f"ws://127.0.0.1:{ws_port}/v1/providers/agent/ws"
     print(f"==> mock release {http_base}  mock ws {ws_url}")
 
     env = isolate_env(home, localappdata, bin_path, http_base, ws_url)

@@ -52,7 +52,11 @@ if /I "%~1"=="tray-open" (
   )
 )
 if /I "%~1"=="tray-debug" (
-  "%INSTALL%scalattice-agent.exe" tray --force
+  if exist "%INSTALL%scalattice-tray.exe" (
+    "%INSTALL%scalattice-tray.exe" tray --force
+  ) else (
+    "%INSTALL%scalattice-agent.exe" tray --force
+  )
   exit /b %ERRORLEVEL%
 )
 "%INSTALL%scalattice-agent.exe" %*

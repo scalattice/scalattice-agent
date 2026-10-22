@@ -68,9 +68,10 @@ pub fn restart_background_from_config(config: &AgentConfig) -> Result<()> {
 
 /// Reap slot workers before any `process::exit`.
 ///
-/// Workers share the `scalattice-agent` binary name and use `kill_on_drop(true)`.
-/// `process::exit` skips Drop, so without this nvidia-smi fills with orphaned
-/// CUDA contexts and the next supervisor spawn adds another set on top.
+/// Slot kids use `kill_on_drop(true)` and (on Windows) a Job Object, but
+/// `process::exit` skips Drop — so we also PID-sweep supervisor + `scalattice-slot-*`
+/// before hard exit. Otherwise nvidia-smi fills with orphan CUDA contexts and the
+/// next spawn stacks another set on top.
 pub fn prepare_process_exit_cleanup() {
     platform::kill_non_tray_agent_processes();
 }
@@ -96,8 +97,14 @@ pub fn run_watchdog_tick() -> Result<()> {
         return Ok(());
     }
     if service_active() {
-        if crate::state::connection_state_looks_wedged() {
-            tracing::warn!("watchdog: background agent looks wedged; restarting");
+        let wedged = crate::state::connection_state_looks_wedged();
+        let orphan_workers = background_looks_orphaned();
+        if wedged || orphan_workers {
+            tracing::warn!(
+                wedged,
+                orphan_workers,
+                "watchdog: background agent unhealthy; sweeping and restarting"
+            );
             let token = crate::config::read_saved_agent_token()
                 .ok_or_else(|| anyhow::anyhow!("no saved provider token"))?;
             let config = AgentConfig::from_env_and_cli(Some(token))?;
@@ -106,6 +113,12 @@ pub fn run_watchdog_tick() -> Result<()> {
         return Ok(());
     }
     ensure_background_running_if_configured()
+}
+
+/// True when slot workers are listed without a healthy supervisor — leftover kids
+/// after `process::exit` skipped Drop (wedge path). All OSes.
+fn background_looks_orphaned() -> bool {
+    platform::background_looks_orphaned()
 }
 
 /// Install the OS reconnect watchdog without restarting this process.
@@ -152,15 +165,16 @@ pub fn restart_runtime_from_saved_token() -> Result<()> {
 
 /// Persist the provider token and ensure the background agent is registered + running.
 ///
-/// Always goes through the full start path (not a "already running" short-circuit) so
-/// Windows Startup shortcuts are created even when the installer already launched a
-/// foreground worker. Skipping that left the tray stuck on "Agent: not set up yet".
+/// Always force-restarts the background worker. A soft "already running" short-circuit
+/// left wedged / orphaned `scalattice-agent.exe` trees looking live (mutex gone, workers
+/// still listed) so tray "Save token → Reconnecting…" did nothing (fleet: New PC /
+/// Haithem multi-worker leftovers after event-loop wedge).
 pub fn save_agent_token(config: &AgentConfig) -> Result<()> {
     persist_agent_token(&config.token)?;
     if !background_service_available() {
         return Ok(());
     }
-    start_background_from_config(config)?;
+    restart_background_from_config(config)?;
     #[cfg(windows)]
     {
         // Interactive set-token / tray Save only: may show UAC once if boot task missing.

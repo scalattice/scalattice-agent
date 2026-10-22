@@ -21,6 +21,8 @@ scalattice-agent status
 
 Full agent logs go to `~/.local/share/scalattice/agent.log` (always verbose; rotated at 8 MiB with one backup). `scalattice-agent logs` tails that file.
 
+Background mode uses a user systemd unit. Slot workers appear as `scalattice-slot-{id}` in `ps`/`nvidia-smi`/`rocm-smi` and die with the unit (`KillMode=control-group`) or when the supervisor exits (`PR_SET_PDEATHSIG`).
+
 ### Windows
 
 Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/scalattice/scalattice-agent/releases/latest/download/ScalatticeAgentSetup-x86_64.exe)** from [GitHub Releases](https://github.com/scalattice/scalattice-agent/releases) (or use **Download Windows installer** on the Providers dashboard).
@@ -32,6 +34,16 @@ Download and run **[ScalatticeAgentSetup-x86_64.exe](https://github.com/scalatti
 Setup guide: https://scalattice.cloud/install/agent-setup
 
 The agent registers a **boot** scheduled task (runs as SYSTEM before sign-in) plus logon Startup/Task rails. Use the notification area icon for status, token changes, and live logs. Full detail is written to `%LOCALAPPDATA%\Scalattice\logs\agent.log` (rotated at 8 MiB, one backup). The tray Live log can show a Simplified view; the file itself is always verbose.
+
+**Process tree (all OSes):** one install binary, three roles (hardlink/symlink of the same bytes so `ps` / Task Manager / Activity Monitor show distinct names):
+
+| Image name | Role |
+|------------|------|
+| `scalattice-agent` (`.exe` on Windows) | Supervisor — Cloud WebSocket, routing, spawns kids |
+| `scalattice-slot-{id}` (e.g. `cuda-0`, `vulkan-0`, `metal-0`, `cpu`) | Per-device inference worker (NVIDIA / AMD / Intel / Apple / CPU) |
+| `scalattice-tray` | Tray / menu-bar control panel (Windows + macOS) |
+
+Healthy multi-GPU box: **1 supervisor + 1 slot worker per compute device** (+ optional tray). Kids are tied to the supervisor so a wedge cannot orphan GPU contexts: Windows Job Object, Linux `PR_SET_PDEATHSIG` + systemd `KillMode=control-group`, macOS tracked PID reap + LaunchAgent watchdog sweeps.
 
 ### macOS (Apple Silicon)
 
@@ -47,7 +59,7 @@ Setup guide: https://scalattice.cloud/install/agent-setup?os=macos
 
 The binary is compiled and signed on GitHub’s `macos-14` runners. See [docs/macos-signing.md](docs/macos-signing.md).
 
-Background mode uses a LaunchAgent. Stay signed in (or enable auto-login) so launchd keeps the agent running. The menu bar app is the same control panel as Windows (status, token, logs).
+Background mode uses a LaunchAgent. Stay signed in (or enable auto-login) so launchd keeps the agent running. The menu bar app is the same control panel as Windows (status, token, logs). Slot workers show as `scalattice-slot-metal-0` (etc.) in Activity Monitor; the tray uses `scalattice-tray`.
 
 ### Uninstall
 

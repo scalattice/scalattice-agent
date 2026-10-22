@@ -4,10 +4,15 @@ use std::env;
 use std::path::Path;
 
 /// Hard-coded Scalattice Cloud WebSocket endpoint (not configurable).
+/// Must be `/v1/providers/agent/ws` — `/v1/operators/...` is the developer
+/// inference gateway and returns HTTP 401 for `slt_provider_…` tokens.
 pub const SCALATTICE_WS_URL: &str = "wss://api.scalattice.cloud/v1/providers/agent/ws";
 
-/// Hard-coded Scalattice Cloud HTTPS API base for agent control calls.
-pub const SCALATTICE_API_BASE: &str = "https://api.scalattice.cloud/v1/providers/agent";
+/// Backend HTTPS for agent lifecycle (uninstall notify). Must hit scalattice.cloud
+/// `/api/v1/providers/agent/*` — api.*/operators/uninstall is the developer inference
+/// gateway and rejects `slt_provider_…` tokens (uninstall never landed until this split).
+pub const SCALATTICE_LIFECYCLE_API_BASE: &str =
+    "https://scalattice.cloud/api/v1/providers/agent";
 
 /// Loopback-only release HTTP base (`SCALATTICE_UPDATE_BASE`). Production stays
 /// on Scalattice Cloud; CI update smoke points this at a local mock.

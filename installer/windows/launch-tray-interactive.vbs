@@ -17,7 +17,9 @@ env("SCALATTICE_TRAY_OPEN") = "1"
 env("SCALATTICE_TRAY") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.CurrentDirectory = install
-sh.Run """" & install & "\scalattice-agent.exe"" tray --open", 0, False
+exe = install & "\scalattice-tray.exe"
+If Not fso.FileExists(exe) Then exe = install & "\scalattice-agent.exe"
+sh.Run """" & exe & """ tray --open", 0, False
 
 Function CudaRuntimeOk(fso, lib, install)
   Dim names, i, name

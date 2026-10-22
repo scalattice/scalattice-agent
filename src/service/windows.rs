@@ -110,7 +110,18 @@ fn force_restart_background(config: &AgentConfig, skip_tray: bool) -> Result<()>
     sync_launch_scripts()?;
     ensure_agent_autostart_registered()?;
 
-    stop_background_for_token_restart()?;
+    // Sweep first even when stop loops think nothing is running — orphan workers
+    // can survive a soft stop and then block the next mutex acquire / eat VRAM.
+    kill_non_tray_agent_processes();
+    stop_background_for_token_restart().or_else(|err| {
+        // Last resort: kill again and proceed; spawn still takes the mutex.
+        kill_non_tray_agent_processes();
+        if background_agent_running() {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    })?;
     spawn_background_detached()?;
 
     if !skip_tray && !in_tray_process() && !crate::config::update_smoke_test() {
@@ -254,10 +265,11 @@ fn force_kill_all_agent_processes() {
         return;
     }
     for _ in 0..8 {
-        let _ = Command::new("taskkill")
-            .args(["/IM", "scalattice-agent.exe", "/F", "/T"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+        // Kill by PID so we catch supervisor, tray hardlink, and scalattice-slot-*.exe.
+        // `/IM scalattice-agent.exe` alone leaves named slot orphans.
+        for pid in agent_exe_pids() {
+            let _ = taskkill_pid(pid);
+        }
         std::thread::sleep(std::time::Duration::from_millis(350));
         if !background_agent_running() && !tray_instance_running() {
             break;
@@ -312,8 +324,14 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     // scheduled tasks fire.
     ensure_agent_autostart_registered()?;
 
-    if token_changed || !background_agent_running() {
-        if token_changed && background_agent_running() {
+    let running = background_agent_running();
+    let orphaned = background_looks_orphaned();
+    let wedged = crate::state::connection_state_looks_wedged();
+    // Soft-skip only when a healthy mutex-holding agent is already up. Orphans /
+    // wedge leftovers used to count as "running" via process listing alone, so
+    // Save token never restarted (fleet: DESKTOP-SJVL4OL / Haithem).
+    if token_changed || !running || orphaned || wedged {
+        if running || orphaned {
             stop_background_for_token_restart()?;
         }
         start_background_with_retry()?;
@@ -325,6 +343,22 @@ fn ensure_background_task(config: &AgentConfig, skip_tray: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Agent exe processes exist but the Global background mutex does not — leftover
+/// slot workers (or a dead supervisor) after wedge/`process::exit` skipped Drop.
+pub fn background_looks_orphaned() -> bool {
+    if crate::config::update_smoke_test() {
+        return false;
+    }
+    if background_mutex_held() {
+        return false;
+    }
+    let me = std::process::id();
+    let tray_pid = tray_pid_from_file();
+    agent_exe_pids()
+        .into_iter()
+        .any(|pid| pid != me && Some(pid) != tray_pid)
 }
 
 fn start_background_with_retry() -> Result<()> {
@@ -572,7 +606,10 @@ fn background_agent_process_listed() -> bool {
                             .collect::<Vec<_>>()
                             .as_slice(),
                     );
-                    if name.eq_ignore_ascii_case("scalattice-agent.exe") {
+                    let lower = name.to_ascii_lowercase();
+                    if lower == "scalattice-agent.exe"
+                        || (lower.starts_with("scalattice-slot-") && lower.ends_with(".exe"))
+                    {
                         found = true;
                         break;
                     }
@@ -621,6 +658,9 @@ fn stop_background_agent_only() {
     // like a live agent to background_agent_process_listed — tray then refuses
     // to start a fresh background process. Never taskkill /IM (that kills tray).
     kill_non_tray_agent_processes();
+    // Second pass: first /T tree kill can race a respawning worker.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    kill_non_tray_agent_processes();
 }
 
 /// Kill every scalattice-agent.exe except this process and the tray.
@@ -650,30 +690,50 @@ fn taskkill_pid(pid: u32) -> bool {
 }
 
 fn agent_exe_pids() -> Vec<u32> {
-    // Lightweight: tasklist CSV, no WMI command-line lookup (that can hang on bad drivers).
-    let output = Command::new("tasklist")
-        .args([
-            "/FI",
-            "IMAGENAME eq scalattice-agent.exe",
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            // "scalattice-agent.exe","1234","Session","..."
-            let mut parts = line.split(',');
-            let _name = parts.next()?;
-            let pid = parts.next()?.trim().trim_matches('"').parse().ok()?;
-            Some(pid)
-        })
-        .collect()
+    // Lightweight: Toolhelp snapshot so we catch both `scalattice-agent.exe` and
+    // per-slot hardlinks `scalattice-slot-*.exe` (tasklist /FI is one image name).
+    let mut pids = Vec::new();
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return pids;
+        }
+        let mut entry = std::mem::zeroed::<PROCESSENTRY32W>();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let name = String::from_utf16_lossy(
+                    entry
+                        .szExeFile
+                        .iter()
+                        .copied()
+                        .take_while(|&c| c != 0)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                );
+                let lower = name.to_ascii_lowercase();
+                if lower == "scalattice-agent.exe"
+                    || (lower.starts_with("scalattice-slot-") && lower.ends_with(".exe"))
+                    || lower == "scalattice-tray.exe"
+                {
+                    let pid = entry.th32ProcessID;
+                    if pid != 0 {
+                        pids.push(pid);
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    pids
 }
 
 fn stop_background_for_token_restart() -> Result<()> {
@@ -733,6 +793,16 @@ fn sync_launch_scripts() -> Result<()> {
     let install = install_dir()?;
     fs::create_dir_all(&install)?;
 
+    // Distinct Task Manager name for the tray (same binary via hardlink).
+    if let Ok(agent_bin) = crate::paths::resolve_agent_binary() {
+        let _ = crate::supervisor::worker_job::tray_image(&agent_bin);
+    } else {
+        let agent_bin = install.join("scalattice-agent.exe");
+        if agent_bin.is_file() {
+            let _ = crate::supervisor::worker_job::tray_image(&agent_bin);
+        }
+    }
+
     // Keep in sync with installer/windows/scalattice-run.cmd
     let run_cmd = "@echo off\r\n\
 setlocal\r\n\
@@ -786,7 +856,11 @@ if /I \"%~1\"==\"tray-open\" (\r\n\
   )\r\n\
 )\r\n\
 if /I \"%~1\"==\"tray-debug\" (\r\n\
-  \"%INSTALL%scalattice-agent.exe\" tray --force\r\n\
+  if exist \"%INSTALL%scalattice-tray.exe\" (\r\n\
+    \"%INSTALL%scalattice-tray.exe\" tray --force\r\n\
+  ) else (\r\n\
+    \"%INSTALL%scalattice-agent.exe\" tray --force\r\n\
+  )\r\n\
   exit /b %ERRORLEVEL%\r\n\
 )\r\n\
 \"%INSTALL%scalattice-agent.exe\" %*\r\n\
@@ -859,7 +933,9 @@ env("SCALATTICE_TRAY_HIDDEN") = "1"
 env("SCALATTICE_TRAY") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.CurrentDirectory = install
-sh.Run """" & install & "\scalattice-agent.exe"" tray", 0, False
+exe = install & "\scalattice-tray.exe"
+If Not fso.FileExists(exe) Then exe = install & "\scalattice-agent.exe"
+sh.Run """" & exe & """ tray", 0, False
 
 Function CudaRuntimeOk(fso, lib, install)
   Dim names, i, name
@@ -907,7 +983,9 @@ env("SCALATTICE_TRAY_OPEN") = "1"
 env("SCALATTICE_TRAY") = "1"
 env("PATH") = install & ";" & lib & ";" & env("PATH")
 sh.CurrentDirectory = install
-sh.Run """" & install & "\scalattice-agent.exe"" tray --open", 0, False
+exe = install & "\scalattice-tray.exe"
+If Not fso.FileExists(exe) Then exe = install & "\scalattice-agent.exe"
+sh.Run """" & exe & """ tray --open", 0, False
 
 Function CudaRuntimeOk(fso, lib, install)
   Dim names, i, name

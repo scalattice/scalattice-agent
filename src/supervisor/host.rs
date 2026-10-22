@@ -124,6 +124,8 @@ pub struct Supervisor {
     local_blocks: Mutex<HashMap<String, HashSet<String>>>,
     /// Metal slots whose GPU decode collapsed/failed; respawned workers skip GPU tiers.
     metal_gpu_unreliable: Mutex<HashSet<String>>,
+    /// Windows Job Object: closing this (or supervisor death) kills every slot worker.
+    worker_job: crate::supervisor::worker_job::WorkerJob,
 }
 
 /// Give up only when the worker stops sending progress/token lines.
@@ -406,6 +408,8 @@ impl Supervisor {
                 crate::specs::accelerator_incompatible_message()
             );
         }
+        let worker_job = crate::supervisor::worker_job::WorkerJob::create()
+            .context("create slot-worker job object (orphan prevention)")?;
         let mut workers = HashMap::new();
         let mut unusable_slots = HashSet::new();
         for slot in &plan.slots {
@@ -417,7 +421,7 @@ impl Supervisor {
                 unusable_slots.insert(slot.id.clone());
                 continue;
             }
-            match spawn_worker(slot, false).await {
+            match spawn_worker(slot, false, &worker_job).await {
                 Ok(w) => {
                     if w.healthy {
                         info!(slot = %slot.id, kind = %slot.kind, "slot worker ready");
@@ -458,6 +462,7 @@ impl Supervisor {
             server_blocks: Mutex::new(HashMap::new()),
             local_blocks: Mutex::new(HashMap::new()),
             metal_gpu_unreliable: Mutex::new(HashSet::new()),
+            worker_job,
         }))
     }
 
@@ -497,7 +502,7 @@ impl Supervisor {
 
     async fn spawn_plan_worker(&self, slot: &ComputeSlot) -> Result<SlotWorker> {
         let metal = self.metal_gpu_unreliable_for(&slot.id).await;
-        spawn_worker(slot, metal).await
+        spawn_worker(slot, metal, &self.worker_job).await
     }
 
     /// Refuse a router preferred pin that cannot host this job on nameplate or
@@ -2547,7 +2552,7 @@ impl Supervisor {
             tp_group: None,
         };
 
-        let mut tp_worker = match spawn_worker(&tp_spec, false).await {
+        let mut tp_worker = match spawn_worker(&tp_spec, false, &self.worker_job).await {
             Ok(w) => w,
             Err(err) => {
                 // Restore siblings so slots aren't stuck busy after a failed claim.
@@ -2555,7 +2560,7 @@ impl Supervisor {
                 for sid in &placement.slot_ids {
                     if let Some(spec) = self.plan.slots.iter().find(|s| s.id == *sid) {
                         let metal = self.metal_gpu_unreliable_for(&spec.id).await;
-                        match spawn_worker(spec, metal).await {
+                        match spawn_worker(spec, metal, &self.worker_job).await {
                             Ok(mut w) => {
                                 w.busy = false;
                                 workers.insert(sid.clone(), w);
@@ -2619,7 +2624,7 @@ impl Supervisor {
         for sid in &placement.slot_ids {
             if let Some(spec) = self.plan.slots.iter().find(|s| s.id == *sid) {
                 let metal = self.metal_gpu_unreliable_for(&spec.id).await;
-                match spawn_worker(spec, metal).await {
+                match spawn_worker(spec, metal, &self.worker_job).await {
                     Ok(mut w) => {
                         w.busy = false;
                         workers.insert(sid.clone(), w);
@@ -2639,7 +2644,11 @@ impl Supervisor {
     }
 }
 
-async fn spawn_worker(slot: &ComputeSlot, metal_gpu_decode_unreliable: bool) -> Result<SlotWorker> {
+async fn spawn_worker(
+    slot: &ComputeSlot,
+    metal_gpu_decode_unreliable: bool,
+    worker_job: &crate::supervisor::worker_job::WorkerJob,
+) -> Result<SlotWorker> {
     let boot = WorkerBootConfig {
         slot_id: slot.id.clone(),
         card: slot.card.clone(),
@@ -2648,15 +2657,18 @@ async fn spawn_worker(slot: &ComputeSlot, metal_gpu_decode_unreliable: bool) -> 
             && matches!(slot.card.strategy, PoolStrategy::Metal),
     };
     let boot_json = serde_json::to_string(&boot)?;
-    // Always re-exec this binary so PATH can't pick an older agent without `worker`.
-    let bin = std::env::current_exe().unwrap_or_else(|_| {
+    // Re-exec this install's binary (or a per-slot hardlink/symlink) so PATH can't
+    // pick an older agent, and process lists show scalattice-slot-{id} not a clone.
+    let agent_bin = std::env::current_exe().unwrap_or_else(|_| {
         crate::paths::resolve_agent_binary()
             .unwrap_or_else(|_| std::path::PathBuf::from("scalattice-agent"))
     });
+    let bin = crate::supervisor::worker_job::worker_image_for_slot(&agent_bin, &slot.id);
 
-    let mut child = Command::new(&bin)
-        .arg("worker")
+    let mut cmd = Command::new(&bin);
+    cmd.arg("worker")
         .env("SCALATTICE_WORKER_CONFIG", &boot_json)
+        .env("SCALATTICE_SLOT_ID", &slot.id)
         // Worker logging owns its EnvFilter (full llama detail → agent.log).
         // Do not inherit a supervisor `RUST_LOG=warn` that would drop INFO thoughts.
         .env_remove("RUST_LOG")
@@ -2665,9 +2677,30 @@ async fn spawn_worker(slot: &ComputeSlot, metal_gpu_decode_unreliable: bool) -> 
         // Never inherit stderr into a GUI parent: Windows tray apps often don't
         // drain it, so llama/tracing fills the pipe and the worker stalls for minutes.
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+
+    // Linux: PR_SET_PDEATHSIG so a hard-exited supervisor cannot orphan kids
+    // (cuda/vulkan/metal/cpu). macOS: tracked PIDs + watchdog (no pdeathsig).
+    // tokio::process::Command::pre_exec is inherent on Unix — no CommandExt import.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| crate::supervisor::worker_job::install_child_guards());
+    }
+
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn worker for slot {} ({})", slot.id, bin.display()))?;
+
+    if let Some(pid) = child.id() {
+        if let Err(err) = worker_job.assign_pid(pid) {
+            warn!(
+                slot = %slot.id,
+                pid,
+                error = %err,
+                "failed to register slot worker with orphan-prevention job; orphan risk on hard exit"
+            );
+        }
+    }
 
     let slot_log_id = slot.id.clone();
     if let Some(stderr) = child.stderr.take() {
