@@ -75,22 +75,76 @@ fn link_tracks_agent(agent_bin: &Path, link: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        match (
-            agent_meta.volume_serial_number(),
-            link_meta.volume_serial_number(),
-            agent_meta.file_index(),
-            link_meta.file_index(),
-        ) {
-            (Some(av), Some(lv), Some(ai), Some(li)) => av == lv && ai == li,
-            _ => false,
-        }
+        // `MetadataExt::{volume_serial_number,file_index}` need unstable
+        // `windows_by_handle` (E0658 on stable CI). Use Win32 file identity instead.
+        let _ = (agent_meta, link_meta);
+        return windows_same_file_identity(agent_bin, link);
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (agent_meta, link_meta);
         false
     }
+}
+
+/// Windows hardlink / same-MFT check via stable `GetFileInformationByHandle`.
+#[cfg(windows)]
+fn windows_same_file_identity(a: &Path, b: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    fn open(path: &Path) -> Option<HANDLE> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            None
+        } else {
+            Some(handle)
+        }
+    }
+
+    fn identity(handle: HANDLE) -> Option<(u32, u64)> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Some((info.dwVolumeSerialNumber, index))
+    }
+
+    let Some(ha) = open(a) else {
+        return false;
+    };
+    let Some(hb) = open(b) else {
+        unsafe {
+            CloseHandle(ha);
+        }
+        return false;
+    };
+    let same = match (identity(ha), identity(hb)) {
+        (Some(ia), Some(ib)) => ia == ib,
+        _ => false,
+    };
+    unsafe {
+        CloseHandle(ha);
+        CloseHandle(hb);
+    }
+    same
 }
 
 /// Prefer a same-directory hardlink (same inode → same codesign CDHash on macOS).
