@@ -220,9 +220,10 @@ pub(crate) fn decode_token(model: &LlamaModel, token: LlamaToken) -> Result<Stri
         .context("decode generated token")
 }
 
-/// Qwen vocab[0] is `!`. Broken GPU kernels (wrong Metal metallib, starved
-/// offload) emit it for the whole completion. The generate loop treats a
-/// trip as a failed placement tier so the cache can walk to the next one.
+/// Broken GPU kernels (wrong Metal metallib, starved offload) collapse to
+/// vocab[0] for the whole completion — `!` on Qwen, `<unk>` / pad on Mistral
+/// family. The generate loop treats a trip as a failed placement tier so the
+/// cache can walk to the next one.
 pub(crate) const VOCAB_ZERO_COLLAPSE: &str = "vocab_zero_collapse";
 
 /// Set when Metal GPU layers produce garbage logits. Later loads on this
@@ -272,20 +273,17 @@ pub(crate) fn bump_vocab_zero_run(token: LlamaToken, piece: &str, run: &mut u32)
     *run >= 8
 }
 
-/// Greedy argmax on broken Metal logits always picks token 0 (`!` on Qwen).
-/// Mask it so decode can continue; a bang-run still stops as EOS below.
+/// Greedy argmax on broken Metal logits always picks token 0 (`!` on Qwen,
+/// `<unk>` on Mistral/Ministral). Always mask it so decode can continue on
+/// any tokenizer; an 8-token vocab-zero run still fails the placement tier.
 fn sampler_for_model(model: &LlamaModel) -> LlamaSampler {
-    let mut stages = Vec::with_capacity(2);
-    if let Ok(piece) = decode_token(model, LlamaToken(0)) {
-        if !piece.is_empty() && piece.chars().all(|c| c == '!') {
-            stages.push(LlamaSampler::logit_bias(
-                model.n_vocab(),
-                &[LlamaLogitBias::new(LlamaToken(0), -1.0e9)],
-            ));
-        }
-    }
-    stages.push(LlamaSampler::greedy());
-    LlamaSampler::chain_simple(stages)
+    LlamaSampler::chain_simple(vec![
+        LlamaSampler::logit_bias(
+            model.n_vocab(),
+            &[LlamaLogitBias::new(LlamaToken(0), -1.0e9)],
+        ),
+        LlamaSampler::greedy(),
+    ])
 }
 
 pub(crate) fn backend() -> Result<&'static LlamaBackend> {
@@ -1291,6 +1289,12 @@ mod tests {
         assert!(!bump_vocab_zero_run(LlamaToken(0), "!", &mut run));
         assert!(!bump_vocab_zero_run(LlamaToken(42), "Hi", &mut run));
         assert_eq!(run, 0);
+        // Mistral/Ministral vocab[0] is typically <unk>, not `!` — still trips.
+        run = 0;
+        for _ in 0..7 {
+            assert!(!bump_vocab_zero_run(LlamaToken(0), "<unk>", &mut run));
+        }
+        assert!(bump_vocab_zero_run(LlamaToken(0), "<unk>", &mut run));
         assert!(is_cpu_load_label("cpu-metal"));
         assert!(is_cpu_load_label("cpu-only"));
         assert!(!is_cpu_load_label("gpu-full"));
