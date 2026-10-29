@@ -2214,8 +2214,15 @@ async fn handle_server_message(
                         });
                         if state.lock().await.needs_reregister() {
                             send_register_message(state, write).await?;
-                        } else if purge_requested || catalog_updated {
+                        } else if catalog_updated {
+                            // Catalog push: advertise ASAP. Do NOT heartbeat solely for
+                            // purge_requested — staged deletes are async and the disk
+                            // inventory is still stale, so the next pong would still list
+                            // the same purges and we'd tight-loop platform heartbeats.
                             send_heartbeat(state, write).await?;
+                        } else if purge_requested {
+                            // Let the regular 12s heartbeat carry the post-purge disk view.
+                            debug!("purge requested; waiting for staged delete before re-heartbeat");
                         }
                     }
                 }
