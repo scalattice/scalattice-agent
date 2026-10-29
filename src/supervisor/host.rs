@@ -405,7 +405,24 @@ impl Supervisor {
             crate::supervisor::worker_job::reap_slot_image_processes(&id);
         }
         workers.clear();
+        drop(workers);
+        // Workers checked out for an in-flight invoke/evict sit outside `workers`.
+        // Kill those PIDs before clearing the checkout map, then reap by argv so
+        // Linux (15-char `comm`) cannot leave a same-slot orphan beside a rebuild.
+        let checkout_pids: Vec<u32> = self
+            .checkouts
+            .lock()
+            .await
+            .values()
+            .filter_map(|c| c.pid)
+            .collect();
+        for pid in checkout_pids {
+            force_kill_pid(pid);
+        }
         self.checkouts.lock().await.clear();
+        for slot in &self.plan.slots {
+            crate::supervisor::worker_job::reap_slot_image_processes(&slot.id);
+        }
     }
 
     pub async fn start(devices: &[ComputeDevice]) -> Result<Arc<Self>> {

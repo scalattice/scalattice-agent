@@ -231,15 +231,59 @@ pub fn worker_image_for_slot(agent_bin: &Path, slot_id: &str) -> PathBuf {
     ensure_role_image(agent_bin, &slot_link_name(slot_id))
 }
 
+/// Linux `comm` is capped at 15 chars, so `pkill -x scalattice-slot-cuda-*`
+/// can never match (`scalattice-slot-cuda-0` is 22 chars; live `comm` is
+/// `scalattice-slot`). Identify workers by argv instead.
+#[cfg(target_os = "linux")]
+fn linux_slot_worker_pids(slot_id: &str) -> Vec<u32> {
+    let name = slot_link_name(slot_id);
+    let name_bytes = name.as_bytes();
+    let me = std::process::id();
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let mut args = raw.split(|b| *b == 0).filter(|a| !a.is_empty());
+        let Some(argv0) = args.next() else {
+            continue;
+        };
+        let Some(argv1) = args.next() else {
+            continue;
+        };
+        if argv1 != b"worker" {
+            continue;
+        }
+        let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
+        if base == name_bytes {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
 /// Kill any leftover processes still running under this slot's role image name.
 ///
 /// Supervisor rebuild (VRAM nameplate refresh) and failed-handshake respawns can
 /// leave a second `scalattice-slot-cuda-0` beside the live worker when the old
 /// `Supervisor` Arc is still held. Reap by image name before every spawn.
 pub fn reap_slot_image_processes(slot_id: &str) {
-    let name = slot_link_name(slot_id);
     #[cfg(windows)]
     {
+        let name = slot_link_name(slot_id);
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let _ = std::process::Command::new("taskkill")
@@ -249,8 +293,18 @@ pub fn reap_slot_image_processes(slot_id: &str) {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
+        for pid in linux_slot_worker_pids(slot_id) {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            tracing::warn!(slot = %slot_id, pid, "reaped leftover slot worker");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let name = slot_link_name(slot_id);
         // `-x` = exact comm match (hardlink basename). Ignore exit status when none.
         let _ = std::process::Command::new("pkill")
             .args(["-x", &name])

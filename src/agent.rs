@@ -115,6 +115,8 @@ struct SessionState {
     /// Cached machine specs. RefCell: SessionState is only accessed while holding the tokio Mutex.
     specs_cache: RefCell<Option<(Instant, MachineSpecs)>>,
     supervisor: Option<Arc<Supervisor>>,
+    /// Process-wide live supervisor (shared with `run_agent` reconnect loop).
+    supervisor_slot: Option<Arc<Mutex<Arc<Supervisor>>>>,
     cached_slots: Vec<SlotStatus>,
     cached_idle_slots: u32,
     cached_gpu_occupied: bool,
@@ -170,6 +172,7 @@ impl SessionState {
             vram_lifecycle: VramLifecycleState::default(),
             specs_cache: RefCell::new(None),
             supervisor: None,
+            supervisor_slot: None,
             cached_slots: Vec::new(),
             cached_idle_slots: 0,
             cached_gpu_occupied: false,
@@ -1116,6 +1119,9 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
         slots = supervisor.plan().slots.len(),
         "compute supervisor online"
     );
+    // Shared across reconnects so a mid-session rebuild replaces the Arc that
+    // the next session-start reconcile uses (avoids spawning onto a stale map).
+    let supervisor_slot: Arc<Mutex<Arc<Supervisor>>> = Arc::new(Mutex::new(supervisor));
 
     let liveness = EventLoopLiveness::spawn();
     let mut backoff = RECONNECT_BACKOFF_MIN;
@@ -1132,7 +1138,10 @@ pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
             }
         }
 
-        match run_agent_session(&config, supervisor.clone(), &liveness, &mut backoff).await {
+        let supervisor = supervisor_slot.lock().await.clone();
+        match run_agent_session(&config, supervisor, supervisor_slot.clone(), &liveness, &mut backoff)
+            .await
+        {
             // Only Ctrl+C / explicit shutdown returns Ok. A server Close, idle
             // proxy drop, or any other session end must reconnect — on Windows the
             // background process is a one-shot task, so exiting here used to stay
@@ -1368,6 +1377,7 @@ async fn send_ws_message_timed(write: &SharedWsWrite, message: Message) -> Resul
 async fn run_agent_session(
     config: &AgentConfig,
     supervisor: Arc<Supervisor>,
+    supervisor_slot: Arc<Mutex<Arc<Supervisor>>>,
     liveness: &EventLoopLiveness,
     reconnect_backoff: &mut Duration,
 ) -> Result<()> {
@@ -1394,6 +1404,7 @@ async fn run_agent_session(
     {
         let mut guard = state.lock().await;
         guard.supervisor = Some(supervisor.clone());
+        guard.supervisor_slot = Some(supervisor_slot);
     }
     refresh_slot_cache(&state).await;
 
@@ -1613,18 +1624,23 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
             }
         };
         if let Some(specs) = specs {
-            // Drop the live supervisor from session state and shut it down
-            // *before* spawning replacements. Other Arcs may keep the old
-            // value alive briefly; shutdown+reap still kills its slot kids so
-            // we never end up with two scalattice-slot-cuda-0 processes.
-            let previous = state.lock().await.supervisor.take();
-            if let Some(prev) = previous {
-                prev.shutdown().await;
-            }
+            // Keep the previous supervisor reachable until the replacement is
+            // installed (avoids a window where invokes see "not started"), then
+            // shut it down. `Supervisor::start` reaps same-slot leftovers first.
             match Supervisor::start(&specs.compute_devices).await {
                 Ok(supervisor) => {
-                    let mut guard = state.lock().await;
-                    guard.supervisor = Some(supervisor);
+                    let (previous, slot) = {
+                        let mut guard = state.lock().await;
+                        let previous = guard.supervisor.replace(supervisor.clone());
+                        let slot = guard.supervisor_slot.clone();
+                        (previous, slot)
+                    };
+                    if let Some(slot) = slot {
+                        *slot.lock().await = supervisor;
+                    }
+                    if let Some(prev) = previous {
+                        prev.shutdown().await;
+                    }
                     info!("compute supervisor restarted (device policy or VRAM nameplate refresh)");
                 }
                 Err(err) => {
