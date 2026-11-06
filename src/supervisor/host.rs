@@ -402,13 +402,15 @@ impl Supervisor {
                 let _ = w.child.kill().await;
                 let _ = w.child.wait().await;
             }
-            crate::supervisor::worker_job::reap_slot_image_processes(&id);
         }
         workers.clear();
         drop(workers);
-        // Workers checked out for an in-flight invoke/evict sit outside `workers`.
-        // Kill those PIDs before clearing the checkout map, then reap by argv so
-        // Linux (15-char `comm`) cannot leave a same-slot orphan beside a rebuild.
+        // Checked-out workers sit outside `workers`. Kill those PIDs only.
+        // Do not reap by image name here: a replacement supervisor may already
+        // have spawned `scalattice-slot-{id}`, and a name reap kills that live
+        // process. The next write then fails with Broken pipe (os error 32)
+        // or "The pipe is being closed" (os error 232). Orphans are reaped
+        // at the start of the next `spawn_worker`, before the new process exists.
         let checkout_pids: Vec<u32> = self
             .checkouts
             .lock()
@@ -420,9 +422,6 @@ impl Supervisor {
             force_kill_pid(pid);
         }
         self.checkouts.lock().await.clear();
-        for slot in &self.plan.slots {
-            crate::supervisor::worker_job::reap_slot_image_processes(&slot.id);
-        }
     }
 
     pub async fn start(devices: &[ComputeDevice]) -> Result<Arc<Self>> {
@@ -2830,19 +2829,22 @@ async fn worker_rpc(worker: &mut SlotWorker, req: WorkerRequest) -> Result<Worke
     };
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');
-    worker.stdin.write_all(line.as_bytes()).await?;
-    worker.stdin.flush().await?;
+    if let Err(err) = write_worker_request(worker, line.as_bytes()).await {
+        return Err(err);
+    }
 
     let read = async {
         let mut buf = String::new();
         let mut skipped = 0u32;
         loop {
             buf.clear();
-            let n = worker
-                .reader
-                .read_line(&mut buf)
-                .await
-                .context("read worker response")?;
+            let n = match worker.reader.read_line(&mut buf).await {
+                Ok(n) => n,
+                Err(err) => {
+                    worker.healthy = false;
+                    return Err(worker_read_error(err));
+                }
+            };
             if n == 0 {
                 worker.healthy = false;
                 return Err(crate::invoke_code::coded(
@@ -2901,8 +2903,9 @@ async fn worker_rpc_invoke_cancellable(
     let expect_id = request_id(&req);
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');
-    worker.stdin.write_all(line.as_bytes()).await?;
-    worker.stdin.flush().await?;
+    if let Err(err) = write_worker_request(worker, line.as_bytes()).await {
+        return Err(err);
+    }
 
     let mut buf = String::new();
     let mut last_phase = String::from("start");
@@ -2967,7 +2970,13 @@ async fn worker_rpc_invoke_cancellable(
                 bail!("request_canceled");
             }
             n = worker.reader.read_line(&mut buf) => {
-                let n = n.context("read worker invoke response")?;
+                let n = match n {
+                    Ok(n) => n,
+                    Err(err) => {
+                        worker.healthy = false;
+                        return Err(worker_read_error(err));
+                    }
+                };
                 if n == 0 {
                     worker.healthy = false;
                     return Err(crate::invoke_code::coded(
@@ -3104,11 +3113,69 @@ fn worker_crash_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
     d.contains("closed stdout")
+        || d.contains("broken pipe")
+        || d.contains("pipe is being closed")
+        || d.contains("pipe has been ended")
+        || d.contains("os error 232")
         || d.contains("null result")
         || d.contains("create llama context")
         || d.contains("out of memory")
         || d.contains("cudamalloc")
         || d.contains("cuda error")
+}
+
+/// Worker already gone: surface a coded loss, not the raw OS pipe error.
+fn worker_pipe_closed(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::BrokenPipe {
+        return true;
+    }
+    match err.raw_os_error() {
+        // Unix EPIPE. Windows 32 is a sharing violation, not a pipe.
+        Some(32) if !cfg!(windows) => true,
+        // ERROR_BROKEN_PIPE and ERROR_NO_DATA ("The pipe is being closed").
+        Some(109) | Some(232) => true,
+        _ => false,
+    }
+}
+
+fn worker_read_error(err: std::io::Error) -> anyhow::Error {
+    if worker_pipe_closed(&err) {
+        worker_lost("worker process exited (broken pipe while reading the reply)")
+    } else {
+        anyhow::Error::new(err).context("read worker response")
+    }
+}
+
+fn worker_lost(detail: impl Into<String>) -> anyhow::Error {
+    crate::invoke_code::coded(crate::invoke_code::InvokeErrorCode::WorkerLost, detail)
+}
+
+async fn write_worker_request(worker: &mut SlotWorker, bytes: &[u8]) -> Result<()> {
+    if worker.child.try_wait().ok().flatten().is_some() {
+        worker.healthy = false;
+        return Err(worker_lost(
+            "worker process already exited before the job was sent",
+        ));
+    }
+    if let Err(err) = worker.stdin.write_all(bytes).await {
+        worker.healthy = false;
+        if worker_pipe_closed(&err) {
+            return Err(worker_lost(
+                "worker process exited (broken pipe while sending the job)",
+            ));
+        }
+        return Err(err).context("write worker request");
+    }
+    if let Err(err) = worker.stdin.flush().await {
+        worker.healthy = false;
+        if worker_pipe_closed(&err) {
+            return Err(worker_lost(
+                "worker process exited (broken pipe while sending the job)",
+            ));
+        }
+        return Err(err).context("flush worker request");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3162,6 +3229,25 @@ mod tests {
     fn stdout_close_retries_on_another_slot() {
         let err = anyhow::anyhow!("worker closed stdout during invoke");
         assert!(worker_crash_retryable(&err));
+    }
+
+    #[test]
+    fn broken_pipe_is_a_dead_worker_not_a_model_failure() {
+        let unix = std::io::Error::from_raw_os_error(32);
+        let win = std::io::Error::from_raw_os_error(232);
+        if !cfg!(windows) {
+            assert!(super::worker_pipe_closed(&unix));
+        }
+        assert!(super::worker_pipe_closed(&win));
+        assert!(worker_crash_retryable(&anyhow::anyhow!(
+            "Broken pipe (os error 32)"
+        )));
+        assert!(worker_crash_retryable(&anyhow::anyhow!(
+            "The pipe is being closed. (os error 232)"
+        )));
+        let coded = super::worker_lost("worker process exited (broken pipe while sending the job)");
+        assert_eq!(code_of(&coded), InvokeErrorCode::WorkerLost);
+        assert!(worker_crash_retryable(&coded));
     }
 
     #[test]
