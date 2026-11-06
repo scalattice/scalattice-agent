@@ -158,6 +158,21 @@ xcrun notarytool submit "$SUBMIT" \
   --issuer "$APPLE_API_ISSUER_ID" \
   --wait
 
+# Notarization can be Accepted while CloudKit's ticket lookup drops the
+# connection (NSURLError -1005, stapler exit 68). The ticket is already
+# issued; staple again instead of failing the release.
 echo "==> stapler staple"
-xcrun stapler staple "$SUBMIT"
+stapled=0
+for attempt in 1 2 3 4 5 6; do
+  if xcrun stapler staple "$SUBMIT"; then
+    stapled=1
+    break
+  fi
+  echo "stapler failed (attempt ${attempt}); retrying ticket lookup" >&2
+  sleep $((attempt * 15))
+done
+if [[ "$stapled" -ne 1 ]]; then
+  echo "stapler staple failed after retries" >&2
+  exit 1
+fi
 echo "==> Notarized and stapled $(basename "$SUBMIT")"
