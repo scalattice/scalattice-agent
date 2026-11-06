@@ -24,7 +24,7 @@ pub use health::{
 pub use storage::{
     list_cached_runtime_models, list_model_disk_status, model_weights_ready, models_cache_disk_gb,
     models_dir, purge_failed_download, purge_incomplete_model_weights, resolve_mmproj,
-    resolve_model_gguf, ModelDiskStatus,
+    resolve_model_gguf, target_gguf_path, weight_filenames, ModelDiskStatus,
 };
 pub use sync::spawn_catalog_sync;
 pub use vram_plan::{full_host_need_from_weight, full_host_need_gb};

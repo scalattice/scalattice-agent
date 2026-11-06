@@ -25,6 +25,11 @@ pub enum InvokeErrorCode {
     ImageEditUnsupported,
     ImageEditRequired,
     ImageTooMany,
+    /// This machine has no llama-tts binary for a speech job.
+    TtsRuntimeMissing,
+    InvalidVoice,
+    TtsModelChatUnsupported,
+    ChatModelTtsUnsupported,
     DiskFull,
     /// Worker process died. The supervisor may try another slot.
     WorkerLost,
@@ -53,6 +58,10 @@ impl InvokeErrorCode {
             Self::ImageEditUnsupported => "image_edit_unsupported",
             Self::ImageEditRequired => "image_edit_required",
             Self::ImageTooMany => "image_too_many",
+            Self::TtsRuntimeMissing => "tts_runtime_missing",
+            Self::InvalidVoice => "invalid_voice",
+            Self::TtsModelChatUnsupported => "tts_model_chat_unsupported",
+            Self::ChatModelTtsUnsupported => "chat_model_tts_unsupported",
             Self::DiskFull => "disk_full",
             // The socket still reports a failed invoke. Retry is an internal decision.
             Self::WorkerLost => "inference_failed",
@@ -85,6 +94,10 @@ impl InvokeErrorCode {
             "image_edit_unsupported" => Some(Self::ImageEditUnsupported),
             "image_edit_required" => Some(Self::ImageEditRequired),
             "image_too_many" => Some(Self::ImageTooMany),
+            "tts_runtime_missing" => Some(Self::TtsRuntimeMissing),
+            "invalid_voice" => Some(Self::InvalidVoice),
+            "tts_model_chat_unsupported" => Some(Self::TtsModelChatUnsupported),
+            "chat_model_tts_unsupported" => Some(Self::ChatModelTtsUnsupported),
             "disk_full" => Some(Self::DiskFull),
             "worker_lost" => Some(Self::WorkerLost),
             "vocab_zero_collapse" => Some(Self::VocabZeroCollapse),
@@ -104,6 +117,7 @@ impl InvokeErrorCode {
                 | Self::DiskFull
                 | Self::PromptTooLong
                 | Self::InvalidImage
+                | Self::InvalidVoice
                 | Self::ModelNotInstalled
         )
     }
@@ -284,9 +298,12 @@ fn classify_foreign(err: &anyhow::Error) -> &'static str {
         "chat_model_image_unsupported"
     } else if detail.contains("image_stream_unsupported") {
         "image_stream_unsupported"
+    } else if detail.contains("tts_runtime_missing") {
+        "tts_runtime_missing"
     } else if crate::models::is_no_space_error(err) || detail.contains("disk_full") {
         "disk_full"
-    } else if detail.contains("diffusers load failed")
+    } else if detail.contains("candle load failed")
+        || detail.contains("diffusers load failed")
         || detail.contains("qwen-image load failed")
         || detail.contains("model_load_failed")
     {

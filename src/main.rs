@@ -24,6 +24,7 @@ mod settings;
 mod specs;
 mod state;
 mod supervisor;
+mod tts;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
 mod update;

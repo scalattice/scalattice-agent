@@ -1,46 +1,24 @@
-//! Second runtime: Hugging Face Diffusers via an isolated CPython venv.
-//! NVIDIA CUDA, AMD (ROCm / DirectML), Intel Arc (XPU), or Apple Silicon MPS.
-//! Catalog `jobKind: image` rows supply the repo. Setup runs when an image
-//! SKU is installed; teardown when the last image SKU is removed.
+//! Image generation. The engine is stable-diffusion.cpp (`scalattice-sd`),
+//! spawned on the slot the server assigned, with that slot's GPU visibility.
+//! It loads the checkpoint the catalog names (safetensors, ckpt, gguf, or
+//! diffusers components): SD 1/2/XL, SD3, FLUX, Qwen-Image, and the other
+//! families upstream stable-diffusion.cpp supports. CUDA, Vulkan, and Metal
+//! come from that binary, not from a cargo feature on the agent.
 
-mod python;
+pub mod sdcpp;
+mod sd_models;
 
 use crate::compute_pool::{PoolStrategy, VirtualCard};
 use crate::protocol::{CatalogModel, GeneratedImage};
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use sd_models::{ModelFiles, SdVersion};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::Notify;
+use std::time::Duration;
 use tracing::{info, warn};
 
-const WORKER_PY: &str = include_str!("worker.py");
-const IMAGE_WALL_CLOCK: Duration = Duration::from_secs(45 * 60);
-/// Healthy image workers emit JSON at least every 12s. Allow one missed beat
-/// (GIL / import hiccup), then kill. This is not a load-time budget.
-const IMAGE_SILENCE: Duration = Duration::from_secs(30);
-const DEPS_MARKER: &str = ".deps_ok_v4";
-const HOST_PYTHON_UNSET: &[&str] = &[
-    "PYTHONHOME",
-    "PYTHONPATH",
-    "PYTHONSTARTUP",
-    "PYTHONUSERBASE",
-    "VIRTUAL_ENV",
-    "CONDA_PREFIX",
-    "CONDA_DEFAULT_ENV",
-    "CONDA_PYTHON_EXE",
-    "CONDA_SHLVL",
-    "PIP_USER",
-    "PIP_REQUIRE_VIRTUALENV",
-    "UV_SYSTEM_PYTHON",
-    "PYENV_VERSION",
-    "PYENV_VIRTUAL_ENV",
-];
+/// 1x1 PNG returned when `SCALATTICE_QWEN_IMAGE_STUB=1` (tests / CI).
+pub(crate) const STUB_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 #[derive(Debug, Clone)]
 pub struct ImageJob {
@@ -49,28 +27,20 @@ pub struct ImageJob {
     pub height: u32,
     pub n: u32,
     pub seed: Option<i64>,
+    /// Catalog repo. The runner resolves files from the catalog model, not this copy.
+    #[allow(dead_code)]
     pub repo: String,
+    /// Revision / token are consumed at install time (`install_image_model`);
+    /// generation reads only the local hub cache. Kept so call sites stay stable.
+    #[allow(dead_code)]
     pub revision: String,
+    #[allow(dead_code)]
     pub hf_token: Option<String>,
     pub input_images: Vec<GeneratedImage>,
 }
 
-#[derive(Debug, Deserialize)]
-struct WorkerLine {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    phase: String,
-    #[serde(default)]
-    pct: Option<f32>,
-    #[serde(default)]
-    images: Vec<GeneratedImage>,
-    #[serde(default)]
-    error: String,
-    #[serde(default)]
-    detail: String,
-}
-
+/// Legacy location of the Diffusers venv / portable CPython. Only used to
+/// clean up installs from before the stable-diffusion.cpp runner.
 pub fn runtimes_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SCALATTICE_RUNTIMES_DIR") {
         if !dir.trim().is_empty() {
@@ -84,24 +54,6 @@ pub fn runtimes_dir() -> PathBuf {
         .join("runtimes")
 }
 
-pub fn diffusers_venv_dir(device: &str) -> PathBuf {
-    let name = match device {
-        "mps" => "diffusers-mps",
-        "rocm" => "diffusers-rocm",
-        "dml" => "diffusers-dml",
-        "xpu" => "diffusers-xpu",
-        _ => "diffusers-cuda",
-    };
-    runtimes_dir().join(name)
-}
-
-fn all_diffusers_venv_dirs() -> Vec<PathBuf> {
-    ["cuda", "mps", "rocm", "dml", "xpu"]
-        .into_iter()
-        .map(diffusers_venv_dir)
-        .collect()
-}
-
 pub fn hf_hub_cache_dir() -> PathBuf {
     crate::models::models_dir().join("hub")
 }
@@ -111,16 +63,9 @@ pub fn hub_repo_dir(repo: &str) -> PathBuf {
     hf_hub_cache_dir().join(cache_key)
 }
 
-pub fn is_qwen_image_family(repo: &str) -> bool {
-    repo.trim()
-        .to_ascii_lowercase()
-        .replace('_', "-")
-        .contains("qwen-image")
-}
-
-/// Map invoke pixels onto the checkpoint. Qwen-Image uses 1328-class natives;
-/// other Diffusers repos keep the requested size (default 1024). Zero stays
-/// zero when reference images are present so edits can follow the input.
+/// Map invoke pixels onto the checkpoint. Sides under 64 become the family's
+/// native size (SDXL 1024, SD 2.1 768, SD 1.5 / Turbo 512). Zero stays zero
+/// when reference images are present so img2img can follow the input.
 pub fn resolve_image_job_size(
     repo: &str,
     width: u32,
@@ -130,232 +75,13 @@ pub fn resolve_image_job_size(
     if width < 64 && height < 64 && has_input_images {
         return (0, 0);
     }
-    if is_qwen_image_family(repo) {
-        return match (width, height) {
-            (0, 0) | (256, 256) | (512, 512) | (1024, 1024) => (1328, 1328),
-            (1792, 1024) => (1664, 928),
-            (1024, 1792) => (928, 1664),
-            (w, h) if w < 64 || h < 64 => (1328, 1328),
-            other => other,
-        };
-    }
+    let default = SdVersion::from_repo(repo)
+        .map(SdVersion::default_size)
+        .unwrap_or(1024);
     (
-        if width < 64 { 1024 } else { width },
-        if height < 64 { 1024 } else { height },
+        if width < 64 { default } else { width },
+        if height < 64 { default } else { height },
     )
-}
-
-fn is_real_weight_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    meta.is_file() && meta.len() > 0
-}
-
-fn is_weight_filename(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    if name.ends_with(".incomplete") || name.ends_with(".index.json") {
-        return false;
-    }
-    name.ends_with(".safetensors")
-        || name.ends_with(".bin")
-        || name.ends_with(".pt")
-        || name.ends_with(".ckpt")
-        || name.ends_with(".gguf")
-}
-
-/// `model-00001-of-00004.safetensors` → (prefix, idx, n)
-fn parse_shard_name(name: &str) -> Option<(&str, u32, u32)> {
-    let stem = name
-        .strip_suffix(".safetensors")
-        .or_else(|| name.strip_suffix(".bin"))
-        .or_else(|| name.strip_suffix(".pt"))?;
-    let of = stem.rfind("-of-")?;
-    let n: u32 = stem[of + 4..].parse().ok()?;
-    let rest = &stem[..of];
-    let dash = rest.rfind('-')?;
-    let idx: u32 = rest[dash + 1..].parse().ok()?;
-    if idx == 0 || n == 0 || idx > n {
-        return None;
-    }
-    Some((&rest[..dash], idx, n))
-}
-
-fn index_listed_shards(dir: &Path) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return names;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let fname = fname.to_string_lossy();
-        if !fname.ends_with(".index.json") {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(map) = value.get("weight_map").and_then(|m| m.as_object()) else {
-            continue;
-        };
-        for file in map.values().filter_map(|v| v.as_str()) {
-            if let Some(base) = Path::new(file).file_name() {
-                names.insert(base.to_string_lossy().into_owned());
-            }
-        }
-    }
-    names
-}
-
-fn component_weights_complete(dir: &Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    let listed = index_listed_shards(dir);
-    if !listed.is_empty() {
-        return listed
-            .iter()
-            .all(|name| is_real_weight_file(&dir.join(name)));
-    }
-
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    let mut groups: BTreeMap<(String, u32), BTreeSet<u32>> = BTreeMap::new();
-    let mut any_weight = false;
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if child.is_dir() {
-            subdirs.push(child);
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_weight_filename(&name) {
-            continue;
-        }
-        if !is_real_weight_file(&child) {
-            continue;
-        }
-        any_weight = true;
-        if let Some((prefix, idx, n)) = parse_shard_name(&name) {
-            groups
-                .entry((prefix.to_string(), n))
-                .or_default()
-                .insert(idx);
-        }
-    }
-    if !groups.is_empty() {
-        return groups
-            .iter()
-            .all(|((_, n), have)| (1..=*n).all(|i| have.contains(&i)));
-    }
-    if any_weight {
-        return true;
-    }
-    subdirs.iter().any(|child| component_weights_complete(child))
-}
-
-const WEIGHT_COMPONENTS: &[&str] = &[
-    "transformer",
-    "unet",
-    "vae",
-    "text_encoder",
-    "text_encoder_2",
-    "text_encoder_3",
-    "image_encoder",
-    "visual",
-];
-
-fn snapshot_components_ready(snap: &Path) -> bool {
-    let index_path = snap.join("model_index.json");
-    let Ok(raw) = std::fs::read_to_string(&index_path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    let mut saw_weight_component = false;
-    for (key, val) in obj {
-        if key.starts_with('_') || !val.is_array() {
-            continue;
-        }
-        if !WEIGHT_COMPONENTS.iter().any(|name| *name == key.as_str()) {
-            continue;
-        }
-        saw_weight_component = true;
-        let folder = snap.join(key);
-        if !component_weights_complete(&folder) {
-            return false;
-        }
-    }
-    if saw_weight_component {
-        return true;
-    }
-    component_weights_complete(snap)
-}
-
-fn snapshot_from_refs(root: &Path) -> Option<PathBuf> {
-    let snapshots = root.join("snapshots");
-    let refs = root.join("refs");
-    let Ok(entries) = std::fs::read_dir(&refs) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let Ok(hash) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let snap = snapshots.join(hash.trim());
-        if snapshot_components_ready(&snap) {
-            return Some(snap);
-        }
-    }
-    None
-}
-
-/// First complete snapshot directory under a Hugging Face hub repo cache.
-pub fn hf_ready_snapshot_path_in(root: &Path) -> Option<PathBuf> {
-    if let Some(snap) = snapshot_from_refs(root) {
-        return Some(snap);
-    }
-    let snapshots = root.join("snapshots");
-    let Ok(entries) = std::fs::read_dir(&snapshots) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let snap = entry.path();
-        if snap.is_dir() && snapshot_components_ready(&snap) {
-            return Some(snap);
-        }
-    }
-    None
-}
-
-/// Complete Diffusers snapshot — `model_index.json` alone is not enough;
-/// Hugging Face writes that file first, then the multi-GB weight shards.
-/// Leftover `*.incomplete` blobs from an earlier attempt do not block a
-/// snapshot that already has its weight components.
-#[cfg(test)]
-pub fn hf_snapshot_dir_ready(root: &Path) -> bool {
-    hf_ready_snapshot_path_in(root).is_some()
-}
-
-pub fn hf_ready_snapshot_path(repo: &str) -> Option<PathBuf> {
-    let repo = repo.trim();
-    if repo.is_empty() {
-        return None;
-    }
-    hf_ready_snapshot_path_in(&hub_repo_dir(repo))
-}
-
-pub fn hf_snapshot_ready(repo: &str) -> bool {
-    hf_ready_snapshot_path(repo).is_some()
 }
 
 pub fn image_repo(model: &CatalogModel) -> Option<&str> {
@@ -367,55 +93,72 @@ pub fn image_repo(model: &CatalogModel) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn image_runtime_ready() -> bool {
-    if image_stub_enabled() {
-        return true;
-    }
-    if !python::portable_python_ready() {
-        return false;
-    }
-    all_diffusers_venv_dirs()
-        .iter()
-        .any(|dir| dir.join(DEPS_MARKER).is_file())
+fn weights_use_f16() -> bool {
+    true
 }
 
-pub fn image_install_ready(model: &CatalogModel) -> bool {
+fn files_for(repo: &str, version: SdVersion) -> ModelFiles {
+    sd_models::model_files(repo, version, weights_use_f16())
+}
+
+/// Every required file resolved inside `hub`, or the first missing one.
+fn resolve_files_in(hub: &Path, files: &ModelFiles) -> std::result::Result<(), String> {
+    let find = |f: &sd_models::RepoFile| -> std::result::Result<(), String> {
+        let root = hub.join(format!("models--{}", f.repo.replace('/', "--")));
+        sd_models::find_cached_file(&root, &f.path)
+            .map(|_| ())
+            .ok_or_else(|| format!("{}/{}", f.repo, f.path))
+    };
+    find(&files.tokenizer)?;
+    if let Some(file) = &files.tokenizer2 {
+        find(file)?;
+    }
+    find(&files.clip)?;
+    if let Some(file) = &files.clip2 {
+        find(file)?;
+    }
+    find(&files.unet)?;
+    find(&files.vae)?;
+    Ok(())
+}
+
+fn checkpoint_ready_in(hub: &Path, repo: &str) -> bool {
+    if let Some(files) = sd_models::aux_repo_files(repo) {
+        let root = hub.join(format!("models--{}", repo.trim().replace('/', "--")));
+        return files
+            .iter()
+            .all(|f| sd_models::find_cached_file(&root, f).is_some());
+    }
+    let Some(version) = SdVersion::from_repo(repo) else {
+        return false;
+    };
+    resolve_files_in(hub, &files_for(repo, version)).is_ok()
+}
+
+/// All required weight + tokenizer files for this repo are in the hub cache.
+pub fn hf_snapshot_ready(repo: &str) -> bool {
+    let repo = repo.trim();
+    !repo.is_empty() && checkpoint_ready_in(&hf_hub_cache_dir(), repo)
+}
+
+/// Checkpoint bytes are on disk (catalog file, or a diffusers snapshot).
+pub fn image_weights_ready(model: &CatalogModel) -> bool {
     if !model.is_image_job() {
         return false;
     }
     if image_stub_enabled() {
         return true;
     }
-    let Some(repo) = image_repo(model) else {
-        return false;
-    };
-    image_runtime_ready() && hf_snapshot_ready(repo)
+    sdcpp::weights_on_disk(model)
+}
+
+/// Weights are on disk and `scalattice-sd` is installed next to the agent.
+pub fn image_install_ready(model: &CatalogModel) -> bool {
+    image_weights_ready(model) && (image_stub_enabled() || sdcpp::runtime_available())
 }
 
 fn image_repo_on_disk(repo: &str) -> bool {
-    let dir = hub_repo_dir(repo);
-    dir.is_dir()
-}
-
-/// Keep CPython + Diffusers venv while any other image SKU is still enabled
-/// or still has a Hub snapshot on disk (including a partial install).
-pub fn keep_image_runtime(
-    catalog: &[CatalogModel],
-    skip_model_ids: &[String],
-    mut is_enabled: impl FnMut(&str) -> bool,
-) -> bool {
-    catalog.iter().any(|model| {
-        if !model.is_image_job() {
-            return false;
-        }
-        if skip_model_ids.iter().any(|id| id == &model.model_id) {
-            return false;
-        }
-        if is_enabled(&model.model_id) {
-            return true;
-        }
-        image_repo(model).is_some_and(image_repo_on_disk)
-    })
+    hub_repo_dir(repo).is_dir()
 }
 
 /// Keep this Hub snapshot when another remaining image SKU still uses the repo.
@@ -446,18 +189,8 @@ pub fn keep_image_repo(
     })
 }
 
-fn ensure_worker_script(venv_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(venv_dir).map_err(|err| map_image_io_error(err, venv_dir))?;
-    let dest = venv_dir.join("worker.py");
-    let existing = std::fs::read_to_string(&dest).unwrap_or_default();
-    if existing != WORKER_PY {
-        write_runtime_bytes(&dest, WORKER_PY.as_bytes())?;
-    }
-    Ok(dest)
-}
-
-/// Image jobs write job JSON, worker.py, and PyTorch scratch. Refuse before
-/// claiming a GPU when the model cache volume is already full.
+/// Image jobs write weights and scratch. Refuse before claiming a GPU when
+/// the model cache volume is already full.
 pub fn refuse_if_disk_full() -> Result<()> {
     // Always re-measure the models volume so a prior ENOSPC sticky bit clears
     // once free space returns (fleet: OSART33-PC diskFull=true with 192 GB free).
@@ -482,54 +215,6 @@ fn map_image_io_error(err: std::io::Error, path: &Path) -> anyhow::Error {
     } else {
         anyhow::Error::new(err).context(format!("write {}", path.display()))
     }
-}
-
-fn write_runtime_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).map_err(|err| map_image_io_error(err, path))
-}
-
-fn write_runtime_json(path: &Path, payload: &serde_json::Value) -> Result<()> {
-    write_runtime_bytes(path, &serde_json::to_vec_pretty(payload)?)
-}
-
-fn which_bin(name: &str) -> Result<PathBuf> {
-    let output = if cfg!(windows) {
-        std::process::Command::new("where").arg(name).output()?
-    } else {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("command -v {name}"))
-            .output()?
-    };
-    if !output.status.success() {
-        bail!("{name} not found");
-    }
-    let path = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if path.is_empty() {
-        bail!("{name} not found");
-    }
-    Ok(PathBuf::from(path))
-}
-
-pub(crate) fn apply_isolated_python_env(cmd: &mut std::process::Command) {
-    for key in HOST_PYTHON_UNSET {
-        cmd.env_remove(*key);
-    }
-    cmd.env("PYTHONNOUSERSITE", "1");
-    cmd.env("PIP_USER", "0");
-}
-
-fn apply_isolated_python_env_tokio(cmd: &mut Command) {
-    for key in HOST_PYTHON_UNSET {
-        cmd.env_remove(*key);
-    }
-    cmd.env("PYTHONNOUSERSITE", "1");
-    cmd.env("PIP_USER", "0");
 }
 
 fn looks_like_amd(id: &str, name: &str, kind: &str) -> bool {
@@ -568,26 +253,9 @@ pub fn is_intel_arc_card(card: &VirtualCard) -> bool {
         .any(|d| looks_like_intel_arc(&d.id, &d.name, &d.kind))
 }
 
+/// Any accelerator chat can use. CPU slots are not image slots.
 pub fn image_card_eligible(card: &VirtualCard) -> bool {
-    if matches!(card.strategy, PoolStrategy::CpuOnly) {
-        return false;
-    }
-    if card
-        .devices
-        .iter()
-        .any(|d| d.kind == "integrated" && !looks_like_intel_arc(&d.id, &d.name, &d.kind))
-        && !is_amd_discrete_card(card)
-        && !is_intel_arc_card(card)
-    {
-        return false;
-    }
-    let nvidia = matches!(card.strategy, PoolStrategy::Single)
-        && !card.uses_vulkan
-        && !card.cuda_device_ids.is_empty();
-    let metal = matches!(card.strategy, PoolStrategy::Metal);
-    let vulkan_ok = matches!(card.strategy, PoolStrategy::Vulkan)
-        && (is_amd_discrete_card(card) || is_intel_arc_card(card));
-    nvidia || metal || vulkan_ok
+    !matches!(card.strategy, PoolStrategy::CpuOnly)
 }
 
 pub fn amd_visible_index(card: &VirtualCard) -> Vec<u32> {
@@ -609,363 +277,50 @@ fn vendor_visible_index(card: &VirtualCard, prefix: &str) -> Vec<u32> {
     vec![0]
 }
 
+/// Backend label for logs. stable-diffusion.cpp selects the device from the
+/// process environment, not from this string.
 pub fn image_backend_for_card(card: &VirtualCard) -> &'static str {
     match card.strategy {
-        PoolStrategy::Metal => "mps",
-        PoolStrategy::Vulkan if is_intel_arc_card(card) => "xpu",
-        PoolStrategy::Vulkan => {
-            if cfg!(windows) {
-                "dml"
-            } else {
-                "rocm"
-            }
-        }
-        _ => "cuda",
+        PoolStrategy::Metal => "metal",
+        PoolStrategy::Vulkan => "vulkan",
+        PoolStrategy::CpuOnly => "cpu",
+        PoolStrategy::TensorParallel | PoolStrategy::Single => "cuda",
     }
 }
 
-pub fn host_image_backend() -> &'static str {
-    if cfg!(target_os = "macos") {
-        return "mps";
-    }
-    if nvidia_cuda_available() {
-        return "cuda";
-    }
-    let devices = crate::specs::detect_all_compute_devices();
-    let amd = devices
-        .iter()
-        .any(|d| d.enabled && looks_like_amd(&d.id, &d.name, &d.kind));
-    let arc = devices
-        .iter()
-        .any(|d| d.enabled && looks_like_intel_arc(&d.id, &d.name, &d.kind));
-    if amd {
-        return if cfg!(windows) { "dml" } else { "rocm" };
-    }
-    if arc {
-        return "xpu";
-    }
-    if cfg!(windows) {
-        "dml"
-    } else {
-        "rocm"
-    }
+fn unsupported_repo_error(repo: &str) -> anyhow::Error {
+    crate::invoke_code::coded(
+        crate::invoke_code::InvokeErrorCode::ImageRuntimeMissing,
+        format!(
+            "{repo} has no weights.filename. Name the checkpoint file \
+             (safetensors, ckpt, or gguf) the way a chat model names its GGUF"
+        ),
+    )
 }
 
-fn torch_index_for(device: &str) -> &'static str {
-    match device {
-        "cuda" => "https://download.pytorch.org/whl/cu124",
-        "rocm" => "https://download.pytorch.org/whl/rocm6.3",
-        "xpu" => "https://download.pytorch.org/whl/xpu",
-        _ => "",
-    }
-}
-
-fn extra_pip_for(device: &str) -> Vec<&'static str> {
-    if device == "dml" {
-        vec!["torch-directml"]
-    } else {
-        Vec::new()
-    }
-}
-
-fn worker_payload(
-    device: &str,
-    venv_dir: &Path,
-    cache_dir: &Path,
-    repo: &str,
-    revision: &str,
-    hf_token: Option<&str>,
-    mode: &str,
-    job: Option<&ImageJob>,
-) -> serde_json::Value {
-    let extra_pip = extra_pip_for(device);
-    let mut payload = serde_json::json!({
-        "mode": mode,
-        "repo": repo,
-        "revision": revision,
-        "hf_token": hf_token,
-        "cache_dir": cache_dir.display().to_string(),
-        "venv_dir": venv_dir.display().to_string(),
-        "device": device,
-        "torch_index": torch_index_for(device),
-        "extra_pip": extra_pip,
-    });
-    if let Some(snap) = hf_ready_snapshot_path(repo) {
-        payload["snapshot_dir"] = serde_json::json!(snap.display().to_string());
-    }
-    if let Some(job) = job {
-        payload["prompt"] = serde_json::json!(job.prompt);
-        payload["width"] = serde_json::json!(job.width);
-        payload["height"] = serde_json::json!(job.height);
-        payload["n"] = serde_json::json!(job.n.clamp(1, 4));
-        payload["seed"] = serde_json::json!(job.seed);
-        payload["images"] = serde_json::json!(job.input_images);
-    }
-    payload
-}
-
-async fn run_image_worker(
-    python: &Path,
-    script: &Path,
-    job_path: &Path,
-    device: &str,
-    gpu_visible: &[u32],
-    setup: bool,
-    cancel: Option<&Notify>,
-    cancel_flag: Option<&AtomicBool>,
-    mut on_progress: impl FnMut(&str, Option<f32>),
-) -> Result<Vec<GeneratedImage>> {
-    let cache_dir = hf_hub_cache_dir();
-    let cvd = gpu_visible
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let mut cmd = Command::new(python);
-    cmd.arg(script);
-    if setup {
-        cmd.arg("--setup");
-    }
-    cmd.arg(job_path)
-        .env("PYTHONUNBUFFERED", "1")
-        .env("HF_HUB_CACHE", &cache_dir)
-        .env("HUGGINGFACE_HUB_CACHE", &cache_dir)
-        // hf_xet reconstructs shards in a background writer. On a 24 GB card
-        // that often dies as "Background writer channel closed" (disk full,
-        // half-written CAS, or the Hub being contacted again at invoke).
-        // HTTP downloads + local snapshot load are the supported path.
-        .env("HF_HUB_DISABLE_XET", "1")
-        .env("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        // 0.0 disables the limiter and macOS jetsam SIGKILLs the Python worker.
-        .env("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.8")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Own process group so pip / huggingface_hub children die with the worker.
-    #[cfg(unix)]
+fn download_error(file: &sd_models::RepoFile, err: impl std::fmt::Display) -> anyhow::Error {
+    let text = format!("{err}");
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("no space left")
+        || lower.contains("os error 28")
+        || lower.contains("os error 112")
+        || lower.contains("not enough space")
     {
-        cmd.process_group(0);
+        crate::state::set_disk_full(true);
+        return anyhow!(
+            "disk_full: no space left while downloading {}/{}",
+            file.repo,
+            file.path
+        );
     }
-    apply_isolated_python_env_tokio(&mut cmd);
-    cmd.env_remove("CUDA_VISIBLE_DEVICES");
-    cmd.env_remove("HIP_VISIBLE_DEVICES");
-    cmd.env_remove("ROCR_VISIBLE_DEVICES");
-    cmd.env_remove("ZE_AFFINITY_MASK");
-    if !cvd.is_empty() && device != "mps" && device != "dml" {
-        if device == "xpu" {
-            cmd.env("ZE_AFFINITY_MASK", &cvd);
-        } else {
-            cmd.env("CUDA_VISIBLE_DEVICES", &cvd);
-            if device == "rocm" {
-                cmd.env("HIP_VISIBLE_DEVICES", &cvd);
-                cmd.env("ROCR_VISIBLE_DEVICES", &cvd);
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = cmd
-        .spawn()
-        .context("spawn Diffusers image python worker")?;
-
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let t = line.trim();
-                        if t.is_empty() {
-                            continue;
-                        }
-                        if t.contains("unauthenticated requests to the HF Hub") {
-                            continue;
-                        }
-                        info!(target: "qwen_image", "{t}");
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    let stdout = child.stdout.take().context("worker stdout")?;
-    let mut reader = BufReader::new(stdout);
-    let mut buf = String::new();
-    let started = Instant::now();
-    let mut last_progress = Instant::now();
-    let mut images: Option<Vec<GeneratedImage>> = None;
-    let mut setup_done = false;
-
-    loop {
-        if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            kill_image_child(&mut child).await;
-            bail!("request_canceled");
-        }
-        if started.elapsed() >= IMAGE_WALL_CLOCK {
-            kill_image_child(&mut child).await;
-            bail!("invoke_timeout: image job exceeded wall-clock limit");
-        }
-        let silence_left = IMAGE_SILENCE
-            .checked_sub(last_progress.elapsed())
-            .unwrap_or(Duration::ZERO);
-        let wall_left = IMAGE_WALL_CLOCK
-            .checked_sub(started.elapsed())
-            .unwrap_or(Duration::from_millis(1));
-        let wait = silence_left.min(wall_left).max(Duration::from_millis(50));
-        // Setup cancel is an AtomicBool; poll it instead of waiting on silence.
-        let wait = if cancel_flag.is_some() {
-            wait.min(Duration::from_millis(250))
-        } else {
-            wait
-        };
-        tokio::select! {
-            biased;
-            _ = async {
-                if let Some(n) = cancel {
-                    n.notified().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                kill_image_child(&mut child).await;
-                bail!("request_canceled");
-            }
-            n = reader.read_line(&mut buf) => {
-                let n = n.context("read image worker stdout")?;
-                if n == 0 {
-                    break;
-                }
-                last_progress = Instant::now();
-                let line = buf.trim().to_string();
-                buf.clear();
-                if line.is_empty() {
-                    continue;
-                }
-                let parsed: WorkerLine = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        warn!(line = %line, "ignoring non-json image worker stdout");
-                        continue;
-                    }
-                };
-                match parsed.kind.as_str() {
-                    "progress" => {
-                        let phase = if parsed.phase.is_empty() {
-                            "working"
-                        } else {
-                            parsed.phase.as_str()
-                        };
-                        on_progress(phase, parsed.pct);
-                    }
-                    "result" => {
-                        setup_done = true;
-                        images = Some(parsed.images);
-                    }
-                    "error" => {
-                        kill_image_child(&mut child).await;
-                        let code = if parsed.error.is_empty() {
-                            "inference_failed".to_string()
-                        } else {
-                            parsed.error
-                        };
-                        return Err(crate::invoke_code::error_from_wire(&if parsed.detail.is_empty() {
-                            code
-                        } else {
-                            format!("{code}: {}", parsed.detail)
-                        }));
-                    }
-                    _ => {}
-                }
-            }
-            _ = tokio::time::sleep(wait) => {
-                if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
-                    kill_image_child(&mut child).await;
-                    bail!("request_canceled");
-                }
-                if last_progress.elapsed() >= IMAGE_SILENCE {
-                    kill_image_child(&mut child).await;
-                    bail!("agent invoke timeout");
-                }
-            }
-        }
-    }
-
-    let status = child.wait().await.context("wait image worker")?;
-    if setup {
-        if !status.success() && !setup_done {
-            bail!("image_runtime_missing: image setup worker exited {status}");
-        }
-        return Ok(images.unwrap_or_default());
-    }
-    let images = images.ok_or_else(|| {
-        if status.success() {
-            crate::invoke_code::coded(
-                crate::invoke_code::InvokeErrorCode::InferenceFailed,
-                "image worker returned no images",
-            )
-        } else if image_worker_oom_killed(&status) {
-            crate::invoke_code::coded(
-                crate::invoke_code::InvokeErrorCode::InsufficientVram,
-                "image worker ran out of memory (killed by the OS)",
-            )
-        } else {
-            crate::invoke_code::coded(
-                crate::invoke_code::InvokeErrorCode::InferenceFailed,
-                format!("image worker exited {status}"),
-            )
-        }
-    })?;
-    if images.is_empty() {
-        bail!("inference_failed: image worker produced no images");
-    }
-    Ok(images)
+    anyhow!(
+        "model_load_failed: download {}/{} failed: {text}",
+        file.repo,
+        file.path
+    )
 }
 
-fn image_worker_oom_killed(status: &std::process::ExitStatus) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        matches!(status.signal(), Some(9))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = status;
-        false
-    }
-}
-
-async fn kill_image_child(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            // Negative pid = process group we created with process_group(0).
-            let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        }
-    }
-    #[cfg(windows)]
-    {
-        if let Some(pid) = child.id() {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .status();
-        }
-    }
-    let _ = child.start_kill();
-}
-
-/// Install isolated CPython, Diffusers venv, and the HF snapshot for this SKU.
+/// Download the safetensors + tokenizer files for this SKU into the hub cache.
 pub async fn install_image_model(
     model: &CatalogModel,
     hf_token: Option<&str>,
@@ -975,106 +330,125 @@ pub async fn install_image_model(
         return Ok(());
     }
     refuse_if_disk_full()?;
-    let repo = image_repo(model).context(
-        "image_runtime_missing: catalog image models need a Hugging Face Diffusers repo",
-    )?;
+    let repo = image_repo(model)
+        .context("image_runtime_missing: catalog image models need a Hugging Face repo")?;
+    let version = SdVersion::from_repo(repo).ok_or_else(|| unsupported_repo_error(repo))?;
     if cancel.load(Ordering::Relaxed) {
         bail!("request_canceled");
     }
     if image_install_ready(model) {
         return Ok(());
     }
-    let device = host_image_backend();
-    let venv_dir = diffusers_venv_dir(device);
-    let script = ensure_worker_script(&venv_dir)?;
-    let mut on_progress = |phase: &str, pct: Option<f32>| {
-        info!(
-            phase,
-            pct = pct.unwrap_or(-1.0),
-            repo,
-            "image runtime setup"
-        );
-    };
-    let python = python::ensure_image_python(&mut on_progress, Some(cancel)).await?;
-    if cancel.load(Ordering::Relaxed) {
-        bail!("request_canceled");
-    }
-    let cache_dir = hf_hub_cache_dir();
-    let _ = std::fs::create_dir_all(&cache_dir);
     let revision = model
         .weights
         .as_ref()
-        .map(|w| w.revision.as_str())
-        .unwrap_or("main");
-    let payload = worker_payload(
-        device,
-        &venv_dir,
-        &cache_dir,
-        repo,
-        revision,
-        hf_token,
-        "setup",
-        None,
-    );
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let job_path = venv_dir.join(format!("setup-{}-{nonce}.json", std::process::id()));
-    write_runtime_json(&job_path, &payload)?;
-    struct JobFileGuard(PathBuf);
-    impl Drop for JobFileGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+        .map(|w| w.revision.trim())
+        .filter(|r| !r.is_empty())
+        .unwrap_or("main")
+        .to_string();
+    let cache_dir = hf_hub_cache_dir();
+    std::fs::create_dir_all(&cache_dir).map_err(|e| map_image_io_error(e, &cache_dir))?;
+
+    let mut builder = hf_hub::api::tokio::ApiBuilder::new()
+        .with_cache_dir(cache_dir.clone())
+        .with_progress(false);
+    if let Some(token) = hf_token.map(str::trim).filter(|t| !t.is_empty()) {
+        builder = builder.with_token(Some(token.to_string()));
     }
-    let _job_guard = JobFileGuard(job_path.clone());
-    info!(repo, device, "setting up isolated Diffusers runtime");
-    run_image_worker(
-        &python,
-        &script,
-        &job_path,
-        device,
-        &[],
-        true,
-        None,
-        Some(cancel),
-        on_progress,
-    )
-    .await?;
+    let api = builder
+        .build()
+        .map_err(|e| anyhow!("model_load_failed: Hugging Face client: {e}"))?;
+
+    let files = files_for(repo, version);
+    let wanted = files.all();
+    let total = wanted.len();
+    info!(
+        repo,
+        family = version.label(),
+        files = total,
+        "installing image checkpoint"
+    );
+    for (idx, file) in wanted.into_iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("request_canceled");
+        }
+        let root = hub_repo_dir(&file.repo);
+        if sd_models::find_cached_file(&root, &file.path).is_some() {
+            continue;
+        }
+        let file_revision = if file.repo.eq_ignore_ascii_case(repo) {
+            revision.clone()
+        } else {
+            "main".to_string()
+        };
+        info!(
+            repo = %file.repo,
+            path = %file.path,
+            step = idx + 1,
+            total,
+            "downloading image checkpoint file"
+        );
+        let hub_repo = api.repo(hf_hub::Repo::with_revision(
+            file.repo.clone(),
+            hf_hub::RepoType::Model,
+            file_revision,
+        ));
+        let fetch = hub_repo.get(&file.path);
+        tokio::pin!(fetch);
+        let fetched = loop {
+            tokio::select! {
+                res = &mut fetch => break res,
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        bail!("request_canceled");
+                    }
+                }
+            }
+        };
+        fetched.map_err(|e| download_error(file, e))?;
+    }
     if !hf_snapshot_ready(repo) {
-        bail!("model_load_failed: Diffusers snapshot missing after setup ({repo})");
+        bail!("model_load_failed: image checkpoint files missing after download ({repo})");
     }
     Ok(())
 }
 
-pub fn teardown_image_runtime() {
-    python::teardown_portable_python();
-    for dir in all_diffusers_venv_dirs() {
-        if dir.is_dir() {
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => info!(path = %dir.display(), "removed Diffusers image venv"),
+/// Remove old Diffusers venvs and portable CPython (best effort,
+/// on a background thread; they can be several GB).
+pub fn cleanup_legacy_diffusers_runtime() {
+    let dir = runtimes_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let stale: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("diffusers-") || n.starts_with("cpython-"))
+        })
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    info!(
+        count = stale.len(),
+        "removing legacy Diffusers image runtime"
+    );
+    std::thread::spawn(move || {
+        for path in stale {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => info!(path = %path.display(), "removed legacy Diffusers runtime dir"),
                 Err(err) => warn!(
-                    path = %dir.display(),
+                    path = %path.display(),
                     error = %err,
-                    "failed to remove Diffusers image venv"
+                    "failed to remove legacy Diffusers runtime dir"
                 ),
             }
         }
-    }
-}
-
-pub fn maybe_teardown_image_runtime(keep_runtime: bool) {
-    if keep_runtime {
-        return;
-    }
-    if !python::portable_python_ready()
-        && all_diffusers_venv_dirs().iter().all(|d| !d.exists())
-    {
-        return;
-    }
-    info!("no image models remain installed; removing isolated Diffusers runtime");
-    teardown_image_runtime();
+    });
 }
 
 pub fn stage_purge_image_snapshot(repo: &str) -> Option<PathBuf> {
@@ -1096,19 +470,21 @@ pub fn stage_purge_image_snapshot(repo: &str) -> Option<PathBuf> {
     ));
     match std::fs::rename(&dir, &trash) {
         Ok(()) => {
-            info!(repo, trash = %trash.display(), "staged Diffusers snapshot for delete");
+            info!(repo, trash = %trash.display(), "staged image checkpoint for delete");
             Some(trash)
         }
         Err(err) => {
-            warn!(repo, error = %err, "fast rename of Diffusers snapshot failed; deleting");
+            warn!(repo, error = %err, "fast rename of image checkpoint failed; deleting");
             let _ = std::fs::remove_dir_all(&dir);
             None
         }
     }
 }
 
-/// Best-effort cleanup of leftover Hub `.purging-*` dirs from a previous run.
+/// Best-effort cleanup of leftover Hub `.purging-*` dirs from a previous run,
+/// plus any leftover Diffusers runtime.
 pub fn sweep_staged_image_purge_dirs() {
+    cleanup_legacy_diffusers_runtime();
     let Ok(entries) = std::fs::read_dir(hf_hub_cache_dir()) else {
         return;
     };
@@ -1131,89 +507,8 @@ pub fn sweep_staged_image_purge_dirs() {
     }
 }
 
-pub async fn run_qwen_image(
-    job: &ImageJob,
-    cuda_visible: &[u32],
-    device: &str,
-    cancel: &Notify,
-    mut on_progress: impl FnMut(&str, Option<f32>),
-) -> Result<Vec<GeneratedImage>> {
-    refuse_if_disk_full()?;
-    let venv_dir = diffusers_venv_dir(device);
-    let script = ensure_worker_script(&venv_dir)?;
-    let python = python::ensure_image_python(&mut on_progress, None).await?;
-    let cache_dir = hf_hub_cache_dir();
-    let _ = std::fs::create_dir_all(&cache_dir);
-
-    let payload = worker_payload(
-        device,
-        &venv_dir,
-        &cache_dir,
-        &job.repo,
-        &job.revision,
-        job.hf_token.as_deref(),
-        "generate",
-        Some(job),
-    );
-
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let job_path = venv_dir.join(format!("job-{}-{nonce}.json", std::process::id()));
-    write_runtime_json(&job_path, &payload)?;
-    struct JobFileGuard(PathBuf);
-    impl Drop for JobFileGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _job_guard = JobFileGuard(job_path.clone());
-
-    info!(
-        repo = %job.repo,
-        width = job.width,
-        height = job.height,
-        n = job.n,
-        device = %device,
-        "starting Diffusers image worker"
-    );
-
-    run_image_worker(
-        &python,
-        &script,
-        &job_path,
-        device,
-        cuda_visible,
-        false,
-        Some(cancel),
-        None,
-        on_progress,
-    )
-    .await
-}
-
-pub fn nvidia_cuda_available() -> bool {
-    if image_stub_enabled() {
-        return true;
-    }
-    if which_bin("nvidia-smi").is_ok() {
-        return true;
-    }
-    crate::specs::detect_all_compute_devices().iter().any(|d| {
-        d.enabled
-            && d.kind == "discrete"
-            && (d.id.starts_with("nvidia:")
-                || d.name.to_ascii_lowercase().contains("nvidia")
-                || d.name.to_ascii_lowercase().contains("geforce"))
-    })
-}
-
 pub fn metal_image_available() -> bool {
-    if image_stub_enabled() {
-        return true;
-    }
-    cfg!(target_os = "macos") && crate::compute_pool::metal_runtime_supported()
+    image_stub_enabled() || crate::compute_pool::metal_runtime_supported()
 }
 
 fn image_stub_enabled() -> bool {
@@ -1246,60 +541,36 @@ mod tests {
     }
 
     #[test]
-    fn worker_script_embeds() {
-        assert!(WORKER_PY.contains("DiffusionPipeline"));
-        assert!(WORKER_PY.contains("SCALATTICE_QWEN_IMAGE_STUB"));
-        assert!(WORKER_PY.contains("os.execv"));
-        assert!(WORKER_PY.contains("image_edit_unsupported"));
-        assert!(WORKER_PY.contains("is_qwen_image_family"));
-        assert!(WORKER_PY.contains("pick_torch_device"));
-        assert!(WORKER_PY.contains("torch_index"));
-        assert!(WORKER_PY.contains("--setup"));
-        assert!(WORKER_PY.contains("torch_directml"));
-        assert!(WORKER_PY.contains("isolate_from_host_python"));
-        assert!(WORKER_PY.contains("snapshot_download"));
-        assert!(WORKER_PY.contains("local_files_only"));
-        assert!(WORKER_PY.contains("HF_HUB_DISABLE_XET"));
-        assert!(WORKER_PY.contains("quiet_hf_progress"));
-        assert!(WORKER_PY.contains("model_not_installed"));
-        assert!(WORKER_PY.contains("snapshot_weights_complete"));
-        assert!(WORKER_PY.contains("snapshot_dir"));
-        assert!(WORKER_PY.contains("place_pipeline"));
-        assert!(WORKER_PY.contains("enable_model_cpu_offload"));
-        assert!(WORKER_PY.contains("enable_group_offload"));
-        assert!(WORKER_PY.contains("quantization_config"));
-        assert!(WORKER_PY.contains("tight_memory_quant_configs"));
-        assert!(WORKER_PY.contains("optimum-quanto"));
-        assert!(WORKER_PY.contains("torchvision"));
-        assert!(WORKER_PY.contains(".deps_ok_v5"));
-        assert!(WORKER_PY.contains("PYTORCH_MPS_HIGH_WATERMARK_RATIO"));
-        assert!(WORKER_PY.contains("image_accelerator_required"));
-        assert!(WORKER_PY.contains(r#"want == "xpu""#));
-        assert!(WORKER_PY.contains("torch.xpu"));
-    }
-
-    #[test]
-    fn qwen_repo_maps_openai_sizes() {
+    fn sd_repos_use_family_native_size() {
         assert_eq!(
-            resolve_image_job_size("Qwen/Qwen-Image", 1024, 1024, false),
-            (1328, 1328)
-        );
-        assert_eq!(
-            resolve_image_job_size("Qwen/Qwen-Image", 1792, 1024, false),
-            (1664, 928)
-        );
-        assert_eq!(
-            resolve_image_job_size("Qwen/Qwen-Image-Edit-2509", 0, 0, true),
-            (0, 0)
-        );
-    }
-
-    #[test]
-    fn other_diffusers_repos_keep_requested_size() {
-        assert_eq!(
-            resolve_image_job_size("stabilityai/stable-diffusion-xl-base-1.0", 1024, 1024, false),
+            resolve_image_job_size(
+                "stabilityai/stable-diffusion-xl-base-1.0",
+                1024,
+                1024,
+                false
+            ),
             (1024, 1024)
         );
+        assert_eq!(
+            resolve_image_job_size("stabilityai/sdxl-turbo", 0, 0, false),
+            (512, 512)
+        );
+        assert_eq!(
+            resolve_image_job_size("stabilityai/stable-diffusion-2-1", 0, 0, false),
+            (768, 768)
+        );
+        assert_eq!(
+            resolve_image_job_size("runwayml/stable-diffusion-v1-5", 256, 256, false),
+            (256, 256)
+        );
+        assert_eq!(
+            resolve_image_job_size("runwayml/stable-diffusion-v1-5", 0, 640, false),
+            (512, 640)
+        );
+    }
+
+    #[test]
+    fn other_repos_keep_requested_size() {
         assert_eq!(
             resolve_image_job_size("black-forest-labs/FLUX.1-dev", 0, 0, false),
             (1024, 1024)
@@ -1307,6 +578,10 @@ mod tests {
         assert_eq!(
             resolve_image_job_size("some-org/edit-pipe", 0, 0, true),
             (0, 0)
+        );
+        assert_eq!(
+            resolve_image_job_size("Qwen/Qwen-Image", 1792, 1024, false),
+            (1792, 1024)
         );
     }
 
@@ -1337,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn amd_discrete_card_is_image_eligible() {
+    fn vulkan_cards_are_image_eligible() {
         let amd = card(
             "amd:0",
             "discrete",
@@ -1348,14 +623,7 @@ mod tests {
         assert!(is_amd_discrete_card(&amd));
         assert!(image_card_eligible(&amd));
         assert_eq!(amd_visible_index(&amd), vec![0]);
-        assert_eq!(
-            image_backend_for_card(&amd),
-            if cfg!(windows) { "dml" } else { "rocm" }
-        );
-    }
-
-    #[test]
-    fn intel_arc_card_is_image_eligible() {
+        assert_eq!(image_backend_for_card(&amd), "vulkan");
         let arc = card(
             "pci-intel:0",
             "discrete",
@@ -1367,7 +635,7 @@ mod tests {
         assert!(is_intel_arc_card(&arc));
         assert!(image_card_eligible(&arc));
         assert_eq!(intel_visible_index(&arc), vec![0]);
-        assert_eq!(image_backend_for_card(&arc), "xpu");
+        assert_eq!(image_backend_for_card(&arc), "vulkan");
         let uhd = card(
             "pci-intel:0",
             "integrated",
@@ -1376,102 +644,36 @@ mod tests {
             true,
         );
         assert!(!is_intel_arc_card(&uhd));
-        assert!(!image_card_eligible(&uhd));
         let cpu = card("cpu:0", "cpu", "CPU", PoolStrategy::CpuOnly, false);
         assert!(!image_card_eligible(&cpu));
     }
 
     #[test]
-    fn teardown_removes_cpython_and_venvs() {
-        let dir = std::env::temp_dir().join(format!(
-            "scalattice-image-teardown-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::var("SCALATTICE_RUNTIMES_DIR").ok();
-        std::env::set_var("SCALATTICE_RUNTIMES_DIR", &dir);
-        let py = python::install_root();
-        std::fs::create_dir_all(&py).unwrap();
-        std::fs::write(py.join("marker"), b"x").unwrap();
-        for name in [
-            "diffusers-cuda",
-            "diffusers-rocm",
-            "diffusers-dml",
-            "diffusers-mps",
-            "diffusers-xpu",
-        ]
-        {
-            let v = dir.join(name);
-            std::fs::create_dir_all(&v).unwrap();
-            std::fs::write(v.join(".deps_ok_v4"), b"ok").unwrap();
-        }
-        teardown_image_runtime();
-        assert!(!py.exists());
-        for name in [
-            "diffusers-cuda",
-            "diffusers-rocm",
-            "diffusers-dml",
-            "diffusers-mps",
-            "diffusers-xpu",
-        ]
-        {
-            assert!(!dir.join(name).exists(), "{name}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        match prev {
-            Some(v) => std::env::set_var("SCALATTICE_RUNTIMES_DIR", v),
-            None => std::env::remove_var("SCALATTICE_RUNTIMES_DIR"),
-        }
+    fn nvidia_and_metal_cards_are_image_eligible() {
+        let nv = card(
+            "nvidia:0",
+            "discrete",
+            "NVIDIA RTX 4090",
+            PoolStrategy::Single,
+            false,
+        );
+        assert!(image_card_eligible(&nv));
+        assert_eq!(image_backend_for_card(&nv), "cuda");
+        let mac = card(
+            "metal:0",
+            "integrated",
+            "Apple M3 Max",
+            PoolStrategy::Metal,
+            false,
+        );
+        assert!(image_card_eligible(&mac));
+        assert_eq!(image_backend_for_card(&mac), "metal");
     }
 
     #[test]
-    fn keep_runtime_while_another_image_sku_is_enabled() {
-        let catalog = vec![
-            image_sku("img-a", "org/a"),
-            image_sku("img-b", "org/b"),
-        ];
-        let skip = vec!["img-a".to_string()];
-        assert!(keep_image_runtime(&catalog, &skip, |id| id == "img-b"));
-        assert!(!keep_image_runtime(&catalog, &skip, |_| false));
-    }
-
-    #[test]
-    fn keep_runtime_while_another_image_snapshot_is_on_disk() {
-        let models = std::env::temp_dir().join(format!(
-            "scalattice-image-keep-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&models);
-        let prev = std::env::var("SCALATTICE_MODELS_DIR").ok();
-        std::env::set_var("SCALATTICE_MODELS_DIR", &models);
-        let repo = "org/kept-image";
-        std::fs::create_dir_all(hub_repo_dir(repo)).unwrap();
-        let catalog = vec![
-            image_sku("img-a", "org/purged-image"),
-            image_sku("img-b", repo),
-        ];
-        let skip = vec!["img-a".to_string()];
-        assert!(keep_image_runtime(&catalog, &skip, |_| false));
-        assert!(keep_image_repo(&catalog, repo, &skip, |_| false));
-        assert!(!keep_image_repo(
-            &catalog,
-            "org/purged-image",
-            &skip,
-            |_| false
-        ));
-        let _ = std::fs::remove_dir_all(&models);
-        match prev {
-            Some(v) => std::env::set_var("SCALATTICE_MODELS_DIR", v),
-            None => std::env::remove_var("SCALATTICE_MODELS_DIR"),
-        }
-    }
-
-    #[test]
-    fn last_image_sku_does_not_keep_runtime_or_repo() {
+    fn last_image_sku_does_not_keep_repo() {
         let catalog = vec![image_sku("img-a", "org/a")];
         let skip = vec!["img-a".to_string()];
-        assert!(!keep_image_runtime(&catalog, &skip, |_| false));
         assert!(!keep_image_repo(&catalog, "org/a", &skip, |_| false));
     }
 
@@ -1486,114 +688,66 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_index_alone_is_not_ready() {
-        let root = std::env::temp_dir().join(format!("slt-hf-index-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let snap = root.join("snapshots").join("abc");
-        std::fs::create_dir_all(snap.join("transformer")).unwrap();
-        std::fs::write(
-            snap.join("model_index.json"),
-            r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
-        )
-        .unwrap();
-        assert!(
-            !hf_snapshot_dir_ready(&root),
-            "model_index.json without weights must not advertise"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn snapshot_ready_when_transformer_weights_exist() {
-        let root = std::env::temp_dir().join(format!("slt-hf-ready-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let snap = root.join("snapshots").join("abc");
-        std::fs::create_dir_all(snap.join("transformer")).unwrap();
-        std::fs::write(
-            snap.join("model_index.json"),
-            r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
-        )
-        .unwrap();
-        std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
-        assert!(hf_snapshot_dir_ready(&root));
-        assert_eq!(hf_ready_snapshot_path_in(&root).as_deref(), Some(snap.as_path()));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn ready_snapshot_prefers_refs_revision() {
-        let root = std::env::temp_dir().join(format!("slt-hf-refs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for hash in ["aaa", "bbb"] {
-            let snap = root.join("snapshots").join(hash);
-            std::fs::create_dir_all(snap.join("transformer")).unwrap();
-            std::fs::write(
-                snap.join("model_index.json"),
-                r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
-            )
-            .unwrap();
-            std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
+    fn keep_repo_while_snapshot_is_on_disk() {
+        let models =
+            std::env::temp_dir().join(format!("scalattice-image-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&models);
+        let prev = std::env::var("SCALATTICE_MODELS_DIR").ok();
+        std::env::set_var("SCALATTICE_MODELS_DIR", &models);
+        let repo = "org/kept-image";
+        std::fs::create_dir_all(hub_repo_dir(repo)).unwrap();
+        let catalog = vec![
+            image_sku("img-a", "org/purged-image"),
+            image_sku("img-b", repo),
+        ];
+        let skip = vec!["img-a".to_string()];
+        assert!(keep_image_repo(&catalog, repo, &skip, |_| false));
+        assert!(!keep_image_repo(
+            &catalog,
+            "org/purged-image",
+            &skip,
+            |_| false
+        ));
+        let _ = std::fs::remove_dir_all(&models);
+        match prev {
+            Some(v) => std::env::set_var("SCALATTICE_MODELS_DIR", v),
+            None => std::env::remove_var("SCALATTICE_MODELS_DIR"),
         }
-        std::fs::create_dir_all(root.join("refs")).unwrap();
-        std::fs::write(root.join("refs").join("main"), b"bbb\n").unwrap();
-        assert_eq!(
-            hf_ready_snapshot_path_in(&root).unwrap().file_name().unwrap(),
-            "bbb"
-        );
-        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn touch(hub: &Path, repo: &str, rel: &str) {
+        let snap = hub
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join("abc");
+        let path = snap.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"weights").unwrap();
     }
 
     #[test]
-    fn leftover_incomplete_blob_does_not_block_ready_snapshot() {
-        let root = std::env::temp_dir().join(format!("slt-hf-inc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let snap = root.join("snapshots").join("abc");
-        std::fs::create_dir_all(snap.join("transformer")).unwrap();
-        std::fs::create_dir_all(root.join("blobs")).unwrap();
-        std::fs::write(
-            snap.join("model_index.json"),
-            r#"{"_class_name":"X","transformer":["diffusers","T"]}"#,
-        )
-        .unwrap();
-        std::fs::write(snap.join("transformer").join("model.safetensors"), b"weights").unwrap();
-        std::fs::write(root.join("blobs").join("shard.incomplete"), b"partial").unwrap();
-        assert!(
-            hf_snapshot_dir_ready(&root),
-            "complete weight components must win over leftover .incomplete blobs"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn sharded_text_encoder_needs_every_piece() {
-        let root = std::env::temp_dir().join(format!("slt-hf-shards-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let snap = root.join("snapshots").join("abc");
-        let te = snap.join("text_encoder");
-        std::fs::create_dir_all(&te).unwrap();
-        std::fs::write(
-            snap.join("model_index.json"),
-            r#"{"_class_name":"X","text_encoder":["transformers","T"]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            te.join("model.safetensors.index.json"),
-            r#"{"weight_map":{"a":"model-00001-of-00004.safetensors","b":"model-00002-of-00004.safetensors","c":"model-00003-of-00004.safetensors","d":"model-00004-of-00004.safetensors"}}"#,
-        )
-        .unwrap();
-        for i in 2..=4 {
-            std::fs::write(
-                te.join(format!("model-0000{i}-of-00004.safetensors")),
-                b"weights",
-            )
-            .unwrap();
+    fn checkpoint_ready_needs_every_file() {
+        let hub = std::env::temp_dir().join(format!("slt-sd-ready-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&hub);
+        let repo = "runwayml/stable-diffusion-v1-5";
+        let files = files_for(repo, SdVersion::V1_5);
+        let all = files.all();
+        assert!(!checkpoint_ready_in(&hub, repo));
+        for f in &all[..all.len() - 1] {
+            touch(&hub, &f.repo, &f.path);
         }
-        assert!(
-            !hf_snapshot_dir_ready(&root),
-            "missing shard 1 of 4 must not advertise ready"
-        );
-        std::fs::write(te.join("model-00001-of-00004.safetensors"), b"weights").unwrap();
-        assert!(hf_snapshot_dir_ready(&root));
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(!checkpoint_ready_in(&hub, repo), "missing the last file");
+        let last = all[all.len() - 1];
+        touch(&hub, &last.repo, &last.path);
+        assert!(checkpoint_ready_in(&hub, repo));
+        // Tokenizer repo is complete on its own for storage listings.
+        assert!(checkpoint_ready_in(&hub, "openai/clip-vit-base-patch32"));
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn unsupported_repo_is_never_ready() {
+        let hub = std::env::temp_dir().join("slt-sd-unsupported");
+        assert!(!checkpoint_ready_in(&hub, "Qwen/Qwen-Image"));
     }
 }

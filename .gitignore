@@ -2,3 +2,9 @@
 /target-*
 /dist
 /.tools
+# Engine checkouts and build output. scripts/build-*.sh recreate these.
+/native/sd/upstream/
+/native/sd/out/
+/native/tts/sherpa-onnx/
+/native/tts/llama.cpp/
+/native/tts/out/

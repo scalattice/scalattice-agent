@@ -194,11 +194,18 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/scalattice-agent dist/
           chmod +x scripts/bundle-release-libs.sh
           scripts/bundle-release-libs.sh dist/scalattice-agent dist target/aarch64-unknown-linux-gnu/release
+          chmod +x scripts/build-stable-diffusion.sh scripts/build-tts.sh
+          scripts/build-stable-diffusion.sh
+          scripts/build-tts.sh
+          rm -rf dist/sd dist/tts
+          mkdir -p dist/sd dist/tts
+          cp -a native/sd/out/. dist/sd/
+          cp -a native/tts/out/. dist/tts/
+          tar_items=(scalattice-agent sd tts)
           if [ -d dist/lib ]; then
-            tar -czf dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz -C dist scalattice-agent lib
-          else
-            tar -czf dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz -C dist scalattice-agent
+            tar_items+=(lib)
           fi
+          tar -czf dist/scalattice-agent-aarch64-unknown-linux-gnu.tar.gz -C dist "${tar_items[@]}"
       - name: Vet auto-update and remote restart
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.cuda-path }}
@@ -247,7 +254,9 @@ jobs:
           cp target/aarch64-apple-darwin/release/scalattice-agent dist/scalattice-agent
           file dist/scalattice-agent
           lipo -archs dist/scalattice-agent | grep -qx arm64
-          chmod +x scripts/package-macos.sh
+          chmod +x scripts/package-macos.sh scripts/build-stable-diffusion.sh scripts/build-tts.sh
+          scripts/build-stable-diffusion.sh
+          scripts/build-tts.sh
           scripts/package-macos.sh
       - name: Sign and notarize
         env:

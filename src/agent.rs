@@ -9,7 +9,7 @@ use crate::protocol::{
     parse_envelope, parse_error, parse_invoke, parse_invoke_cancel, parse_invoke_split,
     parse_invoke_split_state_chunk, parse_pong, parse_ready, parse_registered, AgentSchedule,
     CatalogModel, ComputeDevicePolicy, ControlAckMessage, ControlMessage, HeartbeatMessage,
-    InvokeDeltaMessage, InvokeErrorMessage, InvokeResultMessage, InvokeSplitStateChunkMessage,
+    InvokeDeltaMessage, InvokeErrorMessage, InvokeResultMessage, InvokeSplitStateChunkMessage, InvokeTimings,
     LogsBatchMessage, LogsLinePayload, LogsSubscribeMessage, ModelPolicyEntry, RegisterMessage,
 };
 use crate::runtime::{build_runtime, JobState};
@@ -274,6 +274,9 @@ impl SessionState {
         if model.is_image_job() {
             return crate::image::image_install_ready(model);
         }
+        if model.is_tts_job() {
+            return crate::tts::tts_install_ready(model);
+        }
         if !self.disk_inventory_primed {
             // Unprimed: skip GGUF walks on the WS thread. Inventory fills this in
             // spawn_blocking; the agent re-registers once the scan lands.
@@ -349,7 +352,7 @@ impl SessionState {
             return None;
         }
         if self.catalog.iter().any(|m| {
-            m.is_image_job()
+            (m.is_image_job() || m.is_tts_job())
                 && (m.runtime_model.trim() == runtime || m.model_id.trim() == runtime)
         }) {
             return None;
@@ -430,7 +433,7 @@ impl SessionState {
         self.download_cancel = Arc::new(AtomicBool::new(false));
         // Leave sync_in_flight set until the catalog-sync task actually exits
         // so a later sync_model_weights cannot start a second install on top
-        // of CPython / pip / huggingface_hub children that are still dying.
+        // of downloads that are still dying.
         state::set_downloading_model(None);
     }
 
@@ -493,9 +496,6 @@ impl SessionState {
                 cancelled = true;
             }
         }
-        if !self.sync_in_flight.load(Ordering::Relaxed) {
-            self.sync_image_runtime_presence();
-        }
         cancelled
     }
 
@@ -536,9 +536,6 @@ impl SessionState {
         self.logged_download_blockers = false;
         self.last_sync_token = None;
         self.prune_disabled_model_weights();
-        if !self.sync_in_flight.load(Ordering::Relaxed) {
-            self.sync_image_runtime_presence();
-        }
         if !same_ids {
             info!(
                 catalog_models = self.catalog.len(),
@@ -699,7 +696,7 @@ impl SessionState {
                             info!(
                                 repo,
                                 model_id,
-                                "keeping Diffusers snapshot; another image SKU still uses it"
+                                "keeping image checkpoint; another image SKU still uses it"
                             );
                         } else if let Some(path) = crate::image::stage_purge_image_snapshot(repo) {
                             staged.push(path);
@@ -716,7 +713,6 @@ impl SessionState {
             info!("purging model weights for {model_id} ({runtime_model})");
             trash.append(&mut staged);
         }
-        self.sync_image_runtime_presence_except(model_ids);
         trash
     }
 
@@ -729,24 +725,6 @@ impl SessionState {
             .find(|(id, _)| id == model_id)
             .map(|(_, enabled)| *enabled)
             .unwrap_or(false)
-    }
-
-    fn sync_image_runtime_presence(&self) {
-        self.sync_image_runtime_presence_except(&[]);
-    }
-
-    fn sync_image_runtime_presence_except(&self, skip_model_ids: &[String]) {
-        // Empty catalog means policy/catalog has not landed yet (reconnect). Do
-        // not tear down CPython/venv just because we have not applied SKUs.
-        if self.catalog.is_empty() {
-            return;
-        }
-        let keep = crate::image::keep_image_runtime(
-            &self.catalog,
-            skip_model_ids,
-            |id| self.is_model_enabled(id),
-        );
-        crate::image::maybe_teardown_image_runtime(keep);
     }
 
     /// Models the server enabled for this machine. Fit is the server's decision.
@@ -958,9 +936,9 @@ impl SessionState {
             // background. Empty until the first off-thread scan completes.
             Vec::new()
         };
-        // Image SKUs are Diffusers snapshots, not GGUF folders. Report them as
-        // soon as the isolated runtime + hub snapshot are ready so the cloud
-        // does not 409 model_not_installed while advertising the SKU.
+        // Image checkpoints are not GGUF folders. Report them once the weights
+        // and scalattice-sd are both present so the cloud does not 409
+        // model_not_installed while advertising the SKU.
         for model in &self.catalog {
             if !model.is_image_job() || !crate::image::image_install_ready(model) {
                 continue;
@@ -973,6 +951,19 @@ impl SessionState {
                 {
                     loaded_models.push(id.to_string());
                 }
+            }
+        }
+        // Speech voices report ready once the GGUF and llama-tts are both present.
+        for model in &self.catalog {
+            if !model.is_tts_job() || !crate::tts::tts_install_ready(model) {
+                continue;
+            }
+            let id = model.model_id.as_str();
+            if !loaded_models
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(id))
+            {
+                loaded_models.push(id.to_string());
             }
         }
         let slot_fault = self
@@ -1999,9 +1990,7 @@ async fn handle_server_message(
                         guard.apply_max_completion_tokens(ready.max_completion_tokens);
                         guard.cpu_ram_headroom_gb = ready.cpu_ram_headroom_gb;
                         guard.apply_cloud_ws_max_bytes(ready.max_ws_message_bytes);
-                        // Catalog before policy: image teardown looks at enabled
-                        // image SKUs in catalog. An empty catalog on reconnect
-                        // used to delete CPython/venv and then re-download them.
+                        // Catalog before policy: policy sync reads the catalog.
                         guard.catalog = ready.catalog.clone();
                         let cancelled = guard.apply_model_policy(&ready.enabled_models);
                         guard.warm_runtime_model = ready
@@ -2030,7 +2019,6 @@ async fn handle_server_message(
                     }
                     {
                         let mut guard = state.lock().await;
-                        guard.sync_image_runtime_presence();
                         guard.sync_model_weights(hf_token, &config.token);
                         guard.persist_local_state();
                     }
@@ -2220,8 +2208,7 @@ async fn handle_server_message(
                         let trash = {
                             let mut guard = state.lock().await;
                             let trash = guard.apply_purge_models(&pong.purge_models);
-                            guard.sync_image_runtime_presence();
-                            guard.sync_model_weights(hf_token, &config.token);
+                                guard.sync_model_weights(hf_token, &config.token);
                             guard.tick_vram_lifecycle();
                             guard.persist_local_state();
                             trash
@@ -2712,6 +2699,141 @@ async fn respond_invoke(
             return Ok(());
         }
 
+        if catalog_model.is_tts_job() {
+            let text = if !invoke.prompt.trim().is_empty() {
+                invoke.prompt.clone()
+            } else {
+                invoke
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default()
+            };
+            let stream_audio = invoke.stream;
+            let audio_tx = delta_tx.clone();
+            let audio_id = invoke_id.clone();
+            let mut forward_audio = if stream_audio {
+                Some(move |chunk: &[u8]| {
+                    if chunk.is_empty() {
+                        return;
+                    }
+                    use base64::Engine as _;
+                    let Ok(text) = serde_json::to_string(
+                        &crate::protocol::InvokeAudioDeltaMessage {
+                            kind: "invoke_audio_delta",
+                            id: audio_id.clone(),
+                            data: base64::engine::general_purpose::STANDARD.encode(chunk),
+                        },
+                    ) else {
+                        return;
+                    };
+                    let _ = audio_tx.send(text);
+                })
+            } else {
+                None
+            };
+            let on_chunk: Option<&mut (dyn FnMut(&[u8]) + Send)> = match forward_audio.as_mut() {
+                Some(cb) => Some(cb),
+                None => None,
+            };
+            let tts_out = if !crate::tts::tts_weights_ready(&catalog_model) {
+                Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::ModelNotInstalled,
+                    "Speech weights are incomplete. This machine will fill missing files."
+                        .to_string(),
+                ))
+            } else if !crate::tts::runner::runtime_available(&catalog_model) {
+                Err(crate::invoke_code::coded(
+                    crate::invoke_code::InvokeErrorCode::TtsRuntimeMissing,
+                    "no speech runner for this model. Speech models are GGUF and run through llama-tts (scripts/build-tts.sh)."
+                        .to_string(),
+                ))
+            } else {
+                let started = std::time::Instant::now();
+                let pin = invoke.preferred_slot_id.trim();
+                let pin = if pin.is_empty() { None } else { Some(pin) };
+                supervisor
+                    .invoke_tts(
+                        &invoke.id,
+                        &catalog_model,
+                        crate::tts::TtsJob {
+                            text,
+                            voice: invoke.voice.clone(),
+                            speed: invoke.speed,
+                            model: catalog_model.clone(),
+                        },
+                        ram_gb,
+                        headroom,
+                        pin,
+                        on_chunk,
+                    )
+                    .await
+                    .map(|(out, slot)| (out, started.elapsed().as_millis() as u64, slot))
+            };
+            drop(forward_audio);
+            drop(delta_tx);
+            let _ = delta_writer.await;
+            match tts_out {
+                Ok((out, total_ms, slot_id)) => {
+                    info!(
+                        chars = out.characters,
+                        seconds = out.seconds,
+                        "invoke {} tts completed",
+                        invoke_id
+                    );
+                    let result = InvokeResultMessage {
+                        kind: "invoke_result",
+                        id: invoke_id.clone(),
+                        content: String::new(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        images: Vec::new(),
+                        image_count: 0,
+                        // Chunks already went out as invoke_audio_delta. The full clip
+                        // would repeat them and can blow the socket limit.
+                        audio: if stream_audio {
+                            None
+                        } else {
+                            use base64::Engine as _;
+                            Some(crate::protocol::GeneratedAudio {
+                                mime: "audio/wav".to_string(),
+                                data: base64::engine::general_purpose::STANDARD
+                                    .encode(&out.wav),
+                            })
+                        },
+                        audio_seconds: out.seconds,
+                        characters: out.characters,
+                        timings: Some(InvokeTimings {
+                            total_ms: Some(total_ms),
+                            ..Default::default()
+                        }),
+                        slot_id: Some(slot_id),
+                    };
+                    return ws_send_text(write, &serde_json::to_string(&result)?).await;
+                }
+                Err(err) => {
+                    let code = invoke_error_code(&err);
+                    if code == "model_not_installed" {
+                        info!("invoke {} tts not installed: {err:#}", invoke_id);
+                    } else {
+                        warn!("tts invoke failed: {err:#}");
+                        state::record_inference_failure(code, &format!("{err:#}"));
+                    }
+                    let msg = InvokeErrorMessage {
+                        kind: "invoke_error",
+                        id: invoke_id.clone(),
+                        error: code.to_string(),
+                        detail: Some(crate::protocol::cloud_invoke_error_detail(&err)),
+                        slot_id: None,
+                    };
+                    let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+                    return Ok(());
+                }
+            }
+        }
+
         if catalog_model.is_image_job() {
             if invoke.stream {
                 let msg = InvokeErrorMessage {
@@ -2744,13 +2866,18 @@ async fn respond_invoke(
                 .map(|w| w.repo.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_default();
-            if repo.is_empty() {
+            let named_file = catalog_model
+                .weights
+                .as_ref()
+                .is_some_and(|w| !w.filename.trim().is_empty());
+            if repo.is_empty() && !named_file {
                 let msg = InvokeErrorMessage {
                     kind: "invoke_error",
                     id: invoke_id.clone(),
                     error: "model_load_failed".to_string(),
                     detail: Some(
-                        "Catalog image models need a Hugging Face Diffusers repo.".to_string(),
+                        "Catalog image models need weights.filename (a checkpoint) or a Hugging Face repo."
+                            .to_string(),
                     ),
                 
                     slot_id: None,
@@ -2760,14 +2887,14 @@ async fn respond_invoke(
                 let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
                 return Ok(());
             }
-            if !crate::image::image_install_ready(&catalog_model) {
+            if !crate::image::image_weights_ready(&catalog_model) {
                 withdraw_incomplete_image_snapshot(state, write, &catalog_model).await;
                 let msg = InvokeErrorMessage {
                     kind: "invoke_error",
                     id: invoke_id.clone(),
                     error: "model_not_installed".to_string(),
                     detail: Some(format!(
-                        "Diffusers snapshot is incomplete for {repo}. This machine will fill missing files."
+                        "Image checkpoint is incomplete for {repo}. This machine will fill missing files."
                     )),
                 
                     slot_id: None,
@@ -2847,6 +2974,9 @@ async fn respond_invoke(
                         completion_tokens: 0,
                         images,
                         image_count,
+                        audio: None,
+                        audio_seconds: 0.0,
+                        characters: 0,
                         timings: Some(timings),
                         slot_id: Some(slot_id),
                     };
@@ -2935,6 +3065,9 @@ async fn respond_invoke(
                     completion_tokens,
                     images: Vec::new(),
                     image_count: 0,
+                    audio: None,
+                    audio_seconds: 0.0,
+                    characters: 0,
                     timings: Some(timings),
                     slot_id: Some(slot_id),
                 };
@@ -3033,6 +3166,18 @@ async fn respond_invoke_split(
             guard.cpu_ram_headroom_gb,
         )
     };
+
+    if catalog_model.is_tts_job() {
+        let err = InvokeErrorMessage {
+            kind: "invoke_error",
+            id: invoke.id.clone(),
+            error: "tts_model_chat_unsupported".to_string(),
+            detail: Some("TTS models do not support split inference.".to_string()),
+            slot_id: None,
+        };
+        ws_send_text(write, &serde_json::to_string(&err)?).await?;
+        return Ok(());
+    }
 
     if catalog_model.is_image_job() {
         let err = InvokeErrorMessage {
@@ -3447,11 +3592,11 @@ mod invoke_error_code_tests {
     #[test]
     fn incomplete_image_snapshot_is_model_not_installed() {
         let err = anyhow::anyhow!(
-            "model_not_installed: Diffusers snapshot is incomplete for Qwen/Qwen-Image-2512. This machine will fill missing files."
+            "model_not_installed: image checkpoint is incomplete for stabilityai/sdxl-turbo (missing unet/diffusion_pytorch_model.fp16.safetensors)"
         );
         assert_eq!(invoke_error_code(&err), "model_not_installed");
         let err = anyhow::anyhow!(
-            "Diffusers load failed for Qwen/Qwen-Image-2512: No such file or directory: text_encoder/model-00001-of-00004.safetensors"
+            "Candle load failed for stabilityai/sdxl-turbo: No such file or directory: text_encoder/model.fp16.safetensors"
         );
         assert_eq!(invoke_error_code(&err), "model_not_installed");
     }
@@ -3459,11 +3604,11 @@ mod invoke_error_code_tests {
     #[test]
     fn mps_image_oom_is_insufficient_vram() {
         let err = anyhow::anyhow!(
-            "insufficient_vram: Not enough GPU memory to load Qwen/Qwen-Image-2512: MPS backend out of memory (MPS allocated: 42.38 GiB, max allowed: 42.43 GiB). Tried to allocate 72.00 MiB on shared pool. Use PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0"
+            "insufficient_vram: not enough GPU memory to load UNet: Metal out of memory"
         );
         assert_eq!(invoke_error_code(&err), "insufficient_vram");
         let err = anyhow::anyhow!(
-            "model_load_failed: Diffusers load failed for Qwen/Qwen-Image-2512: MPS backend out of memory (MPS allocated: 42.38 GiB, other allocations: 384.00 KiB, max allowed: 42.43 GiB)"
+            "model_load_failed: Candle load failed for stabilityai/sdxl-turbo: unexpected dtype"
         );
         assert_eq!(invoke_error_code(&err), "model_load_failed");
         let err = anyhow::anyhow!(
@@ -3484,9 +3629,9 @@ mod invoke_error_code_tests {
     }
 
     #[test]
-    fn enospc_job_json_is_disk_full() {
+    fn enospc_checkpoint_write_is_disk_full() {
         let err = anyhow::anyhow!(
-            "write ~/.cache/scalattice/runtimes/diffusers-mps/job-41999.json: No space left on device (os error 28)"
+            "write hub/models--stabilityai--sdxl-turbo/blobs/abc.part: No space left on device (os error 28)"
         );
         assert_eq!(invoke_error_code(&err), "disk_full");
         let err = anyhow::anyhow!(
@@ -3580,7 +3725,7 @@ mod image_purge_tests {
     }
 
     #[test]
-    fn purge_keeps_shared_runtime_when_another_image_sku_remains() {
+    fn purge_keeps_shared_checkpoint_when_another_image_sku_remains() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -3590,51 +3735,55 @@ mod image_purge_tests {
             std::process::id()
         ));
         let models = root.join("models");
-        let runtimes = root.join("runtimes");
         std::fs::create_dir_all(&models).unwrap();
-        std::fs::create_dir_all(&runtimes).unwrap();
         let prev_models = std::env::var("SCALATTICE_MODELS_DIR").ok();
-        let prev_runtimes = std::env::var("SCALATTICE_RUNTIMES_DIR").ok();
         std::env::set_var("SCALATTICE_MODELS_DIR", &models);
-        std::env::set_var("SCALATTICE_RUNTIMES_DIR", &runtimes);
 
         std::fs::create_dir_all(crate::image::hub_repo_dir("org/a")).unwrap();
         std::fs::create_dir_all(crate::image::hub_repo_dir("org/b")).unwrap();
-        let venv = crate::image::diffusers_venv_dir("cuda");
-        std::fs::create_dir_all(&venv).unwrap();
-        std::fs::write(venv.join(".deps_ok_v4"), b"ok").unwrap();
+        std::fs::create_dir_all(crate::image::hub_repo_dir("org/shared")).unwrap();
 
         let mut session = SessionState::new();
-        session.catalog = vec![image_sku("img-a", "org/a"), image_sku("img-b", "org/b")];
-        session.model_policy = vec![("img-a".into(), false), ("img-b".into(), true)];
-        session.apply_purge_models(&["img-a".to_string()]);
+        session.catalog = vec![
+            image_sku("img-a", "org/a"),
+            image_sku("img-b", "org/b"),
+            image_sku("img-c", "org/shared"),
+            image_sku("img-d", "org/shared"),
+        ];
+        session.model_policy = vec![
+            ("img-a".into(), false),
+            ("img-b".into(), true),
+            ("img-c".into(), false),
+            ("img-d".into(), true),
+        ];
+        session.apply_purge_models(&["img-a".to_string(), "img-c".to_string()]);
 
         assert!(
             !crate::image::hub_repo_dir("org/a").exists(),
-            "purged image snapshot should be staged away"
+            "purged image checkpoint should be staged away"
         );
         assert!(
             crate::image::hub_repo_dir("org/b").exists(),
-            "remaining image snapshot must stay"
+            "remaining image checkpoint must stay"
         );
-        assert!(venv.exists(), "Diffusers venv must stay for the other SKU");
-
-        session.model_policy = vec![("img-a".into(), false), ("img-b".into(), false)];
-        session.apply_purge_models(&["img-b".to_string()]);
-        assert!(!crate::image::hub_repo_dir("org/b").exists());
         assert!(
-            !venv.exists(),
-            "last image SKU purge should remove the Diffusers venv"
+            crate::image::hub_repo_dir("org/shared").exists(),
+            "checkpoint shared with an enabled sibling SKU must stay"
         );
+
+        session.model_policy = vec![("img-b".into(), false), ("img-d".into(), false)];
+        session.apply_purge_models(&[
+            "img-b".to_string(),
+            "img-c".to_string(),
+            "img-d".to_string(),
+        ]);
+        assert!(!crate::image::hub_repo_dir("org/b").exists());
+        assert!(!crate::image::hub_repo_dir("org/shared").exists());
 
         let _ = std::fs::remove_dir_all(&root);
         match prev_models {
             Some(v) => std::env::set_var("SCALATTICE_MODELS_DIR", v),
             None => std::env::remove_var("SCALATTICE_MODELS_DIR"),
-        }
-        match prev_runtimes {
-            Some(v) => std::env::set_var("SCALATTICE_RUNTIMES_DIR", v),
-            None => std::env::remove_var("SCALATTICE_RUNTIMES_DIR"),
         }
     }
 }

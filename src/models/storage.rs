@@ -257,7 +257,10 @@ pub fn model_weights_ready(runtime_model: &str) -> bool {
 /// or an existing GGUF whose catalog filename merely drifted.
 pub fn catalog_model_weights_ready(model: &crate::protocol::CatalogModel) -> bool {
     if model.is_image_job() {
-        return crate::image::image_install_ready(model);
+        return crate::image::image_weights_ready(model);
+    }
+    if model.is_tts_job() {
+        return crate::tts::tts_weights_ready(model);
     }
     let runtime = runtime_id_for_catalog(model);
     if model_weights_ready(runtime) {
@@ -554,7 +557,7 @@ fn list_image_hub_disk_status() -> Vec<(String, ModelDiskStatus)> {
                     bytes,
                     complete: false,
                     state: "removing".to_string(),
-                    error: Some("Removing Diffusers snapshot from disk.".to_string()),
+                    error: Some("Removing image checkpoint from disk.".to_string()),
                 },
             ));
             continue;

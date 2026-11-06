@@ -252,6 +252,24 @@ chmod +x "$DEST"
 # Drop stale role hardlinks (old inode) so the new binary recreates them.
 rm -f "$(dirname "$DEST")"/scalattice-slot-* "$(dirname "$DEST")"/scalattice-tray 2>/dev/null || true
 
+# Image and speech are separate programs the agent starts. They cannot be
+# linked into the agent binary (each has its own ggml, and CUDA stays out of
+# the agent). A release puts them in sd/ and tts/ beside the binary; do the same.
+install_runner() {
+  local name="$1" src="$2" dest
+  dest="$(dirname "$DEST")/${name}"
+  if [[ ! -d "$src" ]]; then
+    echo "warning: ${name} runner is not built (${src}); image/speech jobs will not start" >&2
+    return 0
+  fi
+  echo "==> install ${name} runner -> ${dest}"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp -a "$src"/. "$dest"/
+}
+install_runner sd native/sd/out
+install_runner tts native/tts/out
+
 echo "==> restart (systemd only — never leave a second foreground owner)"
 if command -v systemctl >/dev/null 2>&1 && systemctl --user cat "$UNIT" >/dev/null 2>&1; then
   systemctl --user daemon-reload 2>/dev/null || true

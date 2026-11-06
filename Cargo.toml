@@ -43,6 +43,8 @@ tar = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

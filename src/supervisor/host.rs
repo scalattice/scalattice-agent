@@ -1452,9 +1452,15 @@ impl Supervisor {
 
     pub async fn loaded_models_union(&self) -> Vec<String> {
         let workers = self.workers.lock().await;
+        let checkouts = self.checkouts.lock().await;
         let mut set = std::collections::BTreeSet::new();
         for w in workers.values() {
             for m in &w.loaded_models {
+                set.insert(m.clone());
+            }
+        }
+        for c in checkouts.values() {
+            for m in &c.loaded_models {
                 set.insert(m.clone());
             }
         }
@@ -2117,20 +2123,18 @@ impl Supervisor {
         Err(last_crash.unwrap_or_else(|| anyhow!("agent_busy: no remaining compute slot")))
     }
 
-    pub async fn invoke_image(
+    /// Same slot rules as chat: a server pin is the only slot, a busy or
+    /// server-blocked slot is refused, and an unpinned job may use another
+    /// idle allowed slot. Does not move a pinned job.
+    async fn reserve_catalog_slot(
         &self,
         job_id: &str,
         model: &CatalogModel,
-        job: crate::image::ImageJob,
         ram_gb: u32,
         cpu_ram_headroom_gb: u32,
-        mut on_delta: Option<Box<dyn FnMut(String) + Send>>,
         preferred_slot_id: Option<&str>,
-    ) -> Result<(Vec<GeneratedImage>, InvokeTimings, String)> {
-        // Before claiming a GPU / killing llama.cpp: image jobs cannot run on a full disk.
-        crate::image::refuse_if_disk_full()?;
-        let cancel = self.register_job_cancel(job_id).await;
-        let started = Instant::now();
+        kind: &str,
+    ) -> Result<Placement> {
         let blocked = self.blocked_slot_ids(&model.model_id).await;
         let required_slot = preferred_slot_id
             .map(str::trim)
@@ -2175,7 +2179,7 @@ impl Supervisor {
                         }
                     }
                 }
-                info!(slot = %want, "claimed server-required image slot");
+                info!(slot = %want, kind, "claimed server-required slot");
                 placement
             } else {
                 let workers = self.workers.lock().await;
@@ -2253,88 +2257,264 @@ impl Supervisor {
             }
         };
         self.changed.notify_waiters();
+        Ok(placement)
+    }
 
-        let slot_id = placement
-            .slot_ids
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("empty placement"))?;
-        let image_device = crate::image::image_backend_for_card(&placement.card);
-        info!(slot = %slot_id, device = %image_device, job_id, "claimed slot for image job");
-
-        let mut worker = {
+    /// Stop llama.cpp on these slots so an image or speech engine can use the
+    /// GPUs. [`resume_slots`] starts the chat workers again.
+    async fn suspend_slots(
+        &self,
+        placement: &Placement,
+        job_id: &str,
+        model_ids: &[&str],
+    ) -> Result<Vec<(String, SlotWorker)>> {
+        let mut checked_out = Vec::new();
+        let mut missing: Option<String> = None;
+        {
             let mut workers = self.workers.lock().await;
-            match workers.remove(&slot_id) {
-                Some(w) => w,
-                None => {
-                    drop(workers);
-                    self.clear_job_cancel(job_id).await;
-                    return Err(self.err_missing_slot_worker(&slot_id).await);
+            for sid in &placement.slot_ids {
+                match workers.remove(sid) {
+                    Some(worker) => checked_out.push((sid.clone(), worker)),
+                    None => {
+                        for (id, worker) in checked_out.drain(..) {
+                            workers.insert(id, worker);
+                        }
+                        missing = Some(sid.clone());
+                        break;
+                    }
                 }
             }
-        };
-        let pid = worker.child.id();
-        let runtime = model.runtime_model.trim();
-        // Show the in-flight runtime under Loaded while the worker is checked out.
-        if !runtime.is_empty()
-            && !worker
-                .loaded_models
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(runtime))
-        {
-            worker.loaded_models.push(runtime.to_string());
         }
-        self.mark_checkout(&slot_id, job_id, pid, worker.loaded_models.clone())
-            .await;
-
-        // Evict llama.cpp so PyTorch can take the same GPU.
-        let _ = worker.child.kill().await;
-        let _ = worker.child.wait().await;
-        // Metal residency sets can linger after SIGKILL; give the OS a beat
-        // before the Diffusers process maps the same unified memory.
+        if let Some(sid) = missing {
+            return Err(self.err_missing_slot_worker(&sid).await);
+        }
+        for (sid, worker) in &mut checked_out {
+            let mut loaded: Vec<String> = Vec::new();
+            for id in model_ids {
+                let id = id.trim();
+                if !id.is_empty() && !loaded.iter().any(|m| m.eq_ignore_ascii_case(id)) {
+                    loaded.push(id.to_string());
+                }
+            }
+            if loaded.is_empty() {
+                loaded = worker.loaded_models.clone();
+            }
+            let pid = worker.child.id();
+            self.mark_checkout(sid, job_id, pid, loaded).await;
+            let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+        }
+        self.changed.notify_waiters();
+        // Metal residency can linger after SIGKILL.
         let drain = if cfg!(target_os = "macos") {
             Duration::from_millis(1500)
         } else {
             Duration::from_millis(400)
         };
         tokio::time::sleep(drain).await;
+        Ok(checked_out)
+    }
+
+    async fn resume_slots(&self, checked_out: Vec<(String, SlotWorker)>) {
+        for (sid, worker) in checked_out {
+            match self.spawn_plan_worker(&worker.spec).await {
+                Ok(new_w) => self.return_worker(sid, new_w).await,
+                Err(err) => {
+                    warn!(slot = %sid, error = %err, "failed to respawn llama worker");
+                    let mut worker = worker;
+                    worker.healthy = false;
+                    self.return_worker(sid, worker).await;
+                }
+            }
+        }
+    }
+
+    async fn release_slot_busy(&self, slot_ids: &[String]) {
+        let mut workers = self.workers.lock().await;
+        for sid in slot_ids {
+            if let Some(worker) = workers.get_mut(sid) {
+                worker.busy = false;
+            }
+        }
+        drop(workers);
+        self.changed.notify_waiters();
+    }
+
+    pub async fn invoke_tts(
+        &self,
+        job_id: &str,
+        model: &CatalogModel,
+        job: crate::tts::TtsJob,
+        ram_gb: u32,
+        cpu_ram_headroom_gb: u32,
+        preferred_slot_id: Option<&str>,
+        on_chunk: Option<&mut (dyn FnMut(&[u8]) + Send)>,
+    ) -> Result<(crate::tts::TtsOutput, String)> {
+        let _cancel = self.register_job_cancel(job_id).await;
+        let placement = match self
+            .reserve_catalog_slot(
+                job_id,
+                model,
+                ram_gb,
+                cpu_ram_headroom_gb,
+                preferred_slot_id,
+                "tts",
+            )
+            .await
+        {
+            Ok(placement) => placement,
+            Err(err) => {
+                self.clear_job_cancel(job_id).await;
+                return Err(err);
+            }
+        };
+        let slot_id = if placement.use_tp_worker {
+            format!("tp:{}", placement.slot_ids.join("+"))
+        } else {
+            placement
+                .slot_ids
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        };
+        info!(slot = %slot_id, job_id, "running tts on claimed slot");
+        let outcome = if crate::tts::runner::occupies_gpu(model) {
+            let names = [model.model_id.as_str(), model.runtime_model.as_str()];
+            let suspended = match self.suspend_slots(&placement, job_id, &names).await {
+                Ok(slots) => slots,
+                Err(err) => {
+                    self.release_slot_busy(&placement.slot_ids).await;
+                    self.clear_job_cancel(job_id).await;
+                    return Err(err);
+                }
+            };
+            let outcome = crate::tts::runner::synthesize(
+                job,
+                &placement.card,
+                &placement.cuda_visible,
+                on_chunk,
+            )
+            .await;
+            self.resume_slots(suspended).await;
+            outcome
+        } else {
+            let outcome = crate::tts::runner::synthesize(
+                job,
+                &placement.card,
+                &placement.cuda_visible,
+                on_chunk,
+            )
+            .await;
+            self.release_slot_busy(&placement.slot_ids).await;
+            outcome
+        };
+        self.clear_job_cancel(job_id).await;
+        self.changed.notify_waiters();
+        let out = match outcome {
+            Ok(out) => out,
+            Err(err) => {
+                let code = crate::invoke_code::wire_code(&err);
+                let slot = placement.slot_ids.first().map(|s| s.as_str()).unwrap_or("");
+                self.note_slot_failure(&model.model_id, slot, code, &format!("{err:#}"))
+                    .await;
+                return Err(err.context(format!("slot_id={slot_id}")));
+            }
+        };
+        Ok((out, slot_id))
+    }
+
+    pub async fn invoke_image(
+        &self,
+        job_id: &str,
+        model: &CatalogModel,
+        job: crate::image::ImageJob,
+        ram_gb: u32,
+        cpu_ram_headroom_gb: u32,
+        mut on_delta: Option<Box<dyn FnMut(String) + Send>>,
+        preferred_slot_id: Option<&str>,
+    ) -> Result<(Vec<GeneratedImage>, InvokeTimings, String)> {
+        // Before claiming a GPU / killing llama.cpp: image jobs cannot run on a full disk.
+        crate::image::refuse_if_disk_full()?;
+        let cancel = self.register_job_cancel(job_id).await;
+        let started = Instant::now();
+        let placement = match self
+            .reserve_catalog_slot(
+                job_id,
+                model,
+                ram_gb,
+                cpu_ram_headroom_gb,
+                preferred_slot_id,
+                "image",
+            )
+            .await
+        {
+            Ok(placement) => placement,
+            Err(err) => {
+                self.clear_job_cancel(job_id).await;
+                return Err(err);
+            }
+        };
+
+        let slot_id = if placement.use_tp_worker {
+            format!("tp:{}", placement.slot_ids.join("+"))
+        } else {
+            placement
+                .slot_ids
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let image_device = crate::image::image_backend_for_card(&placement.card);
+        info!(slot = %slot_id, device = %image_device, split = placement.use_tp_worker, job_id, "claimed slot for image job");
+
+        let names = [model.model_id.as_str(), model.runtime_model.as_str()];
+        let suspended = match self.suspend_slots(&placement, job_id, &names).await {
+            Ok(slots) => slots,
+            Err(err) => {
+                self.release_slot_busy(&placement.slot_ids).await;
+                self.clear_job_cancel(job_id).await;
+                return Err(err);
+            }
+        };
 
         let mut on_progress = |phase: &str, pct: Option<f32>| {
             if let Some(cb) = on_delta.as_mut() {
                 cb(format!("\u{1e}{}\u{1e}{}", phase, pct.unwrap_or(-1.0)));
             }
         };
+        on_progress("loading", Some(0.0));
 
         let outcome = tokio::select! {
             biased;
             _ = cancel.notified() => {
                 Err(anyhow!("request_canceled"))
             }
-            result = crate::image::run_qwen_image(
-                &job,
-                &placement.cuda_visible,
-                image_device,
-                &cancel,
-                &mut on_progress,
-            ) => result,
+            result = async {
+                let weights = crate::image::sdcpp::resolve_weights(model)?;
+                crate::image::sdcpp::generate(
+                    &job,
+                    &weights,
+                    &placement.card,
+                    &placement.cuda_visible,
+                    placement.use_tp_worker,
+                    &cancel,
+                )
+                .await
+            } => result,
         };
 
-        match self.spawn_plan_worker(&worker.spec).await {
-            Ok(new_w) => worker = new_w,
-            Err(err) => {
-                warn!(slot = %slot_id, error = %err, "failed to respawn llama worker after image job");
-                worker.healthy = false;
-            }
-        }
-        self.return_worker(slot_id.clone(), worker).await;
+        self.resume_slots(suspended).await;
         self.clear_job_cancel(job_id).await;
 
         let images = match outcome {
             Ok(images) => images,
             Err(err) => {
                 let code = crate::invoke_code::wire_code(&err);
-                self.note_slot_failure(&model.model_id, &slot_id, code, &format!("{err:#}"))
-                    .await;
+                let detail = format!("{err:#}");
+                for sid in &placement.slot_ids {
+                    self.note_slot_failure(&model.model_id, sid, code, &detail)
+                        .await;
+                }
                 return Err(err.context(format!("slot_id={slot_id}")));
             }
         };
@@ -3246,7 +3426,10 @@ mod tests {
             "The pipe is being closed. (os error 232)"
         )));
         let coded = super::worker_lost("worker process exited (broken pipe while sending the job)");
-        assert_eq!(code_of(&coded), InvokeErrorCode::WorkerLost);
+        assert_eq!(
+            code_of(&coded),
+            InvokeErrorCode::WorkerLost
+        );
         assert!(worker_crash_retryable(&coded));
     }
 
