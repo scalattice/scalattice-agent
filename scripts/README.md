@@ -33,7 +33,7 @@ Linux build host                       Windows (self-hosted runner)
 ```
 
 **`release.sh --dev`**. Linux x86_64 here + Windows on your runner (skip aarch64 Linux and macOS).  
-**`release.sh`**: same + aarch64 Linux on GitHub `ubuntu-24.04-arm` + macOS Metal on `macos-14`.  
+**`release.sh`**: same + aarch64 Linux on GitHub `ubuntu-24.04-arm` + macOS Metal on `macos-15`.  
 Merging `development` → `production` runs the full Release workflow (including Linux x86_64 in CI). Each platform job vets auto-update **before** the asset is uploaded: a loopback mock serves the just-built package as v99.0.0, then the agent must download, replace itself, and come back running (remote `control/update` and CLI `update`). There is never a future GitHub release to update to while cutting this one.
 
 Useful flags: `--version 1.0.2`, `--skip-build`, `--local-windows`, `--github-hosted-windows`, `--no-push`.

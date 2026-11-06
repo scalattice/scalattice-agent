@@ -57,7 +57,7 @@ Download and open **[ScalatticeAgentSetup-aarch64.dmg](https://github.com/scalat
 
 Setup guide: https://scalattice.cloud/install/agent-setup?os=macos
 
-The binary is compiled and signed on GitHub’s `macos-14` runners. See [docs/macos-signing.md](docs/macos-signing.md).
+The binary is compiled and signed on GitHub’s `macos-15` runners. See [docs/macos-signing.md](docs/macos-signing.md).
 
 Background mode uses a LaunchAgent. Stay signed in (or enable auto-login) so launchd keeps the agent running. The menu bar app is the same control panel as Windows (status, token, logs). Slot workers show as `scalattice-slot-metal-0` (etc.) in Activity Monitor; the tray uses `scalattice-tray`.
 

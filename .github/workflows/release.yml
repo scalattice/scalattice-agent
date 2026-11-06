@@ -4,7 +4,7 @@ name: Release
 # Linux x86_64 CUDA is built here (no local build host required).
 # Windows defaults to a GitHub-hosted windows-2022 runner (full-speed upload).
 # workflow_dispatch may override to the self-hosted home PC (scalattice-release).
-# macOS is GitHub-hosted macos-14 (Apple Silicon). Unsigned if Apple secrets are missing.
+# macOS is GitHub-hosted macos-15 (Apple Silicon). Unsigned if Apple secrets are missing.
 on:
   workflow_dispatch:
     inputs:
@@ -213,7 +213,7 @@ jobs:
   build-macos:
     needs: prepare
     if: needs.prepare.result == 'success' && (needs.prepare.outputs.targets == 'macos-only' || needs.prepare.outputs.targets == 'full')
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 240
     steps:
       - name: Require Apple Silicon
