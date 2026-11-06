@@ -229,12 +229,16 @@ jobs:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-macos-metal
+          shared-key: release-macos-15-metal
           cache-targets: true
           cache-workspace-crates: true
       - name: Build Metal (arm64 only)
         env:
           CARGO_INCREMENTAL: "0"
+          # Homebrew OpenSSL 3.6 on macos-15 is found, then CMake's OpenSSL::SSL
+          # target is missing when llama.cpp regenerates. Chat does not use
+          # llama.cpp's HTTPS client (LLAMA_CURL is already off).
+          CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
         run: |
           set -euo pipefail
           rustup target add aarch64-apple-darwin
