@@ -123,6 +123,9 @@ struct SessionState {
     cached_max_jobs: u32,
     cached_loaded_models: Vec<String>,
     pending_supervisor_restart: bool,
+    /// True while slot workers are being replaced. Invokes must hop, not write
+    /// to a worker this restart is about to kill.
+    supervisor_restarting: bool,
     /// Disk inventory for heartbeats. Refreshed off the WS thread: walking GGUFs
     /// inline stalls invoke/log frames for tens of seconds on some machines.
     disk_inventory_primed: bool,
@@ -179,6 +182,7 @@ impl SessionState {
             cached_max_jobs: 1,
             cached_loaded_models: Vec::new(),
             pending_supervisor_restart: false,
+            supervisor_restarting: false,
             disk_inventory_primed: false,
             cached_disk_ready: Vec::new(),
             cached_disk_gb: 0,
@@ -1624,29 +1628,46 @@ async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
             }
         };
         if let Some(specs) = specs {
-            // Keep the previous supervisor reachable until the replacement is
-            // installed (avoids a window where invokes see "not started"), then
-            // shut it down. `Supervisor::start` reaps same-slot leftovers first.
-            match Supervisor::start(&specs.compute_devices).await {
-                Ok(supervisor) => {
-                    let (previous, slot) = {
-                        let mut guard = state.lock().await;
-                        let previous = guard.supervisor.replace(supervisor.clone());
-                        let slot = guard.supervisor_slot.clone();
-                        (previous, slot)
-                    };
-                    if let Some(slot) = slot {
-                        *slot.lock().await = supervisor;
-                    }
-                    if let Some(prev) = previous {
-                        prev.shutdown().await;
-                    }
-                    info!("compute supervisor restarted (device policy or VRAM nameplate refresh)");
+            // A job may have started during device detection. Leave the live
+            // workers alone until the machine is idle again.
+            let previous = {
+                let mut guard = state.lock().await;
+                if guard.active_job_count > 0 {
+                    guard.pending_supervisor_restart = true;
+                    None
+                } else {
+                    guard.supervisor_restarting = true;
+                    Some(guard.supervisor.take())
                 }
-                Err(err) => {
-                    warn!("supervisor restart failed: {err:#}");
-                    // Allow a later refresh to retry.
-                    state.lock().await.pending_supervisor_restart = true;
+            };
+            if let Some(previous) = previous {
+                // Stop the old workers before start() reaps by process name.
+                // The old order spawned the replacement first, then shutdown()
+                // killed every `scalattice-slot-*` — including the new ones.
+                // The next job wrote to that dead pipe: Broken pipe (os error
+                // 32) on Unix, "The pipe is being closed" (os error 232) on Windows.
+                if let Some(prev) = previous {
+                    prev.shutdown().await;
+                }
+                match Supervisor::start(&specs.compute_devices).await {
+                    Ok(supervisor) => {
+                        let slot = {
+                            let mut guard = state.lock().await;
+                            guard.supervisor = Some(supervisor.clone());
+                            guard.supervisor_restarting = false;
+                            guard.supervisor_slot.clone()
+                        };
+                        if let Some(slot) = slot {
+                            *slot.lock().await = supervisor;
+                        }
+                        info!("compute supervisor restarted (device policy or VRAM nameplate refresh)");
+                    }
+                    Err(err) => {
+                        warn!("supervisor restart failed: {err:#}");
+                        let mut guard = state.lock().await;
+                        guard.supervisor_restarting = false;
+                        guard.pending_supervisor_restart = true;
+                    }
                 }
             }
         }
@@ -2551,6 +2572,19 @@ async fn respond_invoke(
     let (supervisor, catalog_model, runtime_model, ram_gb, headroom, max_tokens, hf_token, mut job_lease) = {
         let mut guard = state.lock().await;
         crate::state::adopt_update_drain_request();
+        if guard.supervisor_restarting {
+            let msg = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke.id.clone(),
+                error: "agent_busy".to_string(),
+                detail: Some(
+                    "agent_busy: compute workers are restarting; try another machine".to_string(),
+                ),
+                slot_id: None,
+            };
+            let _ = ws_send_text(write, &serde_json::to_string(&msg)?).await;
+            return Ok(());
+        }
         if crate::state::update_draining() {
             let msg = InvokeErrorMessage {
                 kind: "invoke_error",
@@ -3050,6 +3084,19 @@ async fn respond_invoke_split(
     {
         let mut guard = state.lock().await;
         crate::state::adopt_update_drain_request();
+        if guard.supervisor_restarting {
+            let err = InvokeErrorMessage {
+                kind: "invoke_error",
+                id: invoke.id.clone(),
+                error: "agent_busy".to_string(),
+                detail: Some(
+                    "agent_busy: compute workers are restarting; try another machine".to_string(),
+                ),
+                slot_id: None,
+            };
+            ws_send_text(write, &serde_json::to_string(&err)?).await?;
+            return Ok(());
+        }
         if crate::state::update_draining() {
             let err = InvokeErrorMessage {
                 kind: "invoke_error",
