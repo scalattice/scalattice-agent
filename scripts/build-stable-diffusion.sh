@@ -10,19 +10,43 @@ SRC="${ROOT}/native/sd/upstream"
 BUILD="${SRC}/build"
 OUT="${ROOT}/native/sd/out"
 WRAPPER="${ROOT}/native/sd/scalattice_sd.cpp"
+# Pin: scripts/patches/sd-load-cuda-on-demand.patch is authored against this tip.
+# Bumping requires refreshing that patch (and plugin_entry.cpp) first.
+SD_UPSTREAM_PIN="${SD_UPSTREAM_PIN:-f5df5f8b84f139f1e80496902da90798a0d92896}"
 
 mkdir -p "${ROOT}/native/sd"
 if [[ ! -d "${SRC}/.git" ]]; then
-  git clone --depth 1 --recursive https://github.com/leejet/stable-diffusion.cpp "${SRC}"
+  git clone --recursive https://github.com/leejet/stable-diffusion.cpp "${SRC}"
 fi
+# Detached pin so CI does not silently drift past our CUDA-on-demand patch.
+git -C "${SRC}" fetch --depth 1 origin "${SD_UPSTREAM_PIN}" 2>/dev/null || \
+  git -C "${SRC}" fetch --depth 50 origin master
+git -C "${SRC}" checkout --detach -f "${SD_UPSTREAM_PIN}"
 # ggml is a submodule. A previous clone without --recursive leaves the directory empty.
 if [[ ! -f "${SRC}/ggml/CMakeLists.txt" ]]; then
   git -C "${SRC}" submodule update --init --recursive --depth 1
 fi
 # CUDA kernels live in libsd-cuda.so and are opened only on NVIDIA machines.
+# Without this patch, libstable-diffusion.so DT_NEEDs libcuda and AMD/Intel hosts
+# cannot start the image runner — fail the build rather than ship a broken binary.
 patch_file="${ROOT}/scripts/patches/sd-load-cuda-on-demand.patch"
-if [[ -f "${patch_file}" ]] && git -C "${SRC}" apply --check "${patch_file}" >/dev/null 2>&1; then
+if [[ ! -f "${patch_file}" ]]; then
+  echo "missing ${patch_file}" >&2
+  exit 1
+fi
+if git -C "${SRC}" apply --reverse --check "${patch_file}" >/dev/null 2>&1; then
+  echo "==> sd CUDA-on-demand patch already applied"
+elif git -C "${SRC}" apply --check "${patch_file}" >/dev/null 2>&1; then
   git -C "${SRC}" apply "${patch_file}"
+  echo "==> applied sd CUDA-on-demand patch"
+else
+  echo "sd CUDA-on-demand patch does not apply at ${SD_UPSTREAM_PIN}; refresh the patch" >&2
+  git -C "${SRC}" apply --check "${patch_file}" || true
+  exit 1
+fi
+if [[ ! -f "${SRC}/src/core/cuda/plugin_entry.cpp" ]]; then
+  echo "plugin_entry.cpp missing after patch; CUDA plugin cannot register" >&2
+  exit 1
 fi
 
 cmake_args=(
@@ -124,15 +148,38 @@ link_args=(
   -L"${OUT}/lib"
   -lstable-diffusion -lggml -lggml-base
 )
+stub_link=""
 case "$(uname -s)" in
   Darwin)
     link_args+=(-Wl,-rpath,@loader_path/lib)
     ;;
   *)
     link_args+=(-Wl,-rpath-link,"${OUT}/lib" -Wl,-rpath,'$ORIGIN/lib')
+    # GPU-less CI: libsd-cuda (and a mis-patched libstable-diffusion) may
+    # DT_NEED libcuda.so.1. Resolve symbols against the toolkit stub only —
+    # never bake the stubs dir into the runtime rpath.
+    stub_dir=""
+    for candidate in \
+      "${CUDA_PATH:-}/lib64/stubs" \
+      /usr/local/cuda/lib64/stubs \
+      /usr/local/cuda-12.6/lib64/stubs
+    do
+      if [[ -f "${candidate}/libcuda.so" ]]; then
+        stub_dir="${candidate}"
+        break
+      fi
+    done
+    if [[ -n "${stub_dir}" ]]; then
+      stub_link="$(mktemp -d)"
+      ln -s "${stub_dir}/libcuda.so" "${stub_link}/libcuda.so.1"
+      link_args+=(-Wl,-rpath-link,"${stub_link}")
+    fi
     ;;
 esac
 "${cxx}" "${link_args[@]}" -o "${OUT}/scalattice-sd"
+if [[ -n "${stub_link}" ]]; then
+  rm -rf "${stub_link}"
+fi
 chmod +x "${OUT}/scalattice-sd"
 if command -v patchelf >/dev/null 2>&1; then
   for lib in "${OUT}"/libggml-*.so "${OUT}/lib"/libsd-cuda.so; do
