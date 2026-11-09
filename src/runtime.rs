@@ -98,15 +98,20 @@ pub fn build_runtime(
     // idle_slots==0 alone used to mark Busy forever when a worker was checked out
     // by an abandoned invoke; prefer the session job flag, and only use empty
     // idle as a secondary signal when we also have an active job id.
+    let any_slot_busy = slots.iter().any(|s| s.busy);
     let reported_state = if job_state == JobState::Busy {
         JobState::Busy
     } else if idle_slots == 0 && max_concurrent_jobs > 0 && active_job_id.is_some() {
         JobState::Busy
     } else if gpu_occupied {
         JobState::Idle
-    } else if idle_slots == 0 && max_concurrent_jobs > 0 && fault.is_none() {
-        // Transient: slot map empty/busy during checkout. Heartbeat reconcile heals lies.
-        // A driver fault with no workers is not a job.
+    } else if any_slot_busy {
+        // Slot map is authoritative when workers report busy.
+        JobState::Busy
+    } else if idle_slots == 0 && max_concurrent_jobs > 0 && fault.is_none() && slots.is_empty() {
+        // Transient only while the slot map is still empty during checkout.
+        // A stale idle_slots=0 with every reported worker idle is not a job —
+        // that used to leave dashboards flashing Busy after a failed invoke.
         JobState::Busy
     } else {
         JobState::Idle
@@ -461,5 +466,29 @@ mod tests {
             None,
         );
         assert_eq!(runtime.status_label, "Running ornith-1.5-9b");
+    }
+
+    #[test]
+    fn stale_idle_slots_zero_with_idle_workers_is_not_busy() {
+        // After a failed/abandoned invoke, idle_slots can stick at 0 while every
+        // worker reports idle. Do not keep reporting Busy for the dashboard flash.
+        let runtime = build_runtime(
+            JobState::Idle,
+            None,
+            None,
+            &["ornith-ai/Ornith-1.5-9B".into()],
+            3,
+            None,
+            0,
+            16,
+            HashMap::new(),
+            dummy_slots(3),
+            2,
+            0,
+            false,
+            None,
+        );
+        assert_eq!(runtime.job_state, "idle");
+        assert!(!runtime.status_label.starts_with("Running"));
     }
 }
