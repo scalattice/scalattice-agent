@@ -12,8 +12,8 @@ use host::bytes_to_gb;
 #[allow(unused_imports)]
 pub use host::disk_avail_bytes;
 pub use host::{
-    detect_cpu_model, detect_hostname, detect_install_id, detect_ram_gb, detect_ram_used_gb,
-    disk_is_full, refresh_disk_full_flag,
+    detect_cpu_model, detect_cpu_util_pct, detect_hostname, detect_install_id, detect_ram_gb,
+    detect_ram_used_gb, disk_is_full, refresh_disk_full_flag,
 };
 
 /// Logical CPU thread count for CPU-slot capability gating.
@@ -1789,7 +1789,7 @@ fn fallback_cpu_device() -> ComputeDevice {
         name: detect_cpu_model().unwrap_or_else(|| "CPU".to_string()),
         vram_gb: None,
         vram_used_gb: None,
-        util_pct: None,
+        util_pct: detect_cpu_util_pct(),
         enabled: false,
     }
 }
@@ -1804,19 +1804,71 @@ fn detect_apple_metal_device() -> Vec<ComputeDevice> {
     } else {
         format!("Apple Silicon GPU ({cpu})")
     };
-    // Do not report system RAM pressure as Metal vramUsedGb. Unified memory
-    // looks "full" while the GPU is idle; the control plane then treats free
-    // VRAM as ~0 and skips the machine for packing (Bedrock forever). Slot
-    // busy / loadedModels / occupiedExternal already convey real occupancy.
+    // Prefer IOAccelerator "In use system memory" (Metal allocations) over
+    // vm_stat free pages. Packing already uses the Metal nameplate, so a real
+    // used figure is safe for UI without Bedrock fallthrough.
+    let (util_pct, vram_used_gb) = detect_metal_util_and_used_gb(usable);
     vec![ComputeDevice {
         id: "metal:0".to_string(),
         kind: "metal".to_string(),
         name,
         vram_gb: Some(usable),
-        vram_used_gb: None,
-        util_pct: None,
+        vram_used_gb,
+        util_pct,
         enabled: true,
     }]
+}
+
+/// Device Utilization % and Metal "In use system memory" from IOAccelerator.
+#[cfg(target_os = "macos")]
+fn detect_metal_util_and_used_gb(usable_gb: u32) -> (Option<u8>, Option<u32>) {
+    let Ok(output) = Command::new("ioreg")
+        .args(["-c", "IOAccelerator", "-r", "-d", "1"])
+        .output()
+    else {
+        return (None, None);
+    };
+    if !output.status.success() {
+        return (None, None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let util = parse_ioreg_int_field(&text, "Device Utilization %").and_then(|n| {
+        if (0..=100).contains(&n) {
+            Some(n as u8)
+        } else {
+            None
+        }
+    });
+    let used = parse_ioreg_int_field(&text, "In use system memory")
+        .or_else(|| parse_ioreg_int_field(&text, "Alloc system memory"))
+        .map(|bytes| {
+            let gb = (bytes as f64 / (1024.0 * 1024.0 * 1024.0)).round() as u32;
+            gb.min(usable_gb.max(1))
+        });
+    (util, used)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ioreg_int_field(text: &str, key: &str) -> Option<u64> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix('"')
+            .and_then(|s| s.strip_prefix(key))
+            .and_then(|s| s.strip_prefix('"'))
+        else {
+            continue;
+        };
+        let Some(eq) = rest.find('=') else {
+            continue;
+        };
+        let raw = rest[eq + 1..].trim();
+        let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u64>() {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// OS/UI RAM that must stay off the Metal GPU budget, and off a second GGUF mmap.

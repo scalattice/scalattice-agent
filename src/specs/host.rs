@@ -413,6 +413,30 @@ pub fn detect_cpu_model() -> Option<String> {
     }
 }
 
+/// Rough host CPU busy % from 1-minute load average / logical cores.
+/// Good enough for heartbeat UI; not a scheduler sample.
+pub fn detect_cpu_util_pct() -> Option<u8> {
+    #[cfg(unix)]
+    {
+        let mut loads = [0f64; 3];
+        // SAFETY: getloadavg writes at most `nelem` doubles into `loadavg`.
+        let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
+        if n < 1 {
+            return None;
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as f64)
+            .unwrap_or(1.0)
+            .max(1.0);
+        let pct = ((loads[0] / cores) * 100.0).round().clamp(0.0, 100.0);
+        return Some(pct as u8);
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn detect_cpu_model_linux() -> Option<String> {
     if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
