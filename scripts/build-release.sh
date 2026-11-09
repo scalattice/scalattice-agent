@@ -84,6 +84,19 @@ EOF
 fi
 export PATH="${CUDA_PATH}/bin:${PATH}"
 
+# llama-cpp-sys-2 0.1.154 hard_links shared libs into the profile dir and panics
+# on AlreadyExists when rust-cache leaves soname stubs behind (broken symlinks
+# make Path::exists() false, then hard_link EEXIST). See utilityai/llama-cpp-rs#896.
+PROFILE="target/${TARGET}/release"
+rm -f \
+  "${PROFILE}"/libggml*.so* \
+  "${PROFILE}"/libllama*.so* \
+  "${PROFILE}"/libmtmd*.so* \
+  "${PROFILE}/deps"/libggml*.so* \
+  "${PROFILE}/deps"/libllama*.so* \
+  "${PROFILE}/deps"/libmtmd*.so* \
+  2>/dev/null || true
+
 cargo "${args[@]}"
 
 RELEASE="target/${TARGET}/release"

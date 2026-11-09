@@ -77,6 +77,12 @@ pub struct SlotStatus {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub occupied_external: bool,
+    /// Current invoke phase (`load` / `prefill` / `decode` / …).
+    #[serde(rename = "progressPhase", skip_serializing_if = "Option::is_none")]
+    pub progress_phase: Option<String>,
+    /// Phase-local progress in `0.0..=1.0` (decode = tokens / max_tokens).
+    #[serde(rename = "progressPct", skip_serializing_if = "Option::is_none")]
+    pub progress_pct: Option<f32>,
 }
 
 struct SlotWorker {
@@ -151,6 +157,8 @@ pub struct Supervisor {
     job_cancels: Mutex<HashMap<String, Arc<JobCancel>>>,
     /// Slots whose worker is currently owned by an invoke/warm stack frame.
     checkouts: Mutex<HashMap<String, SlotCheckout>>,
+    /// job_id → (phase, pct 0..=1). Sync so invoke_progress callbacks can update it.
+    job_progress: std::sync::Mutex<HashMap<String, (String, f32)>>,
     ram_gb: u32,
     /// On tight RAM, two concurrent GGUF mmaps OOM the box and drop the WebSocket.
     mmap_gate: Mutex<()>,
@@ -531,6 +539,7 @@ impl Supervisor {
             changed: Notify::new(),
             job_cancels: Mutex::new(HashMap::new()),
             checkouts: Mutex::new(HashMap::new()),
+            job_progress: std::sync::Mutex::new(HashMap::new()),
             ram_gb,
             mmap_gate: Mutex::new(()),
             occupancy: Mutex::new(OccupancyWatch::new()),
@@ -1078,7 +1087,37 @@ impl Supervisor {
     }
 
     async fn clear_checkout(&self, slot_id: &str) {
-        self.checkouts.lock().await.remove(slot_id);
+        let job_id = self
+            .checkouts
+            .lock()
+            .await
+            .remove(slot_id)
+            .map(|row| row.job_id);
+        if let Some(job_id) = job_id {
+            self.clear_job_progress(&job_id);
+        }
+    }
+
+    /// Record phase-local progress for an in-flight invoke (0..=1).
+    pub fn note_job_progress(&self, job_id: &str, phase: &str, pct: f32) {
+        let id = job_id.trim();
+        let phase = phase.trim();
+        if id.is_empty() || phase.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.job_progress.lock() {
+            guard.insert(id.to_string(), (phase.to_string(), pct.clamp(0.0, 1.0)));
+        }
+    }
+
+    pub fn clear_job_progress(&self, job_id: &str) {
+        let id = job_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.job_progress.lock() {
+            guard.remove(id);
+        }
     }
 
     /// Claim saw an empty worker map entry. Checked-out slots are busy (not "missing");
@@ -1301,27 +1340,37 @@ impl Supervisor {
                 })
                 .collect()
         };
-        let checkout_loaded: HashMap<String, Vec<String>> = {
+        let checkout_meta: HashMap<String, (Vec<String>, String)> = {
             let checkouts = self.checkouts.lock().await;
             checkouts
                 .iter()
-                .map(|(id, c)| (id.clone(), c.loaded_models.clone()))
+                .map(|(id, c)| (id.clone(), (c.loaded_models.clone(), c.job_id.clone())))
                 .collect()
         };
+        let job_progress = self
+            .job_progress
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         self.plan
             .slots
             .iter()
             .map(|spec| {
                 // Missing from the map = temporarily checked out for an in-flight invoke.
-                let (busy, healthy, loaded) = if self.unusable_slots.contains(&spec.id) {
-                    (false, false, Vec::new())
+                let (busy, healthy, loaded, job_id) = if self.unusable_slots.contains(&spec.id) {
+                    (false, false, Vec::new(), None)
                 } else if let Some((busy, healthy, loaded)) = worker_views.get(&spec.id) {
-                    (*busy, *healthy, loaded.clone())
-                } else if let Some(loaded) = checkout_loaded.get(&spec.id) {
-                    (true, true, loaded.clone())
+                    (*busy, *healthy, loaded.clone(), None)
+                } else if let Some((loaded, job_id)) = checkout_meta.get(&spec.id) {
+                    (true, true, loaded.clone(), Some(job_id.clone()))
                 } else {
-                    (true, true, Vec::new())
+                    (true, true, Vec::new(), None)
                 };
+                let (progress_phase, progress_pct) = job_id
+                    .and_then(|id| job_progress.get(&id).cloned())
+                    .map(|(phase, pct)| (Some(phase), Some(pct)))
+                    .unwrap_or((None, None));
                 SlotStatus {
                     id: spec.id.clone(),
                     kind: spec.kind.clone(),
@@ -1334,6 +1383,8 @@ impl Supervisor {
                     device_ids: spec.card.devices.iter().map(|d| d.id.clone()).collect(),
                     tp_group: spec.tp_group.clone(),
                     occupied_external: occupied.contains(&spec.id),
+                    progress_phase,
+                    progress_pct,
                 }
             })
             .collect()

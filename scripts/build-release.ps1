@@ -85,6 +85,16 @@ if ($rustflags -notmatch 'delayimp') {
     $rustflags = ("{0} -C link-arg=delayimp.lib" -f $rustflags.Trim()).Trim()
 }
 $env:RUSTFLAGS = $rustflags
+# llama-cpp-sys-2 hard_links ggml/llama DLLs into the profile dir and panics on
+# AlreadyExists when rust-cache leaves stubs (utilityai/llama-cpp-rs#896).
+$profileDir = Join-Path (Get-CargoTargetRoot) (Join-Path $Target "release")
+foreach ($dir in @($profileDir, (Join-Path $profileDir "deps"))) {
+    if (-not (Test-Path $dir)) { continue }
+    Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(lib)?(ggml|llama|mtmd)' -and $_.Extension -match '\.(dll|lib)$' } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "==> cargo build --locked --release --target $Target --no-default-features --features $Features"
 Write-Host "    RUSTFLAGS=$($env:RUSTFLAGS)"
 cargo build --locked --release --target $Target --no-default-features --features $Features
