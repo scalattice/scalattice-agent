@@ -20,10 +20,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: Align Cargo.toml with published tip
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: ./scripts/align-cargo-version.sh --check
+      # Version numbers are owned by origin tags / release CI (ci-prepare-release.sh).
+      # development Cargo.toml routinely lags the tip; do not fail the compile gate on that.
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build deps
         run: |

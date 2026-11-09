@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Align Cargo.toml / Cargo.lock to the highest published agent tag on origin
-# (and GitHub releases). Do not invent versions by hand — release CI bumps the
-# next free patch from this tip via scripts/ci-prepare-release.sh.
+# Align Cargo.toml / Cargo.lock to the highest agent tag that still exists on
+# origin. Do not invent versions by hand — release CI bumps the next free patch
+# from that tip via scripts/ci-prepare-release.sh (Cargo.toml is not a floor).
 #
 # Usage:
-#   ./scripts/align-cargo-version.sh           # set to latest published tip
+#   ./scripts/align-cargo-version.sh           # set to latest origin tag tip
 #   ./scripts/align-cargo-version.sh --check   # exit 1 if Cargo.toml is behind tip
 set -euo pipefail
 
@@ -53,6 +53,7 @@ latest_origin_tag_version() {
     | semver_sort_highest || true
 }
 
+# Cold-start only when origin has no v* tags.
 latest_github_version() {
   local repo
   repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo scalattice/scalattice-agent)"
@@ -61,22 +62,14 @@ latest_github_version() {
     | semver_sort_highest || true
 }
 
-max_version() {
-  local best="" v
-  for v in "$@"; do
-    [[ -n "$v" ]] || continue
-    if [[ -z "$best" ]] || version_ge "$v" "$best"; then
-      best="$v"
-    fi
-  done
-  echo "$best"
-}
-
 git fetch origin --tags --force >/dev/null 2>&1 || true
 
-TIP="$(max_version "$(latest_origin_tag_version)" "$(latest_github_version)")"
+TIP="$(latest_origin_tag_version)"
 if [[ -z "$TIP" ]]; then
-  echo "error: could not resolve latest agent tag from origin/GitHub" >&2
+  TIP="$(latest_github_version)"
+fi
+if [[ -z "$TIP" ]]; then
+  echo "error: could not resolve latest agent tag from origin" >&2
   exit 1
 fi
 

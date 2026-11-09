@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Create (or reuse) a GitHub release tag for CI. Used by .github/workflows/release.yml.
 #
-# On a production merge, pick the next free patch from the highest of Cargo.toml,
-# origin tags, and GitHub releases, then skip any tag/release that already exists.
-# A stale development Cargo.toml cannot ship behind production.
+# On a production merge, pick the next patch after the highest semver tag that
+# still exists on origin. Cargo.toml is NOT a floor — a failed release that
+# bumped Cargo.toml and then deleted its tag must reuse that number, not skip
+# ahead. An orphan GitHub release without an origin tag is reused (assets can
+# be re-uploaded), not skipped.
 #
 # Env:
 #   RELEASE_TAG          Optional explicit tag (v1.2.3)
@@ -32,23 +34,6 @@ bump_patch() {
   echo "${major}.${minor}.$((patch + 1))"
 }
 
-version_ge() {
-  local a="$1" b="$2"
-  IFS=. read -r a1 a2 a3 <<< "$a"
-  IFS=. read -r b1 b2 b3 <<< "$b"
-  a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
-  b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
-  if (( a1 != b1 )); then
-    (( a1 > b1 ))
-    return
-  fi
-  if (( a2 != b2 )); then
-    (( a2 > b2 ))
-    return
-  fi
-  (( a3 >= b3 ))
-}
-
 normalize_tag() {
   local raw="$1"
   raw="${raw#v}"
@@ -59,14 +44,8 @@ semver_sort_highest() {
   grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1
 }
 
-latest_github_version() {
-  gh release list --repo "$REPO" --limit 100 --json tagName -q '.[].tagName' 2>/dev/null \
-    | sed 's/^v//' \
-    | semver_sort_highest || true
-}
-
-# Origin tags are the source of truth (a release can exist without Cargo.toml
-# on development matching it). Ignore local tags: they drift and clobber fetches.
+# Origin tags are the only chronological source of truth. Ignore local tags
+# and Cargo.toml (both drift after a deleted failed release).
 latest_origin_tag_version() {
   git ls-remote --tags origin 'refs/tags/v*' 2>/dev/null \
     | awk '{print $2}' \
@@ -76,15 +55,11 @@ latest_origin_tag_version() {
     | semver_sort_highest || true
 }
 
-max_version() {
-  local best="" v
-  for v in "$@"; do
-    [[ -n "$v" ]] || continue
-    if [[ -z "$best" ]] || version_ge "$v" "$best"; then
-      best="$v"
-    fi
-  done
-  echo "$best"
+# Cold-start fallback when origin has no v* tags yet.
+latest_github_version() {
+  gh release list --repo "$REPO" --limit 100 --json tagName -q '.[].tagName' 2>/dev/null \
+    | sed 's/^v//' \
+    | semver_sort_highest || true
 }
 
 origin_has_tag() {
@@ -92,15 +67,19 @@ origin_has_tag() {
 }
 
 next_free_version() {
-  local cargo latest next
-  cargo="$(cargo_version)"
-  latest="$(max_version "$cargo" "$(latest_origin_tag_version)" "$(latest_github_version)")"
-  if [[ -z "$latest" ]]; then
+  local tip next
+  tip="$(latest_origin_tag_version)"
+  if [[ -z "$tip" ]]; then
+    tip="$(latest_github_version)"
+  fi
+  if [[ -z "$tip" ]]; then
     echo "1.0.0"
     return
   fi
-  next="$(bump_patch "$latest")"
-  while origin_has_tag "$next" || gh release view "v${next}" -R "$REPO" >/dev/null 2>&1; do
+  next="$(bump_patch "$tip")"
+  # Only origin tags block a number. A leftover GitHub release from a deleted
+  # tag is reused so a failed build can retry the same version.
+  while origin_has_tag "$next"; do
     next="$(bump_patch "$next")"
   done
   echo "$next"
