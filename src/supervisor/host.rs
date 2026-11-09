@@ -103,13 +103,52 @@ struct SlotCheckout {
     loaded_models: Vec<String>,
 }
 
+/// Latching cancel for an in-flight invoke.
+///
+/// Plain `Notify::notify_waiters()` is lost if cancel arrives before the task
+/// awaits. This flag sticks so a late waiter still observes the cancel — needed
+/// when the invoke is blocked in reconcile / prep before `cancelled().await`.
+pub struct JobCancel {
+    flag: AtomicBool,
+    notify: Notify,
+}
+
+impl JobCancel {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolves once cancelled, including if cancel already happened.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 pub struct Supervisor {
     plan: ComputePlan,
     devices: Vec<ComputeDevice>,
     workers: Mutex<HashMap<String, SlotWorker>>,
     changed: Notify,
-    /// In-flight job_id → cancel signal (kill worker when router abandons).
-    job_cancels: Mutex<HashMap<String, Arc<Notify>>>,
+    /// In-flight job_id → latching cancel (kill worker when router abandons).
+    job_cancels: Mutex<HashMap<String, Arc<JobCancel>>>,
     /// Slots whose worker is currently owned by an invoke/warm stack frame.
     checkouts: Mutex<HashMap<String, SlotCheckout>>,
     ram_gb: u32,
@@ -888,13 +927,13 @@ impl Supervisor {
         }
     }
 
-    async fn register_job_cancel(&self, job_id: &str) -> Arc<Notify> {
-        let notify = Arc::new(Notify::new());
+    async fn register_job_cancel(&self, job_id: &str) -> Arc<JobCancel> {
+        let cancel = Arc::new(JobCancel::new());
         self.job_cancels
             .lock()
             .await
-            .insert(job_id.to_string(), notify.clone());
-        notify
+            .insert(job_id.to_string(), cancel.clone());
+        cancel
     }
 
     async fn clear_job_cancel(&self, job_id: &str) {
@@ -903,19 +942,20 @@ impl Supervisor {
 
     /// Kill an in-flight invoke (router abandon / timeout). Returns true if a job was signaled.
     pub async fn cancel_invoke(&self, job_id: &str) -> bool {
-        let Some(notify) = self.job_cancels.lock().await.get(job_id).cloned() else {
+        let Some(cancel) = self.job_cancels.lock().await.get(job_id).cloned() else {
             return false;
         };
-        notify.notify_waiters();
+        cancel.cancel();
         true
     }
 
     /// Signal every registered in-flight job to abort (admin stop-all / session reconnect).
     pub async fn cancel_all_invokes(&self) -> usize {
-        let cancels: Vec<Arc<Notify>> = self.job_cancels.lock().await.values().cloned().collect();
+        let cancels: Vec<Arc<JobCancel>> =
+            self.job_cancels.lock().await.values().cloned().collect();
         let n = cancels.len();
-        for notify in cancels {
-            notify.notify_waiters();
+        for cancel in cancels {
+            cancel.cancel();
         }
         n
     }
@@ -1124,16 +1164,23 @@ impl Supervisor {
 
     /// Detect lied-about busy: orphan `busy` flags, stale checkouts, missing workers.
     /// Safe to call from the heartbeat path under load.
+    ///
+    /// Never holds `workers` and `checkouts` at the same time — opposite lock
+    /// orders between this and `slot_statuses()` previously deadlocked and left
+    /// `active_job_count` stuck at max concurrency.
     pub async fn reconcile_slots(&self) -> u32 {
         let mut recovered = 0u32;
 
         // Clear busy flags on workers that are still in the map but not checked out
         // (warm/invoke crash left busy=true while the process is idle).
         {
-            let checkouts = self.checkouts.lock().await;
+            let checkout_ids: HashSet<String> = {
+                let checkouts = self.checkouts.lock().await;
+                checkouts.keys().cloned().collect()
+            };
             let mut workers = self.workers.lock().await;
             for (id, worker) in workers.iter_mut() {
-                if worker.busy && !checkouts.contains_key(id) {
+                if worker.busy && !checkout_ids.contains(id) {
                     warn!(slot = %id, "clearing orphan busy flag (worker idle in map)");
                     worker.busy = false;
                     recovered += 1;
@@ -1203,13 +1250,20 @@ impl Supervisor {
         }
 
         // Plan slots that exist in neither map nor checkouts (lost after panic).
+        // Snapshot each map alone — never hold both (ABBA with phase 1 above).
         let missing: Vec<ComputeSlot> = {
-            let workers = self.workers.lock().await;
-            let checkouts = self.checkouts.lock().await;
+            let worker_ids: HashSet<String> = {
+                let workers = self.workers.lock().await;
+                workers.keys().cloned().collect()
+            };
+            let checkout_ids: HashSet<String> = {
+                let checkouts = self.checkouts.lock().await;
+                checkouts.keys().cloned().collect()
+            };
             self.plan
                 .slots
                 .iter()
-                .filter(|s| !workers.contains_key(&s.id) && !checkouts.contains_key(&s.id))
+                .filter(|s| !worker_ids.contains(&s.id) && !checkout_ids.contains(&s.id))
                 .cloned()
                 .collect()
         };
@@ -1233,8 +1287,27 @@ impl Supervisor {
 
     pub async fn slot_statuses(&self) -> Vec<SlotStatus> {
         let occupied = self.occupancy.lock().await.latched_ids();
-        let workers = self.workers.lock().await;
-        let checkouts = self.checkouts.lock().await;
+        // Snapshot separately so we never ABBA with reconcile_slots phase 1
+        // (checkouts → workers) while this path historically took workers → checkouts.
+        let worker_views: HashMap<String, (bool, bool, Vec<String>)> = {
+            let workers = self.workers.lock().await;
+            workers
+                .iter()
+                .map(|(id, w)| {
+                    (
+                        id.clone(),
+                        (w.busy, w.healthy, w.loaded_models.clone()),
+                    )
+                })
+                .collect()
+        };
+        let checkout_loaded: HashMap<String, Vec<String>> = {
+            let checkouts = self.checkouts.lock().await;
+            checkouts
+                .iter()
+                .map(|(id, c)| (id.clone(), c.loaded_models.clone()))
+                .collect()
+        };
         self.plan
             .slots
             .iter()
@@ -1242,10 +1315,10 @@ impl Supervisor {
                 // Missing from the map = temporarily checked out for an in-flight invoke.
                 let (busy, healthy, loaded) = if self.unusable_slots.contains(&spec.id) {
                     (false, false, Vec::new())
-                } else if let Some(w) = workers.get(&spec.id) {
-                    (w.busy, w.healthy, w.loaded_models.clone())
-                } else if let Some(c) = checkouts.get(&spec.id) {
-                    (true, true, c.loaded_models.clone())
+                } else if let Some((busy, healthy, loaded)) = worker_views.get(&spec.id) {
+                    (*busy, *healthy, loaded.clone())
+                } else if let Some(loaded) = checkout_loaded.get(&spec.id) {
+                    (true, true, loaded.clone())
                 } else {
                     (true, true, Vec::new())
                 };
@@ -1451,17 +1524,21 @@ impl Supervisor {
     }
 
     pub async fn loaded_models_union(&self) -> Vec<String> {
-        let workers = self.workers.lock().await;
-        let checkouts = self.checkouts.lock().await;
         let mut set = std::collections::BTreeSet::new();
-        for w in workers.values() {
-            for m in &w.loaded_models {
-                set.insert(m.clone());
+        {
+            let workers = self.workers.lock().await;
+            for w in workers.values() {
+                for m in &w.loaded_models {
+                    set.insert(m.clone());
+                }
             }
         }
-        for c in checkouts.values() {
-            for m in &c.loaded_models {
-                set.insert(m.clone());
+        {
+            let checkouts = self.checkouts.lock().await;
+            for c in checkouts.values() {
+                for m in &c.loaded_models {
+                    set.insert(m.clone());
+                }
             }
         }
         set.into_iter().collect()
@@ -1668,19 +1745,18 @@ impl Supervisor {
         n_ctx_override: u32,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         let cancel = self.register_job_cancel(job_id).await;
-        // Heal orphan busy/checkouts before we wait on locks (SJVL/Laptop stuck-agent).
-        let _ = self.reconcile_slots().await;
-        // Resolve weight size / warm residency off the hot path's blocking work with
-        // a hard ceiling so a wedged workers mutex or slow FS cannot eat the whole
-        // fleet poll window (Laptop: invoke logged, never reached "placing").
+        // Heal orphan busy/checkouts before placement. Race cancel against the
+        // whole prep path (including reconcile) so a wedged lock cannot keep the
+        // concurrency permit forever after invoke_cancel.
         let prep = async {
+            let _ = self.reconcile_slots().await;
             let incoming_gb = warm_model_weight_mb(runtime_model) as f64 / 1024.0;
             let already_warm = self.any_slot_has_runtime(runtime_model, model_id).await;
             (incoming_gb, already_warm)
         };
         let (incoming_gb, already_warm) = tokio::select! {
             biased;
-            _ = cancel.notified() => {
+            _ = cancel.cancelled() => {
                 self.clear_job_cancel(job_id).await;
                 bail!("request_canceled");
             }
@@ -1712,7 +1788,7 @@ impl Supervisor {
             );
             tokio::select! {
                 biased;
-                _ = cancel.notified() => {
+                _ = cancel.cancelled() => {
                     self.clear_job_cancel(job_id).await;
                     bail!("request_canceled");
                 }
@@ -2486,7 +2562,7 @@ impl Supervisor {
 
         let outcome = tokio::select! {
             biased;
-            _ = cancel.notified() => {
+            _ = cancel.cancelled() => {
                 Err(anyhow!("request_canceled"))
             }
             result = async {
@@ -2537,7 +2613,7 @@ impl Supervisor {
         max_tokens: u32,
         model: &CatalogModel,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
-        cancel: &Notify,
+        cancel: &JobCancel,
         n_ctx_override: u32,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         let slot_id = placement
@@ -2719,7 +2795,7 @@ impl Supervisor {
         max_tokens: u32,
         model: &CatalogModel,
         on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
-        cancel: &Notify,
+        cancel: &JobCancel,
         n_ctx_override: u32,
     ) -> Result<(String, u32, u32, InvokeTimings, String)> {
         // Slots already claimed busy by invoke(). Pause siblings, run TP, restore.
@@ -3078,7 +3154,7 @@ async fn worker_rpc_invoke_cancellable(
     worker: &mut SlotWorker,
     req: WorkerRequest,
     mut on_delta: Option<&mut Box<dyn FnMut(String) + Send>>,
-    cancel: &Notify,
+    cancel: &JobCancel,
 ) -> Result<(String, u32, u32, InvokeTimings, Vec<String>)> {
     let expect_id = request_id(&req);
     let mut line = serde_json::to_string(&req)?;
@@ -3142,7 +3218,7 @@ async fn worker_rpc_invoke_cancellable(
             .max(Duration::from_millis(50));
         tokio::select! {
             biased;
-            _ = cancel.notified() => {
+            _ = cancel.cancelled() => {
                 info!(slot = %worker.spec.id, "killing worker for canceled invoke");
                 let _ = worker.child.kill().await;
                 let _ = worker.child.wait().await;

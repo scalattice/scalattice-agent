@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::Notify;
+use crate::supervisor::JobCancel;
 
 const WALL: Duration = Duration::from_secs(45 * 60);
 
@@ -206,7 +206,7 @@ pub async fn generate(
     card: &VirtualCard,
     cuda_visible: &[u32],
     split: bool,
-    cancel: &Notify,
+    cancel: &JobCancel,
 ) -> Result<Vec<GeneratedImage>> {
     if super::image_stub_enabled() {
         return Ok(stub_images(job.n));
@@ -265,7 +265,7 @@ pub async fn generate(
     });
     let status = tokio::select! {
         biased;
-        _ = cancel.notified() => {
+        _ = cancel.cancelled() => {
             let _ = child.kill().await;
             let _ = child.wait().await;
             let _ = log_task.await;

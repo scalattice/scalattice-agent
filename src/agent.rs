@@ -1524,6 +1524,9 @@ async fn run_agent_session(
                         let guard = state.lock().await;
                         guard.persist_local_state();
                     }
+                    // Cheap stale-counter heal outside the maintenance gate so a
+                    // wedged refresh_slot_cache cannot leave maxConcurrentJobs stuck.
+                    heal_stale_active_job_count(&state).await;
                     if maintenance_busy
                         .compare_exchange(
                             false,
@@ -1571,6 +1574,52 @@ impl Drop for MaintenanceGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+/// Clear a leaked `active_job_count` when the supervisor has no checkouts and
+/// no busy workers. Runs on the heartbeat path without taking the maintenance
+/// gate, so it still works if refresh_slot_cache is wedged.
+async fn heal_stale_active_job_count(state: &Arc<Mutex<SessionState>>) {
+    let Some(supervisor) = state.lock().await.supervisor.clone() else {
+        return;
+    };
+    let needs = {
+        let guard = state.lock().await;
+        guard.active_job_count > 0
+    };
+    if !needs {
+        return;
+    }
+    if supervisor.has_in_flight_work().await {
+        return;
+    }
+    let slots = match tokio::time::timeout(Duration::from_secs(1), supervisor.slot_statuses()).await
+    {
+        Ok(slots) => slots,
+        Err(_) => {
+            warn!("stale active_job heal: slot_statuses timed out");
+            return;
+        }
+    };
+    if slots.iter().any(|s| s.busy) {
+        return;
+    }
+    let mut guard = state.lock().await;
+    if guard.active_job_count == 0 {
+        return;
+    }
+    warn!(
+        stale = guard.active_job_count,
+        "clearing stale active_job_count; supervisor has no in-flight work"
+    );
+    guard.active_job_count = 0;
+    crate::state::set_reported_active_jobs(0);
+    guard.job_state = JobState::Idle;
+    guard.active_job_id = None;
+    guard.active_model_id = None;
+    drop(guard);
+    supervisor.cancel_all_invokes().await;
+    supervisor.clear_all_job_cancels().await;
 }
 
 async fn refresh_slot_cache(state: &Arc<Mutex<SessionState>>) {
