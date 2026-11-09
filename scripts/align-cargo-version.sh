@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Align Cargo.toml / Cargo.lock to the highest agent tag that still exists on
-# origin. Do not invent versions by hand — release CI bumps the next free patch
-# from that tip via scripts/ci-prepare-release.sh (Cargo.toml is not a floor).
+# origin. Do not invent versions by hand — release CI picks the next patch after
+# the last complete (has assets) release via scripts/ci-prepare-release.sh.
 #
 # Usage:
 #   ./scripts/align-cargo-version.sh           # set to latest origin tag tip

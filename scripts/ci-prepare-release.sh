@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Create (or reuse) a GitHub release tag for CI. Used by .github/workflows/release.yml.
 #
-# On a production merge, pick the next patch after the highest semver tag that
-# still exists on origin. Cargo.toml is NOT a floor — a failed release that
-# bumped Cargo.toml and then deleted its tag must reuse that number, not skip
-# ahead. An orphan GitHub release without an origin tag is reused (assets can
-# be re-uploaded), not skipped.
+# Version rule: next patch after the highest *complete* release (a GitHub release
+# that still has assets). Empty tags/releases left by failed builds are NOT a
+# floor — deleting them or leaving them both yields the same next number.
+#
+# Example: v1.1.164 has assets; v1.1.165–167 are empty leftovers → next is 1.1.165.
 #
 # Env:
 #   RELEASE_TAG          Optional explicit tag (v1.2.3)
@@ -44,8 +44,7 @@ semver_sort_highest() {
   grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1
 }
 
-# Origin tags are the only chronological source of truth. Ignore local tags
-# and Cargo.toml (both drift after a deleted failed release).
+# Origin tags are the chronological ceiling we walk down from.
 latest_origin_tag_version() {
   git ls-remote --tags origin 'refs/tags/v*' 2>/dev/null \
     | awk '{print $2}' \
@@ -66,8 +65,20 @@ origin_has_tag() {
   git ls-remote --tags origin "refs/tags/v$1" 2>/dev/null | grep -q .
 }
 
+# A release "counts" only when it has uploaded assets (builds finished).
+release_is_complete() {
+  local ver="$1" count
+  count="$(
+    gh release view "v${ver}" -R "$REPO" --json assets -q '.assets | length' 2>/dev/null || echo 0
+  )"
+  count="$(printf '%s' "$count" | tr -d '[:space:]')"
+  [[ -n "$count" && "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]
+}
+
+# Next patch after the highest complete release. Incomplete tags above that
+# (failed macOS/notarize runs) are ignored so retries reuse the same number.
 next_free_version() {
-  local tip next
+  local tip cursor major minor patch n=0
   tip="$(latest_origin_tag_version)"
   if [[ -z "$tip" ]]; then
     tip="$(latest_github_version)"
@@ -76,19 +87,60 @@ next_free_version() {
     echo "1.0.0"
     return
   fi
-  next="$(bump_patch "$tip")"
-  # Only origin tags block a number. A leftover GitHub release from a deleted
-  # tag is reused so a failed build can retry the same version.
-  while origin_has_tag "$next"; do
-    next="$(bump_patch "$next")"
+
+  cursor="$tip"
+  while (( n < 80 )); do
+    if release_is_complete "$cursor"; then
+      echo "$(bump_patch "$cursor")"
+      return
+    fi
+    IFS=. read -r major minor patch <<< "$cursor"
+    if [[ -z "${patch:-}" || "$patch" -le 0 ]]; then
+      # Nothing complete below tip — reuse the incomplete tip itself.
+      echo "$tip"
+      return
+    fi
+    cursor="${major}.${minor}.$((patch - 1))"
+    n=$((n + 1))
   done
-  echo "$next"
+  echo "$(bump_patch "$tip")"
+}
+
+# Drop empty leftover tags/releases above the version we are about to ship so
+# the next tip stays honest if this run fails again mid-build.
+prune_incomplete_above() {
+  local keep="$1" tip cursor major minor patch
+  tip="$(latest_origin_tag_version)"
+  [[ -n "$tip" ]] || return 0
+  cursor="$tip"
+  while true; do
+    IFS=. read -r major minor patch <<< "$cursor"
+    # Stop once we reach the version we are shipping (or below).
+    if [[ "$cursor" == "$keep" ]]; then
+      break
+    fi
+    # Semver compare: stop if cursor < keep (walked too far).
+    if [[ "$(printf '%s\n%s\n' "$cursor" "$keep" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" == "$cursor" \
+      && "$cursor" != "$keep" ]]; then
+      break
+    fi
+    if ! release_is_complete "$cursor"; then
+      echo "==> Pruning incomplete leftover v${cursor}"
+      git push origin ":refs/tags/v${cursor}" >/dev/null 2>&1 || true
+      gh release delete "v${cursor}" -R "$REPO" --yes >/dev/null 2>&1 || true
+    fi
+    if [[ "$patch" -le 0 ]]; then
+      break
+    fi
+    cursor="${major}.${minor}.$((patch - 1))"
+  done
 }
 
 REPO="${GH_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 EXPLICIT="${RELEASE_TAG:-}"
 VERSION=""
 TAG=""
+REUSE=0
 
 # Annotated vs lightweight retags on GitHub make `git pull --tags` fail locally
 # ("would clobber existing tag"). CI must follow origin, not a stale checkout.
@@ -101,10 +153,16 @@ if [[ -n "$EXPLICIT" ]]; then
 else
   VERSION="$(next_free_version)"
   TAG="v${VERSION}"
+  if origin_has_tag "$VERSION" && ! release_is_complete "$VERSION"; then
+    REUSE=1
+    echo "==> Reusing incomplete ${TAG} (last complete release is the prior patch)"
+  fi
   if [[ "$(cargo_version)" != "$VERSION" ]]; then
     set_cargo_version "$VERSION"
   fi
 fi
+
+echo "==> Selected ${TAG} (cargo was v$(cargo_version))"
 
 if [[ -n "$(git status --porcelain Cargo.toml Cargo.lock 2>/dev/null)" ]]; then
   git add Cargo.toml
@@ -113,19 +171,26 @@ if [[ -n "$(git status --porcelain Cargo.toml Cargo.lock 2>/dev/null)" ]]; then
   git push origin HEAD:production
 fi
 
-if origin_has_tag "${TAG#v}"; then
-  echo "==> Tag ${TAG} already on origin"
+# Always point the tag at this prepare commit. Force-update when retrying an
+# incomplete number so builds check out the new merge, not the failed attempt.
+git tag -d "$TAG" 2>/dev/null || true
+git tag -a "$TAG" -m "$TAG"
+if [[ "$REUSE" -eq 1 ]] || origin_has_tag "${TAG#v}"; then
+  git push origin "refs/tags/${TAG}" --force
 else
-  git tag -d "$TAG" 2>/dev/null || true
-  git tag -a "$TAG" -m "$TAG"
   git push origin "$TAG"
 fi
+
+prune_incomplete_above "$VERSION"
 
 if ! gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
   gh release create "$TAG" \
     --repo "$REPO" \
     --title "$TAG" \
     --notes "Automated release from production (${GITHUB_SHA:-unknown})."
+else
+  # Clear stale notes; assets are uploaded by platform jobs (--clobber).
+  echo "==> GitHub release ${TAG} already exists (assets will be replaced)"
 fi
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then

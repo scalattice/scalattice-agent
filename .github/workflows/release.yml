@@ -257,7 +257,9 @@ jobs:
           chmod +x scripts/package-macos.sh scripts/build-stable-diffusion.sh scripts/build-tts.sh
           scripts/build-stable-diffusion.sh
           scripts/build-tts.sh
-          scripts/package-macos.sh
+          # App only here — building the DMG before codesign leaves diskimages-helper
+          # wedged ("Resource busy") when CI recreates the signed DMG next.
+          scripts/package-macos.sh --app-only
       - name: Sign and notarize
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
