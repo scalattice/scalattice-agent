@@ -106,11 +106,25 @@ impl CatalogModel {
         )
     }
 
+    /// GGUF voice served by llama-tts.
+    pub fn is_tts_job(&self) -> bool {
+        matches!(
+            self.job_kind.trim().to_ascii_lowercase().as_str(),
+            "tts" | "speech" | "text_to_speech" | "text-to-speech"
+        )
+    }
+
     /// Image generation and chat/VL are separate runtimes. Both sides must agree.
     pub fn invoke_job_kind_error(
         &self,
         invoke_job_kind: &str,
     ) -> Option<(&'static str, &'static str)> {
+        if self.is_tts_job() {
+            return tts_job_kind_error(true, invoke_job_kind);
+        }
+        if invoke_job_kind.trim().eq_ignore_ascii_case("tts") {
+            return tts_job_kind_error(false, invoke_job_kind);
+        }
         invoke_job_kind_error(self.is_image_job(), invoke_job_kind)
     }
 
@@ -355,6 +369,12 @@ pub struct InvokeMessage {
     pub seed: Option<i64>,
     #[serde(default, rename = "inputImages", deserialize_with = "null_as_empty_vec")]
     pub input_images: Vec<ChatImage>,
+    /// `jobKind: tts` — speaker name. Empty = model default.
+    #[serde(default)]
+    pub voice: String,
+    /// `jobKind: tts` — speaking rate multiplier (1.0 = voice default; 0 = unset).
+    #[serde(default)]
+    pub speed: f32,
     /// Admin/debug may pin a compute slot. Empty = agent picks.
     /// Router-required slot id. When set the agent claims this slot only (no remap).
     #[serde(default, rename = "preferredSlotId")]
@@ -379,6 +399,17 @@ pub struct InvokeTimings {
     pub decode_ms: Option<u64>,
     #[serde(rename = "totalMs", skip_serializing_if = "Option::is_none")]
     pub total_ms: Option<u64>,
+}
+
+/// One WAV window while a speech job is still running. `data` is standard base64.
+/// The first chunk is a WAV header; later chunks are PCM. `invoke_result` still
+/// closes the job, and its `audio` body is omitted when these were sent.
+#[derive(Debug, Serialize)]
+pub struct InvokeAudioDeltaMessage {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub id: String,
+    pub data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -538,6 +569,14 @@ pub struct InvokeResultMessage {
     pub images: Vec<GeneratedImage>,
     #[serde(rename = "imageCount", skip_serializing_if = "is_zero_u32")]
     pub image_count: u32,
+    /// `jobKind: tts` result: one RIFF/WAV (16-bit PCM mono). Transcoding to mp3/opus is the router's job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<GeneratedAudio>,
+    #[serde(rename = "audioSeconds", skip_serializing_if = "is_zero_f64")]
+    pub audio_seconds: f64,
+    /// Characters synthesized (`jobKind: tts`); billing meter.
+    #[serde(rename = "characters", skip_serializing_if = "is_zero_u32")]
+    pub characters: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<InvokeTimings>,
     /// Compute slot that ran the job (`cuda-0`, `tp:cuda-0+cuda-1`, …).
@@ -547,6 +586,16 @@ pub struct InvokeResultMessage {
 
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
+}
+
+fn is_zero_f64(n: &f64) -> bool {
+    *n == 0.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedAudio {
+    pub mime: String,
+    pub data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -679,6 +728,25 @@ pub fn parse_invoke_cancel(data: &[u8]) -> anyhow::Result<InvokeCancelMessage> {
 
 pub fn parse_error(data: &[u8]) -> anyhow::Result<Value> {
     Ok(serde_json::from_slice(data)?)
+}
+
+/// `jobKind: tts` catalog rows only run for `jobKind: tts` invokes, and vice versa.
+pub fn tts_job_kind_error(
+    catalog_tts: bool,
+    invoke_job_kind: &str,
+) -> Option<(&'static str, &'static str)> {
+    let invoke_tts = invoke_job_kind.trim().eq_ignore_ascii_case("tts");
+    match (catalog_tts, invoke_tts) {
+        (true, false) => Some((
+            "tts_model_chat_unsupported",
+            "This catalog model synthesizes speech, not chat. Use jobKind tts.",
+        )),
+        (false, true) => Some((
+            "chat_model_tts_unsupported",
+            "This catalog model does not synthesize speech.",
+        )),
+        _ => None,
+    }
 }
 
 /// Catalog `jobKind: image` only runs when the invoke also says `jobKind: image`.

@@ -88,9 +88,9 @@ pub fn placement_for_required_slot(
         return None;
     }
     let slot = plan.slots.iter().find(|s| s.id == want)?;
-    // Image / Diffusers jobs never use the TP worker path.
-    if !model.is_image_job() {
-        if let Some(group_id) = slot.tp_group.as_deref().filter(|g| !g.is_empty()) {
+    // Image jobs split across the pin's tensor-parallel group the same way chat
+    // does. stable-diffusion.cpp uses split_mode=layer on those devices.
+    if let Some(group_id) = slot.tp_group.as_deref().filter(|g| !g.is_empty()) {
             let siblings: Vec<&ComputeSlot> = plan
                 .slots
                 .iter()
@@ -145,7 +145,6 @@ pub fn placement_for_required_slot(
                 }
             }
         }
-    }
     Some(Placement {
         slot_ids: vec![slot.id.clone()],
         card: slot.card.clone(),
@@ -215,7 +214,49 @@ pub fn pick_placement_with_cpu(
     let idle: std::collections::HashSet<&str> = idle_slot_ids.iter().map(|s| s.as_str()).collect();
 
     if model.is_image_job() {
-        return pick_image_placement(plan, &idle, model);
+        if let Some(placement) = pick_image_placement(plan, &idle, model) {
+            return Some(placement);
+        }
+        // No single card can hold it. Every sibling must already be idle,
+        // unblocked, and free. stable-diffusion.cpp splits with split_mode=layer.
+        {
+            let live_cuda = crate::specs::live_cuda_free_vram_by_index();
+            let min_vram = hosting_min_vram_gb(model);
+            for (group_id, phys_ids) in &plan.tp_groups {
+                let siblings: Vec<&ComputeSlot> = plan
+                    .slots
+                    .iter()
+                    .filter(|s| s.tp_group.as_deref() == Some(group_id.as_str()))
+                    .collect();
+                if siblings.is_empty() || siblings.iter().any(|s| !idle.contains(s.id.as_str())) {
+                    continue;
+                }
+                let Ok(tp_card) = crate::compute_pool::build_tp_card_for_group(devices, phys_ids)
+                else {
+                    continue;
+                };
+                if tp_card.strategy != PoolStrategy::TensorParallel {
+                    continue;
+                }
+                if !vram_can_gpu_full_at(
+                    tp_available_gb(&tp_card, &live_cuda),
+                    model,
+                    min_vram,
+                    false,
+                    n_ctx,
+                ) {
+                    continue;
+                }
+                debug!(group = %group_id, "placement: image tensor-parallel group");
+                return Some(Placement {
+                    slot_ids: siblings.iter().map(|s| s.id.clone()).collect(),
+                    card: tp_card,
+                    cuda_visible: phys_ids.clone(),
+                    use_tp_worker: true,
+                });
+            }
+        }
+        return None;
     }
 
     let min_vram = if need_vision {
@@ -1958,7 +1999,7 @@ mod tests {
         let placement =
             pick_placement(&plan, &idle, &image_model(16.0), 32, 2, &[], false).unwrap();
         assert_eq!(placement.slot_ids, vec!["vulkan-0".to_string()]);
-        assert_eq!(placement.cuda_visible, vec![1]);
+        assert!(!placement.use_tp_worker);
     }
 
     #[test]
@@ -1995,7 +2036,7 @@ mod tests {
         let placement =
             pick_placement(&plan, &idle, &image_model(12.0), 32, 2, &[], false).unwrap();
         assert_eq!(placement.slot_ids, vec!["vulkan-0".to_string()]);
-        assert_eq!(placement.cuda_visible, vec![0]);
+        assert!(!placement.use_tp_worker);
     }
 
     fn mixed_1660_3080() -> [ComputeDevice; 3] {

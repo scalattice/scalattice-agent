@@ -14,5 +14,5 @@ mod placement;
 mod worker;
 pub mod worker_job;
 
-pub use host::{SlotStatus, Supervisor};
+pub use host::{JobCancel, SlotStatus, Supervisor};
 pub use worker::run_worker;

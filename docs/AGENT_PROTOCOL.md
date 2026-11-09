@@ -120,7 +120,7 @@ The reference agent sends an extra heartbeat when a job starts or finishes so `j
 }
 ```
 
-Image catalog models (`jobKind: "image"`) use a second runtime. The invoke is **not** chat: no `stream`, no `messages` required. The catalog HF Diffusers repo is loaded with Python Diffusers (NVIDIA CUDA, AMD ROCm/DirectML, Intel Arc XPU, or Apple Silicon MPS). Generated PNGs are returned on `invoke_result.images` (not `content`, which is capped at 512 KiB). Isolation:
+Image catalog models (`jobKind: "image"`) use a second runtime. The invoke is **not** chat: no `stream`, no `messages` required. The agent runs `scalattice-sd` (stable-diffusion.cpp) on the slot the server assigns, with that slot's CUDA, Vulkan, or Metal visibility. A tensor-parallel pin that does not fit on one card uses the whole group (`split_mode=layer`), and only when every card in that group is allowed for the model and free. `weights.filename` is the checkpoint; `companionFilenames` are VAE / CLIP / T5 / LLM tensors. Generated PNGs are returned on `invoke_result.images` (not `content`, which is capped at 512 KiB). Isolation:
 
 - Image runtime runs only when **both** the catalog row and the invoke have `jobKind: "image"`. A chat/VL probe (missing or `chat` `jobKind`) on an image SKU returns `image_model_chat_unsupported` — it must not generate a picture.
 - `jobKind: "image"` on a chat/VL catalog row returns `chat_model_image_unsupported`.
@@ -128,16 +128,34 @@ Image catalog models (`jobKind: "image"`) use a second runtime. The invoke is **
 - `inputImages` are edit references, not VL photos. Chat/VL jobs reject them. Vision photos stay on `messages[].images`.
 - `invoke_result` with `images` must keep `content` empty and token counts at 0.
 
+Text-to-speech catalog models (`jobKind: "tts"`) are a third runtime. The agent claims a compute slot the same way it does for chat. GGUF voices run through llama.cpp `llama-tts` on that GPU (Qwen3-TTS, Pocket TTS, Soprano, LFM3-Audio, Chatterbox, Drama). Isolation mirrors images:
+
+- TTS runs only when **both** the catalog row and the invoke have `jobKind: "tts"`. Mismatches return `tts_model_chat_unsupported` (tts SKU, non-tts invoke) or `chat_model_tts_unsupported` (tts invoke of any other SKU). Split inference is not supported.
+- `"stream": true` asks llama-tts to emit audio as it is generated. Each window is an `invoke_audio_delta` (`data` is base64 WAV: a header, then PCM). `invoke_result` still ends the job and carries `audioSeconds` and `characters`; its `audio` body is omitted because the chunks already delivered the clip.
+- Catalog `weights.filename` is the `.gguf` voice (with an `mmproj` companion when the model needs one).
+- Invoke fields: `prompt` (the text, ≤ 4096 characters), optional `voice` (speaker name; single-speaker voices ignore it) and `speed` (rate multiplier, 0 = voice default).
+- `invoke_result` carries `audio: { "mime": "audio/wav", "data": "<base64 RIFF/WAV, 16-bit mono>" }`, `audioSeconds`, and `characters` (the billing meter), with `content` empty and token counts 0. The router transcodes to mp3 / opus for the public API.
+
+```json
+{ "type": "invoke", "id": "request-uuid", "modelId": "qwen3-tts", "runtimeModel": "qwen3-tts",
+  "jobKind": "tts", "prompt": "Hello from Scalattice.", "voice": "", "speed": 1.0 }
+```
+
+```json
+{ "type": "invoke_result", "id": "request-uuid", "content": "", "promptTokens": 0, "completionTokens": 0,
+  "audio": { "mime": "audio/wav", "data": "<base64>" }, "audioSeconds": 1.4, "characters": 22 }
+```
+
 ```json
 {
   "type": "invoke",
   "id": "request-uuid",
-  "modelId": "qwen-image",
-  "runtimeModel": "Qwen/Qwen-Image",
+  "modelId": "sdxl-turbo",
+  "runtimeModel": "stabilityai/sdxl-turbo",
   "jobKind": "image",
   "prompt": "A red bicycle parked in morning fog",
-  "width": 1328,
-  "height": 1328,
+  "width": 512,
+  "height": 512,
   "n": 1,
   "seed": 42,
   "inputImages": [{ "mime": "image/png", "data": "<base64>" }]
@@ -156,7 +174,7 @@ Image catalog models (`jobKind: "image"`) use a second runtime. The invoke is **
 }
 ```
 
-NVIDIA CUDA, AMD (ROCm on Linux, DirectML on Windows), Intel Arc (PyTorch XPU), or Apple Silicon (MPS). Enabling an image SKU downloads an isolated CPython (never the host's Python), a Diffusers venv (`~/.cache/scalattice/runtimes/diffusers-*`), and the HF snapshot. Disabling the last image SKU removes that runtime. The agent evicts the llama.cpp worker on that GPU for the job, then respawns it. The catalog row's HF repo is the checkpoint (Qwen-Image sizes/CFG apply only when the repo name contains `qwen-image`). Optional `inputImages` (1–4, `{ mime, data }`) are reference pictures for edit pipelines. Set `SCALATTICE_QWEN_IMAGE_STUB=1` to return a 1×1 PNG without PyTorch.
+`scalattice-sd` loads the checkpoint named by the catalog (safetensors, ckpt, or gguf), including the families stable-diffusion.cpp supports (SD 1/2/XL, SD3, FLUX, Qwen-Image, and the rest of that project). A named `weights.filename` is downloaded like a chat weight. A repo-only classic SD row still installs the diffusers snapshot into the hub cache. The agent stops the llama.cpp worker on the claimed GPUs for the job, then starts it again. When `scalattice-sd` is absent, only SDXL, SDXL-Turbo, SD 2.1, and SD 1.5 run, and only on NVIDIA CUDA or Apple Metal. Width/height default to the family's native size (SDXL 1024, SD 2.1 768, SD 1.5 / Turbo 512) and are snapped to multiples of 8. `n` (1–4) images are returned, seed `seed + i`. The first `inputImages` entry (`{ mime, data }`) runs img2img (strength 0.75; zero width/height follows the input); extra references are ignored. Set `SCALATTICE_QWEN_IMAGE_STUB=1` to return a 1×1 PNG without loading weights.
 
 6. **Client → server** while streaming: zero or more `invoke_delta`, then terminal `invoke_result` or `invoke_error`:
 

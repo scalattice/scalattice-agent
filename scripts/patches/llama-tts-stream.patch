@@ -1,0 +1,90 @@
+diff --git a/tools/tts/tts.cpp b/tools/tts/tts.cpp
+index 8578f88..1c239a8 100644
+--- a/tools/tts/tts.cpp
++++ b/tools/tts/tts.cpp
+@@ -11,6 +11,42 @@
+ #include <cstring>
+ #include <string>
+ 
++// --stream is not a llama.cpp flag. Strip it before common_params_parse.
++// While it is set, each finished audio window is written to stdout (WAV header,
++// then PCM) so a caller can play the clip before the last frame.
++static bool take_stream_flag(int & argc, char ** argv) {
++    bool stream = false;
++    int kept = 0;
++    for (int i = 0; i < argc; ++i) {
++        if (std::strcmp(argv[i], "--stream") == 0) {
++            stream = true;
++            continue;
++        }
++        argv[kept++] = argv[i];
++    }
++    argc = kept;
++    return stream;
++}
++
++static bool write_stream_chunk(mtmd_helper::gen_audio & gen) {
++    int32_t sample_rate = 0;
++    const char * data = nullptr;
++    size_t data_len = 0;
++    if (gen.get_output(&sample_rate, &data, &data_len, nullptr) != 0) {
++        LOG_ERR("get_output failed\n");
++        return false;
++    }
++    if (data_len == 0 || data == nullptr) {
++        return true;
++    }
++    if (std::fwrite(data, 1, data_len, stdout) != data_len) {
++        LOG_ERR("failed to write audio chunk\n");
++        return false;
++    }
++    std::fflush(stdout);
++    return true;
++}
++
+ /**
+  * Please note that this is NOT a production-ready binary.
+  * It is a playground for trying TTS support in llama.cpp.
+@@ -39,11 +75,13 @@ static void print_usage(int, char ** argv) {
+     LOG("\n    %s -hf user/model -p \"text to speak\" -o output.wav\n", argv[0]);
+     LOG("\nnote: --tts-lang, --tts-voice and --tts-speaker-file may not be supported in all models");
+     LOG("\n      use -n to limit the output length");
++    LOG("\n      --stream writes WAV chunks to stdout as they are generated");
+     LOG("\n      see tts/README.md for per-model usage notes");
+     LOG("\n\n");
+ }
+ 
+ int main(int argc, char ** argv) {
++    const bool stream = take_stream_flag(argc, argv);
+     common_params params;
+ 
+     common_init();
+@@ -151,6 +189,7 @@ int main(int argc, char ** argv) {
+     inp.top_k       = params.sampling.top_k;
+     inp.top_p       = params.sampling.top_p;
+     inp.seed        = params.sampling.seed;
++    inp.stream      = stream;
+ 
+     //
+     // stage 1: process prompt via backbone model, generate semantic representation
+@@ -207,6 +246,20 @@ int main(int argc, char ** argv) {
+         h_state = h_next;
+         sampled = sample_semantic_code();
+         timings.report(n_frames);
++        if (stream && !write_stream_chunk(gen)) {
++            return 1;
++        }
++    }
++    if (stream) {
++        if (gen.flush() != 0) {
++            LOG_ERR("flush failed\n");
++            return 1;
++        }
++        if (!write_stream_chunk(gen)) {
++            return 1;
++        }
++        llama_backend_free();
++        return 0;
+     }
+     const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
+ 

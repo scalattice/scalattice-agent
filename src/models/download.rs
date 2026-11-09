@@ -430,7 +430,23 @@ pub async fn download_catalog_model(
         anyhow::bail!("no space left on device");
     }
     if model.is_image_job() {
-        return crate::image::install_image_model(model, hf_token, cancel).await;
+        let named = model
+            .weights
+            .as_ref()
+            .is_some_and(|w| !w.filename.trim().is_empty());
+        if !named {
+            return crate::image::install_image_model(model, hf_token, cancel).await;
+        }
+    }
+    if model.is_tts_job()
+        && !model.weights.as_ref().is_some_and(|w| {
+            w.filename
+                .trim()
+                .to_ascii_lowercase()
+                .ends_with(".gguf")
+        })
+    {
+        anyhow::bail!("speech models must be a .gguf voice");
     }
     let runtime_model = if model.runtime_model.trim().is_empty() {
         model.model_id.as_str()

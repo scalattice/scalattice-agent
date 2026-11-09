@@ -105,15 +105,23 @@ scripts/prune-cargo-target.sh
 mkdir -p dist
 cp "$BIN" dist/scalattice-agent
 cp "$UPDATER" dist/scalattice-updater
-chmod +x scripts/bundle-release-libs.sh
+chmod +x scripts/bundle-release-libs.sh scripts/build-stable-diffusion.sh scripts/build-tts.sh
 scripts/bundle-release-libs.sh dist/scalattice-agent dist "${RELEASE}"
 
+# Image engine (stable-diffusion.cpp) and the speech engine (llama-tts).
+# They sit beside the agent the way ggml backends do, and are not linked into it.
+scripts/build-stable-diffusion.sh
+scripts/build-tts.sh
+rm -rf dist/sd dist/tts
+mkdir -p dist/sd dist/tts
+cp -a native/sd/out/. dist/sd/
+cp -a native/tts/out/. dist/tts/
+
 ARCHIVE="dist/scalattice-agent-${TARGET}.tar.gz"
-if [[ -d dist/lib ]]; then
-  tar -czf "$ARCHIVE" -C dist scalattice-agent scalattice-updater lib
-else
-  tar -czf "$ARCHIVE" -C dist scalattice-agent scalattice-updater
-fi
+tar_items=(scalattice-agent scalattice-updater)
+[[ -d dist/lib ]] && tar_items+=(lib)
+tar_items+=(sd tts)
+tar -czf "$ARCHIVE" -C dist "${tar_items[@]}"
 
 echo ""
 echo "==> Built ${ARCHIVE}"

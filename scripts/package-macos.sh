@@ -41,6 +41,14 @@ if [[ "$DMG_FROM_APP" -eq 0 ]]; then
   mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
   cp "$BIN" "${APP}/Contents/MacOS/scalattice-agent"
   chmod +x "${APP}/Contents/MacOS/scalattice-agent"
+  if [[ -d "${ROOT}/native/sd/out" ]]; then
+    mkdir -p "${APP}/Contents/MacOS/sd"
+    cp -a "${ROOT}/native/sd/out/." "${APP}/Contents/MacOS/sd/"
+  fi
+  if [[ -d "${ROOT}/native/tts/out" ]]; then
+    mkdir -p "${APP}/Contents/MacOS/tts"
+    cp -a "${ROOT}/native/tts/out/." "${APP}/Contents/MacOS/tts/"
+  fi
 
   sed \
     -e "/CFBundleShortVersionString/{n;s|<string>.*</string>|<string>${VERSION}</string>|;}" \

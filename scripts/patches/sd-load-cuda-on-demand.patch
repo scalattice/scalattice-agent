@@ -1,0 +1,279 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8c5866d..2059345 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -342,26 +342,9 @@ target_link_libraries(${SD_LIB} PRIVATE Threads::Threads)
+ target_link_libraries(${SD_LIB} PRIVATE onig sd-utf8proc)
+ if (SD_CUDA)
+     find_package(CUDAToolkit REQUIRED)
+-    # Keep the driver stub on downstream link lines when no driver is installed.
+-    target_link_libraries(${SD_LIB} PUBLIC CUDA::cuda_driver)
++    # CUDA stays in libsd-cuda.so. Linking the driver here would put libcuda in
++    # DT_NEEDED and the image runner would refuse to start on AMD and Intel.
+     set_property(SOURCE src/core/ggml_extend_backend.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_USE_CUDA)
+-    if (NOT SD_USE_UPSTREAM_GGML)
+-        include(cmake/cutlass.cmake)
+-        enable_language(CUDA)
+-        set_target_properties(${SD_LIB} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+-        if (SD_CUDA_CUTLASS_PATH)
+-            target_sources(${SD_LIB} PRIVATE src/core/cuda/cute_attention.cu src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu)
+-            set_source_files_properties(src/core/cuda/cute_attention.cu src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu PROPERTIES
+-                INCLUDE_DIRECTORIES "${SD_CUDA_CUTLASS_PATH}/include"
+-                COMPILE_OPTIONS "--use_fast_math;--extended-lambda;--expt-relaxed-constexpr")
+-            if (MSVC)
+-                set_property(SOURCE src/core/cuda/cute_attention.cu src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu APPEND PROPERTY COMPILE_OPTIONS -Xcompiler=/Zc:preprocessor,/Zc:__cplusplus)
+-            endif()
+-            if (GGML_CUDA_FORCE_CUBLAS)
+-                set_property(SOURCE src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu APPEND PROPERTY COMPILE_DEFINITIONS SD_CUDA_FORCE_CUBLAS)
+-            endif()
+-        endif()
+-    endif()
+ endif()
+ set(SD_BACKEND_REGISTRATIONS)
+ if (NOT SD_USE_UPSTREAM_GGML AND (SD_CUDA OR SD_HIPBLAS OR SD_MUSA))
+@@ -370,6 +353,10 @@ if (NOT SD_USE_UPSTREAM_GGML AND (SD_CUDA OR SD_HIPBLAS OR SD_MUSA))
+     endif()
+     add_subdirectory(src/core/cuda)
+     foreach(VENDOR CUDA HIP MUSA)
++        if(VENDOR STREQUAL "CUDA")
++            # Registered from libsd-cuda.so after it loads.
++            continue()
++        endif()
+         if(SD_${VENDOR} OR (VENDOR STREQUAL "HIP" AND SD_HIPBLAS))
+             string(TOLOWER "${VENDOR}" NAMESPACE)
+             list(APPEND SD_BACKEND_REGISTRATIONS "sd_${NAMESPACE}::register_extensions")
+diff --git a/src/core/cuda/CMakeLists.txt b/src/core/cuda/CMakeLists.txt
+index e2dd3f9..7e82f03 100644
+--- a/src/core/cuda/CMakeLists.txt
++++ b/src/core/cuda/CMakeLists.txt
+@@ -22,25 +22,67 @@ endfunction()
+ 
+ if(SD_CUDA)
+     enable_language(CUDA)
+-    sd_cuda_sources(cuda CUDA)
+-    target_sources(${SD_CUDA_TARGET} PRIVATE sage_attention.cu sol_attention.cu)
++    set(SD_CUDA_PLUGIN_SOURCES)
++    foreach(OP rope int8 w4 convrot affine modulate bf16 rms_affine registration)
++        set(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/${OP}_cuda.cu")
++        file(GENERATE OUTPUT "${SOURCE}" CONTENT "#define SD_CUDA_VENDOR_CUDA 1\n#include \"core/cuda/${OP}.cu\"\n")
++        set_source_files_properties("${SOURCE}" PROPERTIES LANGUAGE CUDA)
++        list(APPEND SD_CUDA_PLUGIN_SOURCES "${SOURCE}")
++    endforeach()
++    list(APPEND SD_CUDA_PLUGIN_SOURCES sage_attention.cu sol_attention.cu "${CMAKE_CURRENT_SOURCE_DIR}/plugin_entry.cpp")
++    if(SD_CUDA_CUTLASS_PATH)
++        list(APPEND SD_CUDA_PLUGIN_SOURCES
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/cute_attention.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/i8_projection.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/i8_gated_residual.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/i8_gemm.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/bf16_gemm.cu")
++    endif()
++    add_library(sd-cuda SHARED ${SD_CUDA_PLUGIN_SOURCES})
++    target_include_directories(sd-cuda PRIVATE "${PROJECT_SOURCE_DIR}/src")
++    target_link_libraries(sd-cuda PRIVATE ggml CUDA::cudart CUDA::cublas CUDA::cuda_driver)
++    target_compile_features(sd-cuda PRIVATE cxx_std_17)
++    set_target_properties(sd-cuda PROPERTIES
++        POSITION_INDEPENDENT_CODE ON
++        CUDA_STANDARD 17
++        CUDA_STANDARD_REQUIRED ON
++        OUTPUT_NAME "sd-cuda"
++        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    # Same coverage as ggml's CUDA backend. The parent variable does not
++    # reach this directory, and an empty list compiles only sm_52.
++    set(SD_CUDA_ARCHS 75-virtual 80-virtual 86-real)
++    if(CUDAToolkit_VERSION VERSION_LESS "13")
++        list(INSERT SD_CUDA_ARCHS 0 50-virtual 61-virtual 70-virtual)
++    endif()
++    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
++        list(APPEND SD_CUDA_ARCHS 89-real 90-virtual)
++    endif()
++    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
++        list(APPEND SD_CUDA_ARCHS 120a-real)
++    endif()
++    set_property(TARGET sd-cuda PROPERTY CUDA_ARCHITECTURES "${SD_CUDA_ARCHS}")
+     set_source_files_properties(sage_attention.cu sol_attention.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+-    set_source_files_properties(${SD_CUDA_SOURCES} PROPERTIES COMPILE_OPTIONS "--use_fast_math")
++    foreach(OP rope int8 w4 convrot affine modulate bf16 rms_affine registration)
++        set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/${OP}_cuda.cu" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
++    endforeach()
+     if(SD_CUDA_CUTLASS_PATH)
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/w4_cuda.cu" APPEND PROPERTY COMPILE_DEFINITIONS SD_CUDA_W4_CUTLASS)
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/w4_cuda.cu" APPEND PROPERTY INCLUDE_DIRECTORIES "${SD_CUDA_CUTLASS_PATH}/include")
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/w4_cuda.cu" APPEND PROPERTY COMPILE_OPTIONS --expt-relaxed-constexpr)
+-        if(MSVC)
+-            set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/w4_cuda.cu" APPEND PROPERTY COMPILE_OPTIONS -Xcompiler=/Zc:preprocessor,/Zc:__cplusplus)
+-        endif()
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/bf16_cuda.cu" APPEND PROPERTY COMPILE_DEFINITIONS SD_CUDA_BF16_CUTLASS)
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/int8_cuda.cu" APPEND PROPERTY COMPILE_DEFINITIONS SD_CUDA_I8_CUTLASS)
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/registration_cuda.cu" APPEND PROPERTY COMPILE_DEFINITIONS SD_CUDA_CUTE_ATTENTION)
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/int8_cuda.cu" APPEND PROPERTY INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/src/core/cuda")
++        set_source_files_properties(
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/cute_attention.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/i8_projection.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/i8_gated_residual.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/i8_gemm.cu"
++            "${PROJECT_SOURCE_DIR}/src/core/cuda/bf16_gemm.cu"
++            PROPERTIES
++                INCLUDE_DIRECTORIES "${SD_CUDA_CUTLASS_PATH}/include"
++                COMPILE_OPTIONS "--use_fast_math;--extended-lambda;--expt-relaxed-constexpr")
+     endif()
+-    set_target_properties(${SD_CUDA_TARGET} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+-    target_link_libraries(${SD_CUDA_TARGET} PRIVATE CUDA::cudart CUDA::cublas)
+-    target_link_libraries(${SD_LIB} PRIVATE CUDA::cudart CUDA::cublas)
+ endif()
+ 
+ if(SD_HIPBLAS)
+diff --git a/src/core/cuda/plugin_entry.cpp b/src/core/cuda/plugin_entry.cpp
+new file mode 100644
+index 0000000..19fde13
+--- /dev/null
++++ b/src/core/cuda/plugin_entry.cpp
+@@ -0,0 +1,7 @@
++#include "core/cuda/registration.h"
++
++// Loaded with dlopen only after the process has started. AMD and Intel machines
++// never open this file, so a missing libcuda does not stop the runner.
++extern "C" void sd_cuda_register_extensions(ggml_backend_dev_t device) {
++    sd_cuda::register_extensions(device);
++}
+diff --git a/src/core/ggml_extend_backend.cpp b/src/core/ggml_extend_backend.cpp
+index 47fe80f..c8f95fd 100644
+--- a/src/core/ggml_extend_backend.cpp
++++ b/src/core/ggml_extend_backend.cpp
+@@ -11,7 +11,60 @@
+ #include <vector>
+ 
+ #ifdef SD_USE_CUDA
+-#include <cuda.h>
++#if defined(_WIN32)
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
++// Driver API types, kept local so this file does not need the CUDA toolkit
++// headers. The values match cuda.h.
++using CUresult = int;
++using CUdevice = int;
++using CUdevice_attribute = int;
++constexpr CUresult CUDA_SUCCESS = 0;
++constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
++constexpr CUdevice_attribute CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
++
++struct SdCudaDriver {
++    CUresult (*init)(unsigned int);
++    CUresult (*device_get)(CUdevice*, const char*);
++    CUresult (*device_attr)(int*, CUdevice_attribute, CUdevice);
++};
++
++// The driver is opened only while measuring an NVIDIA device. The image
++// runner itself does not list libcuda as a library it needs at startup.
++static const SdCudaDriver* sd_cuda_driver() {
++    static SdCudaDriver api{};
++    static int state = 0;
++    if (state == 0) {
++        state = -1;
++#if defined(_WIN32)
++        HMODULE lib = LoadLibraryA("nvcuda.dll");
++        if (lib == nullptr) {
++            return nullptr;
++        }
++        api.init       = reinterpret_cast<CUresult (*)(unsigned int)>(GetProcAddress(lib, "cuInit"));
++        api.device_get = reinterpret_cast<CUresult (*)(CUdevice*, const char*)>(GetProcAddress(lib, "cuDeviceGetByPCIBusId"));
++        api.device_attr =
++            reinterpret_cast<CUresult (*)(int*, CUdevice_attribute, CUdevice)>(GetProcAddress(lib, "cuDeviceGetAttribute"));
++#else
++        void* lib = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
++        if (lib == nullptr) {
++            return nullptr;
++        }
++        api.init       = reinterpret_cast<CUresult (*)(unsigned int)>(dlsym(lib, "cuInit"));
++        api.device_get = reinterpret_cast<CUresult (*)(CUdevice*, const char*)>(dlsym(lib, "cuDeviceGetByPCIBusId"));
++        api.device_attr =
++            reinterpret_cast<CUresult (*)(int*, CUdevice_attribute, CUdevice)>(dlsym(lib, "cuDeviceGetAttribute"));
++#endif
++        if (api.init == nullptr || api.device_get == nullptr || api.device_attr == nullptr) {
++            return nullptr;
++        }
++        state = 1;
++    }
++    return state == 1 ? &api : nullptr;
++}
+ #endif
+ 
+ #ifdef SD_USE_HIP
+@@ -471,10 +524,11 @@ static int cuda_compiled_arch(ggml_backend_t backend) {
+         ggml_backend_dev_get_props(dev, &props);
+         CUdevice device;
+         int major = 0, minor = 0;
+-        if (props.device_id == nullptr || cuInit(0) != CUDA_SUCCESS ||
+-            cuDeviceGetByPCIBusId(&device, props.device_id) != CUDA_SUCCESS ||
+-            cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != CUDA_SUCCESS ||
+-            cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != CUDA_SUCCESS) {
++        const SdCudaDriver* cuda = sd_cuda_driver();
++        if (props.device_id == nullptr || cuda == nullptr || cuda->init(0) != CUDA_SUCCESS ||
++            cuda->device_get(&device, props.device_id) != CUDA_SUCCESS ||
++            cuda->device_attr(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != CUDA_SUCCESS ||
++            cuda->device_attr(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != CUDA_SUCCESS) {
+             return 0;
+         }
+         auto reg          = ggml_backend_dev_backend_reg(dev);
+diff --git a/src/core/ggml_extensions.cpp b/src/core/ggml_extensions.cpp
+index 25fa222..b694199 100644
+--- a/src/core/ggml_extensions.cpp
++++ b/src/core/ggml_extensions.cpp
+@@ -11,6 +11,12 @@
+ #include <unordered_set>
+ #include <utility>
+ 
++#if defined(_WIN32)
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
+ #ifdef SD_BACKEND_EXTENSIONS
+ #include "sd_backend_extensions.h"
+ #endif
+@@ -501,6 +507,33 @@ ggml_tensor* ggml_sol_attn(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, gg
+     return ggml_ext_op_create(ctx, sd_ggml_sol_attn_op(), inputs, 3, &params);
+ }
+ 
++static void sd_register_cuda_plugin(ggml_backend_dev_t device) {
++    const char* name = ggml_backend_dev_name(device);
++    if (name == nullptr || std::strstr(name, "CUDA") == nullptr) {
++        return;
++    }
++    using RegisterFn = void (*)(ggml_backend_dev_t);
++    static RegisterFn reg = nullptr;
++    static bool tried     = false;
++    if (!tried) {
++        tried = true;
++#if defined(_WIN32)
++        HMODULE lib = LoadLibraryA("sd-cuda.dll");
++        if (lib != nullptr) {
++            reg = reinterpret_cast<RegisterFn>(GetProcAddress(lib, "sd_cuda_register_extensions"));
++        }
++#else
++        void* lib = dlopen("libsd-cuda.so", RTLD_NOW | RTLD_LOCAL);
++        if (lib != nullptr) {
++            reg = reinterpret_cast<RegisterFn>(dlsym(lib, "sd_cuda_register_extensions"));
++        }
++#endif
++    }
++    if (reg != nullptr) {
++        reg(device);
++    }
++}
++
+ void sd_ggml_register_extensions(ggml_backend_t backend) {
+     if (!backend) {
+         return;
+@@ -515,6 +548,7 @@ void sd_ggml_register_extensions(ggml_backend_t backend) {
+         return;
+     }
+     if (!cpu) {
++        sd_register_cuda_plugin(device);
+ #ifdef SD_BACKEND_EXTENSIONS
+         for (auto register_backend : sd_backend_extensions)
+             register_backend(device);

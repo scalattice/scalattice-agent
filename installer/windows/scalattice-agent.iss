@@ -74,6 +74,8 @@ Source: "resolve-nvidia-driver.ps1"; Flags: dontcopy
 ; PrepareToInstall moves the prior lib dir aside so we can copy fresh files without
 ; in-place overwriting of locked CUDA DLLs (which left stale versions / broken updates).
 Source: "..\..\dist\lib\*"; DestDir: "{localappdata}\Scalattice\lib"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\dist\sd\*"; DestDir: "{app}\sd"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "..\..\dist\tts\*"; DestDir: "{app}\tts"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "..\..\dist\scalattice-run.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\launch-tray-interactive.vbs"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

@@ -549,6 +549,28 @@ fn resolve_tar_binary() -> Option<PathBuf> {
         .map(|_| PathBuf::from("tar"))
 }
 
+/// Image and speech runners ship in the release archive beside the agent.
+/// They are installed with every update, whether or not this machine has an
+/// image or speech model enabled yet.
+#[cfg(target_os = "linux")]
+fn install_bundled_runtimes(staging: &Path) -> Result<()> {
+    let install = install_dir().context("resolve install directory")?;
+    for name in ["sd", "tts"] {
+        let source = staging.join(name);
+        if !source.is_dir() {
+            continue;
+        }
+        let dest = install.join(name);
+        if dest.exists() {
+            fs::remove_dir_all(&dest)
+                .with_context(|| format!("replace {}", dest.display()))?;
+        }
+        copy_dir_recursive(&source, &dest)
+            .with_context(|| format!("install {name} runtime"))?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn apply_update(staging: &Path) -> Result<()> {
     let source_bin = staging.join("scalattice-agent");
@@ -628,6 +650,7 @@ fn apply_update(staging: &Path) -> Result<()> {
         copy_lib_tree(&source_lib, &dest_lib).context("replace bundled libraries")?;
         create_lib_symlinks(&dest_lib).context("create library symlinks")?;
     }
+    install_bundled_runtimes(staging)?;
 
     if self_replace {
         // Caller (remote control) acks then restarts/exits so systemd picks up the
@@ -675,6 +698,7 @@ fn try_external_updater(source_bin: &Path, staging: &Path) -> Result<()> {
         copy_lib_tree(&source_lib, &dest_lib).context("replace bundled libraries")?;
         create_lib_symlinks(&dest_lib).context("create library symlinks")?;
     }
+    install_bundled_runtimes(staging)?;
 
     // Delegate agent binary update to external updater
     let status = Command::new(&updater)
