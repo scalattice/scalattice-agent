@@ -358,6 +358,8 @@ mod tests {
                 device_ids: vec![format!("dev:{i}")],
                 tp_group: None,
                 occupied_external: false,
+                progress_phase: None,
+                progress_pct: None,
             })
             .collect()
     }

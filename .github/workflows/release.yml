@@ -116,7 +116,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Jammy + LunarG SDK key (24.04 caches / old cmake vulkan paths break jammy).
-          shared-key: release-x86_64-gpu-jammy-vulkansdk
+          # v2: bust cache that left llama-cpp-sys hard_link EEXIST stubs (llama-cpp-rs#896).
+          shared-key: release-x86_64-gpu-jammy-vulkansdk-v2
           cache-targets: true
           cache-workspace-crates: true
       - name: Build + package
@@ -176,7 +177,8 @@ jobs:
           method: auto
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-aarch64-gpu
+          # v2: same llama-cpp-sys hard_link EEXIST bust as x86_64 (llama-cpp-rs#896).
+          shared-key: release-aarch64-gpu-v2
           cache-targets: true
           cache-workspace-crates: true
       - name: Build + package
@@ -189,6 +191,16 @@ jobs:
           set -euo pipefail
           export PATH="${CUDA_PATH}/bin:$PATH"
           nvcc --version
+          # Drop cached soname stubs before cargo; llama-cpp-sys-2 panics on EEXIST.
+          PROFILE=target/aarch64-unknown-linux-gnu/release
+          rm -f \
+            "${PROFILE}"/libggml*.so* \
+            "${PROFILE}"/libllama*.so* \
+            "${PROFILE}"/libmtmd*.so* \
+            "${PROFILE}/deps"/libggml*.so* \
+            "${PROFILE}/deps"/libllama*.so* \
+            "${PROFILE}/deps"/libmtmd*.so* \
+            2>/dev/null || true
           cargo build --locked --release --target aarch64-unknown-linux-gnu --no-default-features --features arm-gpu
           mkdir -p dist
           cp target/aarch64-unknown-linux-gnu/release/scalattice-agent dist/

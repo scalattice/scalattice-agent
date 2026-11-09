@@ -2693,6 +2693,7 @@ async fn respond_invoke(
             }
         });
         let delta_tx_cb = delta_tx.clone();
+        let supervisor_progress = supervisor.clone();
         let on_delta: Option<Box<dyn FnMut(String) + Send>> =
             Some(Box::new(move |delta: String| {
                 let invoke_id = invoke_id_cb.clone();
@@ -2704,6 +2705,9 @@ async fn respond_invoke(
                         .next()
                         .and_then(|s| s.parse::<f32>().ok())
                         .filter(|v| *v >= 0.0);
+                    if let Some(p) = pct {
+                        supervisor_progress.note_job_progress(&invoke_id, &phase, p);
+                    }
                     serde_json::to_string(&crate::protocol::InvokeProgressMessage {
                         kind: "invoke_progress",
                         id: invoke_id,
@@ -3102,6 +3106,7 @@ async fn respond_invoke(
             .await;
         drop(delta_tx);
         let _ = delta_writer.await;
+        supervisor.clear_job_progress(&invoke_id);
 
         match invoke_out {
             Ok((content, prompt_tokens, completion_tokens, timings, slot_id)) => {
