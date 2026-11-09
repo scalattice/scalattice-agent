@@ -2,8 +2,8 @@
 name = "scalattice-agent"
 # Owned by Git tags / release CI. Do not invent versions by hand.
 # Align to the highest origin tag: ./scripts/align-cargo-version.sh
-# Next release = next patch after that tip (Cargo.toml is not a floor):
-# scripts/ci-prepare-release.sh (production merge).
+# Next release = next patch after the last release that has assets
+# (empty failed tags are reused, not skipped): scripts/ci-prepare-release.sh
 version = "1.1.167"
 edition = "2021"
 description = "GPU machine agent for the Scalattice inference network"
