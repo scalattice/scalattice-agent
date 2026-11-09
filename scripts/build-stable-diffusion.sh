@@ -81,18 +81,29 @@ fi
 rm -rf "${OUT}"
 mkdir -p "${OUT}/lib"
 shopt -s nullglob
-for lib in "${lib_dir}"/libstable-diffusion.* "${lib_dir}"/libsd-cuda.* \
-           "${lib_dir}"/libggml.so "${lib_dir}"/libggml.so.* \
-           "${lib_dir}"/libggml-base.so "${lib_dir}"/libggml-base.so.*; do
+# Core shared libs next to the runner (Linux .so* / macOS .dylib).
+# Use globs only — a literal missing path would trip `set -e` under Darwin.
+for lib in "${lib_dir}"/libstable-diffusion.* \
+           "${lib_dir}"/libsd-cuda.* \
+           "${lib_dir}"/libggml.* \
+           "${lib_dir}"/libggml-base.*; do
+  case "$(basename "${lib}")" in
+    libggml-cuda.*|libggml-vulkan.*|libggml-metal.*|libggml-cpu.*|libggml-blas.*)
+      # Backends ship beside the executable, not under lib/.
+      continue
+      ;;
+  esac
   cp -a "${lib}" "${OUT}/lib/"
 done
-# ggml opens libggml-cuda.so and libggml-vulkan.so from the executable's
-# directory, and only when that GPU exists. They must not be linked into
-# libstable-diffusion, and they must not be copied a second time under lib/.
-for lib in "${lib_dir}"/libggml-cuda.so "${lib_dir}"/libggml-vulkan.so \
-           "${lib_dir}"/libggml-metal.so "${lib_dir}"/libggml-cpu.so \
-           "${BUILD}/bin"/libggml-cuda.so "${BUILD}/bin"/libggml-vulkan.so \
-           "${BUILD}/bin"/libggml-metal.so "${BUILD}/bin"/libggml-cpu.so; do
+# ggml opens CUDA/Vulkan/Metal/CPU backends from the executable directory,
+# and only when that GPU exists. Keep them out of lib/ and out of the
+# libstable-diffusion link line.
+for lib in "${lib_dir}"/libggml-cuda.* "${lib_dir}"/libggml-vulkan.* \
+           "${lib_dir}"/libggml-metal.* "${lib_dir}"/libggml-cpu.* \
+           "${lib_dir}"/libggml-blas.* \
+           "${BUILD}/bin"/libggml-cuda.* "${BUILD}/bin"/libggml-vulkan.* \
+           "${BUILD}/bin"/libggml-metal.* "${BUILD}/bin"/libggml-cpu.* \
+           "${BUILD}/bin"/libggml-blas.*; do
   [[ -e "${lib}" ]] || continue
   cp -a "${lib}" "${OUT}/"
 done
@@ -106,13 +117,22 @@ if command -v clang++ >/dev/null 2>&1; then
   cxx="clang++"
 fi
 echo "==> ${cxx} scalattice_sd.cpp"
-# libstable-diffusion leaves ggml symbols in libggml-base. Link them
+# libstable-diffusion leaves ggml symbols in libggml / libggml-base. Link them
 # explicitly; modern ld does not pull a shared library's DT_NEEDED for us.
-"${cxx}" -O2 -std=c++17 -I"${SRC}/include" "${WRAPPER}" \
-  -L"${OUT}/lib" -Wl,-rpath-link,"${OUT}/lib" \
-  -lstable-diffusion -lggml -lggml-base \
-  -Wl,-rpath,'$ORIGIN/lib' \
-  -o "${OUT}/scalattice-sd"
+link_args=(
+  -O2 -std=c++17 -I"${SRC}/include" "${WRAPPER}"
+  -L"${OUT}/lib"
+  -lstable-diffusion -lggml -lggml-base
+)
+case "$(uname -s)" in
+  Darwin)
+    link_args+=(-Wl,-rpath,@loader_path/lib)
+    ;;
+  *)
+    link_args+=(-Wl,-rpath-link,"${OUT}/lib" -Wl,-rpath,'$ORIGIN/lib')
+    ;;
+esac
+"${cxx}" "${link_args[@]}" -o "${OUT}/scalattice-sd"
 chmod +x "${OUT}/scalattice-sd"
 if command -v patchelf >/dev/null 2>&1; then
   for lib in "${OUT}"/libggml-*.so "${OUT}/lib"/libsd-cuda.so; do
@@ -120,9 +140,12 @@ if command -v patchelf >/dev/null 2>&1; then
     patchelf --set-rpath '$ORIGIN/lib' "${lib}" || true
   done
 fi
-if readelf -d "${OUT}/lib/libstable-diffusion.so" | grep -q 'libcuda\.so'; then
-  echo "libstable-diffusion.so still requires libcuda; AMD and Intel machines cannot start it" >&2
-  exit 1
+if [[ "$(uname -s)" != Darwin ]] && command -v readelf >/dev/null 2>&1; then
+  if [[ -f "${OUT}/lib/libstable-diffusion.so" ]] && \
+     readelf -d "${OUT}/lib/libstable-diffusion.so" | grep -q 'libcuda\.so'; then
+    echo "libstable-diffusion.so still requires libcuda; AMD and Intel machines cannot start it" >&2
+    exit 1
+  fi
 fi
 
 echo "==> ${OUT}/scalattice-sd"

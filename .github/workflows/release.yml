@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.1.33). Leave empty to bump from Cargo.toml'
+        description: 'Release tag (e.g. v1.1.33). Leave empty to use next patch after highest origin tag'
         required: false
         type: string
       targets:
