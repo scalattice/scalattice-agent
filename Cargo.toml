@@ -4,7 +4,7 @@ name = "scalattice-agent"
 # Align to the highest origin tag: ./scripts/align-cargo-version.sh
 # Next release = next patch after that tip (Cargo.toml is not a floor):
 # scripts/ci-prepare-release.sh (production merge).
-version = "1.1.155"
+version = "1.1.165"
 edition = "2021"
 description = "GPU machine agent for the Scalattice inference network"
 license-file = "LICENSE"
