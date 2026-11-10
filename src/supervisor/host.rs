@@ -254,9 +254,10 @@ fn process_cpu_util_pct(pid: u32) -> Option<u8> {
     }
     #[cfg(target_os = "linux")]
     {
-        use std::sync::Mutex;
+        use std::sync::{Mutex, OnceLock};
         use std::time::Instant;
-        static PREV: Mutex<HashMap<u32, (u64, u64, Instant)>> = Mutex::new(HashMap::new());
+        static PREV: OnceLock<Mutex<HashMap<u32, (u64, u64, Instant)>>> = OnceLock::new();
+        let prev = PREV.get_or_init(|| Mutex::new(HashMap::new()));
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let close = stat.rfind(')')?;
         let after = stat.get(close + 2..)?;
@@ -278,7 +279,7 @@ fn process_cpu_util_pct(pid: u32) -> Option<u8> {
                 .sum::<u64>()
         };
         let now = Instant::now();
-        let mut guard = PREV.lock().ok()?;
+        let mut guard = prev.lock().ok()?;
         let Some((prev_proc, prev_total, prev_at)) = guard.get(&pid).copied() else {
             guard.insert(pid, (proc_j, total_j, now));
             return None;
@@ -300,9 +301,10 @@ fn process_cpu_util_pct(pid: u32) -> Option<u8> {
     }
     #[cfg(windows)]
     {
-        use std::sync::Mutex;
+        use std::sync::{Mutex, OnceLock};
         use std::time::Instant;
-        static PREV: Mutex<HashMap<u32, (f64, Instant)>> = Mutex::new(HashMap::new());
+        static PREV: OnceLock<Mutex<HashMap<u32, (f64, Instant)>>> = OnceLock::new();
+        let prev = PREV.get_or_init(|| Mutex::new(HashMap::new()));
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let output = std::process::Command::new("powershell")
@@ -323,7 +325,7 @@ fn process_cpu_util_pct(pid: u32) -> Option<u8> {
         }
         let cpu_s: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
         let now = Instant::now();
-        let mut guard = PREV.lock().ok()?;
+        let mut guard = prev.lock().ok()?;
         let Some((prev_cpu, prev_at)) = guard.get(&pid).copied() else {
             guard.insert(pid, (cpu_s, now));
             return None;
@@ -344,9 +346,10 @@ fn process_cpu_util_pct(pid: u32) -> Option<u8> {
     }
     #[cfg(target_os = "macos")]
     {
-        use std::sync::Mutex;
+        use std::sync::{Mutex, OnceLock};
         use std::time::Instant;
-        static PREV: Mutex<HashMap<u32, (f64, Instant)>> = Mutex::new(HashMap::new());
+        static PREV: OnceLock<Mutex<HashMap<u32, (f64, Instant)>>> = OnceLock::new();
+        let prev = PREV.get_or_init(|| Mutex::new(HashMap::new()));
         // ps %cpu is averaged since process start — keep a delta via cumulative time if possible.
         let output = std::process::Command::new("ps")
             .args(["-o", "%cpu=", "-p", &pid.to_string()])
@@ -357,7 +360,7 @@ fn process_cpu_util_pct(pid: u32) -> Option<u8> {
         }
         let pct: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
         let now = Instant::now();
-        let mut guard = PREV.lock().ok()?;
+        let mut guard = prev.lock().ok()?;
         // Seed once so the first heartbeat after spawn does not flash a lifetime average.
         if !guard.contains_key(&pid) {
             guard.insert(pid, (pct, now));
