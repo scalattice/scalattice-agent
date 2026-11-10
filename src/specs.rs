@@ -778,6 +778,458 @@ fn parse_nvidia_free_csv(stdout: &str) -> std::collections::HashMap<u32, f64> {
     map
 }
 
+/// Live per-process GPU memory (MiB) keyed by `(gpu_index, pid)`.
+/// Best-effort via `nvidia-smi --query-compute-apps` (often empty under Windows WDDM).
+pub fn live_nvidia_process_vram_mb_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u32> {
+    #[cfg(target_os = "macos")]
+    {
+        std::collections::HashMap::new()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        for bin in nvidia_smi_bins() {
+            let map = live_nvidia_compute_apps_from(&bin);
+            if !map.is_empty() {
+                return map;
+            }
+        }
+        std::collections::HashMap::new()
+    }
+}
+
+/// Sum used GPU memory (MiB) across all GPUs for each PID.
+pub fn live_nvidia_process_vram_mb_by_pid() -> std::collections::HashMap<u32, u32> {
+    let mut by_pid: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for ((_, pid), mb) in live_nvidia_process_vram_mb_by_gpu_pid() {
+        *by_pid.entry(pid).or_insert(0) = by_pid.get(&pid).copied().unwrap_or(0).saturating_add(mb);
+    }
+    by_pid
+}
+
+/// Vendor-merged per-process accelerator memory: `(vendor_gpu_index, pid) → MiB`.
+/// NVIDIA indices are CUDA ordinals; AMD indices are `amd:N` ordinals.
+pub fn live_process_vram_mb_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u32> {
+    process_accel_cache().0
+}
+
+/// Vendor-merged per-process accelerator util: `(vendor_gpu_index, pid) → SM/CU %`.
+pub fn live_process_util_pct_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u8> {
+    process_accel_cache().1
+}
+
+/// Cache nvidia-smi pmon / compute-apps + rocm-smi for a few seconds so
+/// `slot_statuses` does not pay a 1s pmon sample on every heartbeat.
+fn process_accel_cache() -> (
+    std::collections::HashMap<(u32, u32), u32>,
+    std::collections::HashMap<(u32, u32), u8>,
+) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    struct Cache {
+        at: Instant,
+        vram: std::collections::HashMap<(u32, u32), u32>,
+        util: std::collections::HashMap<(u32, u32), u8>,
+    }
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(4);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some(hit) = guard.as_ref() {
+            if hit.at.elapsed() < TTL {
+                return (hit.vram.clone(), hit.util.clone());
+            }
+        }
+    }
+    let mut vram = live_nvidia_process_vram_mb_by_gpu_pid();
+    for (key, mb) in live_amd_process_vram_mb_by_gpu_pid() {
+        vram.entry(key)
+            .and_modify(|v| *v = (*v).saturating_add(mb))
+            .or_insert(mb);
+    }
+    let mut util = live_nvidia_process_util_pct_by_gpu_pid();
+    for (key, pct) in live_amd_process_util_pct_by_gpu_pid() {
+        util.entry(key)
+            .and_modify(|v| *v = (*v).max(pct))
+            .or_insert(pct);
+    }
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some(Cache {
+            at: Instant::now(),
+            vram: vram.clone(),
+            util: util.clone(),
+        });
+    }
+    (vram, util)
+}
+
+/// AMD KFD process VRAM via `rocm-smi --showpids` (+ `--showpidgpus` when present).
+pub fn live_amd_process_vram_mb_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u32> {
+    #[cfg(target_os = "macos")]
+    {
+        std::collections::HashMap::new()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        live_amd_process_samples().0
+    }
+}
+
+/// AMD KFD CU occupancy % when `rocm-smi --showpids` reports it.
+pub fn live_amd_process_util_pct_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u8> {
+    #[cfg(target_os = "macos")]
+    {
+        std::collections::HashMap::new()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        live_amd_process_samples().1
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_amd_process_samples(
+) -> (
+    std::collections::HashMap<(u32, u32), u32>,
+    std::collections::HashMap<(u32, u32), u8>,
+) {
+    let Ok(output) = hide_console(&mut Command::new("rocm-smi"))
+        .args(["--showpids"])
+        .output()
+    else {
+        return Default::default();
+    };
+    if !output.status.success() {
+        return Default::default();
+    }
+    let pid_gpus = live_amd_pid_gpus();
+    parse_rocm_showpids(
+        &String::from_utf8_lossy(&output.stdout),
+        &pid_gpus,
+    )
+}
+
+/// Map PID → DRM/GPU indices from `rocm-smi --showpidgpus`.
+#[cfg(not(target_os = "macos"))]
+fn live_amd_pid_gpus() -> std::collections::HashMap<u32, Vec<u32>> {
+    let Ok(output) = hide_console(&mut Command::new("rocm-smi"))
+        .args(["--showpidgpus"])
+        .output()
+    else {
+        return std::collections::HashMap::new();
+    };
+    if !output.status.success() {
+        return std::collections::HashMap::new();
+    }
+    parse_rocm_showpidgpus(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_rocm_showpidgpus(stdout: &str) -> std::collections::HashMap<u32, Vec<u32>> {
+    let mut map = std::collections::HashMap::new();
+    let mut current_pid: Option<u32> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("PID ") {
+            // "PID 1168514 is using 1 DRM device(s):"
+            let pid = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok());
+            current_pid = pid;
+            if let Some(pid) = pid {
+                map.entry(pid).or_insert_with(Vec::new);
+            }
+            continue;
+        }
+        if let Some(pid) = current_pid {
+            // Following lines are DRM indices ("0", "1") until the next PID.
+            if let Ok(idx) = trimmed.parse::<u32>() {
+                map.entry(pid).or_default().push(idx);
+            } else if trimmed.starts_with('=') || trimmed.is_empty() {
+                current_pid = None;
+            }
+        }
+    }
+    map
+}
+
+/// Parse `rocm-smi --showpids` table rows into VRAM MiB + CU occupancy %.
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_rocm_showpids(
+    stdout: &str,
+    pid_gpus: &std::collections::HashMap<u32, Vec<u32>>,
+) -> (
+    std::collections::HashMap<(u32, u32), u32>,
+    std::collections::HashMap<(u32, u32), u8>,
+) {
+    let mut vram = std::collections::HashMap::new();
+    let mut util = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('=') || trimmed.starts_with("KFD") {
+            continue;
+        }
+        if trimmed.to_ascii_lowercase().starts_with("pid ")
+            && trimmed.to_ascii_lowercase().contains("process")
+        {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        // PID PROCESS GPU(s) VRAM_USED SDMA_USED CU_OCCUPANCY
+        if parts.len() < 4 {
+            continue;
+        }
+        let Ok(pid) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        // VRAM USED is usually bytes; tolerate MiB if the value is already small.
+        let Ok(vram_raw) = parts[3].parse::<u64>() else {
+            continue;
+        };
+        let mb = if vram_raw >= 1024 * 1024 {
+            ((vram_raw + 512 * 1024) / (1024 * 1024)) as u32
+        } else {
+            vram_raw as u32
+        };
+        let cu = parts
+            .get(5)
+            .and_then(|s| parse_util_pct(s))
+            .or_else(|| parts.get(4).and_then(|s| parse_util_pct(s)));
+        let gpus = pid_gpus.get(&pid).cloned().unwrap_or_else(|| {
+            // Fall back to GPU(s) column when showpidgpus is empty.
+            parts
+                .get(2)
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|tok| tok.trim().parse::<u32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        let targets = if gpus.is_empty() { vec![0_u32] } else { gpus };
+        let share = if targets.is_empty() {
+            0
+        } else {
+            mb / (targets.len() as u32).max(1)
+        };
+        for (i, gpu) in targets.iter().copied().enumerate() {
+            // Remainder bytes go to the first GPU so we do not lose MiB to rounding.
+            let piece = if i == 0 {
+                share + mb.saturating_sub(share.saturating_mul(targets.len() as u32))
+            } else {
+                share
+            };
+            if piece > 0 {
+                let key = (gpu, pid);
+                *vram.entry(key).or_insert(0) =
+                    vram.get(&key).copied().unwrap_or(0).saturating_add(piece);
+            }
+            if let Some(pct) = cu {
+                util.insert((gpu, pid), pct);
+            }
+        }
+    }
+    (vram, util)
+}
+
+/// NVIDIA per-process SM util via `nvidia-smi pmon -c 1` (Linux; often empty on WDDM).
+pub fn live_nvidia_process_util_pct_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u8> {
+    #[cfg(target_os = "macos")]
+    {
+        std::collections::HashMap::new()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        for bin in nvidia_smi_bins() {
+            let map = live_nvidia_pmon_util_from(&bin);
+            if !map.is_empty() {
+                return map;
+            }
+        }
+        std::collections::HashMap::new()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_nvidia_pmon_util_from(bin: &str) -> std::collections::HashMap<(u32, u32), u8> {
+    // -c 1: one sample. Prefer -d 1 (required by many drivers). Cached by process_accel_cache.
+    let Some(output) = configure_nvidia_smi_command(bin)
+        .args(["pmon", "-c", "1", "-d", "1"])
+        .output()
+        .ok()
+    else {
+        return std::collections::HashMap::new();
+    };
+    if !output.status.success() {
+        return std::collections::HashMap::new();
+    }
+    parse_nvidia_pmon_util(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_nvidia_pmon_util(stdout: &str) -> std::collections::HashMap<(u32, u32), u8> {
+    let mut map = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        // gpu pid type sm mem enc dec [jpg ofa fb ...] command
+        if parts.len() < 5 {
+            continue;
+        }
+        let Ok(gpu) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        let Ok(pid) = parts[1].parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        let Some(sm) = parse_util_pct(parts[3]) else {
+            continue;
+        };
+        map.entry((gpu, pid))
+            .and_modify(|v| *v = (*v).max(sm))
+            .or_insert(sm);
+    }
+    map
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_nvidia_compute_apps_from(bin: &str) -> std::collections::HashMap<(u32, u32), u32> {
+    let uuid_to_index = nvidia_uuid_to_index(bin);
+    let Some(output) = configure_nvidia_smi_command(bin)
+        .args([
+            "--query-compute-apps=gpu_uuid,pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()
+    else {
+        return std::collections::HashMap::new();
+    };
+    if !output.status.success() {
+        // Older / WDDM drivers may reject gpu_uuid — fall back to pid-only rows
+        // (attributed to GPU 0 when we cannot map).
+        return live_nvidia_compute_apps_pid_only(bin);
+    }
+    let parsed = parse_nvidia_compute_apps_csv(
+        &String::from_utf8_lossy(&output.stdout),
+        &uuid_to_index,
+    );
+    if parsed.is_empty() {
+        return live_nvidia_compute_apps_pid_only(bin);
+    }
+    parsed
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_nvidia_compute_apps_pid_only(bin: &str) -> std::collections::HashMap<(u32, u32), u32> {
+    let Some(output) = configure_nvidia_smi_command(bin)
+        .args([
+            "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()
+    else {
+        return std::collections::HashMap::new();
+    };
+    if !output.status.success() {
+        return std::collections::HashMap::new();
+    }
+    let mut map = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let parts = parse_csv_fields(line);
+        if parts.len() < 2 {
+            continue;
+        }
+        let Ok(pid) = parts[0].trim().parse::<u32>() else {
+            continue;
+        };
+        let Some(mb) = parse_nvidia_number(&parts[1]).map(|v| v.round().max(0.0) as u32) else {
+            continue;
+        };
+        if pid == 0 || mb == 0 {
+            continue;
+        }
+        // No GPU index available — fold onto GPU 0 so single-card boxes still report.
+        let key = (0_u32, pid);
+        *map.entry(key).or_insert(0) = map.get(&key).copied().unwrap_or(0).saturating_add(mb);
+    }
+    map
+}
+
+#[cfg(not(target_os = "macos"))]
+fn nvidia_uuid_to_index(bin: &str) -> std::collections::HashMap<String, u32> {
+    let Some(output) = configure_nvidia_smi_command(bin)
+        .args(["--query-gpu=index,uuid", "--format=csv,noheader"])
+        .output()
+        .ok()
+    else {
+        return std::collections::HashMap::new();
+    };
+    if !output.status.success() {
+        return std::collections::HashMap::new();
+    }
+    let mut map = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let parts = parse_csv_fields(line);
+        if parts.len() < 2 {
+            continue;
+        }
+        let Ok(index) = parts[0].trim().parse::<u32>() else {
+            continue;
+        };
+        let uuid = parts[1].trim().to_string();
+        if !uuid.is_empty() {
+            map.insert(uuid, index);
+        }
+    }
+    map
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_nvidia_compute_apps_csv(
+    stdout: &str,
+    uuid_to_index: &std::collections::HashMap<String, u32>,
+) -> std::collections::HashMap<(u32, u32), u32> {
+    let mut map = std::collections::HashMap::new();
+    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let parts = parse_csv_fields(line);
+        if parts.len() < 3 {
+            continue;
+        }
+        let uuid = parts[0].trim();
+        let Ok(pid) = parts[1].trim().parse::<u32>() else {
+            continue;
+        };
+        let Some(mb) = parse_nvidia_number(&parts[2]).map(|v| v.round().max(0.0) as u32) else {
+            continue;
+        };
+        if pid == 0 || mb == 0 {
+            continue;
+        }
+        let gpu_index = uuid_to_index.get(uuid).copied().unwrap_or(0);
+        let key = (gpu_index, pid);
+        *map.entry(key).or_insert(0) = map.get(&key).copied().unwrap_or(0).saturating_add(mb);
+    }
+    map
+}
+
 /// NVIDIA compute capability as major*10+minor (Ampere 8.0 → 80, Turing 7.5 → 75).
 /// Uses the process's pinned `CUDA_VISIBLE_DEVICES` GPU(s); `None` if unset or unknown.
 pub fn live_cuda_compute_cap() -> Option<u32> {
@@ -2528,6 +2980,43 @@ GPU[1]		: VRAM Total Memory (B): 2147483648
         let map = parse_nvidia_free_csv("0, 24576, 1024, [N/A]\n");
         let free = map.get(&0).copied().unwrap();
         assert!((free - 23.0).abs() < 0.01, "free {free}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_compute_apps_csv_maps_uuid_to_gpu_pid() {
+        let mut uuid_to_index = std::collections::HashMap::new();
+        uuid_to_index.insert("GPU-aaaa".into(), 0);
+        uuid_to_index.insert("GPU-bbbb".into(), 1);
+        let map = parse_nvidia_compute_apps_csv(
+            "GPU-aaaa, 37948, 5120\nGPU-bbbb, 37948, 1024\nGPU-aaaa, 99, 256\n",
+            &uuid_to_index,
+        );
+        assert_eq!(map.get(&(0, 37948)).copied(), Some(5120));
+        assert_eq!(map.get(&(1, 37948)).copied(), Some(1024));
+        assert_eq!(map.get(&(0, 99)).copied(), Some(256));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nvidia_pmon_parses_sm_util() {
+        let map = parse_nvidia_pmon_util(
+            "# gpu pid type sm mem enc dec command\n  0  1046  C  96  80  -  -  llama\n  0  -  -  -  -  -  -  -\n",
+        );
+        assert_eq!(map.get(&(0, 1046)).copied(), Some(96));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn rocm_showpids_parses_vram_bytes() {
+        let mut pid_gpus = std::collections::HashMap::new();
+        pid_gpus.insert(65737, vec![0]);
+        let (vram, util) = parse_rocm_showpids(
+            "KFD process information:\nPID PROCESS NAME GPU(s) VRAM USED SDMA USED CU OCCUPANCY\n65737 ollama_llama_se 0 8790306816 0 40\n",
+            &pid_gpus,
+        );
+        assert_eq!(vram.get(&(0, 65737)).copied(), Some(8382)); // 8790306816 / 1MiB
+        assert_eq!(util.get(&(0, 65737)).copied(), Some(40));
     }
 
     #[cfg(not(target_os = "macos"))]

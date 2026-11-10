@@ -367,6 +367,8 @@ mod tests {
                 progress_pct: None,
                 pid: None,
                 rss_mb: None,
+                vram_used_mb: None,
+                util_pct: None,
             })
             .collect()
     }

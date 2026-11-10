@@ -86,9 +86,15 @@ pub struct SlotStatus {
     /// OS pid of the live slot worker (or checked-out invoke process).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    /// Resident set size of that process in MiB (best-effort; Linux today).
+    /// Resident set size of that process in MiB (best-effort; Linux + Windows).
     #[serde(rename = "rssMb", skip_serializing_if = "Option::is_none")]
     pub rss_mb: Option<u32>,
+    /// GPU / unified memory held by that process on this slot's card(s), MiB.
+    #[serde(rename = "vramUsedMb", skip_serializing_if = "Option::is_none")]
+    pub vram_used_mb: Option<u32>,
+    /// This process's share of device util (GPU SM/CU % or CPU %), when sampled.
+    #[serde(rename = "utilPct", skip_serializing_if = "Option::is_none")]
+    pub util_pct: Option<u8>,
 }
 
 /// Best-effort RSS for a worker pid. Used in slot status so the dashboard can
@@ -112,7 +118,259 @@ fn process_rss_mb(pid: u32) -> Option<u32> {
         }
         None
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let kb: u64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+        if kb == 0 {
+            return None;
+        }
+        Some(((kb + 512) / 1024) as u32)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = std::process::Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &format!(
+                    "(Get-Process -Id {pid} -ErrorAction SilentlyContinue).WorkingSet64"
+                ),
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let bytes: u64 = text.trim().parse().ok()?;
+        if bytes == 0 {
+            return None;
+        }
+        Some(((bytes + 512 * 1024) / (1024 * 1024)) as u32)
+    }
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(target_os = "macos"),
+        not(windows)
+    ))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// GPU indices this slot owns for vendor process maps (CUDA ordinals or amd:N).
+fn slot_vendor_gpu_indices(spec: &ComputeSlot) -> Vec<u32> {
+    if !spec.cuda_visible.is_empty() {
+        return spec.cuda_visible.clone();
+    }
+    spec.card
+        .devices
+        .iter()
+        .filter_map(|d| {
+            d.id.strip_prefix("amd:")
+                .or_else(|| d.id.strip_prefix("nvidia:"))
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .collect()
+}
+
+/// True when process RSS is a fair proxy for accelerator memory (unified / shared iGPU).
+fn slot_uses_rss_as_accelerator_mem(spec: &ComputeSlot) -> bool {
+    matches!(spec.card.strategy, PoolStrategy::Metal)
+        || spec.kind.eq_ignore_ascii_case("integrated")
+        || spec.kind.eq_ignore_ascii_case("metal")
+}
+
+/// Attribute vendor process-memory maps to this slot's worker pid.
+fn process_vram_used_mb(
+    pid: u32,
+    gpu_indices: &[u32],
+    by_gpu_pid: &HashMap<(u32, u32), u32>,
+) -> Option<u32> {
+    if pid == 0 || by_gpu_pid.is_empty() {
+        return None;
+    }
+    let sum: u32 = if gpu_indices.is_empty() {
+        by_gpu_pid
+            .iter()
+            .filter(|((_, p), _)| *p == pid)
+            .map(|(_, mb)| *mb)
+            .fold(0_u32, u32::saturating_add)
+    } else {
+        gpu_indices
+            .iter()
+            .filter_map(|idx| by_gpu_pid.get(&(*idx, pid)).copied())
+            .fold(0_u32, u32::saturating_add)
+    };
+    if sum == 0 {
+        None
+    } else {
+        Some(sum)
+    }
+}
+
+fn process_accel_util_pct(
+    pid: u32,
+    gpu_indices: &[u32],
+    by_gpu_pid: &HashMap<(u32, u32), u8>,
+) -> Option<u8> {
+    if pid == 0 || by_gpu_pid.is_empty() {
+        return None;
+    }
+    let mut best: Option<u8> = None;
+    if gpu_indices.is_empty() {
+        for ((_, p), pct) in by_gpu_pid {
+            if *p == pid {
+                best = Some(best.map(|b| b.max(*pct)).unwrap_or(*pct));
+            }
+        }
+    } else {
+        for idx in gpu_indices {
+            if let Some(pct) = by_gpu_pid.get(&(*idx, pid)).copied() {
+                best = Some(best.map(|b| b.max(pct)).unwrap_or(pct));
+            }
+        }
+    }
+    best
+}
+
+/// Process CPU util % via consecutive samples (Linux /proc or Windows Get-Process).
+fn process_cpu_util_pct(pid: u32) -> Option<u8> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::Mutex;
+        use std::time::Instant;
+        static PREV: Mutex<HashMap<u32, (u64, u64, Instant)>> = Mutex::new(HashMap::new());
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close = stat.rfind(')')?;
+        let after = stat.get(close + 2..)?;
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        // utime (14) stime (15) are fields 11.. after comm — 0-based index 11,12 in `after`.
+        let utime: u64 = fields.get(11)?.parse().ok()?;
+        let stime: u64 = fields.get(12)?.parse().ok()?;
+        let proc_j = utime.saturating_add(stime);
+        let total_j = {
+            let text = std::fs::read_to_string("/proc/stat").ok()?;
+            let cpu = text.lines().next()?;
+            let parts: Vec<&str> = cpu.split_whitespace().collect();
+            // cpu user nice system idle iowait irq softirq steal
+            parts
+                .iter()
+                .skip(1)
+                .take(8)
+                .filter_map(|s| s.parse::<u64>().ok())
+                .sum::<u64>()
+        };
+        let now = Instant::now();
+        let mut guard = PREV.lock().ok()?;
+        let Some((prev_proc, prev_total, prev_at)) = guard.get(&pid).copied() else {
+            guard.insert(pid, (proc_j, total_j, now));
+            return None;
+        };
+        guard.insert(pid, (proc_j, total_j, now));
+        if now.duration_since(prev_at).as_millis() < 200 {
+            return None;
+        }
+        let d_proc = proc_j.saturating_sub(prev_proc);
+        let d_total = total_j.saturating_sub(prev_total);
+        if d_total == 0 {
+            return None;
+        }
+        // `cpu` line jiffies already sum every core — this is % of the whole machine.
+        let pct = ((d_proc as f64 / d_total as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0);
+        Some(pct as u8)
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::Mutex;
+        use std::time::Instant;
+        static PREV: Mutex<HashMap<u32, (f64, Instant)>> = Mutex::new(HashMap::new());
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = std::process::Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &format!(
+                    "(Get-Process -Id {pid} -ErrorAction SilentlyContinue).CPU"
+                ),
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let cpu_s: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+        let now = Instant::now();
+        let mut guard = PREV.lock().ok()?;
+        let Some((prev_cpu, prev_at)) = guard.get(&pid).copied() else {
+            guard.insert(pid, (cpu_s, now));
+            return None;
+        };
+        guard.insert(pid, (cpu_s, now));
+        let dt = now.duration_since(prev_at).as_secs_f64();
+        if dt < 0.2 {
+            return None;
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as f64)
+            .unwrap_or(1.0)
+            .max(1.0);
+        let pct = (((cpu_s - prev_cpu).max(0.0) / dt) / cores * 100.0)
+            .round()
+            .clamp(0.0, 100.0);
+        Some(pct as u8)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::Mutex;
+        use std::time::Instant;
+        static PREV: Mutex<HashMap<u32, (f64, Instant)>> = Mutex::new(HashMap::new());
+        // ps %cpu is averaged since process start — keep a delta via cumulative time if possible.
+        let output = std::process::Command::new("ps")
+            .args(["-o", "%cpu=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let pct: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+        let now = Instant::now();
+        let mut guard = PREV.lock().ok()?;
+        // Seed once so the first heartbeat after spawn does not flash a lifetime average.
+        if !guard.contains_key(&pid) {
+            guard.insert(pid, (pct, now));
+            return None;
+        }
+        guard.insert(pid, (pct, now));
+        Some(pct.round().clamp(0.0, 100.0) as u8)
+    }
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(target_os = "macos"),
+        not(windows)
+    ))]
     {
         let _ = pid;
         None
@@ -1392,6 +1650,9 @@ impl Supervisor {
             .ok()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        // One vendor pass for all slots (NVIDIA compute-apps/pmon + AMD showpids).
+        let vram_by_gpu_pid = crate::specs::live_process_vram_mb_by_gpu_pid();
+        let util_by_gpu_pid = crate::specs::live_process_util_pct_by_gpu_pid();
         self.plan
             .slots
             .iter()
@@ -1412,6 +1673,29 @@ impl Supervisor {
                     .map(|(phase, pct)| (Some(phase), Some(pct)))
                     .unwrap_or((None, None));
                 let rss_mb = pid.and_then(process_rss_mb);
+                let gpu_indices = slot_vendor_gpu_indices(spec);
+                let mut vram_used_mb =
+                    pid.and_then(|p| process_vram_used_mb(p, &gpu_indices, &vram_by_gpu_pid));
+                // Unified / shared memory: process RSS is the best available "ours" sample.
+                if vram_used_mb.is_none() && slot_uses_rss_as_accelerator_mem(spec) {
+                    vram_used_mb = rss_mb.filter(|mb| *mb > 0);
+                }
+                let util_pct = if matches!(spec.card.strategy, PoolStrategy::CpuOnly)
+                    || spec.kind.eq_ignore_ascii_case("cpu")
+                {
+                    pid.and_then(process_cpu_util_pct)
+                } else {
+                    pid.and_then(|p| process_accel_util_pct(p, &gpu_indices, &util_by_gpu_pid))
+                        .or_else(|| {
+                            // Metal / iGPU: when busy and vendor util is missing, treat
+                            // device-busy as ours once we have a live worker.
+                            if busy {
+                                None
+                            } else {
+                                Some(0)
+                            }
+                        })
+                };
                 SlotStatus {
                     id: spec.id.clone(),
                     kind: spec.kind.clone(),
@@ -1428,6 +1712,8 @@ impl Supervisor {
                     progress_pct,
                     pid,
                     rss_mb,
+                    vram_used_mb,
+                    util_pct,
                 }
             })
             .collect()
