@@ -797,15 +797,6 @@ pub fn live_nvidia_process_vram_mb_by_gpu_pid() -> std::collections::HashMap<(u3
     }
 }
 
-/// Sum used GPU memory (MiB) across all GPUs for each PID.
-pub fn live_nvidia_process_vram_mb_by_pid() -> std::collections::HashMap<u32, u32> {
-    let mut by_pid: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for ((_, pid), mb) in live_nvidia_process_vram_mb_by_gpu_pid() {
-        *by_pid.entry(pid).or_insert(0) = by_pid.get(&pid).copied().unwrap_or(0).saturating_add(mb);
-    }
-    by_pid
-}
-
 /// Vendor-merged per-process accelerator memory: `(vendor_gpu_index, pid) → MiB`.
 /// NVIDIA indices are CUDA ordinals; AMD indices are `amd:N` ordinals.
 pub fn live_process_vram_mb_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u32> {
@@ -842,13 +833,13 @@ fn process_accel_cache() -> (
     let mut vram = live_nvidia_process_vram_mb_by_gpu_pid();
     for (key, mb) in live_amd_process_vram_mb_by_gpu_pid() {
         vram.entry(key)
-            .and_modify(|v| *v = (*v).saturating_add(mb))
+            .and_modify(|v: &mut u32| *v = (*v).saturating_add(mb))
             .or_insert(mb);
     }
     let mut util = live_nvidia_process_util_pct_by_gpu_pid();
     for (key, pct) in live_amd_process_util_pct_by_gpu_pid() {
         util.entry(key)
-            .and_modify(|v| *v = (*v).max(pct))
+            .and_modify(|v: &mut u8| *v = (*v).max(pct))
             .or_insert(pct);
     }
     if let Ok(mut guard) = CACHE.lock() {
@@ -1023,8 +1014,8 @@ fn parse_rocm_showpids(
             };
             if piece > 0 {
                 let key = (gpu, pid);
-                *vram.entry(key).or_insert(0) =
-                    vram.get(&key).copied().unwrap_or(0).saturating_add(piece);
+                *vram.entry(key).or_insert(0_u32) =
+                    vram.get(&key).copied().unwrap_or(0_u32).saturating_add(piece);
             }
             if let Some(pct) = cu {
                 util.insert((gpu, pid), pct);
@@ -1094,7 +1085,7 @@ fn parse_nvidia_pmon_util(stdout: &str) -> std::collections::HashMap<(u32, u32),
             continue;
         };
         map.entry((gpu, pid))
-            .and_modify(|v| *v = (*v).max(sm))
+            .and_modify(|v: &mut u8| *v = (*v).max(sm))
             .or_insert(sm);
     }
     map
@@ -1164,7 +1155,8 @@ fn live_nvidia_compute_apps_pid_only(bin: &str) -> std::collections::HashMap<(u3
         }
         // No GPU index available — fold onto GPU 0 so single-card boxes still report.
         let key = (0_u32, pid);
-        *map.entry(key).or_insert(0) = map.get(&key).copied().unwrap_or(0).saturating_add(mb);
+        *map.entry(key).or_insert(0_u32) =
+            map.get(&key).copied().unwrap_or(0_u32).saturating_add(mb);
     }
     map
 }
@@ -1225,7 +1217,8 @@ fn parse_nvidia_compute_apps_csv(
         }
         let gpu_index = uuid_to_index.get(uuid).copied().unwrap_or(0);
         let key = (gpu_index, pid);
-        *map.entry(key).or_insert(0) = map.get(&key).copied().unwrap_or(0).saturating_add(mb);
+        *map.entry(key).or_insert(0_u32) =
+            map.get(&key).copied().unwrap_or(0_u32).saturating_add(mb);
     }
     map
 }
