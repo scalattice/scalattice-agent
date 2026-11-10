@@ -413,8 +413,9 @@ pub fn detect_cpu_model() -> Option<String> {
     }
 }
 
-/// Rough host CPU busy % from 1-minute load average / logical cores.
-/// Good enough for heartbeat UI; not a scheduler sample.
+/// Rough host CPU busy % for heartbeat UI (not a scheduler sample).
+/// Unix: 1-minute load average / logical cores.
+/// Windows: delta of GetSystemTimes (kernel includes idle).
 pub fn detect_cpu_util_pct() -> Option<u8> {
     #[cfg(unix)]
     {
@@ -431,10 +432,66 @@ pub fn detect_cpu_util_pct() -> Option<u8> {
         let pct = ((loads[0] / cores) * 100.0).round().clamp(0.0, 100.0);
         return Some(pct as u8);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        detect_cpu_util_pct_windows()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
+}
+
+/// Windows `FILETIME` busy% from consecutive GetSystemTimes samples.
+/// First call seeds the baseline and returns None.
+#[cfg(windows)]
+fn detect_cpu_util_pct_windows() -> Option<u8> {
+    use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+
+    fn filetime_u64(ft: FILETIME) -> u64 {
+        ((ft.dwHighDateTime as u64) << 32) | u64::from(ft.dwLowDateTime)
+    }
+
+    static PREV: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
+
+    let mut idle = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: pointers are stack FILETIMEs; GetSystemTimes writes three outs.
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    if ok == 0 {
+        return None;
+    }
+    let i = filetime_u64(idle);
+    let k = filetime_u64(kernel);
+    let u = filetime_u64(user);
+    let mut guard = PREV.lock().ok()?;
+    let Some((pi, pk, pu)) = *guard else {
+        *guard = Some((i, k, u));
+        return None;
+    };
+    *guard = Some((i, k, u));
+    let idle_d = i.saturating_sub(pi);
+    // Kernel time includes idle on Windows.
+    let kernel_d = k.saturating_sub(pk);
+    let user_d = u.saturating_sub(pu);
+    let total = kernel_d.saturating_add(user_d);
+    if total == 0 {
+        return None;
+    }
+    let busy = total.saturating_sub(idle_d);
+    Some(((busy as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0) as u8)
 }
 
 #[cfg(target_os = "linux")]

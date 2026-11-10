@@ -83,6 +83,40 @@ pub struct SlotStatus {
     /// Phase-local progress in `0.0..=1.0` (decode = tokens / max_tokens).
     #[serde(rename = "progressPct", skip_serializing_if = "Option::is_none")]
     pub progress_pct: Option<f32>,
+    /// OS pid of the live slot worker (or checked-out invoke process).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Resident set size of that process in MiB (best-effort; Linux today).
+    #[serde(rename = "rssMb", skip_serializing_if = "Option::is_none")]
+    pub rss_mb: Option<u32>,
+}
+
+/// Best-effort RSS for a worker pid. Used in slot status so the dashboard can
+/// show what each live process is actually holding.
+fn process_rss_mb(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        for line in status.lines() {
+            let Some(rest) = line.strip_prefix("VmRSS:") else {
+                continue;
+            };
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())?;
+            return Some(((kb + 512) / 1024) as u32);
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 struct SlotWorker {
@@ -1328,23 +1362,28 @@ impl Supervisor {
         let occupied = self.occupancy.lock().await.latched_ids();
         // Snapshot separately so we never ABBA with reconcile_slots phase 1
         // (checkouts → workers) while this path historically took workers → checkouts.
-        let worker_views: HashMap<String, (bool, bool, Vec<String>)> = {
+        let worker_views: HashMap<String, (bool, bool, Vec<String>, Option<u32>)> = {
             let workers = self.workers.lock().await;
             workers
                 .iter()
                 .map(|(id, w)| {
                     (
                         id.clone(),
-                        (w.busy, w.healthy, w.loaded_models.clone()),
+                        (w.busy, w.healthy, w.loaded_models.clone(), w.child.id()),
                     )
                 })
                 .collect()
         };
-        let checkout_meta: HashMap<String, (Vec<String>, String)> = {
+        let checkout_meta: HashMap<String, (Vec<String>, String, Option<u32>)> = {
             let checkouts = self.checkouts.lock().await;
             checkouts
                 .iter()
-                .map(|(id, c)| (id.clone(), (c.loaded_models.clone(), c.job_id.clone())))
+                .map(|(id, c)| {
+                    (
+                        id.clone(),
+                        (c.loaded_models.clone(), c.job_id.clone(), c.pid),
+                    )
+                })
                 .collect()
         };
         let job_progress = self
@@ -1358,19 +1397,21 @@ impl Supervisor {
             .iter()
             .map(|spec| {
                 // Missing from the map = temporarily checked out for an in-flight invoke.
-                let (busy, healthy, loaded, job_id) = if self.unusable_slots.contains(&spec.id) {
-                    (false, false, Vec::new(), None)
-                } else if let Some((busy, healthy, loaded)) = worker_views.get(&spec.id) {
-                    (*busy, *healthy, loaded.clone(), None)
-                } else if let Some((loaded, job_id)) = checkout_meta.get(&spec.id) {
-                    (true, true, loaded.clone(), Some(job_id.clone()))
+                let (busy, healthy, loaded, job_id, pid) = if self.unusable_slots.contains(&spec.id)
+                {
+                    (false, false, Vec::new(), None, None)
+                } else if let Some((busy, healthy, loaded, pid)) = worker_views.get(&spec.id) {
+                    (*busy, *healthy, loaded.clone(), None, *pid)
+                } else if let Some((loaded, job_id, pid)) = checkout_meta.get(&spec.id) {
+                    (true, true, loaded.clone(), Some(job_id.clone()), *pid)
                 } else {
-                    (true, true, Vec::new(), None)
+                    (true, true, Vec::new(), None, None)
                 };
                 let (progress_phase, progress_pct) = job_id
                     .and_then(|id| job_progress.get(&id).cloned())
                     .map(|(phase, pct)| (Some(phase), Some(pct)))
                     .unwrap_or((None, None));
+                let rss_mb = pid.and_then(process_rss_mb);
                 SlotStatus {
                     id: spec.id.clone(),
                     kind: spec.kind.clone(),
@@ -1385,6 +1426,8 @@ impl Supervisor {
                     occupied_external: occupied.contains(&spec.id),
                     progress_phase,
                     progress_pct,
+                    pid,
+                    rss_mb,
                 }
             })
             .collect()
