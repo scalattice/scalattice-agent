@@ -365,6 +365,8 @@ mod tests {
                 occupied_external: false,
                 progress_phase: None,
                 progress_pct: None,
+                pid: None,
+                rss_mb: None,
             })
             .collect()
     }

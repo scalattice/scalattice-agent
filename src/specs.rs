@@ -1665,9 +1665,11 @@ fn detect_integrated_linux_pci_devices(existing: &[ComputeDevice]) -> Vec<Comput
 
 #[cfg(windows)]
 fn detect_integrated_windows_devices(existing: &[ComputeDevice]) -> Vec<ComputeDevice> {
+    // Name + AdapterRAM (bytes). Shared iGPU memory is often under-reported; still
+    // better than leaving the dashboard at "Not detected" when CIM has a figure.
     let output = powershell_hidden(&[
         "-Command",
-        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+        "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Csv -NoTypeInformation",
     ])
     .output();
 
@@ -1684,29 +1686,80 @@ fn detect_integrated_windows_devices(existing: &[ComputeDevice]) -> Vec<ComputeD
         .collect();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .enumerate()
-        .filter_map(|(index, raw)| {
-            if known_names.contains(&raw.to_ascii_lowercase()) {
-                return None;
+    let mut out = Vec::new();
+    // Index every video controller row (including discrete) so pci:N stays stable
+    // when NVIDIA/AMD discrete already appear earlier in the CIM list.
+    let mut controller_index = 0usize;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.eq_ignore_ascii_case("\"Name\",\"AdapterRAM\"") {
+            continue;
+        }
+        let (raw_name, adapter_ram) = parse_windows_video_csv_row(line);
+        let Some(raw) = raw_name.filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let index = controller_index;
+        controller_index += 1;
+        if known_names.contains(&raw.to_ascii_lowercase()) {
+            continue;
+        }
+        if !is_integrated_pci_name(&raw) {
+            continue;
+        }
+        let vram_gb = adapter_ram
+            .filter(|b| *b >= 256 * 1024 * 1024)
+            .map(|bytes| {
+                ((bytes as f64) / (1024.0 * 1024.0 * 1024.0))
+                    .round()
+                    .max(1.0) as u32
+            });
+        out.push(ComputeDevice {
+            id: format!("pci:{index}"),
+            kind: "integrated".to_string(),
+            name: raw,
+            vram_gb,
+            vram_used_gb: None,
+            // No reliable Windows iGPU util without vendor tools (rocm-smi/ADL).
+            util_pct: None,
+            enabled: false,
+        });
+    }
+    out
+}
+
+/// Parse a ConvertTo-Csv row of `Name, AdapterRAM` (quoted fields).
+#[cfg(windows)]
+fn parse_windows_video_csv_row(line: &str) -> (Option<String>, Option<u64>) {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes && chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = !in_quotes;
+                }
             }
-            if !is_integrated_pci_name(raw) {
-                return None;
+            ',' if !in_quotes => {
+                fields.push(std::mem::take(&mut cur));
             }
-            Some(ComputeDevice {
-                id: format!("pci:{index}"),
-                kind: "integrated".to_string(),
-                name: raw.to_string(),
-                vram_gb: None,
-                vram_used_gb: None,
-                util_pct: None,
-                enabled: false,
-            })
-        })
-        .collect()
+            _ => cur.push(ch),
+        }
+    }
+    fields.push(cur);
+    let name = fields.first().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let ram = fields
+        .get(1)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0);
+    (name, ram)
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
@@ -1820,31 +1873,53 @@ fn detect_apple_metal_device() -> Vec<ComputeDevice> {
 }
 
 /// Device Utilization % and Metal "In use system memory" from IOAccelerator.
+///
+/// Apple Silicon (esp. M3+) sometimes nests stats under PerformanceStatistics
+/// or exposes AGXAccelerator instead of a flat IOAccelerator dump at depth 1.
+/// Try a few class/depth combos and never invent 0 when the keys are absent.
 #[cfg(target_os = "macos")]
 fn detect_metal_util_and_used_gb(usable_gb: u32) -> (Option<u8>, Option<u32>) {
-    let Ok(output) = Command::new("ioreg")
-        .args(["-c", "IOAccelerator", "-r", "-d", "1"])
-        .output()
-    else {
-        return (None, None);
-    };
-    if !output.status.success() {
-        return (None, None);
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let util = parse_ioreg_int_field(&text, "Device Utilization %").and_then(|n| {
-        if (0..=100).contains(&n) {
-            Some(n as u8)
-        } else {
-            None
+    const CLASS_ARGS: &[&[&str]] = &[
+        &["-c", "IOAccelerator", "-r", "-d", "2"],
+        &["-c", "AGXAccelerator", "-r", "-d", "2"],
+        &["-c", "IOGPU", "-r", "-d", "2"],
+        &["-c", "IOAccelerator", "-r"],
+    ];
+    let mut util: Option<u8> = None;
+    let mut used: Option<u32> = None;
+    for args in CLASS_ARGS {
+        let Ok(output) = Command::new("ioreg").args(*args).output() else {
+            continue;
+        };
+        if !output.status.success() || output.stdout.is_empty() {
+            continue;
         }
-    });
-    let used = parse_ioreg_int_field(&text, "In use system memory")
-        .or_else(|| parse_ioreg_int_field(&text, "Alloc system memory"))
-        .map(|bytes| {
-            let gb = (bytes as f64 / (1024.0 * 1024.0 * 1024.0)).round() as u32;
-            gb.min(usable_gb.max(1))
-        });
+        let text = String::from_utf8_lossy(&output.stdout);
+        if util.is_none() {
+            util = parse_ioreg_int_field(&text, "Device Utilization %")
+                .or_else(|| parse_ioreg_int_field(&text, "Renderer Utilization %"))
+                .or_else(|| parse_ioreg_int_field(&text, "Tiler Utilization %"))
+                .and_then(|n| {
+                    if (0..=100).contains(&n) {
+                        Some(n as u8)
+                    } else {
+                        None
+                    }
+                });
+        }
+        if used.is_none() {
+            used = parse_ioreg_int_field(&text, "In use system memory")
+                .or_else(|| parse_ioreg_int_field(&text, "Alloc system memory"))
+                .or_else(|| parse_ioreg_int_field(&text, "In use system memory (driver)"))
+                .map(|bytes| {
+                    let gb = (bytes as f64 / (1024.0 * 1024.0 * 1024.0)).round() as u32;
+                    gb.min(usable_gb.max(1))
+                });
+        }
+        if util.is_some() && used.is_some() {
+            break;
+        }
+    }
     (util, used)
 }
 
