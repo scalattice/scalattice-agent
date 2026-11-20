@@ -22,10 +22,10 @@ fi
 git -C "${SRC}" fetch --depth 1 origin "${SD_UPSTREAM_PIN}" 2>/dev/null || \
   git -C "${SRC}" fetch --depth 50 origin master
 git -C "${SRC}" checkout --detach -f "${SD_UPSTREAM_PIN}"
-# ggml is a submodule. A previous clone without --recursive leaves the directory empty.
-if [[ ! -f "${SRC}/ggml/CMakeLists.txt" ]]; then
-  git -C "${SRC}" submodule update --init --recursive --depth 1
-fi
+# Submodules must match the pin. A recursive clone of master leaves tip ggml in
+# place after checkout -f; tip ggml 1.0 removed ggml_diag_mask_inf while this pin
+# still calls it (minimax_h3_audio_vae.hpp), so the Metal/macOS build fails.
+git -C "${SRC}" submodule update --init --recursive --depth 1
 # CUDA kernels live in libsd-cuda.so and are opened only on NVIDIA machines.
 # Without this patch, libstable-diffusion.so DT_NEEDs libcuda and AMD/Intel hosts
 # cannot start the image runner — fail the build rather than ship a broken binary.
