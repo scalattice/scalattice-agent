@@ -194,7 +194,9 @@ fn slot_uses_rss_as_accelerator_mem(spec: &ComputeSlot) -> bool {
         || spec.kind.eq_ignore_ascii_case("metal")
 }
 
-/// Attribute vendor process-memory maps to this slot's worker pid.
+/// Attribute vendor/OS process-memory maps to this slot's worker pid.
+/// When slot GPU indices miss (WDDM `phys_N` ≠ CUDA ordinal), fall back to any
+/// sample for this pid so Scalattice usage still shows on single-GPU boxes.
 fn process_vram_used_mb(
     pid: u32,
     gpu_indices: &[u32],
@@ -203,18 +205,23 @@ fn process_vram_used_mb(
     if pid == 0 || by_gpu_pid.is_empty() {
         return None;
     }
-    let sum: u32 = if gpu_indices.is_empty() {
+    let sum_for = |indices: Option<&[u32]>| -> u32 {
         by_gpu_pid
             .iter()
-            .filter(|((_, p), _)| *p == pid)
+            .filter(|((gpu, p), _)| {
+                *p == pid && indices.map(|idxs| idxs.contains(gpu)).unwrap_or(true)
+            })
             .map(|(_, mb)| *mb)
             .fold(0_u32, u32::saturating_add)
-    } else {
-        gpu_indices
-            .iter()
-            .filter_map(|idx| by_gpu_pid.get(&(*idx, pid)).copied())
-            .fold(0_u32, u32::saturating_add)
     };
+    let mut sum = if gpu_indices.is_empty() {
+        sum_for(None)
+    } else {
+        sum_for(Some(gpu_indices))
+    };
+    if sum == 0 && !gpu_indices.is_empty() {
+        sum = sum_for(None);
+    }
     if sum == 0 {
         None
     } else {
@@ -230,21 +237,33 @@ fn process_accel_util_pct(
     if pid == 0 || by_gpu_pid.is_empty() {
         return None;
     }
-    let mut best: Option<u8> = None;
-    if gpu_indices.is_empty() {
-        for ((_, p), pct) in by_gpu_pid {
-            if *p == pid {
-                best = Some(best.map(|b| b.max(*pct)).unwrap_or(*pct));
+    let best_for = |indices: Option<&[u32]>| -> Option<u8> {
+        let mut best: Option<u8> = None;
+        for ((gpu, p), pct) in by_gpu_pid {
+            if *p != pid {
+                continue;
             }
+            if let Some(idxs) = indices {
+                if !idxs.contains(gpu) {
+                    continue;
+                }
+            }
+            best = Some(best.map(|b| b.max(*pct)).unwrap_or(*pct));
         }
+        best
+    };
+    best_for(if gpu_indices.is_empty() {
+        None
     } else {
-        for idx in gpu_indices {
-            if let Some(pct) = by_gpu_pid.get(&(*idx, pid)).copied() {
-                best = Some(best.map(|b| b.max(pct)).unwrap_or(pct));
-            }
+        Some(gpu_indices)
+    })
+    .or_else(|| {
+        if gpu_indices.is_empty() {
+            None
+        } else {
+            best_for(None)
         }
-    }
-    best
+    })
 }
 
 /// Process CPU util % via consecutive samples (Linux /proc or Windows Get-Process).
@@ -1653,9 +1672,28 @@ impl Supervisor {
             .ok()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        // One vendor pass for all slots (NVIDIA compute-apps/pmon + AMD showpids).
-        let vram_by_gpu_pid = crate::specs::live_process_vram_mb_by_gpu_pid();
-        let util_by_gpu_pid = crate::specs::live_process_util_pct_by_gpu_pid();
+        // Collect worker PIDs first so Linux DRM fdinfo can target them (cheap).
+        let interest_pids: Vec<u32> = {
+            let mut pids = Vec::new();
+            for spec in &self.plan.slots {
+                if self.unusable_slots.contains(&spec.id) {
+                    continue;
+                }
+                if let Some((_, _, _, pid)) = worker_views.get(&spec.id) {
+                    if let Some(p) = pid {
+                        pids.push(*p);
+                    }
+                } else if let Some((_, _, pid)) = checkout_meta.get(&spec.id) {
+                    if let Some(p) = pid {
+                        pids.push(*p);
+                    }
+                }
+            }
+            pids
+        };
+        // Vendor CLIs (NVIDIA/AMD) + OS fallbacks (Windows PDH, Linux DRM).
+        let vram_by_gpu_pid = crate::specs::live_process_vram_mb_by_gpu_pid(&interest_pids);
+        let util_by_gpu_pid = crate::specs::live_process_util_pct_by_gpu_pid(&interest_pids);
         self.plan
             .slots
             .iter()
@@ -1679,25 +1717,18 @@ impl Supervisor {
                 let gpu_indices = slot_vendor_gpu_indices(spec);
                 let mut vram_used_mb =
                     pid.and_then(|p| process_vram_used_mb(p, &gpu_indices, &vram_by_gpu_pid));
-                // Unified / shared memory: process RSS is the best available "ours" sample.
+                // Unified / shared memory (Metal, iGPU): process RSS is the best "ours" sample.
                 if vram_used_mb.is_none() && slot_uses_rss_as_accelerator_mem(spec) {
                     vram_used_mb = rss_mb.filter(|mb| *mb > 0);
                 }
+                // Omit util when unknown. Never invent `0` for idle GPUs — the dashboard
+                // treats an explicit 0 as "Scalattice used none" and paints other load wrong.
                 let util_pct = if matches!(spec.card.strategy, PoolStrategy::CpuOnly)
                     || spec.kind.eq_ignore_ascii_case("cpu")
                 {
                     pid.and_then(process_cpu_util_pct)
                 } else {
                     pid.and_then(|p| process_accel_util_pct(p, &gpu_indices, &util_by_gpu_pid))
-                        .or_else(|| {
-                            // Metal / iGPU: when busy and vendor util is missing, treat
-                            // device-busy as ours once we have a live worker.
-                            if busy {
-                                None
-                            } else {
-                                Some(0)
-                            }
-                        })
                 };
                 SlotStatus {
                     id: spec.id.clone(),

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 mod host;
+mod process_accel;
 #[cfg(any(test, not(target_os = "macos")))]
 use host::bytes_to_gb;
 #[allow(unused_imports)]
@@ -799,18 +800,25 @@ pub fn live_nvidia_process_vram_mb_by_gpu_pid() -> std::collections::HashMap<(u3
 
 /// Vendor-merged per-process accelerator memory: `(vendor_gpu_index, pid) → MiB`.
 /// NVIDIA indices are CUDA ordinals; AMD indices are `amd:N` ordinals.
-pub fn live_process_vram_mb_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u32> {
-    process_accel_cache().0
+/// `interest_pids` seeds Linux DRM scans (Windows PDH already returns all pids).
+pub fn live_process_vram_mb_by_gpu_pid(
+    interest_pids: &[u32],
+) -> std::collections::HashMap<(u32, u32), u32> {
+    process_accel_cache(interest_pids).0
 }
 
 /// Vendor-merged per-process accelerator util: `(vendor_gpu_index, pid) → SM/CU %`.
-pub fn live_process_util_pct_by_gpu_pid() -> std::collections::HashMap<(u32, u32), u8> {
-    process_accel_cache().1
+pub fn live_process_util_pct_by_gpu_pid(
+    interest_pids: &[u32],
+) -> std::collections::HashMap<(u32, u32), u8> {
+    process_accel_cache(interest_pids).1
 }
 
-/// Cache nvidia-smi pmon / compute-apps + rocm-smi for a few seconds so
-/// `slot_statuses` does not pay a 1s pmon sample on every heartbeat.
-fn process_accel_cache() -> (
+/// Cache nvidia-smi / rocm-smi / OS fallbacks for a few seconds so
+/// `slot_statuses` does not pay a 1s pmon + PDH sample on every heartbeat.
+fn process_accel_cache(
+    interest_pids: &[u32],
+) -> (
     std::collections::HashMap<(u32, u32), u32>,
     std::collections::HashMap<(u32, u32), u8>,
 ) {
@@ -818,14 +826,18 @@ fn process_accel_cache() -> (
     use std::time::{Duration, Instant};
     struct Cache {
         at: Instant,
+        pids_key: Vec<u32>,
         vram: std::collections::HashMap<(u32, u32), u32>,
         util: std::collections::HashMap<(u32, u32), u8>,
     }
     static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(4);
+    let mut pids_key: Vec<u32> = interest_pids.iter().copied().filter(|p| *p > 0).collect();
+    pids_key.sort_unstable();
+    pids_key.dedup();
     if let Ok(guard) = CACHE.lock() {
         if let Some(hit) = guard.as_ref() {
-            if hit.at.elapsed() < TTL {
+            if hit.at.elapsed() < TTL && hit.pids_key == pids_key {
                 return (hit.vram.clone(), hit.util.clone());
             }
         }
@@ -836,15 +848,25 @@ fn process_accel_cache() -> (
             .and_modify(|v: &mut u32| *v = (*v).saturating_add(mb))
             .or_insert(mb);
     }
+    // Windows WDDM / Linux Intel+AMD without vendor CLI / partial maps.
+    process_accel::merge_fill_u32(
+        &mut vram,
+        process_accel::live_os_process_vram_mb_by_gpu_pid(&pids_key),
+    );
     let mut util = live_nvidia_process_util_pct_by_gpu_pid();
     for (key, pct) in live_amd_process_util_pct_by_gpu_pid() {
         util.entry(key)
             .and_modify(|v: &mut u8| *v = (*v).max(pct))
             .or_insert(pct);
     }
+    process_accel::merge_fill_util(
+        &mut util,
+        process_accel::live_os_process_util_pct_by_gpu_pid(&pids_key),
+    );
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some(Cache {
             at: Instant::now(),
+            pids_key,
             vram: vram.clone(),
             util: util.clone(),
         });
