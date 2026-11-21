@@ -27,7 +27,10 @@ bundle_from() {
   while IFS= read -r build_lib; do
     [[ -n "$build_lib" ]] || continue
     ld_path="$build_lib:$ld_path"
-  done < <(find "$SEARCH_ROOT" -type d \( -path '*/llama-cpp-sys-2-*/out/lib' -o -path '*/llama-cpp-sys-2-*/out/build/bin' \) 2>/dev/null | head -20 || true)
+  done < <(find "$SEARCH_ROOT" -type d \( \
+      -path '*/llama-cpp-sys-2-*/out/lib' -o -path '*/llama-cpp-sys-2/*/out/lib' \
+      -o -path '*/llama-cpp-sys-2-*/out/build/bin' -o -path '*/llama-cpp-sys-2/*/out/build/bin' \
+    \) 2>/dev/null | head -20 || true)
 
   LD_LIBRARY_PATH="$ld_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     ldd "$bin" 2>/dev/null | awk '/=> \// {print $3}' | while read -r lib; do
@@ -87,13 +90,20 @@ copy_backend_modules() {
 while IFS= read -r dir; do
   [[ -n "$dir" ]] || continue
   copy_named_libs "$dir"
-done < <(find "$SEARCH_ROOT" -type d \( -path '*/llama-cpp-sys-2-*/out/lib' -o -path '*/llama-cpp-sys-2-*/out/build/bin' -o -path '*/llama-cpp-sys-2-*/out/build/lib' \) 2>/dev/null || true)
+done < <(find "$SEARCH_ROOT" -type d \( \
+    -path '*/llama-cpp-sys-2-*/out/lib' -o -path '*/llama-cpp-sys-2/*/out/lib' \
+    -o -path '*/llama-cpp-sys-2-*/out/build/bin' -o -path '*/llama-cpp-sys-2/*/out/build/bin' \
+    -o -path '*/llama-cpp-sys-2-*/out/build/lib' -o -path '*/llama-cpp-sys-2/*/out/build/lib' \
+  \) 2>/dev/null || true)
 
 # 2) Backend plugins (CUDA / Vulkan / CPU variants).
 while IFS= read -r dir; do
   [[ -n "$dir" ]] || continue
   copy_backend_modules "$dir"
-done < <(find "$SEARCH_ROOT" -type d \( -name backends -o -path '*/llama-cpp-sys-2-*/out/build/bin' \) 2>/dev/null || true)
+done < <(find "$SEARCH_ROOT" -type d \( \
+    -name backends \
+    -o -path '*/llama-cpp-sys-2-*/out/build/bin' -o -path '*/llama-cpp-sys-2/*/out/build/bin' \
+  \) 2>/dev/null || true)
 
 # 2b) CUDA redistributable runtime (cudart/cublas) for libggml-cuda.so.
 # NVIDIA allows shipping these; libcuda.so stays host-driver-only.
