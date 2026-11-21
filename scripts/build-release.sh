@@ -87,7 +87,11 @@ export PATH="${CUDA_PATH}/bin:${PATH}"
 # llama-cpp-sys-2 0.1.154 hard_links shared libs into the profile dir and panics
 # on AlreadyExists when rust-cache leaves soname stubs behind (broken symlinks
 # make Path::exists() false, then hard_link EEXIST). See utilityai/llama-cpp-rs#896.
+#
+# Cargo ≥1.100 nests OUT_DIR as build/<crate>/<hash>/out, so get_cargo_target_dir's
+# nth(3) resolves to profile/build (not profile). hard_link then needs build/deps.
 PROFILE="target/${TARGET}/release"
+mkdir -p "${PROFILE}/deps" "${PROFILE}/build/deps"
 rm -f \
   "${PROFILE}"/libggml*.so* \
   "${PROFILE}"/libllama*.so* \
@@ -95,6 +99,12 @@ rm -f \
   "${PROFILE}/deps"/libggml*.so* \
   "${PROFILE}/deps"/libllama*.so* \
   "${PROFILE}/deps"/libmtmd*.so* \
+  "${PROFILE}/build"/libggml*.so* \
+  "${PROFILE}/build"/libllama*.so* \
+  "${PROFILE}/build"/libmtmd*.so* \
+  "${PROFILE}/build/deps"/libggml*.so* \
+  "${PROFILE}/build/deps"/libllama*.so* \
+  "${PROFILE}/build/deps"/libmtmd*.so* \
   2>/dev/null || true
 
 cargo "${args[@]}"

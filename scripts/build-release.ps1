@@ -87,8 +87,18 @@ if ($rustflags -notmatch 'delayimp') {
 $env:RUSTFLAGS = $rustflags
 # llama-cpp-sys-2 hard_links ggml/llama DLLs into the profile dir and panics on
 # AlreadyExists when rust-cache leaves stubs (utilityai/llama-cpp-rs#896).
+# Cargo ≥1.100: OUT_DIR is build/<crate>/<hash>/out, so nth(3) is profile/build and
+# hard_link needs profile/build/deps (not only profile/deps).
 $profileDir = Join-Path (Get-CargoTargetRoot) (Join-Path $Target "release")
-foreach ($dir in @($profileDir, (Join-Path $profileDir "deps"))) {
+$buildDir = Join-Path $profileDir "build"
+New-Item -ItemType Directory -Force -Path (Join-Path $profileDir "deps") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $buildDir "deps") | Out-Null
+foreach ($dir in @(
+    $profileDir,
+    (Join-Path $profileDir "deps"),
+    $buildDir,
+    (Join-Path $buildDir "deps")
+)) {
     if (-not (Test-Path $dir)) { continue }
     Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^(lib)?(ggml|llama|mtmd)' -and $_.Extension -match '\.(dll|lib)$' } |

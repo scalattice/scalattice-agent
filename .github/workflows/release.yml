@@ -116,8 +116,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Jammy + LunarG SDK key (24.04 caches / old cmake vulkan paths break jammy).
-          # v2: bust cache that left llama-cpp-sys hard_link EEXIST stubs (llama-cpp-rs#896).
-          shared-key: release-x86_64-gpu-jammy-vulkansdk-v2
+          # v3: Cargo 1.100 build-dir layout breaks llama-cpp-sys hard_link (nth(3)→build/deps).
+          shared-key: release-x86_64-gpu-jammy-vulkansdk-v3
           cache-targets: true
           cache-workspace-crates: true
       - name: Build + package
@@ -177,8 +177,8 @@ jobs:
           method: auto
       - uses: Swatinem/rust-cache@v2
         with:
-          # v2: same llama-cpp-sys hard_link EEXIST bust as x86_64 (llama-cpp-rs#896).
-          shared-key: release-aarch64-gpu-v2
+          # v3: same Cargo 1.100 llama-cpp-sys hard_link bust as x86_64.
+          shared-key: release-aarch64-gpu-v3
           cache-targets: true
           cache-workspace-crates: true
       - name: Build + package
@@ -192,7 +192,9 @@ jobs:
           export PATH="${CUDA_PATH}/bin:$PATH"
           nvcc --version
           # Drop cached soname stubs before cargo; llama-cpp-sys-2 panics on EEXIST.
+          # Cargo 1.100: nth(3) → profile/build, so hard_link needs build/deps.
           PROFILE=target/aarch64-unknown-linux-gnu/release
+          mkdir -p "${PROFILE}/deps" "${PROFILE}/build/deps"
           rm -f \
             "${PROFILE}"/libggml*.so* \
             "${PROFILE}"/libllama*.so* \
@@ -200,6 +202,12 @@ jobs:
             "${PROFILE}/deps"/libggml*.so* \
             "${PROFILE}/deps"/libllama*.so* \
             "${PROFILE}/deps"/libmtmd*.so* \
+            "${PROFILE}/build"/libggml*.so* \
+            "${PROFILE}/build"/libllama*.so* \
+            "${PROFILE}/build"/libmtmd*.so* \
+            "${PROFILE}/build/deps"/libggml*.so* \
+            "${PROFILE}/build/deps"/libllama*.so* \
+            "${PROFILE}/build/deps"/libmtmd*.so* \
             2>/dev/null || true
           cargo build --locked --release --target aarch64-unknown-linux-gnu --no-default-features --features arm-gpu
           mkdir -p dist
@@ -248,7 +256,7 @@ jobs:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-macos-15-metal
+          shared-key: release-macos-15-metal-v2
           cache-targets: true
           cache-workspace-crates: true
       - name: Build Metal (arm64 only)
@@ -261,6 +269,22 @@ jobs:
         run: |
           set -euo pipefail
           rustup target add aarch64-apple-darwin
+          PROFILE=target/aarch64-apple-darwin/release
+          mkdir -p "${PROFILE}/deps" "${PROFILE}/build/deps"
+          rm -f \
+            "${PROFILE}"/libggml*.dylib \
+            "${PROFILE}"/libllama*.dylib \
+            "${PROFILE}"/libmtmd*.dylib \
+            "${PROFILE}/deps"/libggml*.dylib \
+            "${PROFILE}/deps"/libllama*.dylib \
+            "${PROFILE}/deps"/libmtmd*.dylib \
+            "${PROFILE}/build"/libggml*.dylib \
+            "${PROFILE}/build"/libllama*.dylib \
+            "${PROFILE}/build"/libmtmd*.dylib \
+            "${PROFILE}/build/deps"/libggml*.dylib \
+            "${PROFILE}/build/deps"/libllama*.dylib \
+            "${PROFILE}/build/deps"/libmtmd*.dylib \
+            2>/dev/null || true
           cargo build --locked --release --target aarch64-apple-darwin --no-default-features --features metal
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/scalattice-agent dist/scalattice-agent
@@ -368,7 +392,7 @@ jobs:
       # Stable across releases. Putting the tag here made every release a cold llama.cpp compile.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-self-hosted-v5
+          shared-key: release-windows-self-hosted-v6
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
@@ -441,7 +465,7 @@ jobs:
       # Stable across releases. Putting the tag here made every release a cold llama.cpp compile.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows-gpu-v5
+          shared-key: release-windows-gpu-v6
           cache-targets: true
           cache-workspace-crates: true
       - uses: ilammy/msvc-dev-cmd@v1
