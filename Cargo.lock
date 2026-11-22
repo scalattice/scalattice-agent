@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "scalattice-agent"
-version = "1.1.168"
+version = "1.1.169"
 dependencies = [
  "anyhow",
  "base64",
